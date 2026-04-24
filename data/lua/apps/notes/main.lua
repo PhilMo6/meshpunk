@@ -73,6 +73,18 @@ local save = footer:Button{w = lvgl.PCT(45), h = 40}
 save:Label{text = "Save", align = lvgl.ALIGN.CENTER}
 save:onClicked(save_file)
 
+-- save file then quit
+local function quit_app()
+    save_file()
+    root:delete()
+    local launcher = require("launcher")
+    launcher.create()
+end
+
+local quit = footer:Button{w = lvgl.PCT(45), h = 40}
+quit:Label{text = "Quit", align = lvgl.ALIGN.CENTER}
+quit:onClicked(quit_app)
+
 load_file()
 
 return root

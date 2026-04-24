@@ -71,6 +71,7 @@ typedef struct {
     lv_style_t text_align_center;
     lv_style_t outline_primary;
     lv_style_t outline_secondary;
+    lv_style_t focus_key_bg;  /* light grey background for focused widgets */
     lv_style_t circle;
     lv_style_t no_radius;
     lv_style_t clip_corner;
@@ -291,6 +292,10 @@ static void style_init(my_theme_t * theme)
     lv_style_set_outline_color(&theme->styles.outline_secondary, theme->base.color_secondary);
     lv_style_set_outline_width(&theme->styles.outline_secondary, OUTLINE_WIDTH);
     lv_style_set_outline_opa(&theme->styles.outline_secondary, LV_OPA_50);
+
+    style_init_reset(&theme->styles.focus_key_bg);
+    lv_style_set_bg_color(&theme->styles.focus_key_bg, lv_color_hex(0xAAAAAA));
+    lv_style_set_bg_opa(&theme->styles.focus_key_bg, LV_OPA_COVER);
 
     style_init_reset(&theme->styles.btn);
     lv_style_set_radius(&theme->styles.btn, RADIUS_MESHPUNK);
@@ -812,6 +817,8 @@ static void theme_apply(lv_theme_t * th, lv_obj_t * obj)
         lv_obj_add_style(obj, &theme->styles.pressed, LV_STATE_PRESSED);
         lv_obj_add_style(obj, &theme->styles.transition_normal, LV_STATE_PRESSED);
         lv_obj_add_style(obj, &theme->styles.outline_primary, LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &theme->styles.focus_key_bg, LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &theme->styles.focus_key_bg, LV_STATE_FOCUSED);
 #if LV_THEME_MESHPUNK_GROW
         lv_obj_add_style(obj, &theme->styles.grow, LV_STATE_PRESSED);
 #endif
@@ -1018,6 +1025,8 @@ static void theme_apply(lv_theme_t * th, lv_obj_t * obj)
         lv_obj_add_style(obj, &theme->styles.pad_small, 0);
         lv_obj_add_style(obj, &theme->styles.disabled, LV_STATE_DISABLED);
         lv_obj_add_style(obj, &theme->styles.outline_primary, LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &theme->styles.focus_key_bg, LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &theme->styles.focus_key_bg, LV_STATE_FOCUSED);
         lv_obj_add_style(obj, &theme->styles.outline_secondary, LV_STATE_EDITED);
         lv_obj_add_style(obj, &theme->styles.scrollbar, LV_PART_SCROLLBAR);
         lv_obj_add_style(obj, &theme->styles.scrollbar_scrolled, LV_PART_SCROLLBAR | LV_STATE_SCROLLED);

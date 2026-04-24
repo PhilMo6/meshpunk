@@ -3,14 +3,17 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
+#include <SD.h>
 #include <TFT_eSPI.h>
 #include <Ticker.h> // Include ticker for LVGL timing
 #include <WiFi.h>
 #include <Wire.h>
-#include <TFT_eSPI.h>
+#include <esp_heap_caps.h> // DMA-capable buffer allocation for LVGL
 #include <lvgl.h>
 #include "theme/lv_theme_meshpunk.h"
+#include "emoji_font.h"
 #include "tdeck-pins.h"
+#include "meshpunk_sync.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -23,6 +26,14 @@
 #include <helpers/IdentityStore.h>
 #include <RTClib.h>
 #include <RadioLib.h>
+#include <TinyGPSPlus.h>
+
+// One-shot GPS time sync (defined below, after the_mesh is declared).
+static void gps_sync_begin();
+// Exposed so meshpunk_tasks.cpp's gps_task can drive it from Core 1.
+// Returns immediately after gps_sync_done is set (after fix or timeout).
+void gps_sync_poll();
+bool gps_sync_is_done();
 
 
 extern "C" {
@@ -66,12 +77,277 @@ ESP32Board board;
 CustomSX1262Wrapper radio_driver(radio, board);
 PunkMesh the_mesh(radio_driver, fast_rng, *new VolatileRTCClock(), tables); // TODO: test with 'rtc_clock' in target.cpp
 
-// Home button
-volatile bool homePressed = false;
+// One-shot GPS time sync: poll in loop() until first fix, then stop.
+static TinyGPSPlus gps_tinygps;
+static HardwareSerial GPSSerial(1);
+static bool gps_sync_done = false;
+static uint32_t gps_sync_start_ms = 0;
+static uint32_t gps_last_stats_ms = 0;
+static uint32_t gps_last_chars = 0;
+static const uint32_t GPS_SYNC_TIMEOUT_MS = 600000;   // 10 min cold-start budget
+static const uint32_t GPS_STATS_INTERVAL_MS = 5000;   // print status every 5s
+
+// Timezone state — "auto" uses longitude-from-GPS; otherwise a fixed offset in minutes.
+// Persisted in LittleFS:/tz.cfg as either "auto" or a signed integer minute count.
+static bool    gps_location_valid_at_fix = false;
+static double  gps_lng_at_fix = 0.0;
+static bool    tz_is_auto = true;
+static int32_t tz_manual_minutes = 0;
+static String  tz_setting_str = "auto";
+
+static int32_t tz_auto_offset_minutes() {
+  if (!gps_location_valid_at_fix) return 0;
+  // 1° longitude = 4 minutes of solar time.
+  int32_t m = (int32_t)lround(gps_lng_at_fix * 4.0);
+  if (m < -14 * 60) m = -14 * 60;
+  if (m >  14 * 60) m =  14 * 60;
+  // Round to nearest whole hour. Longitude is a rough proxy for civil time zones,
+  // and the overwhelming majority of zones sit on hour boundaries — finer rounding
+  // (e.g. 15 min) produces offsets like -8:15 for locations that are really -8:00.
+  m = (int32_t)lround((double)m / 60.0) * 60;
+  return m;
+}
+
+static int32_t tz_effective_offset_minutes() {
+  return tz_is_auto ? tz_auto_offset_minutes() : tz_manual_minutes;
+}
+
+static void tz_load() {
+  File f = LittleFS.open("/tz.cfg", "r");
+  if (!f) {
+    Serial.println("[TZ] no /tz.cfg, defaulting to auto");
+    tz_is_auto = true; tz_setting_str = "auto"; return;
+  }
+  String s = f.readStringUntil('\n');
+  f.close();
+  s.trim();
+  if (s.length() == 0 || s.equalsIgnoreCase("auto")) {
+    tz_is_auto = true; tz_setting_str = "auto";
+  } else {
+    tz_manual_minutes = (int32_t)s.toInt();
+    tz_is_auto = false;
+    tz_setting_str = String(tz_manual_minutes);
+  }
+  Serial.printf("[TZ] loaded setting=%s (auto=%d manual_min=%d)\n",
+                tz_setting_str.c_str(), tz_is_auto ? 1 : 0, (int)tz_manual_minutes);
+}
+
+static bool tz_save() {
+  File f = LittleFS.open("/tz.cfg", "w");
+  if (!f) { Serial.println("[TZ] save failed: cannot open /tz.cfg"); return false; }
+  f.print(tz_setting_str);
+  f.close();
+  return true;
+}
+
+// Auto-baud: T-Deck Plus has shipped with several GPS modules over time.
+// Try common rates until one produces valid NMEA checksums.
+static const uint32_t GPS_BAUD_CANDIDATES[] = { 9600, 38400, 115200, 19200, 57600, 4800 };
+static const uint8_t  GPS_BAUD_COUNT = sizeof(GPS_BAUD_CANDIDATES) / sizeof(GPS_BAUD_CANDIDATES[0]);
+static const uint32_t GPS_BAUD_PROBE_MS = 3000;       // try each rate for 3s
+static uint8_t        gps_baud_idx = 0;
+static uint32_t       gps_baud_probe_start_ms = 0;
+static bool           gps_baud_locked = false;
+static uint32_t       gps_baud_probe_chars_start = 0;
+
+static void gps_print_stats(const char* tag) {
+  uint32_t elapsed = millis() - gps_sync_start_ms;
+  uint32_t chars = gps_tinygps.charsProcessed();
+  uint32_t delta = chars - gps_last_chars;
+  gps_last_chars = chars;
+
+  Serial.printf("[GPS %s] t=%lus chars=%lu(+%lu) sent_with_fix=%lu csum_ok=%lu csum_fail=%lu\n",
+                tag,
+                (unsigned long)(elapsed / 1000UL),
+                (unsigned long)chars,
+                (unsigned long)delta,
+                (unsigned long)gps_tinygps.sentencesWithFix(),
+                (unsigned long)gps_tinygps.passedChecksum(),
+                (unsigned long)gps_tinygps.failedChecksum());
+
+  // Satellites in view (from GSV/GGA)
+  if (gps_tinygps.satellites.isValid()) {
+    Serial.printf("[GPS %s]   sats=%lu (age=%lums)\n",
+                  tag,
+                  (unsigned long)gps_tinygps.satellites.value(),
+                  (unsigned long)gps_tinygps.satellites.age());
+  } else {
+    Serial.printf("[GPS %s]   sats=--\n", tag);
+  }
+
+  // HDOP — lower is better; <5 is usable, <2 is good
+  if (gps_tinygps.hdop.isValid()) {
+    Serial.printf("[GPS %s]   hdop=%.2f\n", tag, gps_tinygps.hdop.hdop());
+  }
+
+  // Date (often appears before full position fix)
+  if (gps_tinygps.date.isValid()) {
+    Serial.printf("[GPS %s]   date=%04u-%02u-%02u (age=%lums)\n",
+                  tag,
+                  gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
+                  (unsigned long)gps_tinygps.date.age());
+  } else {
+    Serial.printf("[GPS %s]   date=INVALID\n", tag);
+  }
+
+  // Time
+  if (gps_tinygps.time.isValid()) {
+    Serial.printf("[GPS %s]   time=%02u:%02u:%02u (age=%lums)\n",
+                  tag,
+                  gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second(),
+                  (unsigned long)gps_tinygps.time.age());
+  } else {
+    Serial.printf("[GPS %s]   time=INVALID\n", tag);
+  }
+
+  // Location (not required for time sync, but useful signal)
+  if (gps_tinygps.location.isValid()) {
+    Serial.printf("[GPS %s]   loc=%.5f,%.5f (age=%lums)\n",
+                  tag,
+                  gps_tinygps.location.lat(), gps_tinygps.location.lng(),
+                  (unsigned long)gps_tinygps.location.age());
+  } else {
+    Serial.printf("[GPS %s]   loc=NO FIX YET\n", tag);
+  }
+
+  // Diagnostic hint
+  if (delta == 0) {
+    Serial.printf("[GPS %s]   !! no new bytes — check power/TX pin (expected RX=%d)\n",
+                  tag, TDECK_GPS_RX);
+  } else if (gps_tinygps.passedChecksum() == 0 && chars > 200 && gps_baud_locked) {
+    Serial.printf("[GPS %s]   !! bytes flowing but 0 valid sentences at locked baud %u\n",
+                  tag, (unsigned)GPS_BAUD_CANDIDATES[gps_baud_idx]);
+  }
+}
+
+static void gps_start_probe_at_current_baud() {
+  uint32_t baud = GPS_BAUD_CANDIDATES[gps_baud_idx];
+  GPSSerial.end();
+  GPSSerial.begin(baud, SERIAL_8N1, TDECK_GPS_RX, TDECK_GPS_TX);
+  gps_baud_probe_start_ms = millis();
+  gps_baud_probe_chars_start = gps_tinygps.charsProcessed();
+  Serial.printf("[GPS] probing baud=%u (candidate %u/%u)\n",
+                (unsigned)baud, (unsigned)(gps_baud_idx + 1), (unsigned)GPS_BAUD_COUNT);
+}
+
+static void gps_sync_begin() {
+  gps_sync_start_ms = millis();
+  gps_last_stats_ms = gps_sync_start_ms;
+  gps_last_chars = 0;
+  gps_baud_idx = 0;
+  gps_baud_locked = false;
+  Serial.printf("[GPS] Listening on UART1 RX=%d TX=%d (auto-baud, timeout=%us)\n",
+                TDECK_GPS_RX, TDECK_GPS_TX,
+                (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
+  gps_start_probe_at_current_baud();
+}
+
+// Returns true once a working baud is locked in.
+static bool gps_baud_probe_tick() {
+  if (gps_baud_locked) return true;
+
+  uint32_t now = millis();
+  uint32_t ok = gps_tinygps.passedChecksum();
+  uint32_t fail = gps_tinygps.failedChecksum();
+
+  // Lock as soon as we see ≥2 clean sentences at this rate.
+  if (ok >= 2) {
+    Serial.printf("[GPS] baud LOCKED at %u (csum_ok=%lu csum_fail=%lu)\n",
+                  (unsigned)GPS_BAUD_CANDIDATES[gps_baud_idx],
+                  (unsigned long)ok, (unsigned long)fail);
+    gps_baud_locked = true;
+    return true;
+  }
+
+  // Advance to next candidate after the probe window expires.
+  if (now - gps_baud_probe_start_ms >= GPS_BAUD_PROBE_MS) {
+    uint32_t delta = gps_tinygps.charsProcessed() - gps_baud_probe_chars_start;
+    Serial.printf("[GPS] baud %u rejected: chars=+%lu csum_ok=%lu csum_fail=%lu\n",
+                  (unsigned)GPS_BAUD_CANDIDATES[gps_baud_idx],
+                  (unsigned long)delta, (unsigned long)ok, (unsigned long)fail);
+    gps_baud_idx = (gps_baud_idx + 1) % GPS_BAUD_COUNT;
+    gps_start_probe_at_current_baud();
+  }
+  return false;
+}
+
+bool gps_sync_is_done() { return gps_sync_done; }
+
+void gps_sync_poll() {
+  if (gps_sync_done) return;
+  while (GPSSerial.available()) gps_tinygps.encode(GPSSerial.read());
+
+  uint32_t now = millis();
+
+  // Auto-baud: cycle candidate rates until one produces valid NMEA.
+  gps_baud_probe_tick();
+
+  // Periodic status dump
+  if (now - gps_last_stats_ms >= GPS_STATS_INTERVAL_MS) {
+    gps_last_stats_ms = now;
+    gps_print_stats("stat");
+  }
+
+  if (gps_tinygps.date.isValid() && gps_tinygps.time.isValid()
+      && gps_tinygps.date.year() >= 2024) {
+    DateTime utc(gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
+                 gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second());
+    MESH_LOCK();
+    the_mesh.getRTCClock()->setCurrentTime(utc.unixtime());
+    MESH_UNLOCK();
+
+    // Capture longitude for auto-timezone (ok if not yet valid — auto falls back to UTC).
+    if (gps_tinygps.location.isValid()) {
+      gps_lng_at_fix = gps_tinygps.location.lng();
+      gps_location_valid_at_fix = true;
+      Serial.printf("[TZ] captured lng=%.5f -> auto offset=%d min\n",
+                    gps_lng_at_fix, (int)tz_auto_offset_minutes());
+    } else {
+      Serial.println("[TZ] no location at time-fix; auto-tz falls back to UTC");
+    }
+
+    Serial.println("[GPS] ======== FIX ACQUIRED ========");
+    gps_print_stats("fix");
+    Serial.printf("[GPS] RTC set to %u UTC (%04u-%02u-%02u %02u:%02u:%02u) after %lus\n",
+                  (unsigned)utc.unixtime(),
+                  gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
+                  gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second(),
+                  (unsigned long)((now - gps_sync_start_ms) / 1000UL));
+    Serial.println("[GPS] Shutting down serial; internal clock takes over.");
+    GPSSerial.end();
+    gps_sync_done = true;
+    return;
+  }
+
+  if (now - gps_sync_start_ms > GPS_SYNC_TIMEOUT_MS) {
+    Serial.println("[GPS] ======== TIMEOUT ========");
+    gps_print_stats("timeout");
+    Serial.printf("[GPS] No fix after %us. Move to open sky for cold start (can take 30s-5min+).\n",
+                  (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
+    GPSSerial.end();
+    gps_sync_done = true;
+  }
+}
+
+// Trackball click — fed into LVGL as LV_KEY_ENTER via keyboard_read_cb
+volatile int trackball_click = 0;
 
 void IRAM_ATTR ISR_click() {
-  homePressed = true;
+  trackball_click++;
 }
+
+// Trackball direction counters — each ISR fires on a FALLING edge pulse
+// from the T-Deck trackball. The keyboard_read_cb consumes these as
+// LV_KEY_UP/DOWN/LEFT/RIGHT presses.
+volatile int trackball_up = 0;
+volatile int trackball_down = 0;
+volatile int trackball_left = 0;
+volatile int trackball_right = 0;
+
+void IRAM_ATTR ISR_trackball_up()    { trackball_up++; }
+void IRAM_ATTR ISR_trackball_down()  { trackball_down++; }
+void IRAM_ATTR ISR_trackball_left()  { trackball_left++; }
+void IRAM_ATTR ISR_trackball_right() { trackball_right++; }
 
 // Keyboard I2C defines
 #define LILYGO_KB_SLAVE_ADDRESS 0x55
@@ -99,6 +375,17 @@ char last_key = 0;
 
 // Filesystem variables
 bool fs_mounted = false;
+bool sd_mounted = false;
+
+
+// sd_spi_take() / sd_spi_release() — mutex-based.
+// TAKE (inline in meshpunk_sync.h) acquires SPI_LOCK.
+// RELEASE releases SPI_LOCK. The historical TFT-reinit poke (SLPOUT/DISPON)
+// that used to live here is gone: the bus mutex now serializes TFT access
+// against SD and radio, so the display never observes a mid-transaction bus.
+void sd_spi_release() {
+  SPI_UNLOCK();
+}
 
 // List dir helper
 void listDir(fs::FS &fs, const char *dirname, int level = 0) {
@@ -153,12 +440,77 @@ String readFile(const char *filename) {
   return content;
 }
 
+// -- Replaced by safe_open version that parses L:/S: prefix
+// static int lua_io_open(lua_State *L) {
+//   const char *filename = luaL_checkstring(L, 1);
+//   const char *mode = luaL_optstring(L, 2, "r");
+//
+//   Serial.print("io.open: ");
+//   Serial.print(filename);
+//   Serial.print(" mode: ");
+//   Serial.println(mode);
+//
+//   const char *fs_mode;
+//   if (strcmp(mode, "r") == 0) {
+//     fs_mode = "r";
+//   } else if (strcmp(mode, "w") == 0) {
+//     fs_mode = "w";
+//   } else {
+//     lua_pushnil(L);
+//     lua_pushstring(L, "Only 'r' and 'w' modes supported");
+//     return 2;
+//   }
+//
+//   fs::File f = LittleFS.open(filename, fs_mode);
+//   if (!f) {
+//     lua_pushnil(L);
+//     lua_pushstring(L, "Failed to open file");
+//     return 2;
+//   }
+//
+//   fs::File *file = new fs::File(f);
+//   fs::File **ud = (fs::File **)lua_newuserdata(L, sizeof(fs::File *));
+//   *ud = file;
+//
+//   luaL_getmetatable(L, "esp32_file");
+//   lua_setmetatable(L, -2);
+//   return 1;
+// }
+
+// File handle struct to track which filesystem a file belongs to
+struct LuaFileHandle {
+    fs::File* file;
+    bool is_sd;
+};
+
+// Safe io.open that parses L: (LittleFS) or S: (SD) prefix
+// Usage: io.open("L:/lua/apps/myapp/save.txt", "r")
+//        io.open("S:/meshpunk/apps/myapp/save.txt", "w")
+//        io.open("/lua/apps/myapp/save.txt", "r")  -- defaults to LittleFS
 static int lua_io_open(lua_State *L) {
   const char *filename = luaL_checkstring(L, 1);
   const char *mode = luaL_optstring(L, 2, "r");
 
+  bool use_sd = false;
+  const char *actual_path = filename;
+
+  // Parse drive letter prefix
+  if (filename[0] != '\0' && filename[1] == ':') {
+    if (filename[0] == 'S' || filename[0] == 's') {
+      use_sd = true;
+      actual_path = filename + 2;
+    } else if (filename[0] == 'L' || filename[0] == 'l') {
+      use_sd = false;
+      actual_path = filename + 2;
+    }
+  }
+
   Serial.print("io.open: ");
   Serial.print(filename);
+  Serial.print(" -> ");
+  Serial.print(use_sd ? "SD" : "LittleFS");
+  Serial.print(":");
+  Serial.print(actual_path);
   Serial.print(" mode: ");
   Serial.println(mode);
 
@@ -167,22 +519,48 @@ static int lua_io_open(lua_State *L) {
     fs_mode = "r";
   } else if (strcmp(mode, "w") == 0) {
     fs_mode = "w";
+  // Added append mode support
+  } else if (strcmp(mode, "a") == 0) {
+    fs_mode = "a";
   } else {
     lua_pushnil(L);
-    lua_pushstring(L, "Only 'r' and 'w' modes supported");
+    lua_pushstring(L, "Only 'r', 'w', and 'a' modes supported");
     return 2;
   }
 
-  fs::File f = LittleFS.open(filename, fs_mode);
-  if (!f) {
-    lua_pushnil(L);
-    lua_pushstring(L, "Failed to open file");
-    return 2;
-  }
+  if (use_sd) {
+    if (!sd_mounted) {
+      lua_pushnil(L);
+      lua_pushstring(L, "SD card not mounted");
+      return 2;
+    }
 
-  fs::File *file = new fs::File(f);
-  fs::File **ud = (fs::File **)lua_newuserdata(L, sizeof(fs::File *));
-  *ud = file;
+    sd_spi_take();
+    fs::File f = SD.open(actual_path, fs_mode);
+    sd_spi_release();
+    if (!f) {
+      lua_pushnil(L);
+      lua_pushstring(L, "Failed to open file on SD");
+      return 2;
+    }
+
+    fs::File *file = new fs::File(f);
+    LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
+    ud->file = file;
+    ud->is_sd = true;
+  } else {
+    fs::File f = LittleFS.open(actual_path, fs_mode);
+    if (!f) {
+      lua_pushnil(L);
+      lua_pushstring(L, "Failed to open file");
+      return 2;
+    }
+
+    fs::File *file = new fs::File(f);
+    LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
+    ud->file = file;
+    ud->is_sd = false;
+  }
 
   luaL_getmetatable(L, "esp32_file");
   lua_setmetatable(L, -2);
@@ -216,17 +594,67 @@ void setBrightness(uint8_t value) {
   level = value;
 }
 
-// LVGL display driver
+// Helper: read the ILI9341 current scanline position via command 0x45.
+// Returns 0–319 indicating the gate line the panel is currently refreshing.
+static uint16_t ili9341_get_scanline() {
+  uint8_t hi = tft.readcommand8(0x45, 1); // GTS[8]
+  uint8_t lo = tft.readcommand8(0x45, 2); // GTS[7:0]
+  return ((hi & 0x01) << 8) | lo;
+}
+
+// Scanline-tracking flush callback.
+//
+// The ILI9341 physically scans gate lines 0→319 regardless of MADCTL
+// rotation settings. In landscape rotation 1 (MADCTL MV|MX), the gate
+// scan sweeps horizontally across the screen, so the scanline value
+// approximately maps to the LVGL x-coordinate.
+//
+// Strategy: before writing pixels, read the current scanline. If it is
+// inside (or just ahead of) the flush area, busy-wait for it to pass.
+// This makes our SPI writes trail behind the panel's read pointer,
+// preventing the display from showing a mix of old and new data.
+//
+// The SCANLINE_MARGIN adds a safety buffer — we wait until the scanline
+// is at least this many lines past the end of our flush area before
+// writing, to account for SPI transaction setup time.
+
+#define SCANLINE_MARGIN 8
+
 static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
                           uint8_t *px_map) {
   uint32_t w = (area->x2 - area->x1 + 1);
   uint32_t h = (area->y2 - area->y1 + 1);
+
+  SPI_LOCK();
+
+  // Read current scanline position.
+  // In rotation 1 the gate scan maps to the y-axis of the flush area
+  // (the ILI9341's 320 native rows become the 240-pixel vertical axis
+  // after MV swap + rotation). Try y1/y2 first; if tearing persists,
+  // switch flush_start/flush_end to use x1/x2 instead.
+  uint16_t scanline = ili9341_get_scanline();
+  uint16_t flush_start = area->y1;
+  uint16_t flush_end   = area->y2 + SCANLINE_MARGIN;
+
+  // Busy-wait if the scanline is inside (or about to enter) the flush
+  // area.  Timeout after ~8 ms to avoid blocking the system forever
+  // if readcommand8 returns garbage (e.g. MISO not connected).
+  int wait_us = 0;
+  while (scanline >= flush_start && scanline <= flush_end && wait_us < 8000) {
+    delayMicroseconds(10);
+    wait_us += 10;
+    scanline = ili9341_get_scanline();
+  }
   tft.startWrite();
   tft.setAddrWindow(area->x1, area->y1, w, h);
   tft.pushColors((uint16_t *)px_map, w * h, false);
   tft.endWrite();
+
+  SPI_UNLOCK();
+
   lv_display_flush_ready(disp);
 }
+
 
 // Touch handling
 int16_t x[5], y[5];
@@ -282,15 +710,34 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
         last_key_time = current_time;
         key_is_new = true;
         was_pressed = true;
-
-        // Serial.print("Key registered: ");
-        // Serial.print(keyValue);
-        // Serial.print(" (");
-        // Serial.print((int)keyValue);
-        // Serial.println(")");
       }
     } else {
       was_pressed = false;
+    }
+  }
+
+  // Check trackball directions and click if no keyboard key is pending
+  if (!key_is_new) {
+    if (trackball_click > 0) {
+      trackball_click--;
+      last_key_code = LV_KEY_ENTER;
+      key_is_new = true;
+    } else if (trackball_up > 0) {
+      trackball_up--;
+      last_key_code = LV_KEY_UP;
+      key_is_new = true;
+    } else if (trackball_down > 0) {
+      trackball_down--;
+      last_key_code = LV_KEY_DOWN;
+      key_is_new = true;
+    } else if (trackball_left > 0) {
+      trackball_left--;
+      last_key_code = LV_KEY_LEFT;
+      key_is_new = true;
+    } else if (trackball_right > 0) {
+      trackball_right--;
+      last_key_code = LV_KEY_RIGHT;
+      key_is_new = true;
     }
   }
 
@@ -311,9 +758,6 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     } else {
       data->key = last_key_code;
     }
-
-    // Serial.print("Sending key to LVGL: ");
-    // Serial.println((char)data->key);
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
   }
@@ -325,16 +769,6 @@ static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   if (touch.isPressed()) {
     uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
     if (touched > 0) {
-      // Print touch coordinates for debugging (limit frequency to avoid
-      // flooding serial)
-      if (touch_debug && (millis() - last_touch_debug > 500)) {
-        // Serial.print("Touch detected! x=");
-        // Serial.print(x[0]);
-        // Serial.print(" y=");
-        // Serial.println(y[0]);
-        last_touch_debug = millis();
-      }
-
       data->state = LV_INDEV_STATE_PRESSED;
       data->point.x = x[0];
       data->point.y = y[0];
@@ -403,13 +837,28 @@ void handleWebSerialCommands() {
 
 // Setup LVGL
 void setupLvgl() {
-#define LVGL_BUFFER_SIZE (TFT_WIDTH * TFT_HEIGHT * sizeof(lv_color_t))
 
-  static uint8_t *buf = (uint8_t *)ps_malloc(LVGL_BUFFER_SIZE);
-  if (!buf) {
-    Serial.println("Memory allocation failed!");
+  // [COMMENTED OUT] Single full-frame PSRAM buffer — caused DMA assert failure
+  // because PSRAM is not DMA-accessible on ESP32-S3. Replaced with double
+  // buffers allocated from internal DMA-capable RAM (Option B).
+  //#define LVGL_BUFFER_SIZE (TFT_WIDTH * TFT_HEIGHT * sizeof(lv_color_t))
+  //
+  //static uint8_t *buf = (uint8_t *)ps_malloc(LVGL_BUFFER_SIZE);
+  //if (!buf) {
+  //  Serial.println("Memory allocation failed!");
+  //  delay(5000);
+  //  assert(buf);
+  //}
+
+#define BUF_LINES 48
+#define BUF_SIZE (TFT_HEIGHT * BUF_LINES * sizeof(lv_color_t))
+
+  static uint8_t *buf1 = (uint8_t *)ps_malloc(BUF_SIZE);
+  static uint8_t *buf2 = (uint8_t *)ps_malloc(BUF_SIZE);
+  if (!buf1 || !buf2) {
+    Serial.println("LVGL buffer allocation failed!");
     delay(5000);
-    assert(buf);
+    assert(buf1 && buf2);
   }
 
   lv_init();
@@ -421,22 +870,30 @@ void setupLvgl() {
   // Create a display
   lv_display_t *disp = lv_display_create(TFT_HEIGHT, TFT_WIDTH);
 
-  // Set theme
+  // Set theme. Emoji font wraps montserrat_14 as fallback so ASCII/Latin still
+  // render from the bitmap font; codepoints >= 0x2600 are loaded as PNGs from
+  // S:/emoji/<hex>.png on the SD card.
+  static lv_font_t * ui_font = emoji_font_create(16, &lv_font_montserrat_14);
+  if (!ui_font) ui_font = (lv_font_t *)&lv_font_montserrat_14;
+
   lv_theme_t *custom_theme = lv_theme_meshpunk_init(
     disp,
     lv_color_make(0x10, 0x10, 0x10),   // Primary color
     lv_color_make(0x30, 0x30, 0x30),   // Secondary color
     true,                              // Dark mode
-    &lv_font_montserrat_14             // Font
+    ui_font                            // Font (emoji + ASCII fallback)
   );
   
   lv_disp_set_theme(disp, custom_theme);
 
-  // lv_obj_add_style(lv_scr_act(), &meshpunk_style, 0); // apply to root
+  // Force the emoji font onto the active screen so all descendants (including
+  // luavgl-created labels) inherit it. The theme sets it on a style object,
+  // but inheritance can be shadowed by other styles — setting it as a local
+  // property on the screen guarantees it's the default for every child.
+  lv_obj_set_style_text_font(lv_display_get_screen_active(disp), ui_font, 0);
 
-  // Initialize the buffer
-  lv_display_set_buffers(disp, buf, NULL, LVGL_BUFFER_SIZE,
-                         LV_DISPLAY_RENDER_MODE_FULL);
+  lv_display_set_buffers(disp, buf1, buf2, BUF_SIZE,
+                         LV_DISPLAY_RENDER_MODE_PARTIAL);
 
   // Set display properties
   lv_display_set_flush_cb(disp, disp_flush_cb);
@@ -474,24 +931,6 @@ static void btn_event_handler(lv_event_t *e) {
 
 // Create a simple UI
 void createUI() {
-  // Get the active screen
-  // lv_obj_t *scr = lv_scr_act();
-
-  // Create a label
-  // label = lv_label_create(scr);
-  // lv_label_set_text(label, "Hello MeshPunk World!");
-  // lv_obj_align(label, LV_ALIGN_TOP_LEFT, 10, 10);
-
-  // // Create a button
-  // lv_obj_t *btn = lv_btn_create(scr);
-  // lv_obj_set_pos(btn, 50, 100);
-  // lv_obj_set_size(btn, 120, 50);
-  // lv_obj_add_event_cb(btn, btn_event_handler, LV_EVENT_CLICKED, NULL);
-
-  // // Create label on the button
-  // lv_obj_t *btn_label = lv_label_create(btn);
-  // lv_label_set_text(btn_label, "Click Me!");
-  // lv_obj_center(btn_label);
 }
 
 // WiFi function for Lua
@@ -638,10 +1077,1010 @@ static int lua_wifi_fetch(lua_State *L) {
   return 1; // Return the result table
 }
 
+// ── Mesh bridge: Lua → C++ ──────────────────────────────────────
+
+// Send a public/group channel message from Lua
+// Usage from Lua: _mesh_send_public("Hello mesh!")
+static int lua_mesh_send_public(lua_State *L) {
+  const char *raw = luaL_checkstring(L, 1);
+  // Normalize smart quotes so both the wire message and the local echo
+  // render cleanly on receivers whose base font lacks U+2018-U+201D.
+  char text[160];
+  normalize_smart_quotes(raw, text, sizeof(text));
+
+  Serial.printf("[MESH TX] lua_mesh_send_public called, text=\"%s\"\n", text);
+
+  MESH_LOCK();
+  if (!the_mesh._public) {
+    MESH_UNLOCK();
+    Serial.println("[MESH TX] ERROR: No public channel configured!");
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "No public channel configured");
+    return 2;
+  }
+
+  uint32_t timestamp = the_mesh.getRTCClock()->getCurrentTime();
+  Serial.printf("[MESH TX] Calling sendGroupMessage, timestamp=%u, sender=%s, text_len=%d\n",
+    timestamp, the_mesh._prefs.node_name, (int)strlen(text));
+
+  bool ok = the_mesh.sendGroupMessage(
+    timestamp,
+    the_mesh._public->channel,
+    the_mesh._prefs.node_name,
+    text,
+    strlen(text)
+  );
+
+  Serial.printf("[MESH TX] sendGroupMessage returned %s\n", ok ? "true" : "false");
+
+  if (ok) {
+    // Persist local echo — Public is always channel slot 0
+    the_mesh.appendChannelMessage(0, the_mesh._prefs.node_name, text, timestamp,
+                                  0.0f, 0.0f, 0, false);
+  }
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
+// Send a direct message to a contact by name prefix
+// Usage from Lua: _mesh_send_direct("alice", "Hey!")
+static int lua_mesh_send_direct(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+  const char *raw = luaL_checkstring(L, 2);
+  char text[160];
+  normalize_smart_quotes(raw, text, sizeof(text));
+
+  MESH_LOCK();
+  ContactInfo *recipient = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!recipient) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  uint32_t expected_ack = 0;
+  uint32_t est_timeout = 0;
+  uint32_t timestamp = the_mesh.getRTCClock()->getCurrentTime();
+
+  int result = the_mesh.sendMessage(
+    *recipient, timestamp, 0, text, expected_ack, est_timeout
+  );
+
+  if (result == MSG_SEND_FAILED) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Send failed");
+    return 2;
+  }
+
+  // Persist local echo — peer is the recipient, from is us.
+  the_mesh.appendDMMessage(recipient->name, the_mesh._prefs.node_name, text,
+                           timestamp, 0.0f, 0.0f, 0,
+                           result == MSG_SEND_SENT_DIRECT);
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, 1);
+  lua_pushstring(L, result == MSG_SEND_SENT_DIRECT ? "direct" : "flood");
+  return 2;
+}
+
+// Get this node's info (name, pubkey hex, freq, tx power)
+// Usage from Lua: local info = _mesh_get_node_info()
+static int lua_mesh_get_node_info(lua_State *L) {
+  lua_newtable(L);
+
+  MESH_LOCK();
+  lua_pushstring(L, the_mesh._prefs.node_name);
+  lua_setfield(L, -2, "name");
+
+  // Public key as hex string
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(hex, the_mesh.self_id.pub_key, PUB_KEY_SIZE);
+  lua_pushstring(L, hex);
+  lua_setfield(L, -2, "pubkey");
+
+  lua_pushnumber(L, the_mesh._prefs.freq);
+  lua_setfield(L, -2, "freq");
+
+  lua_pushinteger(L, the_mesh._prefs.tx_power_dbm);
+  lua_setfield(L, -2, "tx_power");
+
+  lua_pushnumber(L, the_mesh._prefs.node_lat);
+  lua_setfield(L, -2, "lat");
+
+  lua_pushnumber(L, the_mesh._prefs.node_lon);
+  lua_setfield(L, -2, "lon");
+  MESH_UNLOCK();
+
+  return 1;
+}
+
+// Get contact list
+// Usage from Lua: local contacts = _mesh_get_contacts()
+static int lua_mesh_get_contacts(lua_State *L) {
+  lua_newtable(L);
+
+  MESH_LOCK();
+  ContactInfo c;
+  int idx = 1;
+  for (int i = 0; i < the_mesh.getNumContacts(); i++) {
+    if (the_mesh.getContactByIdx(i, c)) {
+      lua_newtable(L);
+
+      lua_pushstring(L, c.name);
+      lua_setfield(L, -2, "name");
+
+      lua_pushinteger(L, c.type);
+      lua_setfield(L, -2, "type");
+
+      lua_pushinteger(L, c.out_path_len);
+      lua_setfield(L, -2, "path_len");
+
+      lua_pushinteger(L, c.last_advert_timestamp);
+      lua_setfield(L, -2, "last_seen");
+
+      char hex[PUB_KEY_SIZE * 2 + 1];
+      mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
+      lua_pushstring(L, hex);
+      lua_setfield(L, -2, "pubkey");
+
+      lua_pushstring(L, the_mesh.getTypeName(c.type));
+      lua_setfield(L, -2, "type_name");
+
+      lua_rawseti(L, -2, idx++);
+    }
+  }
+  MESH_UNLOCK();
+
+  return 1;
+}
+
+// Send self advertisement
+// Usage from Lua: _mesh_send_advert()
+static int lua_mesh_send_advert(lua_State *L) {
+  MESH_LOCK();
+  the_mesh.sendSelfAdvert(0);
+  MESH_UNLOCK();
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Get number of contacts
+static int lua_mesh_get_num_contacts(lua_State *L) {
+  MESH_LOCK();
+  int n = the_mesh.getNumContacts();
+  MESH_UNLOCK();
+  lua_pushinteger(L, n);
+  return 1;
+}
+
+// Set a node config value
+// Usage from Lua: _mesh_set_config("name", "MyNode")
+//                 _mesh_set_config("freq", "915.525")
+//                 _mesh_set_config("tx", "20")
+//                 _mesh_set_config("lat", "37.7749")
+//                 _mesh_set_config("lon", "-122.4194")
+static int lua_mesh_set_config(lua_State *L) {
+  const char *key = luaL_checkstring(L, 1);
+  const char *value = luaL_checkstring(L, 2);
+
+  MESH_LOCK();
+  if (strcmp(key, "name") == 0) {
+    strncpy(the_mesh._prefs.node_name, value, sizeof(the_mesh._prefs.node_name) - 1);
+    the_mesh._prefs.node_name[sizeof(the_mesh._prefs.node_name) - 1] = '\0';
+    the_mesh.savePrefs();
+    Serial.printf("Node name set to: %s\n", the_mesh._prefs.node_name);
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "freq") == 0) {
+    the_mesh._prefs.freq = atof(value);
+    the_mesh.savePrefs();
+    Serial.printf("Frequency set to: %.3f (reboot to apply)\n", the_mesh._prefs.freq);
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "tx") == 0) {
+    the_mesh._prefs.tx_power_dbm = atoi(value);
+    the_mesh.savePrefs();
+    Serial.printf("TX power set to: %d dBm (reboot to apply)\n", the_mesh._prefs.tx_power_dbm);
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "lat") == 0) {
+    the_mesh._prefs.node_lat = atof(value);
+    the_mesh.savePrefs();
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "lon") == 0) {
+    the_mesh._prefs.node_lon = atof(value);
+    the_mesh.savePrefs();
+    lua_pushboolean(L, 1);
+  } else {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Unknown config key");
+    return 2;
+  }
+  MESH_UNLOCK();
+
+  return 1;
+}
+
+// ── New Mesh bridge functions for full MeshCore integration ──────
+
+// Get all channels
+// Usage: local channels = _mesh_get_channels()
+// Returns: {{idx=0, name="Public", has_key=true}, ...}
+static int lua_mesh_get_channels(lua_State *L) {
+  lua_newtable(L);
+  int idx = 1;
+
+  MESH_LOCK();
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails cd;
+    if (the_mesh.getChannel(i, cd)) {
+      // Check if channel has a non-empty name
+      if (cd.name[0] != '\0') {
+        lua_newtable(L);
+
+        lua_pushinteger(L, i);
+        lua_setfield(L, -2, "idx");
+
+        lua_pushstring(L, cd.name);
+        lua_setfield(L, -2, "name");
+
+        // Check if secret is non-zero
+        bool has_key = false;
+        for (int j = 0; j < PUB_KEY_SIZE; j++) {
+          if (cd.channel.secret[j] != 0) { has_key = true; break; }
+        }
+        lua_pushboolean(L, has_key ? 1 : 0);
+        lua_setfield(L, -2, "has_key");
+
+        lua_rawseti(L, -2, idx++);
+      }
+    }
+  }
+  MESH_UNLOCK();
+
+  return 1;
+}
+
+// Set a channel by index
+// Usage: _mesh_set_channel(1, "MyChannel", "base64psk")
+//        _mesh_set_channel(1, "", "")  -- delete channel
+static int lua_mesh_set_channel(lua_State *L) {
+  int ch_idx = luaL_checkinteger(L, 1);
+  const char *name = luaL_checkstring(L, 2);
+  const char *psk = luaL_optstring(L, 3, "");
+
+  if (ch_idx < 0 || ch_idx >= MAX_GROUP_CHANNELS) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Channel index out of range");
+    return 2;
+  }
+
+  MESH_LOCK();
+  if (strlen(name) == 0) {
+    // Delete channel: set empty name and zero secret
+    ChannelDetails cd;
+    memset(&cd, 0, sizeof(cd));
+    the_mesh.setChannel(ch_idx, cd);
+    the_mesh.saveChannels();
+    MESH_UNLOCK();
+    lua_pushboolean(L, 1);
+    return 1;
+  }
+
+  // Check if it's a hashtag channel (name starts with #)
+  if (name[0] == '#') {
+    // Hashtag channel: secret = first 16 bytes of sha256(name)
+    ChannelDetails cd;
+    memset(&cd, 0, sizeof(cd));
+    strncpy(cd.name, name, sizeof(cd.name) - 1);
+    // Compute sha256 of the channel name to derive key
+    uint8_t hash[32];
+    mesh::Utils::sha256(hash, 32, (const uint8_t*)name, strlen(name));
+    memcpy(cd.channel.secret, hash, 16);
+    mesh::Utils::sha256(cd.channel.hash, sizeof(cd.channel.hash), cd.channel.secret, 16);
+    the_mesh.setChannel(ch_idx, cd);
+    the_mesh.saveChannels();
+    MESH_UNLOCK();
+    lua_pushboolean(L, 1);
+    return 1;
+  }
+
+  // Normal channel with PSK
+  ChannelDetails *result = the_mesh.addChannel(name, psk);
+  if (!result) {
+    // addChannel only works for new slots, try setChannel directly
+    // Parse the base64 PSK manually
+    ChannelDetails cd;
+    memset(&cd, 0, sizeof(cd));
+    strncpy(cd.name, name, sizeof(cd.name) - 1);
+    // Use the existing setChannel which will compute the hash
+    // But we need to decode base64 first
+    extern unsigned int decode_base64(unsigned char const *src, unsigned int slen, unsigned char *target);
+    int len = decode_base64((unsigned char *)psk, strlen(psk), cd.channel.secret);
+    if (len != 16 && len != 32) {
+      MESH_UNLOCK();
+      lua_pushboolean(L, 0);
+      lua_pushstring(L, "Invalid PSK length (need 16 or 32 bytes)");
+      return 2;
+    }
+    bool ok = the_mesh.setChannel(ch_idx, cd);
+    if (ok) the_mesh.saveChannels();
+    MESH_UNLOCK();
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+  }
+
+  the_mesh.saveChannels();
+  MESH_UNLOCK();
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Send a message to a specific channel by index
+// Usage: _mesh_send_channel(1, "Hello channel!")
+static int lua_mesh_send_channel(lua_State *L) {
+  int ch_idx = luaL_checkinteger(L, 1);
+  const char *raw = luaL_checkstring(L, 2);
+  char text[160];
+  normalize_smart_quotes(raw, text, sizeof(text));
+
+  MESH_LOCK();
+  ChannelDetails cd;
+  if (!the_mesh.getChannel(ch_idx, cd) || cd.name[0] == '\0') {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Channel not found");
+    return 2;
+  }
+
+  uint32_t timestamp = the_mesh.getRTCClock()->getCurrentTime();
+  bool ok = the_mesh.sendGroupMessage(
+    timestamp, cd.channel, the_mesh._prefs.node_name, text, strlen(text)
+  );
+
+  if (ok) {
+    // Persist local echo for this channel slot
+    the_mesh.appendChannelMessage(ch_idx, the_mesh._prefs.node_name, text,
+                                  timestamp, 0.0f, 0.0f, 0, false);
+  }
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
+// Remove a contact by name prefix
+// Usage: _mesh_remove_contact("alice")
+static int lua_mesh_remove_contact(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  bool ok = the_mesh.removeContact(*c);
+  if (ok) the_mesh.saveContacts();
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
+// Reset path to a contact (force flood routing next time)
+// Usage: _mesh_reset_path("alice")
+static int lua_mesh_reset_path(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  the_mesh.resetPathTo(*c);
+  the_mesh.saveContacts();
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Export a contact as hex biz card string
+// Usage: local hex = _mesh_export_contact("alice")
+static int lua_mesh_export_contact(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushnil(L);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  uint8_t buf[256];
+  uint8_t len = the_mesh.exportContact(*c, buf);
+  MESH_UNLOCK();
+  if (len == 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, "No advert data for contact");
+    return 2;
+  }
+
+  char hex[513];
+  mesh::Utils::toHex(hex, buf, len);
+
+  // Return "meshcore://" prefixed hex string
+  String card = "meshcore://" + String(hex);
+  lua_pushstring(L, card.c_str());
+  return 1;
+}
+
+// Import a contact from hex biz card string
+// Usage: _mesh_import_contact("meshcore://abcdef...")
+static int lua_mesh_import_contact(lua_State *L) {
+  const char *card = luaL_checkstring(L, 1);
+
+  MESH_LOCK();
+  the_mesh.importCard(card);
+  MESH_UNLOCK();
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Share a contact via zero-hop broadcast
+// Usage: _mesh_share_contact("alice")
+static int lua_mesh_share_contact(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  bool ok = the_mesh.shareContactZeroHop(*c);
+  MESH_UNLOCK();
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
+// Login to a room server
+// Usage: local ok, route = _mesh_login_room("myroom", "password123")
+static int lua_mesh_login_room(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+  const char *password = luaL_checkstring(L, 2);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  uint32_t est_timeout = 0;
+  int result = the_mesh.sendLogin(*c, password, est_timeout);
+  MESH_UNLOCK();
+
+  if (result == MSG_SEND_FAILED) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Login send failed");
+    return 2;
+  }
+
+  lua_pushboolean(L, 1);
+  lua_pushstring(L, result == MSG_SEND_SENT_DIRECT ? "direct" : "flood");
+  lua_pushinteger(L, est_timeout);
+  return 3;
+}
+
+// Send a request to a contact (e.g. get stats from repeater/room)
+// Usage: local ok, route = _mesh_send_request("repeater1", 1)  -- 1=GET_STATUS
+static int lua_mesh_send_request(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+  int req_type = luaL_checkinteger(L, 2);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  uint32_t tag = 0;
+  uint32_t est_timeout = 0;
+  int result = the_mesh.sendRequest(*c, (uint8_t)req_type, tag, est_timeout);
+  MESH_UNLOCK();
+
+  if (result == MSG_SEND_FAILED) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Request send failed");
+    return 2;
+  }
+
+  lua_pushboolean(L, 1);
+  lua_pushstring(L, result == MSG_SEND_SENT_DIRECT ? "direct" : "flood");
+  return 2;
+}
+
+// Get last RX radio info (SNR/RSSI from most recent received packet)
+// Usage: local info = _mesh_get_rx_info()
+static int lua_mesh_get_rx_info(lua_State *L) {
+  lua_newtable(L);
+
+  MESH_LOCK();
+  float snr  = the_mesh.last_rx_snr;
+  float rssi = the_mesh.last_rx_rssi;
+  MESH_UNLOCK();
+
+  lua_pushnumber(L, snr);
+  lua_setfield(L, -2, "snr");
+
+  lua_pushnumber(L, rssi);
+  lua_setfield(L, -2, "rssi");
+
+  return 1;
+}
+
+// ── Persistent message history bridge ────────────────────────────
+
+// Read all stored messages for a channel slot.
+// Usage: local msgs = _mesh_get_channel_messages(0)
+// Returns array of { from, peer, text, timestamp, hops, snr, rssi, direct, is_dm, channel_idx }
+static int lua_mesh_get_channel_messages(lua_State *L) {
+  int ch_idx = luaL_checkinteger(L, 1);
+  MESH_LOCK();
+  int n = the_mesh.pushChannelMessagesToLua(L, ch_idx);
+  MESH_UNLOCK();
+  return n;
+}
+
+// Read all stored messages for a DM thread.
+// Usage: local msgs = _mesh_get_dm_messages("alice")
+static int lua_mesh_get_dm_messages(lua_State *L) {
+  const char *peer = luaL_checkstring(L, 1);
+  MESH_LOCK();
+  int n = the_mesh.pushDMMessagesToLua(L, peer);
+  MESH_UNLOCK();
+  return n;
+}
+
+// Enumerate all DM thread peer names that have stored messages.
+// Usage: local names = _mesh_get_dm_threads()
+static int lua_mesh_get_dm_threads(lua_State *L) {
+  MESH_LOCK();
+  int n = the_mesh.pushDMThreadNamesToLua(L);
+  MESH_UNLOCK();
+  return n;
+}
+
+// Configure the max records retained per message log file.
+// Usage: _mesh_set_max_messages(100)
+static int lua_mesh_set_max_messages(lua_State *L) {
+  int n = luaL_checkinteger(L, 1);
+  MESH_LOCK();
+  the_mesh.setMaxMessages(n);
+  MESH_UNLOCK();
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// ── Storage bridge: Lua → C++ ────────────────────────────────────
+
+// Get storage info for the settings UI
+// Returns: { type="SD"|"LittleFS", sd_available=bool, use_sd=bool }
+static int lua_storage_get_info(lua_State *L) {
+  lua_newtable(L);
+
+  // Current active storage type
+  MESH_LOCK();
+  bool is_sd = (the_mesh._storage != &LittleFS);
+  MESH_UNLOCK();
+  lua_pushstring(L, is_sd ? "SD" : "LittleFS");
+  lua_setfield(L, -2, "type");
+
+  // Is SD card physically present?
+  lua_pushboolean(L, sd_mounted ? 1 : 0);
+  lua_setfield(L, -2, "sd_available");
+
+  // Read the preference from LittleFS
+  bool use_sd_pref = false;
+  if (LittleFS.exists("/storage_pref")) {
+    File f = LittleFS.open("/storage_pref");
+    if (f) {
+      uint8_t val = 0;
+      f.read(&val, 1);
+      f.close();
+      use_sd_pref = (val == 1);
+    }
+  }
+  lua_pushboolean(L, use_sd_pref ? 1 : 0);
+  lua_setfield(L, -2, "use_sd");
+
+  return 1;
+}
+
+// Helper: copy a file from one FS to another
+// NOTE: If either srcFS or dstFS is SD, the caller must have already called
+static bool copyFile(fs::FS &srcFS, const char* srcPath, fs::FS &dstFS, const char* dstPath) {
+  if (!srcFS.exists(srcPath)) return false;
+  File src = srcFS.open(srcPath);
+  if (!src) return false;
+
+  File dst = dstFS.open(dstPath, "w", true);
+  if (!dst) { src.close(); return false; }
+
+  uint8_t buf[256];
+  while (src.available()) {
+    int n = src.read(buf, sizeof(buf));
+    if (n > 0) dst.write(buf, n);
+  }
+  src.close();
+  dst.close();
+  return true;
+}
+
+// Set whether to use SD card for mesh data storage
+// Usage: _storage_set_use_sd(true)  -- switch to SD
+//        _storage_set_use_sd(false) -- switch to LittleFS
+// Migrates existing data to the new location and saves preference
+static int lua_storage_set_use_sd(lua_State *L) {
+  bool want_sd = lua_toboolean(L, 1);
+
+  Serial.printf("[STORAGE] User requested: use_sd=%s\n", want_sd ? "true" : "false");
+
+  if (want_sd && !sd_mounted) {
+    Serial.println("[STORAGE] Cannot use SD — card not mounted");
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "SD card not available");
+    return 2;
+  }
+
+  // Determine source and destination
+  MESH_LOCK();
+  fs::FS* oldFS = the_mesh._storage;
+  String oldPrefix = the_mesh._storage_prefix;
+  MESH_UNLOCK();
+
+  fs::FS* newFS;
+  String newPrefix;
+
+  if (want_sd) {
+    newFS = &SD;
+    newPrefix = "/meshpunk";
+
+    if (!SD.exists("/meshpunk")) SD.mkdir("/meshpunk");
+  } else {
+    newFS = &LittleFS;
+    newPrefix = "";
+  }
+
+  // Migrate data files if switching to a different FS
+  if (newFS != oldFS) {
+    Serial.println("[STORAGE] Migrating mesh data...");
+    // Migration may touch SD (either source or destination) plus LittleFS;
+    // holding the SPI mutex across the whole loop is simpler and safe.
+    sd_spi_take();
+    const char* files[] = { "/identity", "/node_prefs", "/contacts" };
+    for (int i = 0; i < 3; i++) {
+      String srcPath = oldPrefix + files[i];
+      String dstPath = newPrefix + files[i];
+      if (oldFS->exists(srcPath.c_str())) {
+        bool ok = copyFile(*oldFS, srcPath.c_str(), *newFS, dstPath.c_str());
+        Serial.printf("[STORAGE]   %s -> %s: %s\n", srcPath.c_str(), dstPath.c_str(), ok ? "OK" : "FAILED");
+      }
+    }
+    sd_spi_release();
+  }
+
+  // Switch active storage
+  MESH_LOCK();
+  the_mesh.setStorage(newFS, newPrefix.c_str());
+  MESH_UNLOCK();
+
+  // Save preference to LittleFS (always on LittleFS, never on SD)
+  File f = LittleFS.open("/storage_pref", "w", true);
+  if (f) {
+    uint8_t val = want_sd ? 1 : 0;
+    f.write(&val, 1);
+    f.close();
+    Serial.printf("[STORAGE] Preference saved to LittleFS: use_sd=%d\n", val);
+  }
+
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// ── Filesystem bridge: Lua → C++ ─────────────────────────────────
+
+// Helper: extract just the last component from a path
+// e.g. "/lua/apps/calculator" -> "calculator", "calculator" -> "calculator"
+static const char* pathBasename(const char* path) {
+  const char* last = strrchr(path, '/');
+  return last ? last + 1 : path;
+}
+
+// List subdirectory names in a LittleFS directory
+// Usage: local dirs = _list_dir("/lua/apps")
+// Returns: {"calculator", "messenger", ...} (directories only, names only)
+static int lua_list_dir(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+
+  lua_newtable(L);
+  int idx = 1;
+
+  File root = LittleFS.open(path);
+  if (!root || !root.isDirectory()) {
+    Serial.printf("[FS] _list_dir: cannot open %s\n", path);
+    return 1; // return empty table
+  }
+
+  File entry = root.openNextFile();
+  while (entry) {
+    if (entry.isDirectory()) {
+      // entry.name() may return full path or just name depending on core version
+      const char *name = pathBasename(entry.name());
+      Serial.printf("[FS] _list_dir: found dir: raw='%s' name='%s'\n", entry.name(), name);
+      if (name[0] != '\0') {
+        lua_pushstring(L, name);
+        lua_rawseti(L, -2, idx++);
+      }
+    }
+    entry = root.openNextFile();
+  }
+
+  Serial.printf("[FS] _list_dir(%s): found %d dirs\n", path, idx - 1);
+  return 1;
+}
+
+// List subdirectory names on SD card
+// Usage: local dirs = _list_dir_sd("/meshpunk/apps")
+static int lua_list_dir_sd(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+
+  lua_newtable(L);
+  int idx = 1;
+
+  if (!sd_mounted) {
+    Serial.println("[FS] _list_dir_sd: SD not mounted");
+    return 1; // return empty table
+  }
+
+  sd_spi_take();
+  File root = SD.open(path);
+  if (!root || !root.isDirectory()) {
+    Serial.printf("[FS] _list_dir_sd: cannot open %s\n", path);
+    sd_spi_release();
+    return 1;
+  }
+
+  File entry = root.openNextFile();
+  while (entry) {
+    if (entry.isDirectory()) {
+      const char *name = pathBasename(entry.name());
+      Serial.printf("[FS] _list_dir_sd: found dir: raw='%s' name='%s'\n", entry.name(), name);
+      if (name[0] != '\0') {
+        lua_pushstring(L, name);
+        lua_rawseti(L, -2, idx++);
+      }
+    }
+    entry = root.openNextFile();
+  }
+  root.close();
+
+  sd_spi_release();
+
+  Serial.printf("[FS] _list_dir_sd(%s): found %d dirs\n", path, idx - 1);
+  return 1;
+}
+
+// List ALL entries (files and directories) in a LittleFS directory
+// Usage: local entries = _list_all("/lua/apps")
+// Returns: {{name="calculator", type="dir", size=0}, {name="main.lua", type="file", size=1234}, ...}
+static int lua_list_all(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+
+  lua_newtable(L);
+  int idx = 1;
+
+  File root = LittleFS.open(path);
+  if (!root || !root.isDirectory()) {
+    Serial.printf("[FS] _list_all: cannot open %s\n", path);
+    return 1; // return empty table
+  }
+
+  File entry = root.openNextFile();
+  while (entry) {
+    lua_newtable(L);
+
+    const char *name = pathBasename(entry.name());
+    if (name[0] != '\0') {
+      lua_pushstring(L, name);
+      lua_setfield(L, -2, "name");
+
+      lua_pushstring(L, entry.isDirectory() ? "dir" : "file");
+      lua_setfield(L, -2, "type");
+
+      lua_pushinteger(L, entry.size());
+      lua_setfield(L, -2, "size");
+
+      lua_rawseti(L, -2, idx++);
+    } else {
+      lua_pop(L, 1); // pop empty entry table
+    }
+
+    entry = root.openNextFile();
+  }
+
+  Serial.printf("[FS] _list_all(%s): found %d entries\n", path, idx - 1);
+  return 1;
+}
+
+// List ALL entries (files and directories) on SD card
+// Usage: local entries = _list_all_sd("/meshpunk/apps")
+static int lua_list_all_sd(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+
+  lua_newtable(L);
+  int idx = 1;
+
+  if (!sd_mounted) {
+    Serial.println("[FS] _list_all_sd: SD not mounted");
+    return 1;
+  }
+
+  sd_spi_take();
+  File root = SD.open(path);
+  if (!root || !root.isDirectory()) {
+    Serial.printf("[FS] _list_all_sd: cannot open %s\n", path);
+    sd_spi_release();
+    return 1;
+  }
+
+  File entry = root.openNextFile();
+  while (entry) {
+    lua_newtable(L);
+
+    const char *name = pathBasename(entry.name());
+    if (name[0] != '\0') {
+      lua_pushstring(L, name);
+      lua_setfield(L, -2, "name");
+
+      lua_pushstring(L, entry.isDirectory() ? "dir" : "file");
+      lua_setfield(L, -2, "type");
+
+      lua_pushinteger(L, entry.size());
+      lua_setfield(L, -2, "size");
+
+      lua_rawseti(L, -2, idx++);
+    } else {
+      lua_pop(L, 1);
+    }
+
+    entry = root.openNextFile();
+  }
+  root.close();
+
+  sd_spi_release();
+
+  Serial.printf("[FS] _list_all_sd(%s): found %d entries\n", path, idx - 1);
+  return 1;
+}
+
+// Check if a file exists on SD card
+// Usage: local exists = _file_exists_sd("/meshpunk/apps/myapp/main.lua")
+static int lua_file_exists_sd(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+  if (!sd_mounted) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  sd_spi_take();
+  bool exists = SD.exists(path);
+  sd_spi_release();
+
+  lua_pushboolean(L, exists ? 1 : 0);
+  return 1;
+}
+
+// Load and execute a Lua file from the SD card
+// Usage: _dofile_sd("/meshpunk/apps/myapp/main.lua")
+// This is needed because dofile/loadfile only read from LittleFS
+static int lua_dofile_sd(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+
+  if (!sd_mounted) {
+    lua_pushnil(L);
+    lua_pushstring(L, "SD card not mounted");
+    return 2;
+  }
+
+  sd_spi_take();
+  File file = SD.open(path);
+  if (!file || file.isDirectory()) {
+    sd_spi_release();
+    lua_pushnil(L);
+    lua_pushfstring(L, "Cannot open SD file: %s", path);
+    return 2;
+  }
+
+  size_t size = file.size();
+  char* buffer = (char*)malloc(size + 1);
+  if (!buffer) {
+    file.close();
+    sd_spi_release();
+    lua_pushnil(L);
+    lua_pushstring(L, "Out of memory reading SD file");
+    return 2;
+  }
+
+  file.readBytes(buffer, size);
+  buffer[size] = '\0';
+  file.close();
+
+  // Release SD bus back to display BEFORE executing the Lua chunk
+  sd_spi_release();
+
+  Serial.printf("[FS] _dofile_sd: loading %s (%d bytes)\n", path, (int)size);
+
+  // Count extra args (everything after the path on the stack)
+  int nargs = lua_gettop(L) - 1;
+
+  int status = luaL_loadbuffer(L, buffer, size, path);
+  free(buffer);
+
+  if (status != LUA_OK) {
+    Serial.printf("[FS] _dofile_sd: load error: %s\n", lua_tostring(L, -1));
+    return lua_error(L);
+  }
+
+  // Stack: [path, arg1, arg2, ..., chunk]
+  // Move chunk to position 2 (after path), then remove path
+  lua_insert(L, 2);
+  lua_remove(L, 1);
+  // Stack: [chunk, arg1, arg2, ...]
+
+  if (lua_pcall(L, nargs, LUA_MULTRET, 0) != LUA_OK) {
+    Serial.printf("[FS] _dofile_sd: exec error: %s\n", lua_tostring(L, -1));
+    return lua_error(L);
+  }
+
+  return lua_gettop(L); // return whatever the script returned
+}
+
+// PSRAM allocator for Lua – keeps internal SRAM free for DMA (AES, etc.)
+static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    (void)ud; (void)osize;
+    if (nsize == 0) {
+        heap_caps_free(ptr);
+        return NULL;
+    }
+    return heap_caps_realloc(ptr, nsize, MALLOC_CAP_SPIRAM);
+}
+
 // Initialize LuaVGL
 void setupLuaVGL() {
-  // Create Lua state
-  L = luaL_newstate();
+  // Create Lua state with PSRAM allocator
+  L = lua_newstate(lua_psram_alloc, NULL);
   if (!L) {
     Serial.println("Failed to create Lua state");
     return;
@@ -662,6 +2101,134 @@ void setupLuaVGL() {
   lua_register(L, "_wifi_status", lua_wifi_status);
   lua_register(L, "_wifi_disconnect", lua_wifi_disconnect);
   lua_register(L, "_wifi_fetch", lua_wifi_fetch);
+
+  // Register Mesh bridge functions
+  lua_register(L, "_mesh_send_public", lua_mesh_send_public);
+  lua_register(L, "_mesh_send_direct", lua_mesh_send_direct);
+  lua_register(L, "_mesh_get_node_info", lua_mesh_get_node_info);
+  lua_register(L, "_mesh_get_contacts", lua_mesh_get_contacts);
+  lua_register(L, "_mesh_send_advert", lua_mesh_send_advert);
+  lua_register(L, "_mesh_get_num_contacts", lua_mesh_get_num_contacts);
+  lua_register(L, "_mesh_set_config", lua_mesh_set_config);
+
+  // Register new MeshCore integration bridge functions
+  lua_register(L, "_mesh_get_channels", lua_mesh_get_channels);
+  lua_register(L, "_mesh_set_channel", lua_mesh_set_channel);
+  lua_register(L, "_mesh_send_channel", lua_mesh_send_channel);
+  lua_register(L, "_mesh_remove_contact", lua_mesh_remove_contact);
+  lua_register(L, "_mesh_reset_path", lua_mesh_reset_path);
+  lua_register(L, "_mesh_export_contact", lua_mesh_export_contact);
+  lua_register(L, "_mesh_import_contact", lua_mesh_import_contact);
+  lua_register(L, "_mesh_share_contact", lua_mesh_share_contact);
+  lua_register(L, "_mesh_login_room", lua_mesh_login_room);
+  lua_register(L, "_mesh_send_request", lua_mesh_send_request);
+  lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
+
+  // Persistent message history APIs — available to any app, not just messenger
+  lua_register(L, "_mesh_get_channel_messages", lua_mesh_get_channel_messages);
+  lua_register(L, "_mesh_get_dm_messages", lua_mesh_get_dm_messages);
+  lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
+  lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
+
+  // Register Storage bridge functions
+  lua_register(L, "_storage_get_info", lua_storage_get_info);
+  lua_register(L, "_storage_set_use_sd", lua_storage_set_use_sd);
+
+  // Register Filesystem bridge functions
+  lua_register(L, "_list_dir", lua_list_dir);
+
+  // RTC epoch seconds (seeded from GPS once at boot, then free-running)
+  lua_register(L, "_rtc_time", [](lua_State *L) -> int {
+    MESH_LOCK();
+    lua_Integer t = (lua_Integer)the_mesh.getRTCClock()->getCurrentTime();
+    MESH_UNLOCK();
+    lua_pushinteger(L, t);
+    return 1;
+  });
+
+  // Effective timezone offset in minutes (resolves "auto" to longitude-derived offset).
+  lua_register(L, "_rtc_tz_offset_minutes", [](lua_State *L) -> int {
+    lua_pushinteger(L, (lua_Integer)tz_effective_offset_minutes());
+    return 1;
+  });
+
+  // Returns current TZ setting: "auto" or a stringified integer (minutes).
+  lua_register(L, "_rtc_tz_get", [](lua_State *L) -> int {
+    lua_pushstring(L, tz_setting_str.c_str());
+    return 1;
+  });
+
+  // _rtc_tz_set("auto") | _rtc_tz_set(<minutes:int>)
+  // Examples: _rtc_tz_set("auto")  _rtc_tz_set(-300)  _rtc_tz_set(330) -- India
+  // Returns: ok:bool, effective_offset:int
+  lua_register(L, "_rtc_tz_set", [](lua_State *L) -> int {
+    if (lua_isstring(L, 1) && !lua_isnumber(L, 1)) {
+      const char* v = lua_tostring(L, 1);
+      if (v && strcasecmp(v, "auto") == 0) {
+        tz_is_auto = true;
+        tz_setting_str = "auto";
+        tz_save();
+        lua_pushboolean(L, 1);
+        lua_pushinteger(L, (lua_Integer)tz_effective_offset_minutes());
+        return 2;
+      }
+      lua_pushboolean(L, 0);
+      lua_pushinteger(L, 0);
+      return 2;
+    }
+    if (lua_isnumber(L, 1)) {
+      int32_t m = (int32_t)lua_tointeger(L, 1);
+      if (m < -14 * 60 || m > 14 * 60) {
+        lua_pushboolean(L, 0);
+        lua_pushinteger(L, 0);
+        return 2;
+      }
+      tz_is_auto = false;
+      tz_manual_minutes = m;
+      tz_setting_str = String(m);
+      tz_save();
+      lua_pushboolean(L, 1);
+      lua_pushinteger(L, (lua_Integer)tz_effective_offset_minutes());
+      return 2;
+    }
+    lua_pushboolean(L, 0);
+    lua_pushinteger(L, 0);
+    return 2;
+  });
+
+  // Register gridnav bridge
+  // Usage: _gridnav_add(obj, flags)
+  //   flags: 0=none, 1=rollover, 2=scroll_first
+  lua_register(L, "_gridnav_add", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    int flags = luaL_optinteger(L, 2, 0);
+    lv_gridnav_add(lobj->obj, (lv_gridnav_ctrl_t)flags);
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+  lua_register(L, "_gridnav_remove", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) return 0;
+    lv_gridnav_remove(lobj->obj);
+    return 0;
+  });
+
+  // Gridnav flag constants for Lua
+  lua_pushinteger(L, LV_GRIDNAV_CTRL_NONE);
+  lua_setglobal(L, "GRIDNAV_NONE");
+  lua_pushinteger(L, LV_GRIDNAV_CTRL_ROLLOVER);
+  lua_setglobal(L, "GRIDNAV_ROLLOVER");
+  lua_pushinteger(L, LV_GRIDNAV_CTRL_SCROLL_FIRST);
+  lua_setglobal(L, "GRIDNAV_SCROLL_FIRST");
+  lua_register(L, "_list_dir_sd", lua_list_dir_sd);
+  lua_register(L, "_file_exists_sd", lua_file_exists_sd);
+  lua_register(L, "_dofile_sd", lua_dofile_sd);
+  lua_register(L, "_list_all", lua_list_all);
+  lua_register(L, "_list_all_sd", lua_list_all_sd);
 
   // Add Lua loader for require function
   lua_getglobal(L, "package");
@@ -706,16 +2273,16 @@ void setupLuaVGL() {
     end
   )");
 
-  // Register file metatable
   luaL_newmetatable(L, "esp32_file");
 
-  // Create a method table for the file object
   lua_newtable(L);
 
   // file:read()
   lua_pushcfunction(L, [](lua_State *L) -> int {
-    fs::File **ud = (fs::File **)luaL_checkudata(L, 1, "esp32_file");
-    String content = (*ud)->readString(); // Read whole file
+    LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
+    if (ud->is_sd) sd_spi_take();
+    String content = ud->file->readString();
+    if (ud->is_sd) sd_spi_release();
     lua_pushstring(L, content.c_str());
     return 1;
   });
@@ -723,10 +2290,12 @@ void setupLuaVGL() {
 
   // file:write(str)
   lua_pushcfunction(L, [](lua_State *L) -> int {
-    fs::File **ud = (fs::File **)luaL_checkudata(L, 1, "esp32_file");
+    LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
     size_t len;
     const char *str = luaL_checklstring(L, 2, &len);
-    size_t written = (*ud)->print(str);
+    if (ud->is_sd) sd_spi_take();
+    size_t written = ud->file->print(str);
+    if (ud->is_sd) sd_spi_release();
     lua_pushinteger(L, written);
     return 1;
   });
@@ -734,18 +2303,24 @@ void setupLuaVGL() {
 
   // file:flush()
   lua_pushcfunction(L, [](lua_State *L) -> int {
-    fs::File **ud = (fs::File **)luaL_checkudata(L, 1, "esp32_file");
-    (*ud)->flush();
+    LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
+    if (ud->is_sd) sd_spi_take();
+    ud->file->flush();
+    if (ud->is_sd) sd_spi_release();
     return 0;
   });
   lua_setfield(L, -2, "flush");
 
   // file:close()
   lua_pushcfunction(L, [](lua_State *L) -> int {
-    fs::File **ud = (fs::File **)luaL_checkudata(L, 1, "esp32_file");
-    (*ud)->close();
-    delete *ud;
-    *ud = nullptr;
+    LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
+    if (ud->file) {
+      if (ud->is_sd) sd_spi_take();
+      ud->file->close();
+      if (ud->is_sd) sd_spi_release();
+      delete ud->file;
+      ud->file = nullptr;
+    }
     return 0;
   });
   lua_setfield(L, -2, "close");
@@ -753,13 +2328,15 @@ void setupLuaVGL() {
   // Set the __index = method table
   lua_setfield(L, -2, "__index");
 
-  // Optional: __gc finalizer (cleanup on Lua garbage collection)
+  // __gc finalizer
   lua_pushcfunction(L, [](lua_State *L) -> int {
-    fs::File **ud = (fs::File **)luaL_checkudata(L, 1, "esp32_file");
-    if (*ud) {
-      (*ud)->close();
-      delete *ud;
-      *ud = nullptr;
+    LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
+    if (ud->file) {
+      if (ud->is_sd) sd_spi_take();
+      ud->file->close();
+      if (ud->is_sd) sd_spi_release();
+      delete ud->file;
+      ud->file = nullptr;
     }
     return 0;
   });
@@ -786,7 +2363,9 @@ void setupLuaVGL() {
 
   Serial.println("Patched IO");
 
-  Serial.println("LuaVGL environment initialized");
+  Serial.println("[LUA] LuaVGL environment initialized");
+  Serial.printf("[LUA] Free heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("[LUA] Free PSRAM: %d bytes\n", ESP.getFreePsram());
 
   if (!fs_mounted) {
     Serial.println("Filesystem not mounted, can't load Lua scripts");
@@ -813,7 +2392,9 @@ void setupLuaVGL() {
   }
 
   String scriptPath = String(LUA_PATH) + "main.lua";
+  Serial.printf("[LUA] Reading script: %s\n", scriptPath.c_str());
   String script = readFile(scriptPath.c_str());
+  Serial.printf("[LUA] Script length: %d bytes\n", script.length());
 
   if (script.length() == 0) {
     Serial.print("Lua script not found: ");
@@ -835,10 +2416,15 @@ void setupLuaVGL() {
     return;
   }
 
-  Serial.print("Executing Lua script: ");
+  Serial.print("[LUA] Executing Lua script: ");
   Serial.println(scriptPath);
+  Serial.println("[LUA] --- luaL_dostring BEGIN ---");
 
-  if (luaL_dostring(L, script.c_str()) != 0) {
+  int lua_result = luaL_dostring(L, script.c_str());
+
+  Serial.printf("[LUA] --- luaL_dostring END --- result=%d\n", lua_result);
+
+  if (lua_result != 0) {
     const char *luaError = lua_tostring(L, -1);
     Serial.print("Lua execution error: ");
     Serial.println(luaError);
@@ -880,8 +2466,14 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Delaying for 50ms...");
   delay(50);
-  
+
   Serial.println("MeshPunk LuaVGL Demo");
+
+  // Create SPI/mesh mutexes and cross-core queues before any subsystem
+  // that relies on them. Safe to call before LVGL/TFT init because the
+  // macros no-op when the handle is null (not needed — this runs first —
+  // but defensive).
+  meshpunk_sync_init();
 
   // Connect trackball / home button
   pinMode(TDECK_TRACKBALL_CLICK, INPUT_PULLUP);
@@ -891,6 +2483,9 @@ void setup() {
   // the peripheral
   pinMode(BOARD_POWERON, OUTPUT);
   digitalWrite(BOARD_POWERON, HIGH);
+
+  // Kick off one-shot GPS time sync; gps_sync_poll() runs it to completion in loop().
+  gps_sync_begin();
 
   // Set CS on all SPI buses to high level during initialization
   pinMode(BOARD_SDCARD_CS, OUTPUT);
@@ -910,10 +2505,13 @@ void setup() {
   pinMode(BOARD_TBOX_G04, INPUT_PULLUP);
   pinMode(BOARD_TBOX_G03, INPUT_PULLUP);
 
+  // Attach trackball direction interrupts
+  attachInterrupt(TDECK_TRACKBALL_UP,    ISR_trackball_up,    FALLING);
+  attachInterrupt(TDECK_TRACKBALL_DOWN,  ISR_trackball_down,  FALLING);
+  attachInterrupt(TDECK_TRACKBALL_LEFT,  ISR_trackball_left,  FALLING);
+  attachInterrupt(TDECK_TRACKBALL_RIGHT, ISR_trackball_right, FALLING);
+
   Serial.println("Initializing display");
-  tft.begin();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_RED);
 
   // Initialize filesystem
   if (LittleFS.begin(true)) {
@@ -922,8 +2520,61 @@ void setup() {
 
     Serial.println("LittleFS contents:");
     listDir(LittleFS, "/lua");
+
+    // Load timezone preference (defaults to "auto" if missing).
+    tz_load();
   } else {
     Serial.println("Error mounting LittleFS!!");
+  }
+
+  // Initialize SD card for persistent mesh data (survives LittleFS reflash)
+  Serial.println("===== SD CARD INIT =====");
+
+  if (SD.begin(BOARD_SDCARD_CS, SPI)) {
+    sd_mounted = true;
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    Serial.printf("[SD] Card mounted, size: %llu MB\n", cardSize);
+
+    // Create meshpunk directories if they don't exist
+    if (!SD.exists("/meshpunk")) {
+      SD.mkdir("/meshpunk");
+      Serial.println("[SD] Created /meshpunk directory");
+    }
+    if (!SD.exists("/meshpunk/apps")) {
+      SD.mkdir("/meshpunk/apps");
+      Serial.println("[SD] Created /meshpunk/apps directory");
+    }
+  } else {
+    Serial.println("[SD] Card mount FAILED");
+  }
+
+  // Read storage preference from LittleFS
+  // This pref is always on LittleFS since it controls WHERE to look for data
+  bool use_sd_pref = true; // default: use SD if available
+  if (fs_mounted && LittleFS.exists("/storage_pref")) {
+    File pf = LittleFS.open("/storage_pref");
+    if (pf) {
+      uint8_t val = 1;
+      pf.read(&val, 1);
+      pf.close();
+      use_sd_pref = (val == 1);
+      Serial.printf("[SD] Storage preference from LittleFS: use_sd=%d\n", use_sd_pref);
+    }
+  } else {
+    Serial.println("[SD] No storage_pref file, defaulting to SD if available");
+  }
+
+  // Decide which storage to use
+  if (sd_mounted && use_sd_pref) {
+    the_mesh.setStorage(&SD, "/meshpunk");
+    Serial.println("[SD] Mesh storage: SD:/meshpunk/");
+  } else {
+    the_mesh.setStorage(&LittleFS, "");
+    if (sd_mounted) {
+      Serial.println("[SD] SD available but user chose LittleFS");
+    } else {
+      Serial.println("[SD] Using LittleFS (no SD card)");
+    }
   }
 
   // Initialize WiFi in station mode
@@ -937,6 +2588,7 @@ void setup() {
   Serial.println("Initializing GT911 touch sensor");
 
   Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+
 
   touch.setPins(-1, BOARD_TOUCH_INT);
   if (!touch.begin(Wire, GT911_SLAVE_ADDRESS_L)) {
@@ -971,50 +2623,54 @@ void setup() {
   tft.fillScreen(TFT_GREEN);
 
   // Initialize LORA Radio
-  Serial.println(F("Initialise the radio"));
+  Serial.println(F("===== RADIO INIT ====="));
 
-  // NZ (AU915) Meshtastic RX Setup
   int16_t state = radio.begin();
-  if(state != RADIOLIB_ERR_NONE) {
-    Serial.print(F("failed, code "));
-    Serial.println(state);
-  } // F("Initialise radio failed"), state, true);
+  Serial.printf("[RADIO] begin() = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   delay(100);
 
-  // MeshCore RX config
-  radio.setFrequency(the_mesh.getFreqPref());         // MHz
-  radio.setBandwidth(LORA_BW);         // kHz
-  radio.setSpreadingFactor(LORA_SF);      // SF10
-  radio.setCodingRate(5);            // CR = 4/5
-  // radio.setSyncWord(0xAB);           // Private network
-  radio.setCRC(true);                // Enable CRC
-  // radio.set
-  radio.setOutputPower(17);          // dBm
+  float freq = the_mesh.getFreqPref();
+  Serial.printf("[RADIO] Setting freq=%.3f MHz, BW=%d kHz, SF=%d, CR=5, TX=17 dBm\n", freq, LORA_BW, LORA_SF);
 
-  // radio.setDio1Action([] {
-  //   lora_packet_ready = true;
-  // });
+  state = radio.setFrequency(freq);
+  Serial.printf("[RADIO] setFrequency = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
+  state = radio.setBandwidth(LORA_BW);
+  Serial.printf("[RADIO] setBandwidth = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
-  // delay(100);
-  
-  // Start radio
-  radio.startReceive();
+  state = radio.setSpreadingFactor(LORA_SF);
+  Serial.printf("[RADIO] setSpreadingFactor = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
-  // Meshcore
+  state = radio.setCodingRate(5);
+  Serial.printf("[RADIO] setCodingRate = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+
+  radio.setCRC(true);
+
+  state = radio.setOutputPower(17);
+  Serial.printf("[RADIO] setOutputPower = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+
+  state = radio.startReceive();
+  Serial.printf("[RADIO] startReceive = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+
+  Serial.println(F("===== MESHCORE INIT ====="));
   fast_rng.begin(123456); // fixed seed for testing
   the_mesh.begin();
   the_mesh.showWelcome();
 
-  // send out initial Advertisement to the mesh
-  the_mesh.sendSelfAdvert(1200);   // add slight delay
+  Serial.printf("[MESH] Node name: %s\n", the_mesh._prefs.node_name);
+  Serial.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh._prefs.freq);
+  Serial.printf("[MESH] TX power pref: %d dBm\n", the_mesh._prefs.tx_power_dbm);
+  Serial.printf("[MESH] Contacts loaded: %d\n", the_mesh.getNumContacts());
+  Serial.printf("[MESH] Public channel: %s\n", the_mesh._public ? "YES" : "NO (PROBLEM!)");
+  Serial.print("[MESH] Pub key: ");
+  mesh::Utils::printHex(Serial, the_mesh.self_id.pub_key, PUB_KEY_SIZE);
+  Serial.println();
 
-  // Reinitialize screen
-  Serial.println("Reinitialize display (TAKE THAT SPI BUS!)");
+  Serial.println("Initialize display");
   tft.begin();
   tft.setRotation(1);
-  tft.fillScreen(TFT_BLUE);
+  tft.fillScreen(TFT_BLACK);
 
   // LVGL tick function
   lvgl_ticker.attach_ms(5, []() {
@@ -1024,8 +2680,17 @@ void setup() {
   // Initialize LVGL
   setupLvgl();
 
+  // Set LVGL screen to opaque dark background
+  // Without this, LVGL objects are transparent and the raw TFT fill color shows through
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_make(0x10, 0x10, 0x10), 0);
+  lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+
+  Serial.println("===== LUA INIT =====");
+
   // Initialize LuaVGL
   setupLuaVGL();
+
+  Serial.println("[LUA] setupLuaVGL() returned");
 
   // Create UI
   createUI();
@@ -1033,95 +2698,50 @@ void setup() {
   // Adjust backlight
   pinMode(BOARD_BL_PIN, OUTPUT);
   setBrightness(16);
+
+  // Hand off mesh + radio to Core 1 now that the_mesh, Lua, LVGL, and the
+  // RX queue are all up. Must happen AFTER createUI / setupLuaVGL so that
+  // any RX events arriving from the mesh task have something to drain into.
+  Serial.printf("[TASK] setup() running on core=%d; spawning mesh_task on Core 1\n",
+                xPortGetCoreID());
+  meshpunk_spawn_mesh_task();
+  meshpunk_spawn_gps_task();
+}
+
+// Forward decls for the Lua dispatchers that live in punkmesh.cpp.
+// These are called only from the UI core (Core 0) to preserve lua_State
+// single-threadedness.
+extern void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, int channel_idx);
+extern void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi);
+
+// Drain RX events posted by the mesh core. Runs every UI tick.
+// Bounded per call so a flood on the queue can't starve LVGL.
+static void drain_rx_events() {
+  if (!rx_event_queue || !L) return;
+  RxEvent ev;
+  int budget = 8; // cap messages per tick to keep UI responsive
+  while (budget-- > 0 && xQueueReceive(rx_event_queue, &ev, 0) == pdTRUE) {
+    if (ev.kind == RxEvent::DIRECT_MSG) {
+      lua_mesh_push_direct_message(L, ev.sender, ev.hops, ev.direct,
+                                   ev.timestamp, ev.text, ev.snr, ev.rssi);
+    } else {
+      lua_mesh_push_channel_message(L, ev.sender, ev.hops, ev.direct,
+                                    ev.timestamp, ev.text, ev.snr, ev.rssi,
+                                    ev.channel_idx);
+    }
+  }
 }
 
 void loop() {
+  // Core 0 (UI domain) — LVGL + Lua + input. The mesh dispatcher runs on
+  // Core 1 via mesh_task (see meshpunk_tasks.cpp).
+
   // Handle LVGL tasks
   lv_timer_handler();
 
-  // Check for touch directly from sensor (as additional test)
-  static unsigned long last_direct_check = 0;
-  if (millis() - last_direct_check > 300) {
-    if (touch.isPressed()) {
-      uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
-      if (touched > 0 && touch_debug) {
-        // Serial.print("Direct touch check: x=");
-        // Serial.print(x[0]);
-        // Serial.print(" y=");
-        // Serial.println(y[0]);
-      }
-    }
-    last_direct_check = millis();
-  }
+  // GPS one-shot time sync runs on Core 1 (gps_task). Nothing to do here.
 
-  // Check keyboard directly (useful for debugging)
-  // static unsigned long last_kb_check = 0;
-  // if (keyboard_available && millis() - last_kb_check > 100) {
-  //   char keyValue = 0;
-  //   Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
-  //   if (Wire.available() > 0) {
-  //     keyValue = Wire.read();
-  //     if (keyValue != 0) {
-  //       // Serial.print("Direct keyboard check: key=");
-  //       // Serial.print(keyValue);
-  //       // Serial.print(" (");
-  //       // Serial.print((int)keyValue);
-  //       // Serial.println(")");
-  //     }
-  //   }
-  //   last_kb_check = millis();
-  // }
-
-  // Check for home button press
-  if (homePressed) {
-    homePressed = false;
-
-    Serial.println("[Home Button] dofile('/launcher')");
-
-    if (L) {
-      String scriptPath = String(LUA_PATH) + "main.lua";
-      int err = luaL_dofile(L, scriptPath.c_str());
-      
-      if (err != 0) {
-        const char* err_msg = lua_tostring(L, -1);
-        Serial.printf("Lua Error: %s\n", err_msg);
-        lua_pop(L, 1); // remove error message
-      }
-
-    } else {
-      Serial.println("Lua state is NULL!");
-    }
-  }
-  
-  // Check radio
-  the_mesh.loop();
-
-  // if (lora_packet_ready) {
-  //   lora_packet_ready = false;
-
-  //   digitalWrite(TFT_CS, HIGH);    // turn off display
-  //   digitalWrite(RADIO_CS_PIN, LOW);    // enable LoRa
-
-  //   uint8_t buffer[256];
-  //   size_t length = sizeof(buffer);
-  //   int state = radio.readData(buffer, length);
-
-  //   digitalWrite(RADIO_CS_PIN, HIGH);   // done with LoRa
-
-  //   if (state == RADIOLIB_ERR_NONE) {
-  //     Serial.print("[LoRa RX] ");
-  //     for (size_t i = 0; i < length; i++) {
-  //       Serial.printf("%02X ", buffer[i]);
-  //     }
-  //     Serial.println();
-  //   } else {
-  //     Serial.printf("[LoRa RX ERROR] %d\n", state);
-  //   }
-  // }
-
-  // Handle webserial
-
-  // handleWebSerialCommands();
-
-  delay(5);
+  // Flush mesh RX events into Lua. lua_State is single-threaded — always
+  // touched from Core 0.
+  drain_rx_events();
 }

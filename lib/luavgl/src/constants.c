@@ -552,6 +552,22 @@ static const rotable_Reg grid_align_const_table[] = {
     {0,                       0                                     },
 };
 
+#if LV_USE_CANVAS
+static const rotable_Reg color_format_const_table[] = {
+    {.name = "RGB565",   .integer = LV_COLOR_FORMAT_RGB565  },
+    {.name = "RGB888",   .integer = LV_COLOR_FORMAT_RGB888  },
+    {.name = "ARGB8888", .integer = LV_COLOR_FORMAT_ARGB8888},
+    {.name = "XRGB8888", .integer = LV_COLOR_FORMAT_XRGB8888},
+    {.name = "L8",       .integer = LV_COLOR_FORMAT_L8      },
+    {.name = "A8",       .integer = LV_COLOR_FORMAT_A8      },
+    {.name = "I1",       .integer = LV_COLOR_FORMAT_I1      },
+    {.name = "I2",       .integer = LV_COLOR_FORMAT_I2      },
+    {.name = "I4",       .integer = LV_COLOR_FORMAT_I4      },
+    {.name = "I8",       .integer = LV_COLOR_FORMAT_I8      },
+    {0,                  0                                  },
+};
+#endif
+
 #if LV_USE_ROLLER
 static const rotable_Reg roller_mode_const_table[] = {
     {.name = "NORMAL",   .integer = LV_ROLLER_MODE_NORMAL  },
@@ -632,6 +648,9 @@ static void luavgl_constants_init(lua_State *L)
   rotable_setfiled(L, -2, "GRID_ALIGN", grid_align_const_table);
 #if LV_USE_ROLLER
   rotable_setfiled(L, -2, "ROLLER_MODE", roller_mode_const_table);
+#endif
+#if LV_USE_CANVAS
+  rotable_setfiled(L, -2, "COLOR_FORMAT", color_format_const_table);
 #endif
   rotable_setfiled(L, -2, "KEY", key_const_table);
   /* miscellaneous. */

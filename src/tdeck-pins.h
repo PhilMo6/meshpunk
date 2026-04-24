@@ -42,3 +42,8 @@
 #define TDECK_I2S_DOUT 6
 
 #define TDECK_BAT_ADC 4
+
+// T-Deck Plus onboard GPS (L76K) on UART1
+#define TDECK_GPS_RX   44
+#define TDECK_GPS_TX   43
+#define TDECK_GPS_BAUD 9600

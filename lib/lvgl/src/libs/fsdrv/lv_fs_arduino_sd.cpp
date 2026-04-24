@@ -52,12 +52,15 @@ extern "C" void lv_fs_arduino_sd_init(void)
 /*Initialize your Storage device and File system.*/
 static void fs_init(void)
 {
-    if(!SD.begin(LV_FS_ARDUINO_SD_CS_PIN, SPI, LV_FS_ARDUINO_SD_FREQUENCY)) {
-        LV_LOG_WARN("Driver Arduino SD Card not mounted");
-        return;
-    }
+    // -- Replaced: SD is already mounted in setup(), calling SD.begin() again would conflict
+    // if(!SD.begin(LV_FS_ARDUINO_SD_CS_PIN, SPI, LV_FS_ARDUINO_SD_FREQUENCY)) {
+    //     LV_LOG_WARN("Driver Arduino SD Card not mounted");
+    //     return;
+    // }
+    // LV_LOG_WARN("Driver Arduino SD Card mounted");
 
-    LV_LOG_WARN("Driver Arduino SD Card mounted");
+    // No-op: SD card is initialized in setup() before LVGL starts
+    LV_LOG_WARN("Driver Arduino SD Card: using existing mount");
 }
 
 /**

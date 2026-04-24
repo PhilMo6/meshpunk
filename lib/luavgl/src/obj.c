@@ -305,7 +305,7 @@ static int luavgl_obj_scroll_to(lua_State *L)
   lua_getfield(L, -1, "y");
   if (!lua_isnil(L, -1)) {
     v = lua_tointeger(L, -1);
-    lv_obj_scroll_to_x(obj, v, anim ? LV_ANIM_ON : LV_ANIM_OFF);
+    lv_obj_scroll_to_y(obj, v, anim ? LV_ANIM_ON : LV_ANIM_OFF);
   }
   lua_pop(L, 1);
 

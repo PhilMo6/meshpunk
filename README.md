@@ -10,6 +10,7 @@ This project demonstrates using [LuaVGL](https://github.com/XuNeo/luavgl) on the
 - Uses PlatformIO for easy building
 - Loads Lua scripts from the filesystem
 - Integrates MeshCore networking
+- emoji support if provided emoji folder is placed on the t-decks SD card
 
 ## Project Structure
 
