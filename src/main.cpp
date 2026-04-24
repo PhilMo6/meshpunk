@@ -2667,6 +2667,7 @@ void setup() {
   mesh::Utils::printHex(Serial, the_mesh.self_id.pub_key, PUB_KEY_SIZE);
   Serial.println();
 
+  //Initialize the disply only after all other spi bus setup is finished
   Serial.println("Initialize display");
   tft.begin();
   tft.setRotation(1);

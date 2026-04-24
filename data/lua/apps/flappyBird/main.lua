@@ -174,23 +174,6 @@ local function Frames(parent, srcs, fps)
     return frame
 end
 
-local function Pipe(parent)
-    local up = Image(parent, IMAGE_PATH .. "pipe_up.png")
-    local down = Image(parent, IMAGE_PATH .. "pipe_down.png")
-    local pipe = {
-        up = up.widget, down = down.widget,
-        w = up.w, h = up.h, x = 0, y = 0
-    }
-
-    function pipe:updatePipePos()
-        self.up:set{ x = self.x, y = self.y - up.h }
-        self.down:set{ x = self.x, y = self.y + PIPE_GAP }
-    end
-
-    pipe:updatePipePos()
-    return pipe
-end
-
 local function ObjInfo(x, y, w, h)
     return { x = x, y = y, w = w, h = h }
 end
@@ -198,34 +181,69 @@ end
 local function Pipes(parent)
     local pipes = {}
 
+    -- Get pipe image dimensions via a temporary widget
+    local tmp = Image(parent, IMAGE_PATH .. "pipe_up.png")
+    local pipe_w = tmp.w
+    local pipe_h = tmp.h
+    tmp.widget:delete()
+
+    pipes.w = pipe_w
+    pipes.h = pipe_h
+
+    local stride   = PIPE_SPACE + pipe_w
+    local canvas_w = PIPE_COUNT * stride + pipe_w
+    local canvas_h = BOTTOM_Y
+
+    pipes.canvas = parent:Canvas{
+        w = canvas_w, h = canvas_h,
+        cf = lvgl.COLOR_FORMAT.ARGB8888,
+        x = W, y = 0
+    }
+    pipes.canvas:clear_flag(lvgl.FLAG.CLICKABLE)
+
     for i = 1, PIPE_COUNT do
-        pipes[i] = Pipe(parent)
-        if i == 1 then
-            pipes.w = pipes[i].w
-            pipes.h = pipes[i].h
+        pipes[i] = { canvas_x = (i - 1) * stride, y = randomY(), x = (i - 1) * stride + W }
+    end
+
+    pipes.birdInfo = ObjInfo(0, 0, 0, 0)
+    pipes.gapInfo  = ObjInfo(0, 0, 0, 0)
+
+    local function drawPipes()
+        pipes.canvas:fill_bg("#000000", 0)
+        for i = 1, PIPE_COUNT do
+            local p  = pipes[i]
+            local cx = p.canvas_x
+            pipes.canvas:draw_image{
+                x1 = cx, y1 = p.y - pipe_h,
+                x2 = cx + pipe_w - 1, y2 = p.y - 1,
+                src = IMAGE_PATH .. "pipe_up.png", opa = 255
+            }
+            pipes.canvas:draw_image{
+                x1 = cx, y1 = p.y + PIPE_GAP,
+                x2 = cx + pipe_w - 1, y2 = p.y + PIPE_GAP + pipe_h - 1,
+                src = IMAGE_PATH .. "pipe_down.png", opa = 255
+            }
         end
     end
 
     local function pipesPosinit()
-        local x = W
-        local y = randomY()
         for i = 1, PIPE_COUNT do
-            local pipe = pipes[i]
-            pipe.x = x
-            pipe.y = y
-            pipe:updatePipePos()
-            x = x + PIPE_SPACE + pipe.w
-            y = randomY()
+            pipes[i].canvas_x = (i - 1) * stride
+            pipes[i].y        = randomY()
+            pipes[i].x        = (i - 1) * stride + W
         end
+        pipes.scroll_offset   = 0
+        pipes.canvas_widget_x = W
+        pipes.front           = 1
+        pipes.last            = PIPE_COUNT
+        pipes.canvas:set{ x = W }
+        drawPipes()
     end
 
     pipesPosinit()
 
-    pipes.score = 0
-    pipes.last = PIPE_COUNT
-    pipes.totalWidth = (PIPE_COUNT) * (PIPE_SPACE + pipes.w)
-    pipes.birdInfo = ObjInfo(0, 0, 0, 0)
-    pipes.gapInfo = ObjInfo(0, 0, 0, 0)
+    pipes.score      = 0
+    pipes.objPassing = -1
 
     function pipes:setObjInfo(x, y, w, h)
         self.birdInfo.x = x
@@ -241,34 +259,18 @@ local function Pipes(parent)
         pipes.gapInfo.h = h
     end
 
-    pipes.objPassing = -1
-
     local function isBirdCollision()
         local bird = pipes.birdInfo
-        local gap = pipes.gapInfo
+        local gap  = pipes.gapInfo
         if bird.x + bird.w < gap.x then return false end
-        if bird.x > gap.x + gap.w then return false end
+        if bird.x > gap.x + gap.w  then return false end
         if (bird.y > gap.y) and (bird.y + bird.h < gap.y + gap.h) then return false end
         return true
     end
 
-    local function moveVirtualX(dx)
-        for i = 1, PIPE_COUNT do
-            local pipe = pipes[i]
-            local newX = pipe.x + dx
-            if newX + pipes.w < 0 then
-                newX = newX + pipes.totalWidth
-                pipe.y = randomY()
-                pipes.last = i
-            end
-            pipe.x = newX
-            pipe.updatePipePos(pipe)
-        end
-    end
-
     local function checkScore(i)
-        local bird = pipes.birdInfo
-        local gap = pipes.gapInfo
+        local bird    = pipes.birdInfo
+        local gap     = pipes.gapInfo
         local passing = pipes.objPassing
         if bird.x + bird.w < gap.x or bird.x > gap.x + gap.w then
             if passing > 0 and i == passing then
@@ -285,9 +287,9 @@ local function Pipes(parent)
     local function collisionDetect()
         local first = (pipes.last % PIPE_COUNT) + 1
         for idx = 0, PIPE_COUNT - 1 do
-            local i = (first + idx - 1) % PIPE_COUNT + 1
+            local i    = (first + idx - 1) % PIPE_COUNT + 1
             local pipe = pipes[i]
-            setGapInfo(pipe.x, pipe.y, pipe.w, PIPE_GAP)
+            setGapInfo(pipe.x, pipe.y, pipes.w, PIPE_GAP)
             if isBirdCollision() then
                 if pipes.collisionCB then pipes.collisionCB() end
             end
@@ -296,7 +298,7 @@ local function Pipes(parent)
     end
 
     pipes.preValue = 0
-    pipes.anim = pipes[1].up:Anim{
+    pipes.anim = pipes.canvas:Anim{
         run = false,
         start_value = 0,
         end_value = W,
@@ -309,21 +311,41 @@ local function Pipes(parent)
             local d
             if value < x then d = value + W - x else d = value - x end
             pipes.preValue = value
-            moveVirtualX(-d)
+
+            pipes.scroll_offset   = pipes.scroll_offset + d
+            pipes.canvas_widget_x = W - pipes.scroll_offset
+            pipes.canvas:set{ x = pipes.canvas_widget_x }
+
+            for i = 1, PIPE_COUNT do
+                pipes[i].x = pipes[i].canvas_x + pipes.canvas_widget_x
+            end
+
+            local front_pipe = pipes[pipes.front]
+            if front_pipe.canvas_x + pipes.canvas_widget_x + pipe_w < 0 then
+                local prev_idx        = (pipes.front - 2 + PIPE_COUNT) % PIPE_COUNT + 1
+                front_pipe.canvas_x   = pipes[prev_idx].canvas_x + stride
+                front_pipe.y          = randomY()
+                front_pipe.x          = front_pipe.canvas_x + pipes.canvas_widget_x
+                pipes.last            = pipes.front
+                pipes.front           = pipes.front % PIPE_COUNT + 1
+                drawPipes()
+                pipes.canvas:set{ x = pipes.canvas_widget_x }
+            end
+
             collisionDetect()
         end
     }
     game:trackAnim(pipes.anim)
 
     function pipes:start() self.anim:start() end
-    function pipes:stop() self.anim:stop() end
+    function pipes:stop()  self.anim:stop()  end
     function pipes:reset()
         pipesPosinit()
-        pipes.score = 0
-        pipes.preValue = 0
+        pipes.score      = 0
+        pipes.preValue   = 0
         pipes.objPassing = -1
     end
-    function pipes:setCollisionCB(cb) self.collisionCB = cb end
+    function pipes:setCollisionCB(cb)    self.collisionCB    = cb end
     function pipes:setScoreUpdateCB(cb) self.scoreUpdateCB = cb end
 
     return pipes
