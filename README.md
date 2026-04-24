@@ -1,16 +1,20 @@
 # MeshPunk - LVGL with Lua for T-Deck
 
-This project demonstrates using [LuaVGL](https://github.com/XuNeo/luavgl) on the LilyGo T-Deck device. LuaVGL is a Lua binding for LVGL that allows you to create GUIs with Lua scripts.
+This branch of the Meshpunk project focuses on extending functionality.
+Some features have been added or documented by with the assistance of AI 
 
 ## Features
 
 - Combines the power of LVGL with the simplicity of Lua scripting
 - Runs on the LilyGo T-Deck
-- Demonstrates touch and display capabilities
 - Uses PlatformIO for easy building
-- Loads Lua scripts from the filesystem
+- Dual buffer display
+- Touch and trackball controls
+- SD card support
+- GPS automaticly gets time
+- Loads Lua scripts from the filesystem automaticly as apps
 - Integrates MeshCore networking
-- emoji support if provided emoji folder is placed on the t-decks SD card
+- Emoji support if provided emoji folder is placed on the t-decks SD card
 
 ## Project Structure
 
@@ -54,6 +58,8 @@ You must close the serial monitor before uploadfs or it wont work.
 
 The example loads the `launcher.lua` script from the filesystem and displays a simple launcher UI. You can edit the Lua scripts in your IDE with proper syntax highlighting and then upload just the filesystem to quickly iterate on your UI design.
 
+Place the emoji folder onto a SD card to use emoji support.
+
 ### Developing Lua Scripts
 
 1. Edit the Lua scripts in `/data/lua`
@@ -67,8 +73,6 @@ You can create additional Lua scripts in the `/data/lua` directory. Scripts can 
 ```lua
 local utils = require('utils')
 ```
-
-You should add your apps to `apps.toml` to have them appear in the launcher.
 
 ## PRs
 
