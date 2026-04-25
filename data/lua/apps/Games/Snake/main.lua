@@ -317,14 +317,15 @@ local function entry()
         if not game.playing then return end
 
         -- Queue direction change (prevent 180° reversal)
+        -- WASD: w=119 W=87, a=97 A=65, s=115 S=83, d=100 D=68
         local dx, dy = snake.dir.x, snake.dir.y
-        if key == lvgl.KEY.UP and dy ~= 1 then
+        if (key == lvgl.KEY.UP or key == 119 or key == 87) and dy ~= 1 then
             snake.next_dir = {x = 0, y = -1}
-        elseif key == lvgl.KEY.DOWN and dy ~= -1 then
+        elseif (key == lvgl.KEY.DOWN or key == 115 or key == 83) and dy ~= -1 then
             snake.next_dir = {x = 0, y = 1}
-        elseif key == lvgl.KEY.LEFT and dx ~= 1 then
+        elseif (key == lvgl.KEY.LEFT or key == 97 or key == 65) and dx ~= 1 then
             snake.next_dir = {x = -1, y = 0}
-        elseif key == lvgl.KEY.RIGHT and dx ~= -1 then
+        elseif (key == lvgl.KEY.RIGHT or key == 100 or key == 68) and dx ~= -1 then
             snake.next_dir = {x = 1, y = 0}
         end
     end)

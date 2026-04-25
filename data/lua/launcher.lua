@@ -58,6 +58,7 @@ local function file_exists(path)
     return false
 end
 
+local indicator
 -- Build the app list from directory scanning
 local function discover_apps()
     local apps = {}
@@ -126,7 +127,7 @@ local function create_launcher(parent)
             align_items = "center",
             align_content = "center",
         },
-        w = 300,
+        w = 320,
         h = 240,
         align = lvgl.ALIGN.CENTER,
     })
@@ -137,15 +138,7 @@ local function create_launcher(parent)
     group:add_obj(root)
 
     -- Unread indicator
-    local indicator = root:Label{text = unread .. ' unread', align = lvgl.ALIGN.CENTER, w = 100, h = 40}
-
-    -- Emoji font probe: 😀 (U+1F600) and ❤ (U+2764). If the imgfont is wired
-    -- up and the PNGs are on SD, these render as images; otherwise tofu.
-    root:Label{
-        text = "emoji: \xF0\x9F\x98\x80 \xE2\x9D\xA4",
-        align = lvgl.ALIGN.CENTER,
-        w = 200, h = 40,
-    }
+    indicator = root:Label{text = unread .. ' unread', align = lvgl.ALIGN.CENTER, w = 100, h = 40}
 
     -- Live clock (seeded from GPS at boot, then free-running in VolatileRTCClock).
     -- Shows UTC + local (using the effective TZ offset: auto-from-GPS or manual setting).
@@ -192,7 +185,7 @@ local function create_launcher(parent)
         print("recv!")
         unread = unread + 1
         print(unread .. " unread")
-        --indicator.text = unread .. ' unread'
+        indicator.text = unread .. ' unread'
         print("set indicator again!")
     end)
 
@@ -202,7 +195,7 @@ local function create_launcher(parent)
     for _, app in ipairs(apps) do
         print("Creating app button for", app.name, app.entrypoint)
 
-        local btn = root:Button{w = 100, h = 40}
+        local btn = root:Button{w = 140, h = 40}
         btn:Label{text = app.name, align = lvgl.ALIGN.CENTER}
 
         btn:onClicked(function()
