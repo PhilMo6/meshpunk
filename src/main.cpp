@@ -763,15 +763,30 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   }
 }
 
-static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
-  data->state = LV_INDEV_STATE_RELEASED;
+static int16_t last_touch_x = 0, last_touch_y = 0;
+static uint8_t release_count = 0;
+static const uint8_t RELEASE_DEBOUNCE = 2;
 
+static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   if (touch.isPressed()) {
+    data->state = LV_INDEV_STATE_PRESSED;
+    release_count = 0;
+
     uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
     if (touched > 0) {
+      last_touch_x = x[0];
+      last_touch_y = y[0];
+    }
+    data->point.x = last_touch_x;
+    data->point.y = last_touch_y;
+  } else {
+    release_count++;
+    if (release_count >= RELEASE_DEBOUNCE) {
+      data->state = LV_INDEV_STATE_RELEASED;
+    } else {
       data->state = LV_INDEV_STATE_PRESSED;
-      data->point.x = x[0];
-      data->point.y = y[0];
+      data->point.x = last_touch_x;
+      data->point.y = last_touch_y;
     }
   }
 }
