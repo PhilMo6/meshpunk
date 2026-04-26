@@ -209,8 +209,13 @@ const void * emoji_path_cb(const lv_font_t * font,
     if (auto * cached = cache_lookup(unicode)) return cached;
 
     auto * fresh = load_bin_to_psram(unicode);
-    // Missing .bin on SD (or OOM) — swallow silently rather than tofu.
-    if (!fresh) return &s_blank_dsc;
+    // Missing .bin on SD (or OOM) — cache the miss so we never retry this
+    // codepoint on SD. Subsequent lookups will hit the cache and return
+    // the blank immediately instead of blocking on a doomed SD open.
+    if (!fresh) {
+        cache_insert(unicode, &s_blank_dsc);
+        return &s_blank_dsc;
+    }
 
     // cache_insert failing means the table is full — we still return the
     // loaded dsc so the glyph renders. Subsequent lookups will reload (the

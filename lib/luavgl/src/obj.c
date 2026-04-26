@@ -431,6 +431,22 @@ static int luavgl_obj_is_scrolling(lua_State *L)
   return 1;
 }
 
+static int luavgl_obj_get_scroll_top(lua_State *L)
+{
+  lv_obj_t *obj = luavgl_to_obj(L, 1);
+  lua_pushinteger(L, lv_obj_get_scroll_top(obj));
+  return 1;
+}
+
+static int luavgl_obj_move_to_index(lua_State *L)
+{
+  lv_obj_t *obj = luavgl_to_obj(L, 1);
+  int32_t index = luavgl_tointeger(L, 2);
+  lv_obj_move_to_index(obj, index);
+  lua_settop(L, 1);
+  return 1;
+}
+
 static int luavgl_obj_scrollbar_invalidate(lua_State *L)
 {
   lv_obj_t *obj = luavgl_to_obj(L, 1);
@@ -898,6 +914,8 @@ static const rotable_Reg luavgl_obj_methods[] = {
     {"get_state",                LUA_TFUNCTION,      {luavgl_obj_get_state}               },
     {"scroll_to",                LUA_TFUNCTION,      {luavgl_obj_scroll_to}               },
     {"is_scrolling",             LUA_TFUNCTION,      {luavgl_obj_is_scrolling}            },
+    {"get_scroll_top",           LUA_TFUNCTION,      {luavgl_obj_get_scroll_top}          },
+    {"move_to_index",            LUA_TFUNCTION,      {luavgl_obj_move_to_index}           },
     {"is_visible",               LUA_TFUNCTION,      {luavgl_obj_is_visible}              },
     {"add_flag",                 LUA_TFUNCTION,      {luavgl_obj_add_flag}                },
     {"clear_flag",               LUA_TFUNCTION,      {luavgl_obj_clear_flag}              },

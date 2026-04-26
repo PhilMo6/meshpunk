@@ -254,9 +254,26 @@ show_chat = function(target)
     elseif target.type == "dm" then
         history = messages:getDMThread(target.name)
     end
+    -- Only render the most recent 20 messages to avoid blocking the UI
+    -- on channels with long history (up to 100 messages).
     local last_lbl
-    for _, msg in ipairs(history) do last_lbl = render_msg(msg) end
+    local start_idx = math.max(1, #history - 19)
+    for i = start_idx, #history do last_lbl = render_msg(history[i]) end
     if last_lbl then last_lbl:scroll_to_view(false) end
+
+    -- Auto-load older messages when the user scrolls to the top.
+    local load_start = start_idx
+    msg_list:onevent(lvgl.EVENT.SCROLL_END, function()
+        if load_start <= 1 then return end
+        if msg_list:get_scroll_top() > 5 then return end
+
+        local new_start = math.max(1, load_start - 20)
+        for i = load_start - 1, new_start, -1 do
+            local lbl = render_msg(history[i])
+            lbl:move_to_index(0)
+        end
+        load_start = new_start
+    end)
 
     -- Live message listener — only render messages for the channel we're viewing.
     -- channel_idx may be nil on locally-broadcast messages (broadcast() doesn't set it),
@@ -525,10 +542,13 @@ end
 show_inbox()
 
 -- ── Periodic peer count update ──────────────────────────────────
-lvgl.Timer.create(function()
-    if current_mode == "inbox" then
-        header_right.text = _mesh_get_num_contacts() .. "p"
+lvgl.Timer {
+    period = 5000,
+    cb = function(t)
+        if current_mode == "inbox" then
+            header_right.text = _mesh_get_num_contacts() .. "p"
+        end
     end
-end, 5000, 0)
+}
 
 return root
