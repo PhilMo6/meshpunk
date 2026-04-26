@@ -80,8 +80,20 @@ local function truncate(str, max)
     return string.sub(str, 1, max - 2) .. ".."
 end
 
+
 -- Forward declarations
 local show_inbox, show_chat, show_contacts, show_channels, show_contact_detail
+
+-- ── Periodic peer count update ──────────────────────────────────
+local contactTimer = lvgl.Timer {
+    period = 5000,
+    cb = function(t)
+        if current_mode == "inbox" then
+            header_right.text = "Contact#:".. _mesh_get_num_contacts()
+        end
+    end
+}
+
 
 -- ── INBOX VIEW ──────────────────────────────────────────────────
 show_inbox = function()
@@ -98,6 +110,7 @@ show_inbox = function()
     local back_btn = body:Button { w = 45, h = 24 }
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
     back_btn:onClicked(function()
+        contactTimer:delete()
         root:delete()
         local launcher = require("launcher")
         launcher.create()
@@ -541,14 +554,4 @@ end
 -- ── Initial view ────────────────────────────────────────────────
 show_inbox()
 
--- ── Periodic peer count update ──────────────────────────────────
-lvgl.Timer {
-    period = 5000,
-    cb = function(t)
-        if current_mode == "inbox" then
-            header_right.text = _mesh_get_num_contacts() .. "p"
-        end
-    end
-}
 
-return root
