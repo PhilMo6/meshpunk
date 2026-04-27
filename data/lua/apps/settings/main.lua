@@ -1,327 +1,117 @@
--- Settings App for MeshPunk
--- Node name, storage toggle, radio info
-
+local app_dir = ...
 local lvgl = require("lvgl")
-local clock_fmt_mod = require("lib/clock_fmt")
+local nav = require("lib/nav")
 
--- Root
-local root = lvgl.Object()
-root:set {
-    w = lvgl.HOR_RES(),
-    h = lvgl.VER_RES(),
-    pad_all = 0,
-    border_width = 0,
-}
-root:clear_flag(lvgl.FLAG.SCROLLABLE)
-
--- Safely get info
-local ok, info = pcall(_mesh_get_node_info)
-if not ok or not info then
-    info = { name = "???", freq = 0, tx_power = 0, pubkey = "", lat = 0, lon = 0 }
-end
-
-local ok2, storage = pcall(_storage_get_info)
-if not ok2 or not storage then
-    storage = { type = "?", sd_available = false, use_sd = false }
-end
-
--- Scrollable content area
-local content = root:Object {
-    flex = {
-        flex_direction = "column",
-        flex_wrap = "nowrap",
-    },
-    w = lvgl.HOR_RES(),
-    h = lvgl.VER_RES(),
-    y = 0,
-    border_width = 0,
-    pad_all = 6,
-}
-
--- Title row
-local title_row = content:Object {
-    w = lvgl.PCT(100),
-    h = 26,
-    border_width = 0,
-    pad_all = 0,
-}
-title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-title_row:Label {
-    text = "Settings",
-    align = lvgl.ALIGN.LEFT_MID,
-}
-
-local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
-back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
-back_btn:onClicked(function()
-    root:delete()
-    local launcher = require("launcher")
-    launcher.create()
-end)
-
--- Status line
-local status_label = content:Label {
-    text = "",
-    w = lvgl.PCT(100),
-    h = 16,
-}
-
--- ── Section: Node Name ──
-content:Label { text = "-- Node Name --", w = lvgl.PCT(100), h = 16 }
-
-local name_row = content:Object {
-    flex = {
-        flex_direction = "row",
-        flex_wrap = "nowrap",
-    },
-    w = lvgl.PCT(100),
-    h = 34,
-    border_width = 0,
-    pad_all = 0,
-}
-name_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local name_input = name_row:Textarea {
-    password_mode = false,
-    one_line = true,
-    text = info.name or "NONAME",
-    w = lvgl.PCT(65),
-    h = 30,
-}
-
-local save_name_btn = name_row:Button { w = lvgl.PCT(30), h = 30 }
-save_name_btn:Label { text = "Save", align = lvgl.ALIGN.CENTER }
-
-save_name_btn:onClicked(function()
-    local new_name = name_input.text
-    if new_name and #new_name > 0 then
-        _mesh_set_config("name", new_name)
-        status_label.text = "Name saved: " .. new_name
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then
+        f:close()
+        return true
     end
-end)
+    return false
+end
 
-name_input:onevent(lvgl.EVENT.KEY, function(obj, code)
-    local indev = lvgl.indev.get_act()
-    local key = indev:get_key()
-    if key == lvgl.KEY.ENTER then
-        local new_name = name_input.text
-        if new_name and #new_name > 0 then
-            _mesh_set_config("name", new_name)
-            status_label.text = "Name saved: " .. new_name
+local function discover_Settings()
+    local Settings = {}
+    local seen = {}
+
+    local ok1, internal_dirs = pcall(_list_dir, "/lua/apps/Settings")
+    if ok1 and type(internal_dirs) == "table" then
+        for _, name in ipairs(internal_dirs) do
+            local entry = "/lua/apps/Settings/" .. name .. "/main.lua"
+            if file_exists(entry) then
+                table.insert(Settings, {
+                    name = name,
+                    entrypoint = entry,
+                    source = "internal",
+                    dir = "L:/lua/apps/Settings/" .. name
+                })
+                seen[name] = true
+                print("[Settings] Found internal: " .. name)
+            end
         end
     end
-end)
 
--- ── Section: Storage ──
-content:Label { text = "-- Storage --", w = lvgl.PCT(100), h = 16 }
-
--- Current storage info
-local storage_info_label = content:Label {
-    text = "Active: " .. (storage.type or "?") .. 
-           (storage.sd_available and " (SD available)" or " (no SD card)"),
-    w = lvgl.PCT(100),
-    h = 16,
-}
-
--- SD card toggle button (acts as checkbox)
-local sd_enabled = storage.use_sd
-
-local sd_row = content:Object {
-    flex = {
-        flex_direction = "row",
-        flex_wrap = "nowrap",
-    },
-    w = lvgl.PCT(100),
-    h = 34,
-    border_width = 0,
-    pad_all = 0,
-}
-sd_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local function get_toggle_text()
-    if not storage.sd_available then
-        return "[ ] Use SD (no card)"
-    elseif sd_enabled then
-        return "[x] Use SD card"
-    else
-        return "[ ] Use SD card"
+    local ok2, sd_dirs = pcall(_list_dir_sd, "/meshpunk/apps/Settings")
+    if ok2 and type(sd_dirs) == "table" then
+        for _, name in ipairs(sd_dirs) do
+            local entry = "/meshpunk/apps/Settings/" .. name .. "/main.lua"
+            local ok3, exists = pcall(_file_exists_sd, entry)
+            if ok3 and exists then
+                if not seen[name] then
+                    table.insert(Settings, {
+                        name = name .. " (SD)",
+                        entrypoint = entry,
+                        source = "sd",
+                        dir = "S:/meshpunk/apps/Settings/" .. name
+                    })
+                    print("[Settings] Found SD: " .. name)
+                else
+                    print("[Settings] SD tool " .. name .. " skipped (internal exists)")
+                end
+            end
+        end
     end
+
+    table.sort(Settings, function(a, b) return a.name < b.name end)
+
+    print("[Settings] Total Settings: " .. #Settings)
+    return Settings
 end
 
-local sd_toggle_btn = sd_row:Button { w = lvgl.PCT(65), h = 30 }
-local sd_toggle_label = sd_toggle_btn:Label { text = get_toggle_text(), align = lvgl.ALIGN.CENTER }
+local root = lvgl.Object({
+    flex = {
+        flex_direction = "row",
+        flex_wrap = "wrap",
+        justify_content = "center",
+        align_items = "center",
+        align_content = "center",
+    },
+    w = 320,
+    h = 240,
+    align = lvgl.ALIGN.CENTER,
+})
 
-local apply_btn = sd_row:Button { w = lvgl.PCT(30), h = 30 }
-apply_btn:Label { text = "Apply", align = lvgl.ALIGN.CENTER }
+_gridnav_add(root, GRIDNAV_ROLLOVER)
+local group = lvgl.group.get_default()
+group:add_obj(root)
 
-sd_toggle_btn:onClicked(function()
-    if not storage.sd_available then
-        status_label.text = "No SD card inserted"
-        return
-    end
-    sd_enabled = not sd_enabled
-    sd_toggle_label.text = get_toggle_text()
-end)
+root:Label{text = "Settings", align = lvgl.ALIGN.CENTER, w = 260, h = 40}
 
-apply_btn:onClicked(function()
-    if sd_enabled and not storage.sd_available then
-        status_label.text = "No SD card inserted"
-        return
-    end
+local Settings = discover_Settings()
 
-    local ok3, err = pcall(_storage_set_use_sd, sd_enabled)
-    if ok3 then
-        -- Re-read storage info
-        local ok4, new_storage = pcall(_storage_get_info)
-        if ok4 and new_storage then
-            storage = new_storage
-            storage_info_label.text = "Active: " .. (storage.type or "?") ..
-                (storage.sd_available and " (SD available)" or " (no SD card)")
-        end
-        if sd_enabled then
-            status_label.text = "Switched to SD card"
+for _, tool in ipairs(Settings) do
+    print("Creating tool button for", tool.name, tool.entrypoint)
+
+    local btn = root:Button{w = 140, h = 40}
+    btn:Label{text = tool.name, align = lvgl.ALIGN.CENTER}
+
+    btn:onClicked(function()
+        print("Launching tool:", tool.entrypoint, "dir:", tool.dir)
+
+        local success, err
+        if tool.source == "sd" and type(_dofile_sd) == "function" then
+            success, err = pcall(_dofile_sd, tool.entrypoint, tool.dir)
         else
-            status_label.text = "Switched to LittleFS"
+            success, err = pcall(function()
+                local chunk, load_err = loadfile(tool.entrypoint)
+                if not chunk then return error(load_err) end
+                root:delete()
+                chunk(tool.dir)
+            end)
         end
-    else
-        status_label.text = "Error: " .. tostring(err)
-    end
-end)
-
--- ── Section: Time Zone ──
-content:Label { text = "-- Time Zone --", w = lvgl.PCT(100), h = 16 }
-
-local function format_offset(mins)
-    local sign = (mins < 0) and "-" or "+"
-    local a = math.abs(mins)
-    return string.format("%s%02d:%02d", sign, math.floor(a / 60), a % 60)
-end
-
-local function describe_tz()
-    local ok_g, setting = pcall(_rtc_tz_get)
-    local ok_o, off = pcall(_rtc_tz_offset_minutes)
-    setting = ok_g and setting or "auto"
-    off = ok_o and off or 0
-    if setting == "auto" then
-        return "Current: auto (" .. format_offset(off) .. ")"
-    else
-        return "Current: " .. format_offset(off) .. " (" .. setting .. " min)"
-    end
-end
-
-local tz_info_label = content:Label { text = describe_tz(), w = lvgl.PCT(100), h = 16 }
-
-local tz_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-tz_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local tz_input = tz_row:Textarea {
-    password_mode = false,
-    one_line = true,
-    text = (function()
-        local ok_g, s = pcall(_rtc_tz_get)
-        return ok_g and s or "auto"
-    end)(),
-    w = lvgl.PCT(65), h = 30,
-}
-
-local tz_save_btn = tz_row:Button { w = lvgl.PCT(30), h = 30 }
-tz_save_btn:Label { text = "Save", align = lvgl.ALIGN.CENTER }
-
-local function apply_tz(value)
-    local arg
-    if value == "auto" then
-        arg = "auto"
-    else
-        local n = tonumber(value)
-        if not n then
-            status_label.text = "TZ: enter 'auto' or minutes (e.g. -300)"
-            return
+        if not success then
+            print("Error launching tool:", err)
         end
-        arg = math.floor(n)
-    end
-    local ok_s, applied = pcall(_rtc_tz_set, arg)
-    if ok_s and applied then
-        tz_info_label.text = describe_tz()
-        status_label.text = "TZ saved: " .. tostring(arg)
-    else
-        status_label.text = "TZ: invalid value (range: -840..840)"
-    end
-end
-
-tz_save_btn:onClicked(function() apply_tz(tz_input.text) end)
-tz_input:onevent(lvgl.EVENT.KEY, function(obj, code)
-    local indev = lvgl.indev.get_act()
-    if indev:get_key() == lvgl.KEY.ENTER then apply_tz(tz_input.text) end
-end)
-
--- Quick-set shortcuts
-local tz_quick = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "wrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-tz_quick:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local presets = {
-    { label = "Auto", value = "auto" },
-    { label = "UTC",  value = "0" },
-    { label = "PT",   value = "-480" },
-    { label = "MT",   value = "-420" },
-    { label = "CT",   value = "-360" },
-    { label = "ET",   value = "-300" },
-    { label = "CET",  value = "60" },
-    { label = "IN",   value = "330" },
-    { label = "JP",   value = "540" },
-}
-for _, p in ipairs(presets) do
-    local b = tz_quick:Button { w = 52, h = 28 }
-    b:Label { text = p.label, align = lvgl.ALIGN.CENTER }
-    b:onClicked(function()
-        tz_input.text = p.value
-        apply_tz(p.value)
     end)
 end
 
--- ── Section: Clock Format ──
-content:Label { text = "-- Clock Format --", w = lvgl.PCT(100), h = 16 }
-
-local clock_fmt = clock_fmt_mod.get()
-
-local fmt_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-fmt_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local btn_12 = fmt_row:Button { w = lvgl.PCT(48), h = 30 }
-local lbl_12 = btn_12:Label { align = lvgl.ALIGN.CENTER }
-local btn_24 = fmt_row:Button { w = lvgl.PCT(48), h = 30 }
-local lbl_24 = btn_24:Label { align = lvgl.ALIGN.CENTER }
-
-local function refresh_fmt_labels()
-    lbl_12.text = (clock_fmt == "12") and "[x] 12-hour" or "[ ] 12-hour"
-    lbl_24.text = (clock_fmt == "24") and "[x] 24-hour" or "[ ] 24-hour"
+if #Settings == 0 then
+    root:Label{text = "No Settings found!", align = lvgl.ALIGN.CENTER, w = 200, h = 40}
 end
-refresh_fmt_labels()
 
-btn_12:onClicked(function()
-    clock_fmt = "12"
-    status_label.text = clock_fmt_mod.set("12") and "Clock: 12-hour" or "Clock: save failed"
-    refresh_fmt_labels()
+local back_btn = root:Button{w = 140, h = 40}
+back_btn:Label{text = "Back", align = lvgl.ALIGN.CENTER}
+back_btn:onClicked(function()
+    nav.goHome(root)
 end)
-btn_24:onClicked(function()
-    clock_fmt = "24"
-    status_label.text = clock_fmt_mod.set("24") and "Clock: 24-hour" or "Clock: save failed"
-    refresh_fmt_labels()
-end)
-
--- ── Section: Radio Info ──
-content:Label { text = "-- Radio --", w = lvgl.PCT(100), h = 16 }
-content:Label { text = "Freq: " .. string.format("%.3f MHz", info.freq or 0), w = lvgl.PCT(100), h = 16 }
-content:Label { text = "TX: " .. tostring(info.tx_power or "?") .. " dBm", w = lvgl.PCT(100), h = 16 }
-content:Label { text = "Key: " .. string.sub(info.pubkey or "", 1, 16) .. "...", w = lvgl.PCT(100), h = 16 }
-
-return root

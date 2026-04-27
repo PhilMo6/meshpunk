@@ -651,27 +651,23 @@ void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
     saveContacts();
 }
 
-bool PunkMesh::processAck(const uint8_t *data)
+ContactInfo* PunkMesh::processAck(const uint8_t *data)
 {
     if (memcmp(data, &expected_ack_crc, 4) == 0)
     { // got an ACK from recipient
         Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
         // NOTE: the same ACK can be received multiple times!
         expected_ack_crc = 0; // reset our expected hash, now that we have received ACK
-        return true;
+        return curr_recipient;
     }
-
-    // uint32_t crc;
-    // memcpy(&crc, data, 4);
-    // MESH_DEBUG_PRINTLN("unknown ACK received: %08X (expected: %08X)", crc, expected_ack_crc);
-    return false;
+    return nullptr;
 }
 
 void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text)
 {
     Serial.println("[MESH RX] ========== DIRECT MSG RECEIVED ==========");
     Serial.printf("[MESH RX] From: %s, route: %s, hops: %d\n",
-        from.name, pkt->isRouteDirect() ? "DIRECT" : "FLOOD", pkt->path_len);
+        from.name, pkt->isRouteDirect() ? "DIRECT" : "FLOOD", pkt->getPathHashCount());
     Serial.printf("[MESH RX] Text: \"%s\"\n", text);
     Serial.printf("[MESH RX] Sender timestamp: %u\n", sender_timestamp);
 
@@ -688,7 +684,7 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
 
     // Persist incoming DM — peer and from are both the sender for incoming.
     appendDMMessage(from.name, from.name, norm_text, sender_timestamp,
-                    last_rx_snr, last_rx_rssi, pkt->path_len,
+                    last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
                     pkt->isRouteDirect());
 
     // Hand off to the UI core via rx_event_queue. The UI loop on Core 0
@@ -697,7 +693,7 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
     if (rx_event_queue) {
         RxEvent ev = {};
         ev.kind        = RxEvent::DIRECT_MSG;
-        ev.hops        = pkt->path_len;
+        ev.hops        = pkt->getPathHashCount();
         ev.channel_idx = -1;
         ev.direct      = pkt->isRouteDirect();
         strncpy(ev.sender, from.name, sizeof(ev.sender) - 1);
@@ -727,7 +723,7 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
     Serial.println("[MESH RX] ========== CHANNEL MSG RECEIVED ==========");
     Serial.printf("[MESH RX] Raw text: \"%s\"\n", text);
     Serial.printf("[MESH RX] Route: %s, hops: %d, timestamp: %u\n",
-        pkt->isRouteDirect() ? "DIRECT" : "FLOOD", pkt->path_len, timestamp);
+        pkt->isRouteDirect() ? "DIRECT" : "FLOOD", pkt->getPathHashCount(), timestamp);
 
     // Parse "sender: message" format used by group messages
     const char *colon = strstr(text, ": ");
@@ -752,14 +748,14 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
 
     // Persist to disk (no-op if channel_idx < 0)
     appendChannelMessage(channel_idx, sender_name, norm_msg, timestamp,
-                         last_rx_snr, last_rx_rssi, pkt->path_len,
+                         last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
                          pkt->isRouteDirect());
 
     // Hand off to UI core. See onMessageRecv for the why.
     if (rx_event_queue) {
         RxEvent ev = {};
         ev.kind        = RxEvent::CHANNEL_MSG;
-        ev.hops        = pkt->path_len;
+        ev.hops        = pkt->getPathHashCount();
         ev.channel_idx = (int8_t)channel_idx;
         ev.direct      = pkt->isRouteDirect();
         strncpy(ev.sender, sender_name, sizeof(ev.sender) - 1);
@@ -809,6 +805,9 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
     strcpy(_prefs.node_name, "NONAME");
     _prefs.freq = LORA_FREQ;
     _prefs.tx_power_dbm = LORA_TX_POWER;
+    _prefs.bandwidth = LORA_BW;
+    _prefs.spreading_factor = LORA_SF;
+    _prefs.coding_rate = LORA_CR;
 
     command[0] = 0;
     curr_recipient = NULL;
@@ -818,6 +817,9 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
 
 float PunkMesh::getFreqPref() const { return _prefs.freq; }
 uint8_t PunkMesh::getTxPowerPref() const { return _prefs.tx_power_dbm; }
+float PunkMesh::getBandwidthPref() const { return _prefs.bandwidth; }
+uint8_t PunkMesh::getSpreadingFactorPref() const { return _prefs.spreading_factor; }
+uint8_t PunkMesh::getCodingRatePref() const { return _prefs.coding_rate; }
 
 void PunkMesh::begin()
 {
@@ -1158,6 +1160,24 @@ void PunkMesh::handleCommand(const char *command)
             savePrefs();
             Serial.println("  OK - reboot to apply");
         }
+        else if (memcmp(config, "bw ", 3) == 0)
+        {
+            _prefs.bandwidth = atof(&config[3]);
+            savePrefs();
+            Serial.println("  OK - reboot to apply");
+        }
+        else if (memcmp(config, "sf ", 3) == 0)
+        {
+            _prefs.spreading_factor = atoi(&config[3]);
+            savePrefs();
+            Serial.println("  OK - reboot to apply");
+        }
+        else if (memcmp(config, "cr ", 3) == 0)
+        {
+            _prefs.coding_rate = atoi(&config[3]);
+            savePrefs();
+            Serial.println("  OK - reboot to apply");
+        }
         else
         {
             Serial.printf("  ERROR: unknown config: %s\n", config);
@@ -1175,8 +1195,9 @@ void PunkMesh::handleCommand(const char *command)
         Serial.printf("  Node name: %s\n", _prefs.node_name);
         Serial.printf("  Freq pref (runtime): %.3f MHz\n", _prefs.freq);
         Serial.printf("  Freq (build-time):   %.3f MHz\n", (float)LORA_FREQ);
-        Serial.printf("  BW (build-time):     %.1f kHz\n", (float)LORA_BW);
-        Serial.printf("  SF (build-time):     %d\n", LORA_SF);
+        Serial.printf("  BW pref: %.1f kHz (build: %d)\n", _prefs.bandwidth, LORA_BW);
+        Serial.printf("  SF pref: %d (build: %d)\n", _prefs.spreading_factor, LORA_SF);
+        Serial.printf("  CR pref: %d (build: %d)\n", _prefs.coding_rate, LORA_CR);
         Serial.printf("  TX power pref: %d dBm (build: %d)\n", _prefs.tx_power_dbm, LORA_TX_POWER);
         Serial.printf("  Airtime factor: %.2f\n", _prefs.airtime_factor);
         Serial.printf("  GPS: %.4f, %.4f\n", _prefs.node_lat, _prefs.node_lon);
@@ -1203,7 +1224,7 @@ void PunkMesh::handleCommand(const char *command)
     else if (memcmp(command, "help", 4) == 0)
     {
         Serial.println("Commands:");
-        Serial.println("   set {name|lat|lon|freq|tx|af} {value}");
+        Serial.println("   set {name|lat|lon|freq|tx|bw|sf|cr|af} {value}");
         Serial.println("   card");
         Serial.println("   import {biz card}");
         Serial.println("   clock");

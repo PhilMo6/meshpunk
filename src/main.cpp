@@ -18,7 +18,7 @@
 // Meshcore
 #include "punkmesh.h"
 #include "../../lib/MeshCore/src/helpers/ESP32Board.h"
-#include "../../lib/MeshCore/src/helpers/radiolib/CustomSX1262Wrapper.h"
+#include "punk_radio_wrapper.h"
 #include <Mesh.h>
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/StaticPoolPacketManager.h>
@@ -74,7 +74,7 @@ StdRNG fast_rng;
 SimpleMeshTables tables;
 
 ESP32Board board;
-CustomSX1262Wrapper radio_driver(radio, board);
+PunkSX1262Wrapper radio_driver(radio, board);
 PunkMesh the_mesh(radio_driver, fast_rng, *new VolatileRTCClock(), tables); // TODO: test with 'rtc_clock' in target.cpp
 
 // One-shot GPS time sync: poll in loop() until first fix, then stop.
@@ -763,30 +763,44 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   }
 }
 
-static int16_t last_touch_x = 0, last_touch_y = 0;
-static uint8_t release_count = 0;
-static const uint8_t RELEASE_DEBOUNCE = 2;
+// Fixed touchpad_read_cb (commented out due to ghost touch issues - see plan for details)
+// static int16_t last_touch_x = 0, last_touch_y = 0;
+// static uint8_t release_count = 0;
+// static const uint8_t RELEASE_DEBOUNCE = 2;
+//
+// static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
+//   if (touch.isPressed()) {
+//     data->state = LV_INDEV_STATE_PRESSED;
+//     release_count = 0;
+//
+//     uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
+//     if (touched > 0) {
+//       last_touch_x = x[0];
+//       last_touch_y = y[0];
+//     }
+//     data->point.x = last_touch_x;
+//     data->point.y = last_touch_y;
+//   } else {
+//     release_count++;
+//     if (release_count >= RELEASE_DEBOUNCE) {
+//       data->state = LV_INDEV_STATE_RELEASED;
+//     } else {
+//       data->state = LV_INDEV_STATE_PRESSED;
+//       data->point.x = last_touch_x;
+//       data->point.y = last_touch_y;
+//     }
+//   }
+// }
 
 static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
-  if (touch.isPressed()) {
-    data->state = LV_INDEV_STATE_PRESSED;
-    release_count = 0;
+  data->state = LV_INDEV_STATE_RELEASED;
 
+  if (touch.isPressed()) {
     uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
     if (touched > 0) {
-      last_touch_x = x[0];
-      last_touch_y = y[0];
-    }
-    data->point.x = last_touch_x;
-    data->point.y = last_touch_y;
-  } else {
-    release_count++;
-    if (release_count >= RELEASE_DEBOUNCE) {
-      data->state = LV_INDEV_STATE_RELEASED;
-    } else {
       data->state = LV_INDEV_STATE_PRESSED;
-      data->point.x = last_touch_x;
-      data->point.y = last_touch_y;
+      data->point.x = x[0];
+      data->point.y = y[0];
     }
   }
 }
@@ -1208,6 +1222,15 @@ static int lua_mesh_get_node_info(lua_State *L) {
 
   lua_pushnumber(L, the_mesh._prefs.node_lon);
   lua_setfield(L, -2, "lon");
+
+  lua_pushnumber(L, the_mesh._prefs.bandwidth);
+  lua_setfield(L, -2, "bandwidth");
+
+  lua_pushinteger(L, the_mesh._prefs.spreading_factor);
+  lua_setfield(L, -2, "spreading_factor");
+
+  lua_pushinteger(L, the_mesh._prefs.coding_rate);
+  lua_setfield(L, -2, "coding_rate");
   MESH_UNLOCK();
 
   return 1;
@@ -1276,6 +1299,9 @@ static int lua_mesh_get_num_contacts(lua_State *L) {
 // Usage from Lua: _mesh_set_config("name", "MyNode")
 //                 _mesh_set_config("freq", "915.525")
 //                 _mesh_set_config("tx", "20")
+//                 _mesh_set_config("bw", "250")
+//                 _mesh_set_config("sf", "10")
+//                 _mesh_set_config("cr", "5")
 //                 _mesh_set_config("lat", "37.7749")
 //                 _mesh_set_config("lon", "-122.4194")
 static int lua_mesh_set_config(lua_State *L) {
@@ -1306,6 +1332,21 @@ static int lua_mesh_set_config(lua_State *L) {
   } else if (strcmp(key, "lon") == 0) {
     the_mesh._prefs.node_lon = atof(value);
     the_mesh.savePrefs();
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "bw") == 0) {
+    the_mesh._prefs.bandwidth = atof(value);
+    the_mesh.savePrefs();
+    Serial.printf("Bandwidth set to: %.1f kHz (reboot to apply)\n", the_mesh._prefs.bandwidth);
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "sf") == 0) {
+    the_mesh._prefs.spreading_factor = atoi(value);
+    the_mesh.savePrefs();
+    Serial.printf("Spreading factor set to: %d (reboot to apply)\n", the_mesh._prefs.spreading_factor);
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "cr") == 0) {
+    the_mesh._prefs.coding_rate = atoi(value);
+    the_mesh.savePrefs();
+    Serial.printf("Coding rate set to: %d (reboot to apply)\n", the_mesh._prefs.coding_rate);
     lua_pushboolean(L, 1);
   } else {
     MESH_UNLOCK();
@@ -1655,6 +1696,34 @@ static int lua_mesh_get_rx_info(lua_State *L) {
   return 1;
 }
 
+// Usage: local enabled = _mesh_get_rx_boost()
+static int lua_mesh_get_rx_boost(lua_State *L) {
+  SPI_LOCK();
+  bool en = radio_driver.getRxBoostedGainMode();
+  SPI_UNLOCK();
+  lua_pushboolean(L, en);
+  return 1;
+}
+
+// Usage: _mesh_set_rx_boost(true)
+// Applies the setting to the radio and persists it to LittleFS.
+static int lua_mesh_set_rx_boost(lua_State *L) {
+  bool en = lua_toboolean(L, 1);
+  SPI_LOCK();
+  radio_driver.setRxBoostedGainMode(en);
+  SPI_UNLOCK();
+
+  File f = LittleFS.open("/rx_boost_pref", "w", true);
+  if (f) {
+    uint8_t val = en ? 1 : 0;
+    f.write(&val, 1);
+    f.close();
+    Serial.printf("[RADIO] RX Boost preference saved: %d\n", val);
+  }
+
+  return 0;
+}
+
 // ── Persistent message history bridge ────────────────────────────
 
 // Read all stored messages for a channel slot.
@@ -1716,18 +1785,8 @@ static int lua_storage_get_info(lua_State *L) {
   lua_pushboolean(L, sd_mounted ? 1 : 0);
   lua_setfield(L, -2, "sd_available");
 
-  // Read the preference from LittleFS
-  bool use_sd_pref = false;
-  if (LittleFS.exists("/storage_pref")) {
-    File f = LittleFS.open("/storage_pref");
-    if (f) {
-      uint8_t val = 0;
-      f.read(&val, 1);
-      f.close();
-      use_sd_pref = (val == 1);
-    }
-  }
-  lua_pushboolean(L, use_sd_pref ? 1 : 0);
+  // Report actual current state so the toggle matches reality
+  lua_pushboolean(L, is_sd ? 1 : 0);
   lua_setfield(L, -2, "use_sd");
 
   return 1;
@@ -2138,6 +2197,8 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_login_room", lua_mesh_login_room);
   lua_register(L, "_mesh_send_request", lua_mesh_send_request);
   lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
+  lua_register(L, "_mesh_get_rx_boost", lua_mesh_get_rx_boost);
+  lua_register(L, "_mesh_set_rx_boost", lua_mesh_set_rx_boost);
 
   // Persistent message history APIs — available to any app, not just messenger
   lua_register(L, "_mesh_get_channel_messages", lua_mesh_get_channel_messages);
@@ -2151,6 +2212,14 @@ void setupLuaVGL() {
 
   // Register Filesystem bridge functions
   lua_register(L, "_list_dir", lua_list_dir);
+
+  // System
+  lua_register(L, "_system_reboot", [](lua_State *L) -> int {
+    Serial.println("[SYSTEM] Reboot requested from Lua");
+    delay(100);
+    ESP.restart();
+    return 0;
+  });
 
   // RTC epoch seconds (seeded from GPS once at boot, then free-running)
   lua_register(L, "_rtc_time", [](lua_State *L) -> int {
@@ -2646,23 +2715,27 @@ void setup() {
   delay(100);
 
   float freq = the_mesh.getFreqPref();
-  Serial.printf("[RADIO] Setting freq=%.3f MHz, BW=%d kHz, SF=%d, CR=5, TX=17 dBm\n", freq, LORA_BW, LORA_SF);
+  uint8_t tx_pwr = the_mesh.getTxPowerPref();
+  float bw = the_mesh.getBandwidthPref();
+  uint8_t sf = the_mesh.getSpreadingFactorPref();
+  uint8_t cr = the_mesh.getCodingRatePref();
+  Serial.printf("[RADIO] Setting freq=%.3f MHz, BW=%.0f kHz, SF=%d, CR=%d, TX=%d dBm\n", freq, bw, sf, cr, tx_pwr);
 
   state = radio.setFrequency(freq);
   Serial.printf("[RADIO] setFrequency = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
-  state = radio.setBandwidth(LORA_BW);
+  state = radio.setBandwidth(bw);
   Serial.printf("[RADIO] setBandwidth = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
-  state = radio.setSpreadingFactor(LORA_SF);
+  state = radio.setSpreadingFactor(sf);
   Serial.printf("[RADIO] setSpreadingFactor = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
-  state = radio.setCodingRate(5);
+  state = radio.setCodingRate(cr);
   Serial.printf("[RADIO] setCodingRate = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   radio.setCRC(true);
 
-  state = radio.setOutputPower(17);
+  state = radio.setOutputPower(tx_pwr);
   Serial.printf("[RADIO] setOutputPower = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   state = radio.startReceive();
@@ -2672,6 +2745,21 @@ void setup() {
   fast_rng.begin(123456); // fixed seed for testing
   the_mesh.begin();
   the_mesh.showWelcome();
+
+  // Restore RX boost preference from LittleFS
+  if (LittleFS.exists("/rx_boost_pref")) {
+    File bf = LittleFS.open("/rx_boost_pref");
+    if (bf) {
+      uint8_t val = 0;
+      bf.read(&val, 1);
+      bf.close();
+      bool boost = (val == 1);
+      SPI_LOCK();
+      radio_driver.setRxBoostedGainMode(boost);
+      SPI_UNLOCK();
+      Serial.printf("[RADIO] RX Boost restored from pref: %s\n", boost ? "ON" : "OFF");
+    }
+  }
 
   Serial.printf("[MESH] Node name: %s\n", the_mesh._prefs.node_name);
   Serial.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh._prefs.freq);

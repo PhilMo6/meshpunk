@@ -30,6 +30,7 @@ static void mesh_task_body(void *param) {
     // section — dispatcher work is bounded per call.
     MESH_LOCK();
     the_mesh.loop();
+    the_mesh.getRTCClock()->tick();
     MESH_UNLOCK();
 
     // Yield so lower priority tasks (IDLE, watchdog) can run.

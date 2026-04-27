@@ -29,6 +29,11 @@ struct NodePrefs
   float freq;
   uint8_t tx_power_dbm;
   uint8_t unused[3];
+  // v2 fields — old prefs files are shorter, so these keep constructor defaults
+  float bandwidth;
+  uint8_t spreading_factor;
+  uint8_t coding_rate;
+  uint8_t _pad2[2];
 };
 
 struct MeshMessage {
@@ -129,6 +134,9 @@ public:
 
   float getFreqPref() const;
   uint8_t getTxPowerPref() const;
+  float getBandwidthPref() const;
+  uint8_t getSpreadingFactorPref() const;
+  uint8_t getCodingRatePref() const;
 
 protected:
   void logRx(mesh::Packet *pkt, int len, float score) override;
@@ -137,7 +145,7 @@ protected:
   bool allowPacketForward(const mesh::Packet *packet) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t *path) override;
   void onContactPathUpdated(const ContactInfo &contact) override;
-  bool processAck(const uint8_t *data) override;
+  ContactInfo* processAck(const uint8_t *data) override;
   void onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text) override;
   void onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text) override;
   void onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const uint8_t *sender_prefix, const char *text) override;

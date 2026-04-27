@@ -214,10 +214,6 @@ show_chat = function(target)
     back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
     back_btn:onClicked(function() show_inbox() end)
 
-    local scroll_to_btn = body:Button { w = 100, h = 20 }
-    scroll_to_btn:Label { text = "Scroll to bot", align = lvgl.ALIGN.RIGHT }
-    scroll_to_btn:onClicked(function() msg_list:scroll_to({x = 10000, anim = false}) end)
-
     if target.type == "dm" then
         local info_btn = body:Button { w = 45, h = 20 }
         info_btn:Label { text = "Info", align = lvgl.ALIGN.CENTER }
