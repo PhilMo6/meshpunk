@@ -45,7 +45,7 @@ static String storagePath(const String& prefix, const char* name) {
 #endif
 
 #ifndef MAX_CONTACTS
-#define MAX_CONTACTS 100
+#define MAX_CONTACTS 300  // set globally via -D in platformio.ini
 #endif
 
 #include <helpers/BaseChatMesh.h>
@@ -130,6 +130,32 @@ void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t
     lua_pop(L, 1); // pop module
 }
 
+void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contact_type) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+
+    lua_getfield(L, -1, "__dispatch_contact");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+
+    lua_pushstring(L, name);
+    lua_pushinteger(L, contact_type);
+
+    if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+        Serial.printf("__dispatch_contact failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    lua_pop(L, 1); // pop module
+}
+
 void PunkMesh::store_message(const char* from, const char* text, uint32_t timestamp, uint8_t hops, bool direct) {
     int idx = (msg_head + msg_count) % MAX_MESSAGES;
 
@@ -184,32 +210,46 @@ void PunkMesh::loadContacts()
         File file = _storage->open(path.c_str());
         if (file)
         {
-            bool full = false;
-            while (!full)
+            char line[320];
+            while (file.available())
             {
+                int len = 0;
+                while (file.available() && len < (int)sizeof(line) - 1) {
+                    char ch = file.read();
+                    if (ch == '\n' || ch == '\r') break;
+                    line[len++] = ch;
+                }
+                line[len] = '\0';
+                if (len == 0) continue;
+
+                // Parse tab-separated: pubkey_hex \t name \t type \t flags \t path_len \t advert_ts \t path_hex
+                char *fields[7];
+                int nf = 0;
+                fields[0] = line;
+                for (int i = 0; i < len && nf < 6; i++) {
+                    if (line[i] == '\t') {
+                        line[i] = '\0';
+                        fields[++nf] = &line[i + 1];
+                    }
+                }
+                if (nf < 1) continue; // need at least pubkey + name
+
                 ContactInfo c;
+                memset(&c, 0, sizeof(c));
+
                 uint8_t pub_key[32];
-                uint8_t unused;
-                uint32_t reserved;
-
-                bool success = (file.read(pub_key, 32) == 32);
-                success = success && (file.read((uint8_t *)&c.name, 32) == 32);
-                success = success && (file.read(&c.type, 1) == 1);
-                success = success && (file.read(&c.flags, 1) == 1);
-                success = success && (file.read(&unused, 1) == 1);
-                success = success && (file.read((uint8_t *)&reserved, 4) == 4);
-                success = success && (file.read((uint8_t *)&c.out_path_len, 1) == 1);
-                success = success && (file.read((uint8_t *)&c.last_advert_timestamp, 4) == 4);
-                success = success && (file.read(c.out_path, 64) == 64);
-                c.gps_lat = c.gps_lon = 0; // not yet supported
-
-                if (!success)
-                    break; // EOF
-
+                if (!mesh::Utils::fromHex(pub_key, 32, fields[0])) continue;
                 c.id = mesh::Identity(pub_key);
+
+                strncpy(c.name, fields[1], sizeof(c.name) - 1);
+                if (nf >= 2) c.type = atoi(fields[2]);
+                if (nf >= 3) c.flags = atoi(fields[3]);
+                if (nf >= 4) c.out_path_len = atoi(fields[4]);
+                if (nf >= 5) c.last_advert_timestamp = strtoul(fields[5], nullptr, 10);
+                if (nf >= 6) mesh::Utils::fromHex(c.out_path, 64, fields[6]);
                 c.lastmod = 0;
-                if (!addContact(c))
-                    full = true;
+
+                if (!addContact(c)) break;
             }
             file.close();
         }
@@ -229,23 +269,18 @@ void PunkMesh::saveContacts()
     {
         ContactsIterator iter;
         ContactInfo c;
-        uint8_t unused = 0;
-        uint32_t reserved = 0;
 
         while (iter.hasNext(this, c))
         {
-            bool success = (file.write(c.id.pub_key, 32) == 32);
-            success = success && (file.write((uint8_t *)&c.name, 32) == 32);
-            success = success && (file.write(&c.type, 1) == 1);
-            success = success && (file.write(&c.flags, 1) == 1);
-            success = success && (file.write(&unused, 1) == 1);
-            success = success && (file.write((uint8_t *)&reserved, 4) == 4);
-            success = success && (file.write((uint8_t *)&c.out_path_len, 1) == 1);
-            success = success && (file.write((uint8_t *)&c.last_advert_timestamp, 4) == 4);
-            success = success && (file.write(c.out_path, 64) == 64);
+            char pubkey_hex[65];
+            mesh::Utils::toHex(pubkey_hex, c.id.pub_key, 32);
 
-            if (!success)
-                break; // write failed
+            char path_hex[129];
+            mesh::Utils::toHex(path_hex, c.out_path, 64);
+
+            file.printf("%s\t%s\t%d\t%d\t%d\t%u\t%s\n",
+                pubkey_hex, c.name, c.type, c.flags,
+                c.out_path_len, c.last_advert_timestamp, path_hex);
         }
         file.close();
     }
@@ -264,22 +299,39 @@ void PunkMesh::loadChannels()
         File file = _storage->open(path.c_str());
         if (file)
         {
-            // Slots are stored in order: slot 1, 2, ..., MAX_GROUP_CHANNELS-1
-            // (slot 0 is always Public, recreated in begin())
-            for (int i = 1; i < MAX_GROUP_CHANNELS; i++) {
-                char name[32];
-                uint8_t secret[32];
-                bool success = (file.read((uint8_t*)name, 32) == 32);
-                success = success && (file.read(secret, 32) == 32);
-                if (!success) break;
-                if (name[0] != '\0') {
-                    ChannelDetails cd;
-                    memset(&cd, 0, sizeof(cd));
-                    memcpy(cd.name, name, 32);
-                    memcpy(cd.channel.secret, secret, 32);
-                    setChannel(i, cd);
-                    Serial.printf("[MESH INIT] Restored channel[%d]: %s\n", i, cd.name);
+            char line[128];
+            while (file.available())
+            {
+                int len = 0;
+                while (file.available() && len < (int)sizeof(line) - 1) {
+                    char ch = file.read();
+                    if (ch == '\n' || ch == '\r') break;
+                    line[len++] = ch;
                 }
+                line[len] = '\0';
+                if (len == 0) continue;
+
+                // Format: slot_idx \t name \t secret_hex
+                char *fields[3];
+                int nf = 0;
+                fields[0] = line;
+                for (int i = 0; i < len && nf < 2; i++) {
+                    if (line[i] == '\t') {
+                        line[i] = '\0';
+                        fields[++nf] = &line[i + 1];
+                    }
+                }
+                if (nf < 2) continue;
+
+                int slot = atoi(fields[0]);
+                if (slot < 1 || slot >= MAX_GROUP_CHANNELS) continue;
+
+                ChannelDetails cd;
+                memset(&cd, 0, sizeof(cd));
+                strncpy(cd.name, fields[1], sizeof(cd.name) - 1);
+                mesh::Utils::fromHex(cd.channel.secret, 32, fields[2]);
+                setChannel(slot, cd);
+                Serial.printf("[MESH INIT] Restored channel[%d]: %s\n", slot, cd.name);
             }
             file.close();
         }
@@ -297,12 +349,14 @@ void PunkMesh::saveChannels()
     File file = _storage->open(path.c_str(), "w", true);
     if (file)
     {
-        // Save slots 1..MAX_GROUP_CHANNELS-1 (slot 0 is always Public)
         for (int i = 1; i < MAX_GROUP_CHANNELS; i++) {
             ChannelDetails cd;
             getChannel(i, cd);
-            file.write((uint8_t*)cd.name, 32);
-            file.write(cd.channel.secret, 32);
+            if (cd.name[0] == '\0') continue;
+
+            char secret_hex[65];
+            mesh::Utils::toHex(secret_hex, cd.channel.secret, 32);
+            file.printf("%d\t%s\t%s\n", i, cd.name, secret_hex);
         }
         file.close();
     }
@@ -643,6 +697,14 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
     Serial.printf("[MESH RX] Total contacts now: %d\n", getNumContacts() + (is_new ? 1 : 0));
 
     saveContacts();
+
+    if (rx_event_queue) {
+        RxEvent ev = {};
+        ev.kind = RxEvent::CONTACT_UPDATE;
+        strncpy(ev.sender, contact.name, sizeof(ev.sender) - 1);
+        ev.hops = contact.type;
+        xQueueSend(rx_event_queue, &ev, 0);
+    }
 }
 
 void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
@@ -833,6 +895,8 @@ void PunkMesh::begin()
     Serial.printf("[STORAGE] Prefs path: %s\n", prefsPath.c_str());
 
     bool identity_loaded = false;
+    bool id_is_sd = (_storage != &LittleFS);
+    if (id_is_sd) sd_spi_take();
     if (_storage->exists(idPath.c_str())) {
         File file = _storage->open(idPath.c_str());
         if (file) {
@@ -847,6 +911,18 @@ void PunkMesh::begin()
     } else {
         Serial.printf("[STORAGE] No identity file at %s\n", idPath.c_str());
     }
+    if (id_is_sd) sd_spi_release();
+
+    if (!identity_loaded && id_is_sd && LittleFS.exists("/identity")) {
+        File lfs_file = LittleFS.open("/identity");
+        if (lfs_file) {
+            identity_loaded = self_id.readFrom(lfs_file);
+            lfs_file.close();
+            if (identity_loaded) {
+                Serial.println("[STORAGE] Loaded identity from LittleFS fallback");
+            }
+        }
+    }
 
     // If no saved identity, generate a new one
     if (!identity_loaded) {
@@ -860,6 +936,8 @@ void PunkMesh::begin()
             count++;
         }
 
+        bool is_sd = (_storage != &LittleFS);
+        if (is_sd) sd_spi_take();
         File file = _storage->open(idPath.c_str(), "w", true);
         if (file) {
             bool ok = self_id.writeTo(file);
@@ -868,15 +946,52 @@ void PunkMesh::begin()
         } else {
             Serial.printf("[STORAGE] ERROR: Cannot open %s for writing!\n", idPath.c_str());
         }
+        if (is_sd) {
+            sd_spi_release();
+            File lfs_file = LittleFS.open("/identity", "w", true);
+            if (lfs_file) {
+                self_id.writeTo(lfs_file);
+                lfs_file.close();
+                Serial.println("[STORAGE] Identity also saved to LittleFS");
+            }
+        }
     }
 
-    // Load persisted prefs
+    // Load persisted prefs (key=value text format)
     if (_storage->exists(prefsPath.c_str()))
     {
         File file = _storage->open(prefsPath.c_str());
         if (file)
         {
-            file.read((uint8_t *)&_prefs, sizeof(_prefs));
+            char line[128];
+            while (file.available()) {
+                int len = 0;
+                while (file.available() && len < (int)sizeof(line) - 1) {
+                    char ch = file.read();
+                    if (ch == '\n' || ch == '\r') break;
+                    line[len++] = ch;
+                }
+                line[len] = '\0';
+                if (len == 0) continue;
+
+                char *eq = strchr(line, '=');
+                if (!eq) continue;
+                *eq = '\0';
+                const char *key = line;
+                const char *val = eq + 1;
+
+                if (strcmp(key, "name") == 0) strncpy(_prefs.node_name, val, sizeof(_prefs.node_name) - 1);
+                else if (strcmp(key, "freq") == 0) _prefs.freq = atof(val);
+                else if (strcmp(key, "tx_power") == 0) _prefs.tx_power_dbm = atoi(val);
+                else if (strcmp(key, "bandwidth") == 0) _prefs.bandwidth = atof(val);
+                else if (strcmp(key, "spreading_factor") == 0) _prefs.spreading_factor = atoi(val);
+                else if (strcmp(key, "coding_rate") == 0) _prefs.coding_rate = atoi(val);
+                else if (strcmp(key, "airtime_factor") == 0) _prefs.airtime_factor = atof(val);
+                else if (strcmp(key, "lat") == 0) _prefs.node_lat = atof(val);
+                else if (strcmp(key, "lon") == 0) _prefs.node_lon = atof(val);
+                else if (strcmp(key, "contact_overwrite") == 0) _prefs.contact_overwrite = atoi(val);
+                else if (strcmp(key, "rx_boost") == 0) _prefs.rx_boost = atoi(val);
+            }
             file.close();
             Serial.printf("[STORAGE] Loaded prefs from %s (name=%s, freq=%.3f)\n",
                 prefsPath.c_str(), _prefs.node_name, _prefs.freq);
@@ -926,23 +1041,40 @@ void PunkMesh::begin()
     //   
   }
 
+static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
+{
+    File file = fs->open(path, "w", true);
+    if (file) {
+        file.printf("name=%s\n", p.node_name);
+        file.printf("freq=%.3f\n", p.freq);
+        file.printf("tx_power=%d\n", p.tx_power_dbm);
+        file.printf("bandwidth=%g\n", p.bandwidth);
+        file.printf("spreading_factor=%d\n", p.spreading_factor);
+        file.printf("coding_rate=%d\n", p.coding_rate);
+        file.printf("airtime_factor=%g\n", p.airtime_factor);
+        file.printf("lat=%.6f\n", p.node_lat);
+        file.printf("lon=%.6f\n", p.node_lon);
+        file.printf("contact_overwrite=%d\n", p.contact_overwrite);
+        file.printf("rx_boost=%d\n", p.rx_boost);
+        file.close();
+        Serial.printf("[STORAGE] Prefs saved to %s\n", path);
+    } else {
+        Serial.printf("[STORAGE] ERROR: Cannot save prefs to %s\n", path);
+    }
+}
+
 void PunkMesh::savePrefs()
 {
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/node_prefs");
-    File file = _storage->open(path.c_str(), "w", true);
-    if (file)
-    {
-        file.write((const uint8_t *)&_prefs, sizeof(_prefs));
-        file.close();
-        Serial.printf("[STORAGE] Prefs saved to %s\n", path.c_str());
-    } else {
-        Serial.printf("[STORAGE] ERROR: Cannot save prefs to %s\n", path.c_str());
-    }
+    writePrefsToFile(_storage, path.c_str(), _prefs);
 
-    if (is_sd) sd_spi_release();
+    if (is_sd) {
+        sd_spi_release();
+        writePrefsToFile(&LittleFS, "/node_prefs", _prefs);
+    }
 }
 
 void PunkMesh::showWelcome()

@@ -12,6 +12,7 @@ local M = {
     __onMessage = nil,
     __onDirectMessage = nil,
     __onAnyMessage = nil,  -- fires for both channel and DM
+    __onContactUpdate = nil,
     __history = {},
     __dm_history = {},
     __dm_threads = {},     -- grouped by contact name: {[name] = {msg, msg, ...}}
@@ -81,6 +82,10 @@ end
 -- Register callback for any message (channel or DM)
 function M:onAnyMessage(cb)
     M.__onAnyMessage = cb
+end
+
+function M:onContactUpdate(cb)
+    M.__onContactUpdate = cb
 end
 
 -- Send a public channel message via MeshCore
@@ -305,6 +310,10 @@ function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi)
 
     if M.__onDirectMessage then M.__onDirectMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
+end
+
+function M.__dispatch_contact(name, ctype)
+    if M.__onContactUpdate then M.__onContactUpdate(name, ctype) end
 end
 
 -- Get all channel message history

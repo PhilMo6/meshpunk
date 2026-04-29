@@ -46,6 +46,7 @@ local current_view = nil  -- the lvgl object for the body area
 local current_input = nil -- the lvgl object for the input bar (if any)
 local current_mode = "inbox" -- "inbox", "chat", "contacts", "channels", "contact_detail"
 local chat_target = nil   -- {type="channel", idx=0, name="Public"} or {type="dm", name="alice"} or {type="room", name="room1"}
+local contact_rows = {}  -- name -> LVGL button object
 
 -- ── Header (always visible) ────────────────────────────────────
 local header = root:Object {
@@ -89,7 +90,7 @@ local contactTimer = lvgl.Timer {
     period = 5000,
     cb = function(t)
         if current_mode == "inbox" then
-            header_right.text = "Contact#:".. _mesh_get_num_contacts()
+            header_right.text = "Contact#:" .. _mesh_get_num_contacts()
         end
     end
 }
@@ -99,34 +100,77 @@ local contactTimer = lvgl.Timer {
 show_inbox = function()
     clear_view()
     current_mode = "inbox"
-    set_header("Messenger", _mesh_get_num_contacts() .. "p")
+    set_header("Messenger", "Contact#:" .. _mesh_get_num_contacts())
 
-    -- Single gridnav body: all buttons are direct children
-    -- Flex row wrap: narrow buttons share a row, wide buttons get own row
-    local body = gridnav_body(root, HEADER_H, H - HEADER_H)
+    local body = root:Object {
+        flex = { flex_direction = "row", flex_wrap = "wrap" },
+        w = W, h = H - HEADER_H, y = HEADER_H,
+        border_width = 0, pad_all = 4,
+    }
+    _gridnav_add(body, GRIDNAV_ROLLOVER)
+    group:add_obj(body)
     current_view = body
 
     -- Nav buttons (narrow, wrap in top row)
-    local back_btn = body:Button { w = 45, h = 24 }
+    local back_btn = body:Button { w = 50, h = 24 }
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
     back_btn:onClicked(function()
         contactTimer:delete()
+        messages:onContactUpdate(nil)
         root:delete()
         local launcher = require("launcher")
         launcher.create()
     end)
 
-    local ch_btn = body:Button { w = 50, h = 24 }
-    ch_btn:Label { text = "Chan", align = lvgl.ALIGN.CENTER }
+    local ch_btn = body:Button { w = 70, h = 24 }
+    ch_btn:Label { text = "Channels", align = lvgl.ALIGN.CENTER }
     ch_btn:onClicked(function() show_channels() end)
 
-    local ct_btn = body:Button { w = 50, h = 24 }
-    ct_btn:Label { text = "DM+", align = lvgl.ALIGN.CENTER }
+    local ct_btn = body:Button { w = 70, h = 24 }
+    ct_btn:Label { text = "Contacts", align = lvgl.ALIGN.CENTER }
     ct_btn:onClicked(function() show_contacts() end)
 
     local adv_btn = body:Button { w = 55, h = 24 }
     adv_btn:Label { text = "Advert", align = lvgl.ALIGN.CENTER }
-    adv_btn:onClicked(function() _mesh_send_advert() end)
+    adv_btn:onClicked(function()
+        local overlay = root:Object {
+            w = W, h = H, x = 0, y = 0,
+            bg_opa = 200, border_width = 0, pad_all = 0,
+        }
+        overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        local box = overlay:Object {
+            w = 200, h = 150, align = lvgl.ALIGN.CENTER,
+            border_width = 1, pad_all = 10,
+            flex = { flex_direction = "column", flex_wrap = "nowrap" },
+        }
+        box:clear_flag(lvgl.FLAG.SCROLLABLE)
+        _gridnav_add(box, GRIDNAV_ROLLOVER)
+        local popup_group = lvgl.group.get_default()
+        popup_group:add_obj(box)
+
+        box:Label { text = "Send Advert", w = lvgl.PCT(100), h = 22 }
+
+        local flood_btn = box:Button { w = lvgl.PCT(100), h = 28 }
+        flood_btn:Label { text = "Flood", align = lvgl.ALIGN.TOP }
+        flood_btn:onClicked(function()
+            pcall(_mesh_send_advert, "flood")
+            overlay:delete()
+        end)
+
+        local zero_btn = box:Button { w = lvgl.PCT(100), h = 28 }
+        zero_btn:Label { text = "Zero Hop", align = lvgl.ALIGN.TOP }
+        zero_btn:onClicked(function()
+            pcall(_mesh_send_advert, "zerohop")
+            overlay:delete()
+        end)
+
+        local cancel_btn = box:Button { w = lvgl.PCT(100), h = 28 }
+        cancel_btn:Label { text = "Cancel", align = lvgl.ALIGN.TOP }
+        cancel_btn:onClicked(function()
+            overlay:delete()
+        end)
+    end)
 
     -- Channel rows (full width, each gets own row)
     local ok_ch, channels = pcall(_mesh_get_channels)
@@ -141,7 +185,7 @@ show_inbox = function()
 
             local row = body:Button { w = lvgl.PCT(100), h = 26 }
             row:Label {
-                text = "#" .. ch.name .. (preview ~= "" and (" - " .. preview) or ""),
+                text = ch.name .. (preview ~= "" and (" - " .. preview) or ""),
                 align = lvgl.ALIGN.LEFT_MID,
             }
             local ch_copy = { type = "channel", idx = ch.idx, name = ch.name }
@@ -194,14 +238,7 @@ show_chat = function(target)
     current_mode = "chat"
     chat_target = target
 
-    local title = ""
-    if target.type == "channel" then
-        title = "#" .. target.name
-    elseif target.type == "dm" then
-        title = "@" .. target.name
-    elseif target.type == "room" then
-        title = "[" .. target.name .. "]"
-    end
+    local title = target.name
     set_header(title, "")
 
     -- Single gridnav body: buttons + msg list + input as direct children
@@ -335,13 +372,19 @@ show_chat = function(target)
     send_btn:onClicked(do_send)
 end
 
--- ── CONTACTS VIEW (DM picker) ───────────────────────────────────
+-- ── CONTACTS VIEW ───────────────────────────────────
 show_contacts = function()
     clear_view()
     current_mode = "contacts"
     set_header("Contacts", "")
 
-    local body = gridnav_body(root, HEADER_H, H - HEADER_H)
+    local body = root:Object {
+        flex = { flex_direction = "row", flex_wrap = "wrap" },
+        w = W, h = H - HEADER_H, y = HEADER_H,
+        border_width = 0, pad_all = 4,
+    }
+    _gridnav_add(body, GRIDNAV_ROLLOVER)
+    group:add_obj(body)
     current_view = body
 
     -- Top buttons (narrow, first row)
@@ -349,15 +392,56 @@ show_contacts = function()
     back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
     back_btn:onClicked(function() show_inbox() end)
 
-    local import_btn = body:Button { w = 60, h = 22 }
-    import_btn:Label { text = "Import", align = lvgl.ALIGN.CENTER }
-    import_btn:onClicked(function()
-        set_header("Contacts", "Paste card in serial")
+    local clear_btn = body:Button { w = 50, h = 22 }
+    clear_btn:Label { text = "Clear", align = lvgl.ALIGN.CENTER }
+    clear_btn:onClicked(function()
+        local overlay = root:Object {
+            w = W, h = H, x = 0, y = 0,
+            bg_opa = 200, border_width = 0, pad_all = 0,
+        }
+        overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        local box = overlay:Object {
+            w = 220, h = 100, align = lvgl.ALIGN.CENTER,
+            border_width = 1, pad_all = 10,
+            flex = { flex_direction = "column", flex_wrap = "nowrap" },
+        }
+        box:clear_flag(lvgl.FLAG.SCROLLABLE)
+        _gridnav_add(box, GRIDNAV_ROLLOVER)
+        local popup_group = lvgl.group.get_default()
+        popup_group:add_obj(box)
+
+        box:Label { text = "Clear all contacts?", w = lvgl.PCT(100), h = 24 }
+
+        local btn_row = box:Object {
+            flex = { flex_direction = "row", flex_wrap = "nowrap" },
+            w = lvgl.PCT(100), h = 40, border_width = 0, pad_all = 4,
+        }
+        btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        local yes_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+        yes_btn:Label { text = "Yes", align = lvgl.ALIGN.CENTER }
+        yes_btn:onClicked(function()
+            pcall(_mesh_clear_contacts)
+            overlay:delete()
+            show_contacts()
+        end)
+
+        local no_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+        no_btn:Label { text = "No", align = lvgl.ALIGN.CENTER }
+        no_btn:onClicked(function()
+            overlay:delete()
+        end)
     end)
 
-    -- Contact rows (full width)
+    -- Contact rows (sorted by last heard)
+    contact_rows = {}
     local ok, contacts = pcall(_mesh_get_contacts)
     if not ok or not contacts then contacts = {} end
+
+    table.sort(contacts, function(a, b)
+        return (a.lastmod or 0) > (b.lastmod or 0)
+    end)
 
     if #contacts == 0 then
         body:Label { text = "No contacts. Send an Advert!", w = lvgl.PCT(100), h = 20 }
@@ -365,15 +449,13 @@ show_contacts = function()
 
     for _, c in ipairs(contacts) do
         local type_icon = ""
-        if c.type == 2 then type_icon = "[R] " end
+        if c.type == 2 then type_icon = "[Rep] " end
         if c.type == 3 then type_icon = "[Room] " end
         if c.type == 4 then type_icon = "[S] " end
 
-        local path_str = c.path_len >= 0 and (" h=" .. c.path_len) or " flood"
-
-        local row = body:Button { w = lvgl.PCT(100), h = 24 }
+        local row = body:Button { w = lvgl.PCT(85), h = 24 }
         row:Label {
-            text = type_icon .. c.name .. path_str,
+            text = type_icon .. c.name,
             align = lvgl.ALIGN.LEFT_MID,
         }
 
@@ -388,7 +470,41 @@ show_contacts = function()
                 show_contact_detail(c_name)
             end
         end)
+        contact_rows[c.name] = row
     end
+
+    messages:onContactUpdate(function(name, ctype)
+        if current_mode ~= "contacts" then return end
+        if not current_view then return end
+
+        local type_icon = ""
+        if ctype == 2 then type_icon = "[Rep] " end
+        if ctype == 3 then type_icon = "[Room] " end
+        if ctype == 4 then type_icon = "[S] " end
+
+        if contact_rows[name] then
+            contact_rows[name]:move_to_index(2)
+        else
+            local row = current_view:Button { w = lvgl.PCT(85), h = 24 }
+            row:Label {
+                text = type_icon .. name,
+                align = lvgl.ALIGN.LEFT_MID,
+            }
+            local c_name = name
+            local c_type = ctype
+            row:onClicked(function()
+                if c_type == 1 then
+                    show_chat({ type = "dm", name = c_name })
+                elseif c_type == 3 then
+                    show_chat({ type = "room", name = c_name })
+                else
+                    show_contact_detail(c_name)
+                end
+            end)
+            row:move_to_index(2)
+            contact_rows[name] = row
+        end
+    end)
 end
 
 -- ── CHANNELS VIEW ───────────────────────────────────────────────
@@ -397,7 +513,13 @@ show_channels = function()
     current_mode = "channels"
     set_header("Channels", "")
 
-    local body = gridnav_body(root, HEADER_H, H - HEADER_H)
+    local body = root:Object {
+        flex = { flex_direction = "row", flex_wrap = "wrap" },
+        w = W, h = H - HEADER_H, y = HEADER_H,
+        border_width = 0, pad_all = 4,
+    }
+    _gridnav_add(body, GRIDNAV_ROLLOVER)
+    group:add_obj(body)
     current_view = body
 
     -- Top row
@@ -425,7 +547,7 @@ show_channels = function()
             for i = 1, 7 do  -- MAX_GROUP_CHANNELS is 8, slot 0 is Public
                 if not used[i] then
                     _mesh_set_channel(i, name, "")
-                    show_channels() 
+                    show_channels()
                     return
                 end
             end
@@ -446,7 +568,13 @@ show_channels = function()
     if not ok or not channels then channels = {} end
 
     for _, ch in ipairs(channels) do
-        local chat_btn = body:Button { w = lvgl.PCT(65), h = 24 }
+        local row = body:Object {
+            flex = { flex_direction = "row", flex_wrap = "nowrap" },
+            w = lvgl.PCT(100), h = 24, border_width = 0, pad_all = 0,
+        }
+        row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        local chat_btn = row:Button { w = lvgl.PCT(65), h = 24 }
         chat_btn:Label {
             text = ch.name .. (ch.has_key and " *" or ""),
             align = lvgl.ALIGN.LEFT_MID,
@@ -455,7 +583,7 @@ show_channels = function()
         chat_btn:onClicked(function() show_chat(ch_copy) end)
 
         if ch.idx > 0 then
-            local del_btn = body:Button { w = 50, h = 24 }
+            local del_btn = row:Button { w = 50, h = 24 }
             del_btn:Label { text = "Del", align = lvgl.ALIGN.CENTER }
             local ch_idx = ch.idx
             del_btn:onClicked(function()

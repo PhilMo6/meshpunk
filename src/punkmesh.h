@@ -33,7 +33,8 @@ struct NodePrefs
   float bandwidth;
   uint8_t spreading_factor;
   uint8_t coding_rate;
-  uint8_t _pad2[2];
+  uint8_t contact_overwrite;
+  uint8_t rx_boost;
 };
 
 struct MeshMessage {
@@ -137,6 +138,9 @@ public:
   float getBandwidthPref() const;
   uint8_t getSpreadingFactorPref() const;
   uint8_t getCodingRatePref() const;
+
+  bool shouldOverwriteWhenFull() const override { return _prefs.contact_overwrite != 0; }
+  void clearContacts() { resetContacts(); }
 
 protected:
   void logRx(mesh::Packet *pkt, int len, float score) override;

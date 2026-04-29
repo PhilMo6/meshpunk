@@ -41,7 +41,7 @@ inline void sd_spi_take()    { SPI_LOCK();   }
 
 // Event structs shuttled across the cores.
 struct RxEvent {
-  enum Kind : uint8_t { DIRECT_MSG, CHANNEL_MSG } kind;
+  enum Kind : uint8_t { DIRECT_MSG, CHANNEL_MSG, CONTACT_UPDATE } kind;
   uint8_t  hops;
   int8_t   channel_idx;   // -1 for DM
   bool     direct;
@@ -74,7 +74,7 @@ void meshpunk_sync_init();
 // radio is initialized and Lua is up. Defined in meshpunk_tasks.cpp.
 void meshpunk_spawn_mesh_task();
 
-// Spawn the Core 1 GPS task (step 6). Defined in meshpunk_tasks.cpp.
+// Spawn the Core 1 GPS task . Defined in meshpunk_tasks.cpp.
 void meshpunk_spawn_gps_task();
 
 #endif

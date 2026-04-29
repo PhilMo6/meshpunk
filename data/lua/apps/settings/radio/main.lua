@@ -34,7 +34,7 @@ local content = root:Object {
     pad_all = 6,
 }
 
-_gridnav_add(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+_gridnav_add(content, GRIDNAV_ROLLOVER)
 local group = lvgl.group.get_default()
 group:add_obj(content)
 
@@ -293,6 +293,39 @@ boost_apply_btn:onClicked(function()
     local ok_set, err = pcall(_mesh_set_rx_boost, boost_enabled)
     if ok_set then
         status_label.text = "RX Boost: " .. (boost_enabled and "ON" or "OFF")
+    else
+        status_label.text = "Error: " .. tostring(err)
+    end
+end)
+
+-- Contact Overwrite toggle
+local overwrite_enabled = info.contact_overwrite or false
+
+local overwrite_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
+}
+overwrite_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local function get_overwrite_text()
+    return overwrite_enabled and "[x] Contact Overwrite" or "[ ] Contact Overwrite"
+end
+
+local overwrite_toggle_btn = overwrite_row:Button { w = lvgl.PCT(65), h = 30 }
+local overwrite_label = overwrite_toggle_btn:Label { text = get_overwrite_text(), align = lvgl.ALIGN.CENTER }
+
+local overwrite_apply_btn = overwrite_row:Button { w = lvgl.PCT(30), h = 30 }
+overwrite_apply_btn:Label { text = "Apply", align = lvgl.ALIGN.CENTER }
+
+overwrite_toggle_btn:onClicked(function()
+    overwrite_enabled = not overwrite_enabled
+    overwrite_label.text = get_overwrite_text()
+end)
+
+overwrite_apply_btn:onClicked(function()
+    local ok_set, err = pcall(_mesh_set_config, "contact_overwrite", overwrite_enabled and "1" or "0")
+    if ok_set then
+        status_label.text = "Contact Overwrite: " .. (overwrite_enabled and "ON" or "OFF")
     else
         status_label.text = "Error: " .. tostring(err)
     end

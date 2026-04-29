@@ -88,12 +88,15 @@ static const uint32_t GPS_SYNC_TIMEOUT_MS = 600000;   // 10 min cold-start budge
 static const uint32_t GPS_STATS_INTERVAL_MS = 5000;   // print status every 5s
 
 // Timezone state — "auto" uses longitude-from-GPS; otherwise a fixed offset in minutes.
-// Persisted in LittleFS:/tz.cfg as either "auto" or a signed integer minute count.
 static bool    gps_location_valid_at_fix = false;
 static double  gps_lng_at_fix = 0.0;
 static bool    tz_is_auto = true;
 static int32_t tz_manual_minutes = 0;
 static String  tz_setting_str = "auto";
+
+// Firmware-level preferences (unified in /firmware_prefs)
+static bool   use_sd_pref = true;
+static String clock_fmt_str = "24";
 
 static int32_t tz_auto_offset_minutes() {
   if (!gps_location_valid_at_fix) return 0;
@@ -112,32 +115,70 @@ static int32_t tz_effective_offset_minutes() {
   return tz_is_auto ? tz_auto_offset_minutes() : tz_manual_minutes;
 }
 
-static void tz_load() {
-  File f = LittleFS.open("/tz.cfg", "r");
-  if (!f) {
-    Serial.println("[TZ] no /tz.cfg, defaulting to auto");
-    tz_is_auto = true; tz_setting_str = "auto"; return;
-  }
-  String s = f.readStringUntil('\n');
+extern bool sd_mounted;
+void sd_spi_release();
+
+static void write_firmware_prefs(fs::FS& fs, const char* path) {
+  File f = fs.open(path, "w", true);
+  if (!f) { Serial.printf("[FW_PREFS] cannot write %s\n", path); return; }
+  f.printf("use_sd=%d\n", use_sd_pref ? 1 : 0);
+  f.printf("tz=%s\n", tz_setting_str.c_str());
+  f.printf("clock_fmt=%s\n", clock_fmt_str.c_str());
   f.close();
-  s.trim();
-  if (s.length() == 0 || s.equalsIgnoreCase("auto")) {
-    tz_is_auto = true; tz_setting_str = "auto";
-  } else {
-    tz_manual_minutes = (int32_t)s.toInt();
-    tz_is_auto = false;
-    tz_setting_str = String(tz_manual_minutes);
-  }
-  Serial.printf("[TZ] loaded setting=%s (auto=%d manual_min=%d)\n",
-                tz_setting_str.c_str(), tz_is_auto ? 1 : 0, (int)tz_manual_minutes);
+  Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
 
-static bool tz_save() {
-  File f = LittleFS.open("/tz.cfg", "w");
-  if (!f) { Serial.println("[TZ] save failed: cannot open /tz.cfg"); return false; }
-  f.print(tz_setting_str);
+static void firmware_prefs_save() {
+  write_firmware_prefs(LittleFS, "/firmware_prefs");
+  if (sd_mounted && use_sd_pref) {
+    sd_spi_take();
+    write_firmware_prefs(SD, "/meshpunk/firmware_prefs");
+    sd_spi_release();
+  }
+}
+
+static void firmware_prefs_load() {
+  File f = LittleFS.open("/firmware_prefs", "r");
+  if (!f) {
+    Serial.println("[FW_PREFS] no /firmware_prefs, using defaults");
+    return;
+  }
+  char line[128];
+  while (f.available()) {
+    int len = 0;
+    while (f.available() && len < (int)sizeof(line) - 1) {
+      char ch = f.read();
+      if (ch == '\n' || ch == '\r') break;
+      line[len++] = ch;
+    }
+    line[len] = '\0';
+    if (len == 0) continue;
+
+    char *eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    const char *key = line;
+    const char *val = eq + 1;
+
+    if (strcmp(key, "use_sd") == 0) {
+      use_sd_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "tz") == 0) {
+      String s(val);
+      s.trim();
+      if (s.length() == 0 || s.equalsIgnoreCase("auto")) {
+        tz_is_auto = true; tz_setting_str = "auto";
+      } else {
+        tz_manual_minutes = (int32_t)s.toInt();
+        tz_is_auto = false;
+        tz_setting_str = String(tz_manual_minutes);
+      }
+    } else if (strcmp(key, "clock_fmt") == 0) {
+      clock_fmt_str = (strcmp(val, "12") == 0) ? "12" : "24";
+    }
+  }
   f.close();
-  return true;
+  Serial.printf("[FW_PREFS] loaded: use_sd=%d tz=%s clock=%s\n",
+                use_sd_pref ? 1 : 0, tz_setting_str.c_str(), clock_fmt_str.c_str());
 }
 
 // Auto-baud: T-Deck Plus has shipped with several GPS modules over time.
@@ -1231,6 +1272,9 @@ static int lua_mesh_get_node_info(lua_State *L) {
 
   lua_pushinteger(L, the_mesh._prefs.coding_rate);
   lua_setfield(L, -2, "coding_rate");
+
+  lua_pushboolean(L, the_mesh._prefs.contact_overwrite != 0);
+  lua_setfield(L, -2, "contact_overwrite");
   MESH_UNLOCK();
 
   return 1;
@@ -1260,6 +1304,9 @@ static int lua_mesh_get_contacts(lua_State *L) {
       lua_pushinteger(L, c.last_advert_timestamp);
       lua_setfield(L, -2, "last_seen");
 
+      lua_pushinteger(L, c.lastmod);
+      lua_setfield(L, -2, "lastmod");
+
       char hex[PUB_KEY_SIZE * 2 + 1];
       mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
       lua_pushstring(L, hex);
@@ -1277,12 +1324,23 @@ static int lua_mesh_get_contacts(lua_State *L) {
 }
 
 // Send self advertisement
-// Usage from Lua: _mesh_send_advert()
+// Usage from Lua: _mesh_send_advert()          -- flood (default)
+//                  _mesh_send_advert("zerohop") -- zero-hop only
 static int lua_mesh_send_advert(lua_State *L) {
+  const char *mode = luaL_optstring(L, 1, "flood");
   MESH_LOCK();
-  the_mesh.sendSelfAdvert(0);
+  auto pkt = the_mesh.createSelfAdvert(the_mesh._prefs.node_name,
+                                       the_mesh._prefs.node_lat,
+                                       the_mesh._prefs.node_lon);
+  if (pkt) {
+    if (strcmp(mode, "zerohop") == 0) {
+      the_mesh.sendZeroHop(pkt, (uint32_t)0);
+    } else {
+      the_mesh.sendFlood(pkt, (uint32_t)0);
+    }
+  }
   MESH_UNLOCK();
-  lua_pushboolean(L, 1);
+  lua_pushboolean(L, pkt ? 1 : 0);
   return 1;
 }
 
@@ -1347,6 +1405,11 @@ static int lua_mesh_set_config(lua_State *L) {
     the_mesh._prefs.coding_rate = atoi(value);
     the_mesh.savePrefs();
     Serial.printf("Coding rate set to: %d (reboot to apply)\n", the_mesh._prefs.coding_rate);
+    lua_pushboolean(L, 1);
+  } else if (strcmp(key, "contact_overwrite") == 0) {
+    the_mesh._prefs.contact_overwrite = (atoi(value) != 0) ? 1 : 0;
+    the_mesh.savePrefs();
+    Serial.printf("Contact overwrite set to: %s\n", the_mesh._prefs.contact_overwrite ? "ON" : "OFF");
     lua_pushboolean(L, 1);
   } else {
     MESH_UNLOCK();
@@ -1526,6 +1589,18 @@ static int lua_mesh_remove_contact(lua_State *L) {
   MESH_UNLOCK();
 
   lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
+// Clear all contacts
+// Usage: _mesh_clear_contacts()
+static int lua_mesh_clear_contacts(lua_State *L) {
+  MESH_LOCK();
+  the_mesh.clearContacts();
+  the_mesh.saveContacts();
+  MESH_UNLOCK();
+  Serial.println("[MESH] All contacts cleared");
+  lua_pushboolean(L, 1);
   return 1;
 }
 
@@ -1713,13 +1788,9 @@ static int lua_mesh_set_rx_boost(lua_State *L) {
   radio_driver.setRxBoostedGainMode(en);
   SPI_UNLOCK();
 
-  File f = LittleFS.open("/rx_boost_pref", "w", true);
-  if (f) {
-    uint8_t val = en ? 1 : 0;
-    f.write(&val, 1);
-    f.close();
-    Serial.printf("[RADIO] RX Boost preference saved: %d\n", val);
-  }
+  the_mesh._prefs.rx_boost = en ? 1 : 0;
+  the_mesh.savePrefs();
+  Serial.printf("[RADIO] RX Boost preference saved: %d\n", en ? 1 : 0);
 
   return 0;
 }
@@ -1870,14 +1941,8 @@ static int lua_storage_set_use_sd(lua_State *L) {
   the_mesh.setStorage(newFS, newPrefix.c_str());
   MESH_UNLOCK();
 
-  // Save preference to LittleFS (always on LittleFS, never on SD)
-  File f = LittleFS.open("/storage_pref", "w", true);
-  if (f) {
-    uint8_t val = want_sd ? 1 : 0;
-    f.write(&val, 1);
-    f.close();
-    Serial.printf("[STORAGE] Preference saved to LittleFS: use_sd=%d\n", val);
-  }
+  use_sd_pref = want_sd;
+  firmware_prefs_save();
 
   lua_pushboolean(L, 1);
   return 1;
@@ -2190,6 +2255,7 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_set_channel", lua_mesh_set_channel);
   lua_register(L, "_mesh_send_channel", lua_mesh_send_channel);
   lua_register(L, "_mesh_remove_contact", lua_mesh_remove_contact);
+  lua_register(L, "_mesh_clear_contacts", lua_mesh_clear_contacts);
   lua_register(L, "_mesh_reset_path", lua_mesh_reset_path);
   lua_register(L, "_mesh_export_contact", lua_mesh_export_contact);
   lua_register(L, "_mesh_import_contact", lua_mesh_import_contact);
@@ -2251,7 +2317,7 @@ void setupLuaVGL() {
       if (v && strcasecmp(v, "auto") == 0) {
         tz_is_auto = true;
         tz_setting_str = "auto";
-        tz_save();
+        firmware_prefs_save();
         lua_pushboolean(L, 1);
         lua_pushinteger(L, (lua_Integer)tz_effective_offset_minutes());
         return 2;
@@ -2270,7 +2336,7 @@ void setupLuaVGL() {
       tz_is_auto = false;
       tz_manual_minutes = m;
       tz_setting_str = String(m);
-      tz_save();
+      firmware_prefs_save();
       lua_pushboolean(L, 1);
       lua_pushinteger(L, (lua_Integer)tz_effective_offset_minutes());
       return 2;
@@ -2278,6 +2344,19 @@ void setupLuaVGL() {
     lua_pushboolean(L, 0);
     lua_pushinteger(L, 0);
     return 2;
+  });
+
+  lua_register(L, "_clock_fmt_get", [](lua_State *L) -> int {
+    lua_pushstring(L, clock_fmt_str.c_str());
+    return 1;
+  });
+
+  lua_register(L, "_clock_fmt_set", [](lua_State *L) -> int {
+    const char *v = luaL_checkstring(L, 1);
+    clock_fmt_str = (strcmp(v, "12") == 0) ? "12" : "24";
+    firmware_prefs_save();
+    lua_pushboolean(L, 1);
+    return 1;
   });
 
   // Register gridnav bridge
@@ -2605,8 +2684,8 @@ void setup() {
     Serial.println("LittleFS contents:");
     listDir(LittleFS, "/lua");
 
-    // Load timezone preference (defaults to "auto" if missing).
-    tz_load();
+    // Load firmware preferences (tz, use_sd, clock_fmt)
+    firmware_prefs_load();
   } else {
     Serial.println("Error mounting LittleFS!!");
   }
@@ -2619,36 +2698,22 @@ void setup() {
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("[SD] Card mounted, size: %llu MB\n", cardSize);
 
-    // Create meshpunk directories if they don't exist
-    if (!SD.exists("/meshpunk")) {
-      SD.mkdir("/meshpunk");
-      Serial.println("[SD] Created /meshpunk directory");
-    }
-    if (!SD.exists("/meshpunk/apps")) {
-      SD.mkdir("/meshpunk/apps");
-      Serial.println("[SD] Created /meshpunk/apps directory");
+    const char* required_dirs[] = {
+      "/meshpunk",
+      "/meshpunk/apps",
+      "/meshpunk/messages",
+    };
+    for (auto dir : required_dirs) {
+      if (!SD.exists(dir)) {
+        SD.mkdir(dir);
+        Serial.printf("[SD] Created %s\n", dir);
+      }
     }
   } else {
     Serial.println("[SD] Card mount FAILED");
   }
 
-  // Read storage preference from LittleFS
-  // This pref is always on LittleFS since it controls WHERE to look for data
-  bool use_sd_pref = true; // default: use SD if available
-  if (fs_mounted && LittleFS.exists("/storage_pref")) {
-    File pf = LittleFS.open("/storage_pref");
-    if (pf) {
-      uint8_t val = 1;
-      pf.read(&val, 1);
-      pf.close();
-      use_sd_pref = (val == 1);
-      Serial.printf("[SD] Storage preference from LittleFS: use_sd=%d\n", use_sd_pref);
-    }
-  } else {
-    Serial.println("[SD] No storage_pref file, defaulting to SD if available");
-  }
-
-  // Decide which storage to use
+  // Decide which storage to use (use_sd_pref loaded by firmware_prefs_load)
   if (sd_mounted && use_sd_pref) {
     the_mesh.setStorage(&SD, "/meshpunk");
     Serial.println("[SD] Mesh storage: SD:/meshpunk/");
@@ -2746,19 +2811,12 @@ void setup() {
   the_mesh.begin();
   the_mesh.showWelcome();
 
-  // Restore RX boost preference from LittleFS
-  if (LittleFS.exists("/rx_boost_pref")) {
-    File bf = LittleFS.open("/rx_boost_pref");
-    if (bf) {
-      uint8_t val = 0;
-      bf.read(&val, 1);
-      bf.close();
-      bool boost = (val == 1);
-      SPI_LOCK();
-      radio_driver.setRxBoostedGainMode(boost);
-      SPI_UNLOCK();
-      Serial.printf("[RADIO] RX Boost restored from pref: %s\n", boost ? "ON" : "OFF");
-    }
+  // Apply RX boost from prefs (loaded in the_mesh.begin())
+  if (the_mesh._prefs.rx_boost) {
+    SPI_LOCK();
+    radio_driver.setRxBoostedGainMode(true);
+    SPI_UNLOCK();
+    Serial.println("[RADIO] RX Boost restored from prefs: ON");
   }
 
   Serial.printf("[MESH] Node name: %s\n", the_mesh._prefs.node_name);
@@ -2817,6 +2875,7 @@ void setup() {
 // single-threadedness.
 extern void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, int channel_idx);
 extern void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi);
+extern void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contact_type);
 
 // Drain RX events posted by the mesh core. Runs every UI tick.
 // Bounded per call so a flood on the queue can't starve LVGL.
@@ -2828,10 +2887,12 @@ static void drain_rx_events() {
     if (ev.kind == RxEvent::DIRECT_MSG) {
       lua_mesh_push_direct_message(L, ev.sender, ev.hops, ev.direct,
                                    ev.timestamp, ev.text, ev.snr, ev.rssi);
-    } else {
+    } else if (ev.kind == RxEvent::CHANNEL_MSG) {
       lua_mesh_push_channel_message(L, ev.sender, ev.hops, ev.direct,
                                     ev.timestamp, ev.text, ev.snr, ev.rssi,
                                     ev.channel_idx);
+    } else if (ev.kind == RxEvent::CONTACT_UPDATE) {
+      lua_mesh_push_contact_update(L, ev.sender, ev.hops);
     }
   }
 }
