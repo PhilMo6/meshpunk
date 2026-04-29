@@ -913,13 +913,30 @@ void PunkMesh::begin()
     }
     if (id_is_sd) sd_spi_release();
 
-    if (!identity_loaded && id_is_sd && LittleFS.exists("/identity")) {
-        File lfs_file = LittleFS.open("/identity");
-        if (lfs_file) {
-            identity_loaded = self_id.readFrom(lfs_file);
-            lfs_file.close();
-            if (identity_loaded) {
-                Serial.println("[STORAGE] Loaded identity from LittleFS fallback");
+    if (id_is_sd) {
+        if (identity_loaded && !LittleFS.exists("/identity")) {
+            File lfs_file = LittleFS.open("/identity", "w", true);
+            if (lfs_file) {
+                self_id.writeTo(lfs_file);
+                lfs_file.close();
+                Serial.println("[STORAGE] Copied identity from SD to LittleFS");
+            }
+        } else if (!identity_loaded && LittleFS.exists("/identity")) {
+            File lfs_file = LittleFS.open("/identity");
+            if (lfs_file) {
+                identity_loaded = self_id.readFrom(lfs_file);
+                lfs_file.close();
+                if (identity_loaded) {
+                    Serial.println("[STORAGE] Loaded identity from LittleFS fallback");
+                    sd_spi_take();
+                    File sd_file = _storage->open(idPath.c_str(), "w", true);
+                    if (sd_file) {
+                        self_id.writeTo(sd_file);
+                        sd_file.close();
+                        Serial.println("[STORAGE] Copied identity from LittleFS to SD");
+                    }
+                    sd_spi_release();
+                }
             }
         }
     }

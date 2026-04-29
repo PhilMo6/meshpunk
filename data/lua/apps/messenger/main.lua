@@ -89,7 +89,7 @@ local show_inbox, show_chat, show_contacts, show_channels, show_contact_detail
 local contactTimer = lvgl.Timer {
     period = 5000,
     cb = function(t)
-        if current_mode == "inbox" then
+        if current_mode == ("inbox" or "contacts") then
             header_right.text = "Contact#:" .. _mesh_get_num_contacts()
         end
     end
@@ -376,7 +376,7 @@ end
 show_contacts = function()
     clear_view()
     current_mode = "contacts"
-    set_header("Contacts", "")
+    set_header("Contacts", "Contact#:" .. _mesh_get_num_contacts())
 
     local body = root:Object {
         flex = { flex_direction = "row", flex_wrap = "wrap" },
