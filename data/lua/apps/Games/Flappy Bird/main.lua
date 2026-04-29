@@ -322,12 +322,21 @@ local function Pipes(parent)
 
             local front_pipe = pipes[pipes.front]
             if front_pipe.canvas_x + pipes.canvas_widget_x + pipe_w < 0 then
-                local prev_idx        = (pipes.front - 2 + PIPE_COUNT) % PIPE_COUNT + 1
-                front_pipe.canvas_x   = pipes[prev_idx].canvas_x + stride
-                front_pipe.y          = randomY()
-                front_pipe.x          = front_pipe.canvas_x + pipes.canvas_widget_x
-                pipes.last            = pipes.front
-                pipes.front           = pipes.front % PIPE_COUNT + 1
+                local prev_idx      = (pipes.front - 2 + PIPE_COUNT) % PIPE_COUNT + 1
+                front_pipe.canvas_x = pipes[prev_idx].canvas_x + stride
+                front_pipe.y        = randomY()
+                pipes.last          = pipes.front
+                pipes.front         = pipes.front % PIPE_COUNT + 1
+                -- Shift all canvas_x left by stride to keep within canvas bounds
+                for i = 1, PIPE_COUNT do
+                    pipes[i].canvas_x = pipes[i].canvas_x - stride
+                end
+                pipes.scroll_offset   = pipes.scroll_offset - stride
+                pipes.canvas_widget_x = W - pipes.scroll_offset
+                -- Recompute screen positions after the shift
+                for i = 1, PIPE_COUNT do
+                    pipes[i].x = pipes[i].canvas_x + pipes.canvas_widget_x
+                end
                 drawPipes()
                 pipes.canvas:set{ x = pipes.canvas_widget_x }
             end
