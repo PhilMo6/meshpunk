@@ -5,6 +5,7 @@
 
 local lvgl = require("lvgl")
 local messages = require("lib/mesh/messages")
+local utils = require("lib/utils")
 
 -- Persistence lives on the C++ PunkMesh side (respects _storage: LittleFS
 -- root or /meshpunk on SD), so any app can access the same message history.
@@ -89,7 +90,7 @@ local show_inbox, show_chat, show_contacts, show_channels, show_contact_detail
 local contactTimer = lvgl.Timer {
     period = 5000,
     cb = function(t)
-        if current_mode == ("inbox" or "contacts") then
+        if current_mode == "inbox" or current_mode =="contacts" then
             header_right.text = "Contact#:" .. _mesh_get_num_contacts()
         end
     end
@@ -172,6 +173,24 @@ show_inbox = function()
         end)
     end)
 
+    --keep track of inbox rows for live updating later when messages are recived.
+    local inboxRows = {}
+
+    local function updateInboxRow(message)
+        if inbox[] then
+            local preview = ""
+            if #ch_history > 0 then
+                local last = ch_history[#ch_history]
+                preview = truncate((last.from or "") .. ": " .. last.text, 30)
+            end
+
+            row:Label {
+                text = ch.name .. (preview ~= "" and (" - " .. preview) or ""),
+                align = lvgl.ALIGN.LEFT_MID,
+            }
+        end
+    end
+
     -- Channel rows (full width, each gets own row)
     local ok_ch, channels = pcall(_mesh_get_channels)
     if ok_ch and channels then
@@ -188,8 +207,11 @@ show_inbox = function()
                 text = ch.name .. (preview ~= "" and (" - " .. preview) or ""),
                 align = lvgl.ALIGN.LEFT_MID,
             }
-            local ch_copy = { type = "channel", idx = ch.idx, name = ch.name }
+            local ch_copy = { type = "channel", idx = ch.idx, name = ch.name, row = row }
             row:onClicked(function() show_chat(ch_copy) end)
+
+            inboxRows[ch.name] = ch_copy
+
         end
     end
 
@@ -230,6 +252,28 @@ show_inbox = function()
             w = lvgl.PCT(100), h = 40,
         }
     end
+
+
+
+    -- Live message listener for inbox
+    --when a message is recived it should update the channels button to reflect the latest mesage
+    -- channel_idx may be nil on locally-broadcast messages (broadcast() doesn't set it),
+    -- in which case treat them as Public (idx 0).
+    if target.type == "channel" then
+        messages:onMessage(function(msg)
+            local idx = msg.channel_idx or 0
+            
+        end)
+    elseif target.type == "dm" then
+        messages:onDirectMessage(function(msg)
+            if msg.from == target.name or msg.to == target.name then
+                local lbl = render_msg(msg)
+                
+            end
+        end)
+    end
+
+
 end
 
 -- ── CHAT VIEW ───────────────────────────────────────────────────
@@ -372,6 +416,7 @@ show_chat = function(target)
     send_btn:onClicked(do_send)
 end
 
+
 -- ── CONTACTS VIEW ───────────────────────────────────
 show_contacts = function()
     clear_view()
@@ -435,44 +480,52 @@ show_contacts = function()
     end)
 
     -- Contact rows (sorted by last heard)
-    contact_rows = {}
-    local ok, contacts = pcall(_mesh_get_contacts)
-    if not ok or not contacts then contacts = {} end
+    --load within a popup due to loading time when contact list is full
+    utils.loadingPopUpAdd(root,"contacts",
+    function()
+        contact_rows = {}
+        local ok, contacts = pcall(_mesh_get_contacts)
+        if not ok or not contacts then contacts = {} end
 
-    table.sort(contacts, function(a, b)
-        return (a.lastmod or 0) > (b.lastmod or 0)
-    end)
-
-    if #contacts == 0 then
-        body:Label { text = "No contacts. Send an Advert!", w = lvgl.PCT(100), h = 20 }
-    end
-
-    for _, c in ipairs(contacts) do
-        local type_icon = ""
-        if c.type == 2 then type_icon = "[Rep] " end
-        if c.type == 3 then type_icon = "[Room] " end
-        if c.type == 4 then type_icon = "[S] " end
-
-        local row = body:Button { w = lvgl.PCT(85), h = 24 }
-        row:Label {
-            text = type_icon .. c.name,
-            align = lvgl.ALIGN.LEFT_MID,
-        }
-
-        local c_name = c.name
-        local c_type = c.type
-        row:onClicked(function()
-            if c_type == 1 then
-                show_chat({ type = "dm", name = c_name })
-            elseif c_type == 3 then
-                show_chat({ type = "room", name = c_name })
-            else
-                show_contact_detail(c_name)
-            end
+        table.sort(contacts, function(a, b)
+            return (a.lastmod or 0) > (b.lastmod or 0)
         end)
-        contact_rows[c.name] = row
-    end
 
+        if #contacts == 0 then
+            body:Label { text = "No contacts. Send an Advert!", w = lvgl.PCT(100), h = 20 }
+        end
+
+        for _, c in ipairs(contacts) do
+            local type_icon = ""
+            if c.type == 2 then type_icon = "[Rep] " end
+            if c.type == 3 then type_icon = "[Room] " end
+            if c.type == 4 then type_icon = "[S] " end
+
+            local row = body:Button { w = lvgl.PCT(85), h = 24 }
+            row:Label {
+                text = type_icon .. c.name,
+                align = lvgl.ALIGN.LEFT_MID,
+            }
+
+            local c_name = c.name
+            local c_type = c.type
+            row:onClicked(function()
+                if c_type == 1 then
+                    show_chat({ type = "dm", name = c_name })
+                elseif c_type == 3 then
+                    show_chat({ type = "room", name = c_name })
+                else
+                    show_contact_detail(c_name)
+                end
+            end)
+            contact_rows[c.name] = row
+        end
+
+        --return true to indicate loading is done
+        return true
+    end
+    )
+    --we only need to assign the onContactUpdate function once this view page is open.
     messages:onContactUpdate(function(name, ctype)
         if current_mode ~= "contacts" then return end
         if not current_view then return end
@@ -481,7 +534,7 @@ show_contacts = function()
         if ctype == 2 then type_icon = "[Rep] " end
         if ctype == 3 then type_icon = "[Room] " end
         if ctype == 4 then type_icon = "[S] " end
-
+ 
         if contact_rows[name] then
             contact_rows[name]:move_to_index(2)
         else
