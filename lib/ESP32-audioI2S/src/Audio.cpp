@@ -305,6 +305,7 @@ Audio::~Audio() {
 //---------------------------------------------------------------------------------------------------------------------
 void Audio::setDefaults() {
     stopSong();
+    m_f_externalFile = false;
     initInBuff(); // initialize InputBuffer if not already done
     InBuff.resetBuffer();
     MP3Decoder_FreeBuffers();
@@ -734,6 +735,38 @@ bool Audio::connecttoFS(fs::FS &fs, const char* path, uint32_t resumeFilePos) {
     return ret;
 }
 #endif // AUDIO_NO_SD_FS
+//---------------------------------------------------------------------------------------------------------------------
+bool Audio::connectToFile(fs::File &f) {
+    setDefaults();
+    audiofile = f;
+    m_f_externalFile = true;
+    if (!audiofile) { m_f_externalFile = false; return false; }
+
+    setDatamode(AUDIO_LOCALFILE);
+    m_file_size = audiofile.size();
+
+    char* afn = strdup(audiofile.name());
+    if (!afn) return false;
+
+    uint8_t dotPos = lastIndexOf(afn, ".");
+    for (uint8_t i = dotPos + 1; i < strlen(afn); i++)
+        afn[i] = toLowerCase(afn[i]);
+
+    if (endsWith(afn, ".mp3"))  m_codec = CODEC_MP3;
+    if (endsWith(afn, ".m4a"))  m_codec = CODEC_M4A;
+    if (endsWith(afn, ".aac"))  m_codec = CODEC_AAC;
+    if (endsWith(afn, ".wav"))  m_codec = CODEC_WAV;
+    if (endsWith(afn, ".flac")) m_codec = CODEC_FLAC;
+
+    if (m_codec == CODEC_NONE)
+        AUDIO_INFO("Unsupported format: %s", afn + dotPos);
+    free(afn);
+
+    bool ret = initializeDecoder();
+    if (ret) m_f_running = true;
+    else     audiofile.close();
+    return ret;
+}
 //---------------------------------------------------------------------------------------------------------------------
 bool Audio::connecttospeech(const char* speech, const char* lang){
 
@@ -2263,14 +2296,15 @@ uint32_t Audio::stopSong() {
         if(getDatamode() == AUDIO_LOCALFILE){
             m_streamType = ST_NONE;
             pos = getFilePos() - inBufferFilled();
-            audiofile.close();
-            AUDIO_INFO("Closing audio file");
+            if(!m_f_externalFile) {
+                audiofile.close();
+                AUDIO_INFO("Closing audio file");
+            }
         }
 #endif // AUDIO_NO_SD_FS
     }
 #ifndef AUDIO_NO_SD_FS
-    if(audiofile){
-        // added this before putting 'm_f_localfile = false' in stopSong(); shoulf never occur....
+    if(audiofile && !m_f_externalFile){
         audiofile.close();
         AUDIO_INFO("Closing audio file");
         log_w("Closing audio file");  // for debug
