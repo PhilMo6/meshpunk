@@ -3,6 +3,7 @@
   Discovers apps by scanning /lua/apps/ and SD:/meshpunk/apps/
 ]]
 
+local utils = require("lib/utils")
 local lvgl = require("lvgl")
 local messages = require("lib/mesh/messages")
 local clock_fmt = require("lib/clock_fmt")
@@ -111,14 +112,8 @@ local function discover_apps()
     return apps
 end
 
-local function create_launcher(parent)
-    local unread = 0
 
-    -- Get past messages
-    for _, msg in ipairs(messages:all()) do
-        unread = unread + 1
-    end
-
+local function newScreen()
     local root = lvgl.Object({
         flex = {
             flex_direction = "row",
@@ -131,6 +126,18 @@ local function create_launcher(parent)
         h = 240,
         align = lvgl.ALIGN.CENTER,
     })
+    return root
+end
+
+local function create_launcher(parent)
+    local unread = 0
+
+    -- Get past messages
+    for _, msg in ipairs(messages:all()) do
+        unread = unread + 1
+    end
+
+    local root = newScreen()
 
     -- Enable trackball navigation on the launcher grid
     _gridnav_add(root, GRIDNAV_ROLLOVER)
@@ -199,22 +206,26 @@ local function create_launcher(parent)
         btn:Label{text = app.name, align = lvgl.ALIGN.CENTER}
 
         btn:onClicked(function()
-            print("Launching app:", app.entrypoint, "dir:", app.dir)
+            utils.loadingPopUpAdd(nil, app.name, function()
+                print("Launching app:", app.entrypoint, "dir:", app.dir)
 
-            local success, err
-            if app.source == "sd" and type(_dofile_sd) == "function" then
-                success, err = pcall(_dofile_sd, app.entrypoint, app.dir)
-            else
-                success, err = pcall(function()
-                    local chunk, load_err = loadfile(app.entrypoint)
-                    if not chunk then return error(load_err) end
-                    root:delete() --remember to close launcher if everything worked before launching app 
-                    chunk(app.dir)
-                end)
-            end
-            if not success then
-                print("Error launching app:", err)
-            end
+                local success, err
+                if app.source == "sd" and type(_dofile_sd) == "function" then
+                    success, err = pcall(_dofile_sd, app.entrypoint, app.dir)
+                else
+                    success, err = pcall(function()
+                        local chunk, load_err = loadfile(app.entrypoint)
+                        if not chunk then return error(load_err) end
+                        chunk(app.dir)
+                    end)
+                end
+                if not success then
+                    print("Error launching app:", err)
+                else
+                    root:delete()
+                end
+                return true
+            end)
         end)
     end
 

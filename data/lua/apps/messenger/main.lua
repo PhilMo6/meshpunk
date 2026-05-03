@@ -176,21 +176,6 @@ show_inbox = function()
     --keep track of inbox rows for live updating later when messages are recived.
     local inboxRows = {}
 
-    local function updateInboxRow(message)
-        if inbox[] then
-            local preview = ""
-            if #ch_history > 0 then
-                local last = ch_history[#ch_history]
-                preview = truncate((last.from or "") .. ": " .. last.text, 30)
-            end
-
-            row:Label {
-                text = ch.name .. (preview ~= "" and (" - " .. preview) or ""),
-                align = lvgl.ALIGN.LEFT_MID,
-            }
-        end
-    end
-
     -- Channel rows (full width, each gets own row)
     local ok_ch, channels = pcall(_mesh_get_channels)
     if ok_ch and channels then
@@ -240,6 +225,7 @@ show_inbox = function()
         }
         local t_name = thread.name
         row:onClicked(function() show_chat({ type = "dm", name = t_name }) end)
+        inboxRows["@" .. thread.name] = { type = "dm", name = thread.name, row = row }
     end
 
     -- Empty state
@@ -256,23 +242,43 @@ show_inbox = function()
 
 
     -- Live message listener for inbox
-    --when a message is recived it should update the channels button to reflect the latest mesage
-    -- channel_idx may be nil on locally-broadcast messages (broadcast() doesn't set it),
-    -- in which case treat them as Public (idx 0).
-    if target.type == "channel" then
-        messages:onMessage(function(msg)
-            local idx = msg.channel_idx or 0
-            
-        end)
-    elseif target.type == "dm" then
-        messages:onDirectMessage(function(msg)
-            if msg.from == target.name or msg.to == target.name then
-                local lbl = render_msg(msg)
-                
+    messages:onMessage(function(msg)
+        if current_mode ~= "inbox" then return end
+        local idx = msg.channel_idx or 0
+        for _, entry in pairs(inboxRows) do
+            if entry.type == "channel" and entry.idx == idx then
+                entry.row:clean()
+                entry.row:Label {
+                    text = entry.name .. " - " .. truncate((msg.from or "") .. ": " .. msg.text, 30),
+                    align = lvgl.ALIGN.LEFT_MID,
+                }
+                break
             end
-        end)
-    end
+        end
+    end)
 
+    messages:onDirectMessage(function(msg)
+        if current_mode ~= "inbox" then return end
+        local thread_name = msg.to or msg.from
+        local key = "@" .. thread_name
+        if inboxRows[key] then
+            local entry = inboxRows[key]
+            entry.row:clean()
+            local dm_history = messages:getDMThread(thread_name)
+            entry.row:Label {
+                text = "@" .. thread_name .. " (" .. #dm_history .. ") " .. truncate(msg.text or "", 28),
+                align = lvgl.ALIGN.LEFT_MID,
+            }
+        else
+            local row = body:Button { w = lvgl.PCT(100), h = 26 }
+            row:Label {
+                text = "@" .. thread_name .. " (1) " .. truncate(msg.text or "", 28),
+                align = lvgl.ALIGN.LEFT_MID,
+            }
+            row:onClicked(function() show_chat({ type = "dm", name = thread_name }) end)
+            inboxRows[key] = { type = "dm", name = thread_name, row = row }
+        end
+    end)
 
 end
 
