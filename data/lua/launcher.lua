@@ -130,12 +130,8 @@ local function newScreen()
 end
 
 local function create_launcher(parent)
-    local unread = 0
-
-    -- Get past messages
-    for _, msg in ipairs(messages:all()) do
-        unread = unread + 1
-    end
+    messages:loadPersisted()
+    local unread = messages:countUnread()
 
     local root = newScreen()
 

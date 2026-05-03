@@ -1,4 +1,5 @@
--- Create a simple hello world label
+local utils = require("lib/utils")
+
 local root = lvgl.Object()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES() }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
@@ -33,6 +34,17 @@ local view = root:Object {
 }
 view:clear_flag(lvgl.FLAG.SCROLLABLE)
 
+local home_btn = view:Button { w = lvgl.PCT(25), h = 22 }
+home_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
+home_btn:onClicked(function()
+    utils.loadingPopUpAdd(nil, "Home", function()
+        root:delete()
+        local launcher = require("launcher")
+        launcher.create()
+        return true
+    end)
+end)
+
 -- Display
 local display = view:Label {
     text = tostring(calc_state.current),
@@ -54,7 +66,7 @@ local button_grid = view:Object {
     },
     border_width = 0,
     w = lvgl.PCT(100),
-    h = lvgl.VER_RES() - 50,
+    h = lvgl.VER_RES() - 72,
     pad_all = 2
 }
 button_grid:clear_flag(lvgl.FLAG.SCROLLABLE)

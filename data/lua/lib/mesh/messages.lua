@@ -45,6 +45,7 @@ function M:loadPersisted()
                 M.__channel_history[i] = list
                 if i == 0 then
                     for _, m in ipairs(list) do
+                        m.seen = true
                         table.insert(M.__history, m)
                     end
                 end
@@ -61,6 +62,7 @@ function M:loadPersisted()
                 if ok2 and type(list) == "table" and #list > 0 then
                     M.__dm_threads[name] = list
                     for _, m in ipairs(list) do
+                        m.seen = true
                         table.insert(M.__dm_history, m)
                     end
                 end
@@ -314,6 +316,14 @@ end
 
 function M.__dispatch_contact(name, ctype)
     if M.__onContactUpdate then M.__onContactUpdate(name, ctype) end
+end
+
+function M:countUnread()
+    local count = 0
+    for _, msg in ipairs(M.__history) do
+        if not msg.seen then count = count + 1 end
+    end
+    return count
 end
 
 -- Get all channel message history

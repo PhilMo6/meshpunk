@@ -1,5 +1,6 @@
 local lvgl  = require("lvgl")
 local sound = require("lib/sound")
+local utils = require("lib/utils")
 
 -- Root
 local root = lvgl.Object()
@@ -40,7 +41,7 @@ title_row:Label {
 }
 
 local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
-back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
+back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 
 -- Status line
 local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
@@ -166,11 +167,14 @@ end)
 
 -- Cleanup on back
 back_btn:onClicked(function()
-    if test_tone then test_tone:delete(); test_tone = nil end
-    if test_file then test_file:delete(); test_file = nil end
-    root:delete()
-    local launcher = require("launcher")
-    launcher.create()
+    utils.loadingPopUpAdd(nil, "Home", function()
+        if test_tone then test_tone:delete(); test_tone = nil end
+        if test_file then test_file:delete(); test_file = nil end
+        root:delete()
+        local launcher = require("launcher")
+        launcher.create()
+        return true
+    end)
 end)
 
 return root

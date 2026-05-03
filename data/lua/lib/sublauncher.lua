@@ -114,7 +114,12 @@ local function create(app_dir)
 
     local back_btn = root:Button{w = 140, h = 40}
     back_btn:Label{text = "Back", align = lvgl.ALIGN.CENTER}
-    back_btn:onClicked(function() nav.goHome(root) end)
+    back_btn:onClicked(function()
+        utils.loadingPopUpAdd(nil, "Home", function()
+            nav.goHome(root)
+            return true
+        end)
+    end)
 end
 
 return create

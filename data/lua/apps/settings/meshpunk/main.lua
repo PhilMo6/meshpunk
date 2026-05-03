@@ -3,6 +3,7 @@
 
 local lvgl = require("lvgl")
 local clock_fmt_mod = require("lib/clock_fmt")
+local utils = require("lib/utils")
 
 local ok2, storage = pcall(_storage_get_info)
 if not ok2 or not storage then
@@ -47,11 +48,14 @@ title_row:Label {
 }
 
 local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
-back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
+back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 back_btn:onClicked(function()
-    root:delete()
-    local launcher = require("launcher")
-    launcher.create()
+    utils.loadingPopUpAdd(nil, "Home", function()
+        root:delete()
+        local launcher = require("launcher")
+        launcher.create()
+        return true
+    end)
 end)
 
 -- Status line

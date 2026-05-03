@@ -116,11 +116,14 @@ show_inbox = function()
     local back_btn = body:Button { w = 50, h = 24 }
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
     back_btn:onClicked(function()
-        contactTimer:delete()
-        messages:onContactUpdate(nil)
-        root:delete()
-        local launcher = require("launcher")
-        launcher.create()
+        utils.loadingPopUpAdd(nil, "Launcher", function()
+            contactTimer:delete()
+            messages:onContactUpdate(nil)
+            root:delete()
+            local launcher = require("launcher")
+            launcher.create()
+            return true
+        end)
     end)
 
     local ch_btn = body:Button { w = 70, h = 24 }
@@ -325,6 +328,7 @@ show_chat = function(target)
     msg_list:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
 
     local function render_msg(msg)
+        msg.seen = true
         local prefix = msg.from or "?"
         local suffix = ""
         if msg.hops and msg.hops > 0 then
