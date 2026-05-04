@@ -29,13 +29,12 @@
 #include <RadioLib.h>
 #include <TinyGPSPlus.h>
 
-// GPS time sync (defined below, after the_mesh is declared).
+// One-shot GPS time sync (defined below, after the_mesh is declared).
 static void gps_sync_begin();
 // Exposed so meshpunk_tasks.cpp's gps_task can drive it from Core 1.
+// Returns immediately after gps_sync_done is set (after fix or timeout).
 void gps_sync_poll();
 bool gps_sync_is_done();
-// Resets GPS state and re-opens serial for a fresh sync cycle.
-void gps_sync_restart();
 
 
 extern "C" {
@@ -406,18 +405,6 @@ void gps_sync_poll() {
     GPSSerial.end();
     gps_sync_done = true;
   }
-}
-
-void gps_sync_restart() {
-  gps_sync_done = false;
-  gps_sync_start_ms = millis();
-  gps_last_stats_ms = gps_sync_start_ms;
-  gps_last_chars = 0;
-  gps_baud_idx = 0;
-  gps_baud_locked = false;
-  Serial.printf("[GPS] Restarting sync (auto-baud, timeout=%us)\n",
-                (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
-  gps_start_probe_at_current_baud();
 }
 
 // Trackball click — fed into LVGL as LV_KEY_ENTER via keyboard_read_cb
