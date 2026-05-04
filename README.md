@@ -96,3 +96,5 @@ MIT
 - LuaVGL by XuNeo: https://github.com/XuNeo/luavgl
 - LVGL: https://lvgl.io/
 - LilyGo for the T-Deck hardware
+- Emojis from https://github.com/googlefonts/noto-emoji
+- Emoji converted to .bin with ImageMagick
