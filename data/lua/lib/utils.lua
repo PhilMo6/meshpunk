@@ -108,5 +108,4 @@ end
 
 
 
--- Return the module
 return utils

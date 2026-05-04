@@ -767,6 +767,33 @@ static uint32_t last_key_code = 0;
 static bool key_is_new = false;
 static uint32_t last_key_time = 0;
 
+// Navigation controller state
+static lv_obj_t *nav_container = NULL;
+static lv_gridnav_ctrl_t nav_flags = LV_GRIDNAV_CTRL_NONE;
+static bool nav_gridnav_active = false;
+
+static void nav_delete_cb(lv_event_t *e) {
+    if (lv_event_get_target(e) == nav_container) {
+        nav_container = NULL;
+        nav_gridnav_active = false;
+    }
+}
+
+static lv_obj_t *nav_find_visible_child(lv_obj_t *cont) {
+    int32_t scroll_top = lv_obj_get_scroll_top(cont);
+    int32_t cont_h = lv_obj_get_content_height(cont);
+    uint32_t cnt = lv_obj_get_child_count(cont);
+    for (uint32_t i = 0; i < cnt; i++) {
+        lv_obj_t *child = lv_obj_get_child(cont, i);
+        if (lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) continue;
+        if (!lv_obj_has_flag(child, LV_OBJ_FLAG_CLICKABLE)) continue;
+        int32_t cy = lv_obj_get_y(child);
+        int32_t ch = lv_obj_get_height(child);
+        if (cy + ch > scroll_top && cy < scroll_top + cont_h) return child;
+    }
+    return NULL;
+}
+
 // LVGL keyboard read callback
 static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   static bool was_pressed = false;
@@ -795,27 +822,49 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   }
 
   // Check trackball directions and click if no keyboard key is pending
+  bool key_from_trackball = false;
   if (!key_is_new) {
     if (trackball_click > 0) {
       trackball_click--;
       last_key_code = LV_KEY_ENTER;
       key_is_new = true;
+      key_from_trackball = true;
     } else if (trackball_up > 0) {
       trackball_up--;
       last_key_code = LV_KEY_UP;
       key_is_new = true;
+      key_from_trackball = true;
     } else if (trackball_down > 0) {
       trackball_down--;
       last_key_code = LV_KEY_DOWN;
       key_is_new = true;
+      key_from_trackball = true;
     } else if (trackball_left > 0) {
       trackball_left--;
       last_key_code = LV_KEY_LEFT;
       key_is_new = true;
+      key_from_trackball = true;
     } else if (trackball_right > 0) {
       trackball_right--;
       last_key_code = LV_KEY_RIGHT;
       key_is_new = true;
+      key_from_trackball = true;
+    }
+  }
+
+  // Re-enable gridnav only on trackball input, not keyboard typing
+  if (key_from_trackball && nav_container && !nav_gridnav_active) {
+    uint32_t cnt = lv_obj_get_child_count(nav_container);
+    for (uint32_t i = 0; i < cnt; i++) {
+      lv_obj_remove_state(lv_obj_get_child(nav_container, i),
+                          LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY | LV_STATE_EDITED);
+    }
+    lv_group_focus_obj(nav_container);
+    lv_gridnav_add(nav_container, nav_flags);
+    nav_gridnav_active = true;
+    lv_obj_t *vis = nav_find_visible_child(nav_container);
+    if (vis) {
+      lv_gridnav_set_focused(nav_container, vis, LV_ANIM_OFF);
     }
   }
 
@@ -879,6 +928,16 @@ static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       data->state = LV_INDEV_STATE_PRESSED;
       data->point.x = x[0];
       data->point.y = y[0];
+
+      if (nav_container && nav_gridnav_active) {
+        uint32_t cnt = lv_obj_get_child_count(nav_container);
+        for (uint32_t i = 0; i < cnt; i++) {
+          lv_obj_remove_state(lv_obj_get_child(nav_container, i),
+                              LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+        }
+        lv_gridnav_remove(nav_container);
+        nav_gridnav_active = false;
+      }
     }
   }
 }
@@ -1352,6 +1411,9 @@ static int lua_mesh_get_contacts(lua_State *L) {
       lua_pushstring(L, the_mesh.getTypeName(c.type));
       lua_setfield(L, -2, "type_name");
 
+      lua_pushboolean(L, (c.flags & 0x01) != 0);
+      lua_setfield(L, -2, "favorite");
+
       lua_rawseti(L, -2, idx++);
     }
   }
@@ -1663,6 +1725,30 @@ static int lua_mesh_reset_path(lua_State *L) {
   return 1;
 }
 
+// Set or clear the favourite flag (bit 0) on a contact
+// Usage: _mesh_set_contact_favorite("alice", true)
+static int lua_mesh_set_contact_favorite(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+  bool fav = lua_toboolean(L, 2);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  if (fav) c->flags |= 0x01;
+  else     c->flags &= ~0x01;
+  the_mesh.saveContacts();
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
 // Export a contact as hex biz card string
 // Usage: local hex = _mesh_export_contact("alice")
 static int lua_mesh_export_contact(lua_State *L) {
@@ -1897,6 +1983,12 @@ static int lua_storage_get_info(lua_State *L) {
   lua_pushboolean(L, is_sd ? 1 : 0);
   lua_setfield(L, -2, "use_sd");
 
+  return 1;
+}
+
+static int lua_emoji_preload(lua_State *L) {
+  uint32_t cp = (uint32_t)luaL_checkinteger(L, 1);
+  lua_pushboolean(L, emoji_preload(cp));
   return 1;
 }
 
@@ -2305,6 +2397,7 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_export_contact", lua_mesh_export_contact);
   lua_register(L, "_mesh_import_contact", lua_mesh_import_contact);
   lua_register(L, "_mesh_share_contact", lua_mesh_share_contact);
+  lua_register(L, "_mesh_set_contact_favorite", lua_mesh_set_contact_favorite);
   lua_register(L, "_mesh_login_room", lua_mesh_login_room);
   lua_register(L, "_mesh_send_request", lua_mesh_send_request);
   lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
@@ -2496,6 +2589,38 @@ void setupLuaVGL() {
   lua_setglobal(L, "GRIDNAV_ROLLOVER");
   lua_pushinteger(L, LV_GRIDNAV_CTRL_SCROLL_FIRST);
   lua_setglobal(L, "GRIDNAV_SCROLL_FIRST");
+
+  // Navigation controller: manages gridnav + touch/trackball switching
+  lua_register(L, "_nav_setup", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) return 0;
+    int flags = luaL_optinteger(L, 2, LV_GRIDNAV_CTRL_ROLLOVER);
+
+    if (nav_container) {
+      lv_gridnav_remove(nav_container);
+    }
+
+    nav_container = lobj->obj;
+    nav_flags = (lv_gridnav_ctrl_t)flags;
+    nav_gridnav_active = true;
+
+    lv_gridnav_add(nav_container, nav_flags);
+    lv_group_add_obj(lv_group_get_default(), nav_container);
+    lv_group_focus_obj(nav_container);
+
+    lv_obj_add_event_cb(nav_container, nav_delete_cb, LV_EVENT_DELETE, NULL);
+    return 0;
+  });
+
+  lua_register(L, "_nav_clear", [](lua_State *L) -> int {
+    if (nav_container) {
+      lv_gridnav_remove(nav_container);
+      nav_container = NULL;
+      nav_gridnav_active = false;
+    }
+    return 0;
+  });
+
   lua_register(L, "_list_dir_sd", lua_list_dir_sd);
   lua_register(L, "_file_exists_sd", lua_file_exists_sd);
   lua_register(L, "_dofile_sd", lua_dofile_sd);

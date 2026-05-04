@@ -70,9 +70,7 @@ local function create(app_dir)
         align = lvgl.ALIGN.CENTER,
     })
 
-    _gridnav_add(root, GRIDNAV_ROLLOVER)
-    local group = lvgl.group.get_default()
-    group:add_obj(root)
+    _nav_setup(root, GRIDNAV_ROLLOVER)
 
     root:Label{text = category, align = lvgl.ALIGN.CENTER, w = 260, h = 40}
 

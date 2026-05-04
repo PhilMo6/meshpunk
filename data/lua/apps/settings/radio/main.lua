@@ -35,9 +35,7 @@ local content = root:Object {
     pad_all = 6,
 }
 
-_gridnav_add(content, GRIDNAV_ROLLOVER)
-local group = lvgl.group.get_default()
-group:add_obj(content)
+_nav_setup(content, GRIDNAV_ROLLOVER)
 
 -- Title row
 local title_row = content:Object {

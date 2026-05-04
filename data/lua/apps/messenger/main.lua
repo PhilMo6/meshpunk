@@ -16,6 +16,7 @@ messages:loadPersisted()
 local W = lvgl.HOR_RES()
 local H = lvgl.VER_RES()
 local HEADER_H = 24
+
 local INPUT_H = 40
 local BODY_H = H - HEADER_H - INPUT_H
 
@@ -32,8 +33,7 @@ local function gridnav_body(parent, y, h, flags)
         border_width = 0, pad_all = 4,
     }
     body:clear_flag(lvgl.FLAG.SCROLLABLE)
-    _gridnav_add(body, flags or GRIDNAV_ROLLOVER)
-    group:add_obj(body)
+    _nav_setup(body, flags or GRIDNAV_ROLLOVER)
     return body
 end
 
@@ -108,8 +108,7 @@ show_inbox = function()
         w = W, h = H - HEADER_H, y = HEADER_H,
         border_width = 0, pad_all = 4,
     }
-    _gridnav_add(body, GRIDNAV_ROLLOVER)
-    group:add_obj(body)
+    _nav_setup(body, GRIDNAV_ROLLOVER)
     current_view = body
 
     -- Nav buttons (narrow, wrap in top row)
@@ -438,8 +437,7 @@ show_contacts = function()
         w = W, h = H - HEADER_H, y = HEADER_H,
         border_width = 0, pad_all = 4,
     }
-    _gridnav_add(body, GRIDNAV_ROLLOVER)
-    group:add_obj(body)
+    _nav_setup(body, GRIDNAV_ROLLOVER)
     current_view = body
 
     -- Top buttons (narrow, first row)
@@ -581,8 +579,7 @@ show_channels = function()
         w = W, h = H - HEADER_H, y = HEADER_H,
         border_width = 0, pad_all = 4,
     }
-    _gridnav_add(body, GRIDNAV_ROLLOVER)
-    group:add_obj(body)
+    _nav_setup(body, GRIDNAV_ROLLOVER)
     current_view = body
 
     -- Top row
@@ -696,6 +693,25 @@ show_contact_detail = function(contact_name)
     body:Label { text = "Type: " .. (contact.type_name or "?"), w = lvgl.PCT(100), h = 16 }
     body:Label { text = "Path: " .. (contact.path_len >= 0 and (contact.path_len .. " hops") or "flood"), w = lvgl.PCT(100), h = 16 }
     body:Label { text = "Key: " .. string.sub(contact.pubkey or "", 1, 16) .. "..", w = lvgl.PCT(100), h = 16 }
+
+    -- Favourite toggle
+    local is_fav = contact.favorite or false
+    local ok_star, has_star = pcall(_emoji_preload, 0x2B50)
+    local ok_circle, has_circle = pcall(_emoji_preload, 0x26AB)
+    local use_emoji = ok_star and has_star and ok_circle and has_circle
+    local function get_fav_text()
+        if use_emoji then
+            return is_fav and "\xe2\xad\x90 Favorite" or "\xe2\x9a\xab Favorite"
+        end
+        return is_fav and "[x] Favorite" or "[ ] Favorite"
+    end
+    local fav_btn = body:Button { w = 80, h = 26 }
+    local fav_label = fav_btn:Label { text = get_fav_text(), align = lvgl.ALIGN.CENTER }
+    fav_btn:onClicked(function()
+        is_fav = not is_fav
+        fav_label.text = get_fav_text()
+        pcall(_mesh_set_contact_favorite, contact_name, is_fav)
+    end)
 
     -- Action buttons (narrow, wrap in rows)
     if contact.type == 1 then

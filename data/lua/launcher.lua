@@ -135,10 +135,7 @@ local function create_launcher(parent)
 
     local root = newScreen()
 
-    -- Enable trackball navigation on the launcher grid
-    _gridnav_add(root, GRIDNAV_ROLLOVER)
-    local group = lvgl.group.get_default()
-    group:add_obj(root)
+    _nav_setup(root, GRIDNAV_ROLLOVER)
 
     -- Unread indicator
     indicator = root:Label{text = unread .. ' unread', align = lvgl.ALIGN.CENTER, w = 100, h = 40}

@@ -731,6 +731,7 @@ local function setupInput(scr)
     scr:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
     local group = lvgl.group.get_default()
     group:add_obj(scr)
+    lvgl.group.focus_obj(scr)
 
     scr:onevent(lvgl.EVENT.KEY, function(obj, code)
         if not game.running then return end
