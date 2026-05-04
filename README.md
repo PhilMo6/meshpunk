@@ -9,12 +9,14 @@ Some features have been added or documented by with the assistance of AI
 - Runs on the LilyGo T-Deck
 - Uses PlatformIO for easy building
 - Dual buffer display
+- Sound support
 - Touch and trackball controls
 - SD card support
 - GPS automaticly gets time
 - Loads Lua scripts from the filesystem automaticly as apps
 - Integrates MeshCore networking
 - Emoji support if provided emoji folder is placed on the t-decks SD card
+- Games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of devopment)
 
 ## Project Structure
 
