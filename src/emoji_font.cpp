@@ -1,4 +1,5 @@
 #include "emoji_font.h"
+#include "meshpunk_sync.h"
 
 #include <cstdio>
 #include <cstring>
@@ -126,7 +127,11 @@ lv_image_dsc_t * load_bin_to_psram(uint32_t cp)
                   static_cast<unsigned>(cp));
 
     lv_fs_file_t f;
-    if (lv_fs_open(&f, path, LV_FS_MODE_RD) != LV_FS_RES_OK) return nullptr;
+    SPI_LOCK();
+    if (lv_fs_open(&f, path, LV_FS_MODE_RD) != LV_FS_RES_OK) {
+        SPI_UNLOCK();
+        return nullptr;
+    }
 
     uint8_t header[MEMO_HEADER_SIZE];
     uint32_t br = 0;
@@ -134,6 +139,7 @@ lv_image_dsc_t * load_bin_to_psram(uint32_t cp)
         br != MEMO_HEADER_SIZE ||
         std::memcmp(header, MEMO_MAGIC, 4) != 0) {
         lv_fs_close(&f);
+        SPI_UNLOCK();
         return nullptr;
     }
 
@@ -145,6 +151,7 @@ lv_image_dsc_t * load_bin_to_psram(uint32_t cp)
     uint32_t data_size = static_cast<uint32_t>(stride) * h;
     if (data_size == 0) {
         lv_fs_close(&f);
+        SPI_UNLOCK();
         return nullptr;
     }
 
@@ -156,6 +163,7 @@ lv_image_dsc_t * load_bin_to_psram(uint32_t cp)
         if (pixels) heap_caps_free(pixels);
         if (out)    heap_caps_free(out);
         lv_fs_close(&f);
+        SPI_UNLOCK();
         return nullptr;
     }
 
@@ -163,9 +171,11 @@ lv_image_dsc_t * load_bin_to_psram(uint32_t cp)
         heap_caps_free(pixels);
         heap_caps_free(out);
         lv_fs_close(&f);
+        SPI_UNLOCK();
         return nullptr;
     }
     lv_fs_close(&f);
+    SPI_UNLOCK();
 
     lv_memzero(out, sizeof(*out));
     out->header.w      = w;
@@ -225,6 +235,20 @@ const void * emoji_path_cb(const lv_font_t * font,
 }
 
 } // anonymous namespace
+
+extern "C" bool emoji_preload(uint32_t codepoint)
+{
+    cache_init_once();
+    if (auto *cached = cache_lookup(codepoint))
+        return cached != &s_blank_dsc;
+    auto *fresh = load_bin_to_psram(codepoint);
+    if (!fresh) {
+        cache_insert(codepoint, &s_blank_dsc);
+        return false;
+    }
+    cache_insert(codepoint, fresh);
+    return true;
+}
 
 extern "C" lv_font_t * emoji_font_create(uint16_t height, const lv_font_t * fallback)
 {

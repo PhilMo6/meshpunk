@@ -2320,6 +2320,7 @@ void setupLuaVGL() {
   // Register Storage bridge functions
   lua_register(L, "_storage_get_info", lua_storage_get_info);
   lua_register(L, "_storage_set_use_sd", lua_storage_set_use_sd);
+  lua_register(L, "_emoji_preload", lua_emoji_preload);
 
   // Register Filesystem bridge functions
   lua_register(L, "_list_dir", lua_list_dir);

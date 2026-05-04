@@ -21,6 +21,10 @@ lv_font_t * emoji_font_create(uint16_t height, const lv_font_t * fallback);
 /** Destroy a font created by emoji_font_create. */
 void emoji_font_destroy(lv_font_t * font);
 
+/** Try to load an emoji .bin from SD into the cache.
+ *  Returns true if the glyph loaded successfully, false if missing/failed. */
+bool emoji_preload(uint32_t codepoint);
+
 #ifdef __cplusplus
 }
 #endif
