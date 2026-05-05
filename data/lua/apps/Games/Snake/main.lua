@@ -92,7 +92,7 @@ end
 local function screenCreate(parent)
     local scr = lvgl.Object(parent, {
         w = W, h = H,
-        bg_opa = lvgl.OPA(0),
+        bg_opa = lvgl.OPA(255),
         border_width = 0, pad_all = 0
     })
     scr:clear_flag(lvgl.FLAG.SCROLLABLE)
