@@ -375,6 +375,8 @@ show_chat = function(target)
             suffix = suffix .. string.format(" %.0fdB", msg.snr)
         end]]
         local lbl = msg_list:Label {
+            border_width = 1, 
+            pad_bottom = 6,
             text = prefix .. ": " .. msg.text,-- .. suffix,
             w = lvgl.PCT(100),
         }
