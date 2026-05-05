@@ -2692,6 +2692,24 @@ void setupLuaVGL() {
     return 0;
   });
 
+  lua_register(L, "_obj_move_foreground", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) return 0;
+    lv_obj_t *parent = lv_obj_get_parent(lobj->obj);
+    if (parent) {
+      int32_t cnt = (int32_t)lv_obj_get_child_count(parent);
+      lv_obj_move_to_index(lobj->obj, cnt - 1);
+    }
+    return 0;
+  });
+
+  lua_register(L, "_obj_move_background", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) return 0;
+    lv_obj_move_to_index(lobj->obj, 0);
+    return 0;
+  });
+
   lua_register(L, "_list_dir_sd", lua_list_dir_sd);
   lua_register(L, "_file_exists_sd", lua_file_exists_sd);
   lua_register(L, "_dofile_sd", lua_dofile_sd);

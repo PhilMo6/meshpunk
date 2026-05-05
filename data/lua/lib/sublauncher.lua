@@ -1,6 +1,7 @@
 local lvgl = require("lvgl")
 local nav = require("lib/nav")
 local utils = require("lib/utils")
+local topbar = require("lib/topbar")
 
 local function file_exists(path)
     local f = io.open(path, "r")
@@ -58,7 +59,7 @@ local function create(app_dir)
         return apps
     end
 
-    local root = lvgl.Object({
+    local body = lvgl.Object({
         flex = {
             flex_direction = "row",
             flex_wrap = "wrap",
@@ -66,21 +67,22 @@ local function create(app_dir)
             align_items = "center",
             align_content = "center",
         },
-        w = 320, h = 240,
-        align = lvgl.ALIGN.CENTER,
+        w = 320, h = 220, x = 0, y = 20,
+        border_width = 0, pad_all = 4,
     })
+    _nav_setup(body, GRIDNAV_ROLLOVER)
+    topbar.raise()
 
-    _nav_setup(root, GRIDNAV_ROLLOVER)
-
-    root:Label{text = category, align = lvgl.ALIGN.CENTER, w = 260, h = 40}
+    body:Label{text = category, align = lvgl.ALIGN.CENTER, w = 260, h = 40}
 
     local apps = discover()
 
     for _, app in ipairs(apps) do
-        local btn = root:Button{w = 140, h = 40}
+        local btn = body:Button{w = 140, h = 40}
         btn:Label{text = app.name, align = lvgl.ALIGN.CENTER}
 
         btn:onClicked(function()
+            topbar.pause()
             utils.loadingPopUpAdd(nil, app.name, function()
                 print("Launching:", app.entrypoint, "dir:", app.dir)
 
@@ -98,7 +100,7 @@ local function create(app_dir)
                 if not success then
                     print("Error launching:", err)
                 else
-                    root:delete()
+                    body:delete()
                 end
                 return true
             end)
@@ -106,15 +108,17 @@ local function create(app_dir)
     end
 
     if #apps == 0 then
-        root:Label{text = "No " .. category:lower() .. " found!",
+        body:Label{text = "No " .. category:lower() .. " found!",
                    align = lvgl.ALIGN.CENTER, w = 200, h = 40}
     end
 
-    local back_btn = root:Button{w = 140, h = 40}
+    local back_btn = body:Button{w = 140, h = 40}
     back_btn:Label{text = "Back", align = lvgl.ALIGN.CENTER}
     back_btn:onClicked(function()
         utils.loadingPopUpAdd(nil, "Home", function()
-            nav.goHome(root)
+            body:delete()
+            local launcher = require("launcher")
+            launcher.create()
             return true
         end)
     end)

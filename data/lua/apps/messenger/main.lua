@@ -349,7 +349,7 @@ show_chat = function(target)
         history = messages:getChannelHistory(target.idx)
         if #history == 0 and target.idx == 0 then
             history = messages:all()
-        end
+        end 
     elseif target.type == "dm" then
         history = messages:getDMThread(target.name)
     end
@@ -488,22 +488,32 @@ show_contacts = function()
     end)
 
     -- Contact rows (sorted by last heard)
-    --load within a popup due to loading time when contact list is full
-    utils.loadingPopUpAdd(root,"contacts",
-    function()
-        contact_rows = {}
-        local ok, contacts = pcall(_mesh_get_contacts)
-        if not ok or not contacts then contacts = {} end
+    -- Load in batches to avoid watchdog timeout with many contacts
+    local contacts = nil
+    local batch_idx = 0
+    local BATCH_SIZE = 5
+    contact_rows = {}
 
-        table.sort(contacts, function(a, b)
-            return (a.lastmod or 0) > (b.lastmod or 0)
-        end)
-
-        if #contacts == 0 then
-            body:Label { text = "No contacts. Send an Advert!", w = lvgl.PCT(100), h = 20 }
+    utils.loadingPopUpAdd(root, "contacts", function()
+        if not contacts then
+            local ok, list = pcall(_mesh_get_contacts)
+            if not ok or not list then list = {} end
+            table.sort(list, function(a, b)
+                return (a.lastmod or 0) > (b.lastmod or 0)
+            end)
+            contacts = list
+            if #contacts == 0 then
+                body:Label { text = "No contacts. Send an Advert!", w = lvgl.PCT(100), h = 20 }
+                return true
+            end
+            return false
         end
 
-        for _, c in ipairs(contacts) do
+        local start_i = batch_idx * BATCH_SIZE + 1
+        local end_i = math.min(start_i + BATCH_SIZE - 1, #contacts)
+
+        for i = start_i, end_i do
+            local c = contacts[i]
             local type_icon = ""
             if c.type == 2 then type_icon = "[Rep] " end
             if c.type == 3 then type_icon = "[Room] " end
@@ -529,10 +539,9 @@ show_contacts = function()
             contact_rows[c.name] = row
         end
 
-        --return true to indicate loading is done
-        return true
-    end
-    )
+        batch_idx = batch_idx + 1
+        return end_i >= #contacts
+    end)
     --we only need to assign the onContactUpdate function once this view page is open.
     messages:onContactUpdate(function(name, ctype)
         if current_mode ~= "contacts" then return end

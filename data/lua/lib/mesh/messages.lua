@@ -9,6 +9,7 @@
 --   * fires onMessage / onDirectMessage / onAnyMessage callbacks
 
 local M = {
+    __onMessageFirst = nil,
     __onMessage = nil,
     __onDirectMessage = nil,
     __onAnyMessage = nil,  -- fires for both channel and DM
@@ -71,6 +72,11 @@ function M:loadPersisted()
     end
 end
 
+-- Register priority callback (fires before onMessage, used by topbar)
+function M:onMessageFirst(cb)
+    M.__onMessageFirst = cb
+end
+
 -- Register callback for incoming channel messages
 function M:onMessage(cb)
     M.__onMessage = cb
@@ -117,6 +123,7 @@ function M:broadcast(text)
     table.insert(M.__history, msg)
     if not M.__channel_history[0] then M.__channel_history[0] = {} end
     table.insert(M.__channel_history[0], msg)
+    if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
 
@@ -186,6 +193,7 @@ function M:sendToChannel(ch_idx, text)
         M.__channel_history[ch_idx] = {}
     end
     table.insert(M.__channel_history[ch_idx], msg)
+    if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
 
@@ -282,6 +290,7 @@ function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_id
         table.insert(M.__channel_history[channel_idx], msg)
     end
 
+    if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
 end
