@@ -86,6 +86,42 @@ end
 -- Forward declarations
 local show_inbox, show_chat, show_contacts, show_channels, show_contact_detail
 
+-- Long-press popup showing message metadata
+local function show_msg_info(msg)
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128,
+        border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local box = overlay:Object {
+        w = W - 20, h = lvgl.SIZE_CONTENT,
+        align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555",
+        pad_all = 8,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    box:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local function info_label(text)
+        box:Label { text = text, w = lvgl.PCT(100) }
+    end
+
+    info_label("-- Message Info --")
+    info_label("From: " .. (msg.from or "?"))
+    info_label("Time: " .. (msg.timestamp and utils.formatTime(msg.timestamp) or "?"))
+    info_label("Hops: " .. (msg.hops or "?"))
+    info_label("SNR: " .. (msg.snr and string.format("%.1f dB", msg.snr) or "N/A"))
+    info_label("RSSI: " .. (msg.rssi and string.format("%.0f dBm", msg.rssi) or "N/A"))
+    info_label("Route: " .. (msg.direct and "Direct" or "Flood"))
+
+    local close_btn = box:Button { w = 60, h = 26 }
+    close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+    close_btn:onClicked(function() overlay:delete() end)
+end
+
 -- ── Periodic peer count update ──────────────────────────────────
 local contactTimer = lvgl.Timer {
     period = 5000,
@@ -331,17 +367,21 @@ show_chat = function(target)
     local function render_msg(msg)
         msg.seen = true
         local prefix = msg.from or "?"
-        local suffix = ""
+        --[[local suffix = ""
         if msg.hops and msg.hops > 0 then
             suffix = " [" .. msg.hops .. "h]"
         end
         if msg.snr and msg.snr ~= 0 then
             suffix = suffix .. string.format(" %.0fdB", msg.snr)
-        end
+        end]]
         local lbl = msg_list:Label {
-            text = prefix .. ": " .. msg.text .. suffix,
+            text = prefix .. ": " .. msg.text,-- .. suffix,
             w = lvgl.PCT(100),
         }
+        lbl:add_flag(lvgl.FLAG.CLICKABLE)
+        lbl:onevent(lvgl.EVENT.LONG_PRESSED, function()
+            show_msg_info(msg)
+        end)
         return lbl
     end
 
