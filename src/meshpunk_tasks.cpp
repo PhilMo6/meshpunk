@@ -57,25 +57,29 @@ void meshpunk_spawn_mesh_task() {
 }
 
 // ── GPS sync task ────────────────────────────────────────────────
-// One-shot: polls UART for NMEA until a fix seeds the RTC (or timeout).
-// Then idles forever (cheap — FreeRTOS just skips it on the scheduler).
-// gps_sync_poll() is defined in main.cpp; it owns the static GPS state.
+// Polls UART for NMEA until a fix seeds the RTC (or timeout), then sleeps
+// 5 minutes and repeats. Can be woken early via task notification.
+// gps_sync_poll()/gps_sync_restart() are defined in main.cpp.
 
 extern void gps_sync_poll();
 extern bool gps_sync_is_done();
+extern void gps_sync_restart();
 
 static TaskHandle_t s_gps_task_handle = nullptr;
 
 static void gps_task_body(void *param) {
   Serial.printf("[TASK] gps_task starting on core=%d\n", xPortGetCoreID());
-  // Fast poll while seeking a fix; go completely idle once done.
-  while (!gps_sync_is_done()) {
-    gps_sync_poll();
-    vTaskDelay(pdMS_TO_TICKS(20));
+  for (;;) {
+    gps_sync_restart();
+    while (!gps_sync_is_done()) {
+      gps_sync_poll();
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    Serial.println("[TASK] gps_task sync cycle done; sleeping 5 min.");
+    // Sleep 5 minutes, or wake early if notified (manual trigger).
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5 * 60 * 1000));
+    Serial.println("[TASK] gps_task waking for next sync cycle.");
   }
-  Serial.println("[TASK] gps_task done — RTC seeded or timed out; task exiting.");
-  s_gps_task_handle = nullptr;
-  vTaskDelete(nullptr);
 }
 
 void meshpunk_spawn_gps_task() {
@@ -91,4 +95,10 @@ void meshpunk_spawn_gps_task() {
     &s_gps_task_handle,
     1 /* pinned to Core 1 */
   );
+}
+
+void gps_notify_wake() {
+  if (s_gps_task_handle) {
+    xTaskNotifyGive(s_gps_task_handle);
+  }
 }

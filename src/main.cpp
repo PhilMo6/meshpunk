@@ -29,12 +29,13 @@
 #include <RadioLib.h>
 #include <TinyGPSPlus.h>
 
-// One-shot GPS time sync (defined below, after the_mesh is declared).
+// GPS time sync (defined below, after the_mesh is declared).
 static void gps_sync_begin();
 // Exposed so meshpunk_tasks.cpp's gps_task can drive it from Core 1.
-// Returns immediately after gps_sync_done is set (after fix or timeout).
 void gps_sync_poll();
 bool gps_sync_is_done();
+// Resets GPS state and re-opens serial for a fresh sync cycle.
+void gps_sync_restart();
 
 
 extern "C" {
@@ -85,19 +86,25 @@ static bool gps_sync_done = false;
 static uint32_t gps_sync_start_ms = 0;
 static uint32_t gps_last_stats_ms = 0;
 static uint32_t gps_last_chars = 0;
+static uint32_t gps_fix_acquired_ms = 0;    // when time fix was captured (for post-fix window)
 static const uint32_t GPS_SYNC_TIMEOUT_MS = 600000;   // 10 min cold-start budget
 static const uint32_t GPS_STATS_INTERVAL_MS = 5000;   // print status every 5s
+static const uint32_t GPS_POST_FIX_MS = 2000;         // keep reading after fix to collect sat count
 
 // Timezone state — "auto" uses longitude-from-GPS; otherwise a fixed offset in minutes.
 static bool    gps_location_valid_at_fix = false;
 static double  gps_lng_at_fix = 0.0;
+static double  gps_lat_at_fix = 0.0;
+static bool    gps_time_fix_valid = false;   // true if last cycle got a time fix (not timeout)
+static uint32_t gps_sats_at_fix = 0;
+static uint32_t gps_hdop_at_fix = 0;        // HDOP * 100 (TinyGPSPlus integer representation)
 static bool    tz_is_auto = true;
 static int32_t tz_manual_minutes = 0;
 static String  tz_setting_str = "auto";
 
 // Firmware-level preferences (unified in /firmware_prefs)
 static bool   use_sd_pref = true;
-static String clock_fmt_str = "24";
+static String clock_fmt_str = "12";
 
 // ── Audio / Sound ──────────────────────────────────────────────────────────
 static Audio*    audio = nullptr;          // ESP32-audioI2S player, created in setup()
@@ -309,15 +316,8 @@ static void gps_start_probe_at_current_baud() {
 }
 
 static void gps_sync_begin() {
-  gps_sync_start_ms = millis();
-  gps_last_stats_ms = gps_sync_start_ms;
-  gps_last_chars = 0;
-  gps_baud_idx = 0;
-  gps_baud_locked = false;
-  Serial.printf("[GPS] Listening on UART1 RX=%d TX=%d (auto-baud, timeout=%us)\n",
-                TDECK_GPS_RX, TDECK_GPS_TX,
-                (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
-  gps_start_probe_at_current_baud();
+  Serial.printf("[GPS] Listening on UART1 RX=%d TX=%d\n", TDECK_GPS_RX, TDECK_GPS_TX);
+  gps_sync_restart();
 }
 
 // Returns true once a working baud is locked in.
@@ -357,10 +357,30 @@ void gps_sync_poll() {
 
   uint32_t now = millis();
 
-  // Auto-baud: cycle candidate rates until one produces valid NMEA.
+  // ── Post-fix window: keep reading to collect satellite count from GPGGA ──
+  // The time fix often comes from GPRMC before GPGGA (which carries sat count)
+  // has been parsed. Wait up to GPS_POST_FIX_MS for a satellite reading to arrive.
+  if (gps_time_fix_valid) {
+    if (gps_tinygps.satellites.isValid() && gps_tinygps.satellites.value() > 0) {
+      gps_sats_at_fix = gps_tinygps.satellites.value();
+      gps_hdop_at_fix = gps_tinygps.hdop.isValid() ? gps_tinygps.hdop.value() : 0;
+    }
+    bool sats_ready = gps_sats_at_fix > 0;
+    bool window_expired = (now - gps_fix_acquired_ms >= GPS_POST_FIX_MS);
+    if (sats_ready || window_expired) {
+      if (window_expired && !sats_ready) {
+        Serial.println("[GPS] post-fix window expired; no satellite count received.");
+      }
+      gps_print_stats("fix-final");
+      GPSSerial.end();
+      gps_sync_done = true;
+    }
+    return;
+  }
+
+  // ── Normal hunt phase ──
   gps_baud_probe_tick();
 
-  // Periodic status dump
   if (now - gps_last_stats_ms >= GPS_STATS_INTERVAL_MS) {
     gps_last_stats_ms = now;
     gps_print_stats("stat");
@@ -374,26 +394,28 @@ void gps_sync_poll() {
     the_mesh.getRTCClock()->setCurrentTime(utc.unixtime());
     MESH_UNLOCK();
 
-    // Capture longitude for auto-timezone (ok if not yet valid — auto falls back to UTC).
+    gps_fix_acquired_ms = now;
+    gps_time_fix_valid = true;
+    gps_sats_at_fix = gps_tinygps.satellites.isValid() ? gps_tinygps.satellites.value() : 0;
+    gps_hdop_at_fix  = gps_tinygps.hdop.isValid()      ? gps_tinygps.hdop.value()       : 0;
+
     if (gps_tinygps.location.isValid()) {
+      gps_lat_at_fix = gps_tinygps.location.lat();
       gps_lng_at_fix = gps_tinygps.location.lng();
       gps_location_valid_at_fix = true;
-      Serial.printf("[TZ] captured lng=%.5f -> auto offset=%d min\n",
-                    gps_lng_at_fix, (int)tz_auto_offset_minutes());
+      Serial.printf("[TZ] captured lat=%.5f lng=%.5f -> auto offset=%d min\n",
+                    gps_lat_at_fix, gps_lng_at_fix, (int)tz_auto_offset_minutes());
     } else {
       Serial.println("[TZ] no location at time-fix; auto-tz falls back to UTC");
     }
 
-    Serial.println("[GPS] ======== FIX ACQUIRED ========");
+    Serial.println("[GPS] ======== FIX ACQUIRED — entering post-fix window ========");
     gps_print_stats("fix");
     Serial.printf("[GPS] RTC set to %u UTC (%04u-%02u-%02u %02u:%02u:%02u) after %lus\n",
                   (unsigned)utc.unixtime(),
                   gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                   gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second(),
                   (unsigned long)((now - gps_sync_start_ms) / 1000UL));
-    Serial.println("[GPS] Shutting down serial; internal clock takes over.");
-    GPSSerial.end();
-    gps_sync_done = true;
     return;
   }
 
@@ -405,6 +427,23 @@ void gps_sync_poll() {
     GPSSerial.end();
     gps_sync_done = true;
   }
+}
+
+void gps_sync_restart() {
+  gps_sync_done = false;
+  gps_sync_start_ms = millis();
+  gps_last_stats_ms = gps_sync_start_ms;
+  gps_last_chars = 0;
+  gps_fix_acquired_ms = 0;
+  gps_baud_idx = 0;
+  gps_baud_locked = false;
+  gps_location_valid_at_fix = false;
+  gps_time_fix_valid = false;
+  gps_sats_at_fix = 0;
+  gps_hdop_at_fix = 0;
+  Serial.printf("[GPS] Restarting sync (auto-baud, timeout=%us)\n",
+                (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
+  gps_start_probe_at_current_baud();
 }
 
 // Trackball click — fed into LVGL as LV_KEY_ENTER via keyboard_read_cb
@@ -2483,6 +2522,38 @@ void setupLuaVGL() {
     lua_pushboolean(L, 0);
     lua_pushinteger(L, 0);
     return 2;
+  });
+
+  // _gps_sync_start() — triggers a new GPS sync if one isn't already running.
+  // Returns true if started, false if a sync is currently in progress.
+  lua_register(L, "_gps_sync_start", [](lua_State *L) -> int {
+    if (!gps_sync_done) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    gps_notify_wake();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  // _gps_sync_status() — returns done:bool, has_location:bool
+  lua_register(L, "_gps_sync_status", [](lua_State *L) -> int {
+    lua_pushboolean(L, gps_sync_done ? 1 : 0);
+    lua_pushboolean(L, gps_location_valid_at_fix ? 1 : 0);
+    return 2;
+  });
+
+  // _gps_info() — returns syncing:bool, got_fix:bool, has_location:bool,
+  //               lat:number, lng:number, sats:int, hdop:number
+  lua_register(L, "_gps_info", [](lua_State *L) -> int {
+    lua_pushboolean(L, !gps_sync_done ? 1 : 0);
+    lua_pushboolean(L, gps_time_fix_valid ? 1 : 0);
+    lua_pushboolean(L, gps_location_valid_at_fix ? 1 : 0);
+    lua_pushnumber(L, gps_lat_at_fix);
+    lua_pushnumber(L, gps_lng_at_fix);
+    lua_pushinteger(L, (lua_Integer)gps_sats_at_fix);
+    lua_pushnumber(L, gps_hdop_at_fix / 100.0);
+    return 7;
   });
 
   lua_register(L, "_clock_fmt_get", [](lua_State *L) -> int {

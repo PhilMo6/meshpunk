@@ -270,4 +270,41 @@ btn_24:onClicked(function()
     refresh_fmt_labels()
 end)
 
+-- ── Section: GPS Time ──
+content:Label { text = "-- GPS Time --", w = lvgl.PCT(100), h = 16 }
+
+local gps_info_label = content:Label {
+    text = "Auto-refreshes every 5 min",
+    w = lvgl.PCT(100), h = 16,
+}
+
+local gps_btn = content:Button { w = lvgl.PCT(60), h = 30 }
+gps_btn:Label { text = "Get GPS Time", align = lvgl.ALIGN.CENTER }
+
+gps_btn:onClicked(function()
+    local ok, started = pcall(_gps_sync_start)
+    if ok and started then
+        gps_info_label.text = "Syncing..."
+        utils.loadingPopUpAdd(nil, "GPS Time", function()
+            local ok2, done, has_loc = pcall(_gps_sync_status)
+            if ok2 and done then
+                if has_loc then
+                    status_label.text = "GPS: time + timezone updated"
+                    gps_info_label.text = "Last sync: got time + location"
+                else
+                    status_label.text = "GPS: time updated (no location)"
+                    gps_info_label.text = "Last sync: got time, no location"
+                end
+                tz_info_label.text = describe_tz()
+                return true
+            end
+            return false
+        end)
+    elseif ok then
+        status_label.text = "GPS sync already in progress"
+    else
+        status_label.text = "GPS sync error"
+    end
+end)
+
 return root

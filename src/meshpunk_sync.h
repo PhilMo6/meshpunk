@@ -74,7 +74,10 @@ void meshpunk_sync_init();
 // radio is initialized and Lua is up. Defined in meshpunk_tasks.cpp.
 void meshpunk_spawn_mesh_task();
 
-// Spawn the Core 1 GPS task . Defined in meshpunk_tasks.cpp.
+// Spawn the Core 1 GPS task. Defined in meshpunk_tasks.cpp.
 void meshpunk_spawn_gps_task();
+
+// Wake the GPS task early from its inter-cycle sleep (manual trigger).
+void gps_notify_wake();
 
 #endif
