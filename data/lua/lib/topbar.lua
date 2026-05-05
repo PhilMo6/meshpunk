@@ -71,10 +71,15 @@ local sat_tick = 0
 local sat_tick_max = 300
 local sat_tick = sat_tick_max - 15 --we want gps to update the first time after the gps has a fix
 local unread = 0
+local unread_label
+
+function M.updateUnread()
+    unread = messages:countUnread()
+    if unread_label then unread_label:set{ text = unread .. M.mail_suffix } end
+end
 
 function M.create()
     messages:loadPersisted()
-    unread = messages:countUnread()
 
     bar = lvgl.Object({
         flex = { flex_direction = "row", flex_wrap = "nowrap", justify_content = "space-between" },
@@ -83,7 +88,8 @@ function M.create()
     })
     bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-    local unread_label = bar:Label{ text = unread .. M.mail_suffix, h = 20 }
+    unread_label = bar:Label{ text = "", h = 20 }
+    M.updateUnread()
     local sat_label = bar:Label{ text = render_sat_indicator(), h = 20 }
     local time_label = bar:Label{ text = render_time(), h = 20 }
 
@@ -119,7 +125,7 @@ function M.raise()
     paused = false
     if updateTimer then updateTimer:resume() end
     if bar then pcall(_obj_move_foreground, bar) end
-    unread = messages:countUnread()
+    M.updateUnread()
 end
 
 function M.lower()
