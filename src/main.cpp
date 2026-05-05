@@ -112,6 +112,9 @@ static uint8_t   sound_volume    = 10;    // 0–21 (ESP32-audioI2S native range
 static bool      sound_muted     = false;
 static bool      active_file_is_sd = false; // true while streaming from SD card
 
+// ── Keyboard Backlight ─────────────────────────────────────────────────────
+static uint8_t kbd_brightness = 200;  // 0–255, persisted
+
 // Sound object registry (dynamic, no fixed limit)
 struct SoundObject {
     int       id;
@@ -163,6 +166,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("clock_fmt=%s\n", clock_fmt_str.c_str());
   f.printf("sound_vol=%d\n",   sound_volume);
   f.printf("sound_muted=%d\n", sound_muted ? 1 : 0);
+  f.printf("kbd_bright=%d\n", kbd_brightness);
   f.close();
   Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -218,6 +222,9 @@ static void firmware_prefs_load() {
       if (v >= 0 && v <= 21) sound_volume = (uint8_t)v;
     } else if (strcmp(key, "sound_muted") == 0) {
       sound_muted = (atoi(val) == 1);
+    } else if (strcmp(key, "kbd_bright") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 255) kbd_brightness = (uint8_t)v;
     }
   }
   f.close();
@@ -2632,6 +2639,21 @@ void setupLuaVGL() {
     return 0;
   });
 
+  // ── Keyboard backlight ────────────────────────────────────────────────────
+  lua_register(L, "_kbd_set_brightness", [](lua_State* L) -> int {
+    int v = luaL_checkinteger(L, 1);
+    if (v < 0) v = 0; if (v > 255) v = 255;
+    kbd_brightness = (uint8_t)v;
+    setKeyboardBrightness(kbd_brightness);
+    firmware_prefs_save();
+    lua_pushinteger(L, kbd_brightness);
+    return 1;
+  });
+  lua_register(L, "_kbd_get_brightness", [](lua_State* L) -> int {
+    lua_pushinteger(L, kbd_brightness);
+    return 1;
+  });
+
   // Register gridnav bridge
   // Usage: _gridnav_add(obj, flags)
   //   flags: 0=none, 1=rollover, 2=scroll_first
@@ -3273,7 +3295,7 @@ void setup() {
 
     // Set initial keyboard brightness
     setKeyboardDefaultBrightness(127);
-    setKeyboardBrightness(200);
+    setKeyboardBrightness(kbd_brightness);
   } else {
     Serial.println("T-Deck keyboard not found!");
   }
