@@ -115,6 +115,9 @@ static bool      active_file_is_sd = false; // true while streaming from SD card
 // ── Keyboard Backlight ─────────────────────────────────────────────────────
 static uint8_t kbd_brightness = 200;  // 0–255, persisted
 
+// ── Display Backlight ──────────────────────────────────────────────────────
+static uint8_t display_brightness = 16;  // 0–16, persisted
+
 // Sound object registry (dynamic, no fixed limit)
 struct SoundObject {
     int       id;
@@ -167,6 +170,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("sound_vol=%d\n",   sound_volume);
   f.printf("sound_muted=%d\n", sound_muted ? 1 : 0);
   f.printf("kbd_bright=%d\n", kbd_brightness);
+  f.printf("disp_bright=%d\n", display_brightness);
   f.close();
   Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -225,6 +229,9 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "kbd_bright") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 255) kbd_brightness = (uint8_t)v;
+    } else if (strcmp(key, "disp_bright") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 16) display_brightness = (uint8_t)v;
     }
   }
   f.close();
@@ -2654,6 +2661,21 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // ── Display backlight ─────────────────────────────────────────────────────
+  lua_register(L, "_disp_set_brightness", [](lua_State* L) -> int {
+    int v = luaL_checkinteger(L, 1);
+    if (v < 0) v = 0; if (v > 16) v = 16;
+    display_brightness = (uint8_t)v;
+    setBrightness(display_brightness);
+    firmware_prefs_save();
+    lua_pushinteger(L, display_brightness);
+    return 1;
+  });
+  lua_register(L, "_disp_get_brightness", [](lua_State* L) -> int {
+    lua_pushinteger(L, display_brightness);
+    return 1;
+  });
+
   // Register gridnav bridge
   // Usage: _gridnav_add(obj, flags)
   //   flags: 0=none, 1=rollover, 2=scroll_first
@@ -3396,7 +3418,7 @@ void setup() {
 
   // Adjust backlight
   pinMode(BOARD_BL_PIN, OUTPUT);
-  setBrightness(16);
+  setBrightness(display_brightness);
 
   // Hand off mesh + radio to Core 1 now that the_mesh, Lua, LVGL, and the
   // RX queue are all up. Must happen AFTER createUI / setupLuaVGL so that

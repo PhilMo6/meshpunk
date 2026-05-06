@@ -19,6 +19,7 @@ root:set {
     border_width = 0,
 }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
+_nav_setup(root, GRIDNAV_ROLLOVER)
 
 -- Scrollable content area
 local content = root:Object {
@@ -32,6 +33,7 @@ local content = root:Object {
     border_width = 0,
     pad_all = 6,
 }
+
 
 -- Title row
 local title_row = content:Object {

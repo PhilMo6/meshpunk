@@ -63,7 +63,7 @@ local bar_row = content:Object {
 bar_row:clear_flag(lvgl.FLAG.SCROLLABLE)
 local segs = {}
 for i = 1, 21 do
-    segs[i] = bar_row:Object { w = 13, h = 14, border_width = 1, pad_all = 0 }
+    segs[i] = bar_row:Object { w = 13, h = 14, border_width = 1, pad_all = 0,bg_color = "#24ba24"}
     segs[i]:clear_flag(lvgl.FLAG.SCROLLABLE)
     segs[i]:clear_flag(lvgl.FLAG.CLICKABLE)
 end

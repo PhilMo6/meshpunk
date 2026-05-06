@@ -37,7 +37,7 @@ local img = root:Image {
         h=100,
         bg_opa = opa
     })
-canvas:fill_bg("#73ea83", 255)
+canvas:fill_bg("#e834ac", 255)
 canvas:draw_rect({x1=10, y1=10, x2=90, y2=90, bg_color="#FF0000", bg_opa=255, radius=5})
 canvas:draw_line({p1={x=0, y=0}, p2={x=99, y=99}, color="#00FF00", width=2})
 canvas:draw_arc({center={x=50, y=50}, radius=30, start_angle=0, end_angle=270, color="#0000FF", width=3})
