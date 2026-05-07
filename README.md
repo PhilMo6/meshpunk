@@ -1,7 +1,7 @@
 # MeshPunk - LVGL with Lua for T-Deck
 
 This branch of the Meshpunk project focuses on extending functionality.
-Some features have been added or documented by with the assistance of AI 
+Some features have been added or documented with the assistance of AI 
 
 ## Features
 
