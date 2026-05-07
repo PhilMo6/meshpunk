@@ -73,6 +73,33 @@ disp_up:onClicked(function()
     status.text = "Screen: " .. _disp_get_brightness() .. "/16"
 end)
 
+-- ── Screen Timeout ──────────────────────────────────────────────────────────
+content:Label { text = "Timeout (sec, 0=never):", w = lvgl.PCT(100), h = 16 }
+local scr_to_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
+}
+scr_to_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local scr_to_input = scr_to_row:Textarea {
+    password_mode = false, one_line = true,
+    text = tostring(_screen_timeout_get()),
+    w = lvgl.PCT(50), h = 30,
+}
+scr_to_input:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local scr_to_btn = scr_to_row:Button { w = lvgl.PCT(40), h = 30 }
+scr_to_btn:Label { text = "Set", align = lvgl.ALIGN.CENTER }
+scr_to_btn:onClicked(function()
+    local v = tonumber(scr_to_input.text)
+    if not v or v < 0 then
+        status.text = "Enter a number >= 0"
+        return
+    end
+    _screen_timeout_set(math.floor(v))
+    status.text = "Screen timeout: " .. math.floor(v) .. "s"
+end)
+
 -- ── Keyboard Backlight ───────────────────────────────────────────────────────
 content:Label { text = "-- Keyboard --", w = lvgl.PCT(100), h = 16 }
 
@@ -125,6 +152,33 @@ kbd_up:onClicked(function()
     _kbd_set_brightness(v)
     refresh_kbd()
     status.text = "Keyboard: " .. _kbd_get_brightness() .. "/255"
+end)
+
+-- ── Keyboard Timeout ────────────────────────────────────────────────────────
+content:Label { text = "Timeout (sec, 0=never):", w = lvgl.PCT(100), h = 16 }
+local kbd_to_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
+}
+kbd_to_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local kbd_to_input = kbd_to_row:Textarea {
+    password_mode = false, one_line = true,
+    text = tostring(_kbd_timeout_get()),
+    w = lvgl.PCT(50), h = 30,
+}
+kbd_to_input:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local kbd_to_btn = kbd_to_row:Button { w = lvgl.PCT(40), h = 30 }
+kbd_to_btn:Label { text = "Set", align = lvgl.ALIGN.CENTER }
+kbd_to_btn:onClicked(function()
+    local v = tonumber(kbd_to_input.text)
+    if not v or v < 0 then
+        status.text = "Enter a number >= 0"
+        return
+    end
+    _kbd_timeout_set(math.floor(v))
+    status.text = "Kbd timeout: " .. math.floor(v) .. "s"
 end)
 
 -- ── Back ─────────────────────────────────────────────────────────────────────

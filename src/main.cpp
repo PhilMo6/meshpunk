@@ -118,6 +118,13 @@ static uint8_t kbd_brightness = 200;  // 0–255, persisted
 // ── Display Backlight ──────────────────────────────────────────────────────
 static uint8_t display_brightness = 16;  // 0–16, persisted
 
+// ── Inactivity Timeouts ───────────────────────────────────────────────────
+static uint16_t screen_timeout_secs  = 60;  // 0 = never, persisted
+static uint16_t kbd_timeout_secs     = 55;  // 0 = never, persisted
+static uint32_t last_activity_ms     = 0;
+static bool     screen_timed_out     = false;
+static bool     kbd_timed_out        = false;
+
 // Sound object registry (dynamic, no fixed limit)
 struct SoundObject {
     int       id;
@@ -171,6 +178,8 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("sound_muted=%d\n", sound_muted ? 1 : 0);
   f.printf("kbd_bright=%d\n", kbd_brightness);
   f.printf("disp_bright=%d\n", display_brightness);
+  f.printf("screen_timeout=%d\n", screen_timeout_secs);
+  f.printf("kbd_timeout=%d\n", kbd_timeout_secs);
   f.close();
   Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -232,6 +241,12 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "disp_bright") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 16) display_brightness = (uint8_t)v;
+    } else if (strcmp(key, "screen_timeout") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 65535) screen_timeout_secs = (uint16_t)v;
+    } else if (strcmp(key, "kbd_timeout") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 65535) kbd_timeout_secs = (uint16_t)v;
     }
   }
   f.close();
@@ -871,6 +886,7 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
         last_key_time = current_time;
         key_is_new = true;
         was_pressed = true;
+        last_activity_ms = current_time;
       }
     } else {
       was_pressed = false;
@@ -906,6 +922,7 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       key_is_new = true;
       key_from_trackball = true;
     }
+    if (key_from_trackball) last_activity_ms = millis();
   }
 
   // Re-enable gridnav only on trackball input, not keyboard typing
@@ -922,6 +939,12 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     if (vis) {
       lv_gridnav_set_focused(nav_container, vis, LV_ANIM_OFF);
     }
+  }
+
+  // Wake from timeout on any input
+  if (key_is_new) {
+    if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
+    if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
   }
 
   // Report key press to LVGL
@@ -984,6 +1007,9 @@ static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       data->state = LV_INDEV_STATE_PRESSED;
       data->point.x = x[0];
       data->point.y = y[0];
+      last_activity_ms = millis();
+      if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
+      if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
 
       if (nav_container && nav_gridnav_active) {
         uint32_t cnt = lv_obj_get_child_count(nav_container);
@@ -2679,6 +2705,36 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // ── Inactivity timeouts ──────────────────────────────────────────────────
+  lua_register(L, "_screen_timeout_set", [](lua_State* L) -> int {
+    int v = luaL_checkinteger(L, 1);
+    if (v < 0) v = 0; if (v > 65535) v = 65535;
+    screen_timeout_secs = (uint16_t)v;
+    last_activity_ms = millis();
+    if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
+    firmware_prefs_save();
+    lua_pushinteger(L, screen_timeout_secs);
+    return 1;
+  });
+  lua_register(L, "_screen_timeout_get", [](lua_State* L) -> int {
+    lua_pushinteger(L, screen_timeout_secs);
+    return 1;
+  });
+  lua_register(L, "_kbd_timeout_set", [](lua_State* L) -> int {
+    int v = luaL_checkinteger(L, 1);
+    if (v < 0) v = 0; if (v > 65535) v = 65535;
+    kbd_timeout_secs = (uint16_t)v;
+    last_activity_ms = millis();
+    if (kbd_timed_out) { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
+    firmware_prefs_save();
+    lua_pushinteger(L, kbd_timeout_secs);
+    return 1;
+  });
+  lua_register(L, "_kbd_timeout_get", [](lua_State* L) -> int {
+    lua_pushinteger(L, kbd_timeout_secs);
+    return 1;
+  });
+
   // Register gridnav bridge
   // Usage: _gridnav_add(obj, flags)
   //   flags: 0=none, 1=rollover, 2=scroll_first
@@ -3423,6 +3479,7 @@ void setup() {
   // Adjust backlight
   pinMode(BOARD_BL_PIN, OUTPUT);
   setBrightness(display_brightness);
+  last_activity_ms = millis();
 
   // Hand off mesh + radio to Core 1 now that the_mesh, Lua, LVGL, and the
   // RX queue are all up. Must happen AFTER createUI / setupLuaVGL so that
@@ -3483,4 +3540,18 @@ void loop() {
   // Flush mesh RX events into Lua. lua_State is single-threaded — always
   // touched from Core 0.
   drain_rx_events();
+
+  // ── Inactivity timeouts ─────────────────────────────────────────────────
+  if (screen_timeout_secs > 0 && !screen_timed_out) {
+    if (millis() - last_activity_ms > (uint32_t)screen_timeout_secs * 1000UL) {
+      setBrightness(0);
+      screen_timed_out = true;
+    }
+  }
+  if (kbd_timeout_secs > 0 && !kbd_timed_out) {
+    if (millis() - last_activity_ms > (uint32_t)kbd_timeout_secs * 1000UL) {
+      setKeyboardBrightness(0);
+      kbd_timed_out = true;
+    }
+  }
 }
