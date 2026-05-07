@@ -66,6 +66,7 @@ end
 
 -- ── Helpers ─────────────────────────────────────────────────────
 local function clear_view()
+    _nav_clear()
     if current_view then
         current_view:delete()
         current_view = nil

@@ -827,8 +827,11 @@ static bool nav_gridnav_active = false;
 
 static void nav_delete_cb(lv_event_t *e) {
     if (lv_event_get_target(e) == nav_container) {
+        if (nav_gridnav_active) {
+            lv_gridnav_remove(nav_container);
+            nav_gridnav_active = false;
+        }
         nav_container = NULL;
-        nav_gridnav_active = false;
     }
 }
 
@@ -2723,7 +2726,8 @@ void setupLuaVGL() {
     lv_group_add_obj(lv_group_get_default(), nav_container);
     lv_group_focus_obj(nav_container);
 
-    lv_obj_add_event_cb(nav_container, nav_delete_cb, LV_EVENT_DELETE, NULL);
+    lv_obj_add_event_cb(nav_container, nav_delete_cb,
+        (lv_event_code_t)(LV_EVENT_PREPROCESS | LV_EVENT_DELETE), NULL);
     return 0;
   });
 
