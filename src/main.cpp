@@ -263,6 +263,7 @@ static uint8_t        gps_baud_idx = 0;
 static uint32_t       gps_baud_probe_start_ms = 0;
 static bool           gps_baud_locked = false;
 static uint32_t       gps_baud_probe_chars_start = 0;
+static bool           gps_serial_active = false;
 
 static void gps_print_stats(const char* tag) {
   uint32_t elapsed = millis() - gps_sync_start_ms;
@@ -336,8 +337,13 @@ static void gps_print_stats(const char* tag) {
 
 static void gps_start_probe_at_current_baud() {
   uint32_t baud = GPS_BAUD_CANDIDATES[gps_baud_idx];
-  GPSSerial.end();
-  GPSSerial.begin(baud, SERIAL_8N1, TDECK_GPS_RX, TDECK_GPS_TX);
+  if (gps_serial_active) {
+    GPSSerial.updateBaudRate(baud);
+  } else {
+    GPSSerial.begin(baud, SERIAL_8N1, TDECK_GPS_RX, TDECK_GPS_TX);
+    gps_serial_active = true;
+  }
+  GPSSerial.flush(false);
   gps_baud_probe_start_ms = millis();
   gps_baud_probe_chars_start = gps_tinygps.charsProcessed();
   Serial.printf("[GPS] probing baud=%u (candidate %u/%u)\n",
@@ -401,7 +407,7 @@ void gps_sync_poll() {
         Serial.println("[GPS] post-fix window expired; no satellite count received.");
       }
       gps_print_stats("fix-final");
-      GPSSerial.end();
+      GPSSerial.println("$PMTK161,0*28");
       gps_sync_done = true;
     }
     return;
@@ -453,12 +459,17 @@ void gps_sync_poll() {
     gps_print_stats("timeout");
     Serial.printf("[GPS] No fix after %us. Move to open sky for cold start (can take 30s-5min+).\n",
                   (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
-    GPSSerial.end();
+    GPSSerial.println("$PMTK161,0*28");
     gps_sync_done = true;
   }
 }
 
 void gps_sync_restart() {
+  new (&gps_tinygps) TinyGPSPlus();
+  if (gps_serial_active) {
+    GPSSerial.write(0xFF);
+    GPSSerial.flush(false);
+  }
   gps_sync_done = false;
   gps_sync_start_ms = millis();
   gps_last_stats_ms = gps_sync_start_ms;
