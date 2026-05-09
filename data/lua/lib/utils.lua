@@ -70,6 +70,7 @@ function utils.loadingPopUpAdd(parent,loadingText,loadingFunction)
             w = W,
             h = H,
             align = lvgl.ALIGN.CENTER,
+            border_width = 0, pad_all = 0
         })
         loadingPopUpOverlayParent = parent
         end
