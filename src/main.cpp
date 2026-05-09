@@ -28,6 +28,7 @@
 #include <RTClib.h>
 #include <RadioLib.h>
 #include <TinyGPSPlus.h>
+#include <new>
 
 // GPS time sync (defined below, after the_mesh is declared).
 static void gps_sync_begin();
