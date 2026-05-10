@@ -88,7 +88,7 @@ end
 local show_inbox, show_chat, show_contacts, show_channels, show_contact_detail
 
 -- Long-press popup showing message metadata
-local function show_msg_info(msg)
+local function show_msg_info(msg, on_reply, on_dismiss)
     local overlay = root:Object {
         w = W, h = H, x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128,
@@ -105,6 +105,7 @@ local function show_msg_info(msg)
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
     box:clear_flag(lvgl.FLAG.SCROLLABLE)
+    _nav_setup(box, GRIDNAV_ROLLOVER)
 
     local function info_label(text)
         box:Label { text = text, w = lvgl.PCT(100) }
@@ -118,9 +119,28 @@ local function show_msg_info(msg)
     info_label("RSSI: " .. (msg.rssi and string.format("%.0f dBm", msg.rssi) or "N/A"))
     info_label("Route: " .. (msg.direct and "Direct" or "Flood"))
 
-    local close_btn = box:Button { w = 60, h = 26 }
+    local btn_row = box:Object {
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
+    }
+    btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    if on_reply then
+        local reply_btn = btn_row:Button { w = lvgl.PCT(48), h = 26 }
+        reply_btn:Label { text = "Reply", align = lvgl.ALIGN.CENTER }
+        reply_btn:onevent(lvgl.EVENT.RELEASED,function()
+            overlay:delete()
+            if on_dismiss then on_dismiss() end
+            on_reply(msg)
+        end)
+    end
+
+    local close_btn = btn_row:Button { w = on_reply and lvgl.PCT(48) or lvgl.PCT(100), h = 26 }
     close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
-    close_btn:onClicked(function() overlay:delete() end)
+    close_btn:onevent(lvgl.EVENT.RELEASED,function()
+        overlay:delete()
+        if on_dismiss then on_dismiss() end
+    end)
 end
 
 -- ── Periodic peer count update ──────────────────────────────────
@@ -151,8 +171,8 @@ show_inbox = function()
     -- Nav buttons (narrow, wrap in top row)
     local back_btn = body:Button { w = 50, h = 24 }
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
-    back_btn:onClicked(function()
-        utils.loadingPopUpAdd(nil, "Launcher", function()
+    back_btn:onevent(lvgl.EVENT.RELEASED,function()
+        utils.loadingPopUpAdd(nil, "Home", function()
             contactTimer:delete()
             messages:onMessage(nil)
             messages:onDirectMessage(nil)
@@ -166,15 +186,15 @@ show_inbox = function()
 
     local ch_btn = body:Button { w = 70, h = 24 }
     ch_btn:Label { text = "Channels", align = lvgl.ALIGN.CENTER }
-    ch_btn:onClicked(function() show_channels() end)
+    ch_btn:onevent(lvgl.EVENT.RELEASED,function() show_channels() end)
 
     local ct_btn = body:Button { w = 70, h = 24 }
     ct_btn:Label { text = "Contacts", align = lvgl.ALIGN.CENTER }
-    ct_btn:onClicked(function() show_contacts() end)
+    ct_btn:onevent(lvgl.EVENT.RELEASED,function() show_contacts() end)
 
     local adv_btn = body:Button { w = 55, h = 24 }
     adv_btn:Label { text = "Advert", align = lvgl.ALIGN.CENTER }
-    adv_btn:onClicked(function()
+    adv_btn:onevent(lvgl.EVENT.RELEASED,function()
         local overlay = root:Object {
             w = W, h = H, x = 0, y = 0,
             bg_opa = 200, border_width = 0, pad_all = 0,
@@ -195,21 +215,21 @@ show_inbox = function()
 
         local flood_btn = box:Button { w = lvgl.PCT(100), h = 28 }
         flood_btn:Label { text = "Flood", align = lvgl.ALIGN.TOP }
-        flood_btn:onClicked(function()
+        flood_btn:onevent(lvgl.EVENT.RELEASED,function()
             pcall(_mesh_send_advert, "flood")
             overlay:delete()
         end)
 
         local zero_btn = box:Button { w = lvgl.PCT(100), h = 28 }
         zero_btn:Label { text = "Zero Hop", align = lvgl.ALIGN.TOP }
-        zero_btn:onClicked(function()
+        zero_btn:onevent(lvgl.EVENT.RELEASED,function()
             pcall(_mesh_send_advert, "zerohop")
             overlay:delete()
         end)
 
         local cancel_btn = box:Button { w = lvgl.PCT(100), h = 28 }
         cancel_btn:Label { text = "Cancel", align = lvgl.ALIGN.TOP }
-        cancel_btn:onClicked(function()
+        cancel_btn:onevent(lvgl.EVENT.RELEASED,function()
             overlay:delete()
         end)
     end)
@@ -234,7 +254,7 @@ show_inbox = function()
                 align = lvgl.ALIGN.LEFT_MID,
             }
             local ch_copy = { type = "channel", idx = ch.idx, name = ch.name, row = row }
-            row:onClicked(function() show_chat(ch_copy) end)
+            row:onevent(lvgl.EVENT.RELEASED,function() show_chat(ch_copy) end)
 
             inboxRows[ch.name] = ch_copy
 
@@ -250,7 +270,7 @@ show_inbox = function()
             text = "#Public - " .. truncate((last.from or "") .. ": " .. last.text, 30),
             align = lvgl.ALIGN.LEFT_MID,
         }
-        row:onClicked(function()
+        row:onevent(lvgl.EVENT.RELEASED,function()
             show_chat({ type = "channel", idx = 0, name = "Public" })
         end)
     end
@@ -265,7 +285,7 @@ show_inbox = function()
             align = lvgl.ALIGN.LEFT_MID,
         }
         local t_name = thread.name
-        row:onClicked(function() show_chat({ type = "dm", name = t_name }) end)
+        row:onevent(lvgl.EVENT.RELEASED,function() show_chat({ type = "dm", name = t_name }) end)
         inboxRows["@" .. thread.name] = { type = "dm", name = thread.name, row = row }
     end
 
@@ -316,7 +336,7 @@ show_inbox = function()
                 text = "@" .. thread_name .. " (1) " .. truncate(msg.text or "", 28),
                 align = lvgl.ALIGN.LEFT_MID,
             }
-            row:onClicked(function() show_chat({ type = "dm", name = thread_name }) end)
+            row:onevent(lvgl.EVENT.RELEASED,function() show_chat({ type = "dm", name = thread_name }) end)
             inboxRows[key] = { type = "dm", name = thread_name, row = row }
         end
     end)
@@ -340,16 +360,16 @@ show_chat = function(target)
     -- Top buttons (narrow, wrap in first row)
     local back_btn = body:Button { w = 45, h = 20 }
     back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
-    back_btn:onClicked(function() show_inbox() end)
+    back_btn:onevent(lvgl.EVENT.RELEASED,function() show_inbox() end)
 
     if target.type == "dm" then
         local info_btn = body:Button { w = 45, h = 20 }
         info_btn:Label { text = "Info", align = lvgl.ALIGN.CENTER }
-        info_btn:onClicked(function() show_contact_detail(target.name) end)
+        info_btn:onevent(lvgl.EVENT.RELEASED,function() show_contact_detail(target.name) end)
     elseif target.type == "room" then
         local login_btn = body:Button { w = 50, h = 20 }
         login_btn:Label { text = "Login", align = lvgl.ALIGN.CENTER }
-        login_btn:onClicked(function()
+        login_btn:onevent(lvgl.EVENT.RELEASED,function()
             local ok, route = pcall(_mesh_login_room, target.name, "")
             set_header(title, ok and "Logging in.." or "Login fail")
         end)
@@ -365,6 +385,35 @@ show_chat = function(target)
     }
     msg_list:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
 
+    local in_msg_select = false
+    local textArea
+    local context_menu_open = false
+
+    msg_list:onevent(lvgl.EVENT.RELEASED, function()
+        if context_menu_open then return end
+        if in_msg_select then return end
+        in_msg_select = true
+        _nav_setup(msg_list, GRIDNAV_ROLLOVER, true)
+    end)
+
+    msg_list:onevent(lvgl.EVENT.KEY, function()
+        local indev = lvgl.indev.get_act()
+        local key = indev:get_key()
+        if key == 113 then -- 'q' exits message selection
+            in_msg_select = false
+            _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+        end
+    end)
+
+    --[[
+    msg_list:onevent(lvgl.EVENT.SCROLL, function()
+        if in_msg_select and not _nav_is_active() then
+            in_msg_select = false
+            _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+        end
+    end)
+]]
+
     local function render_msg(msg)
         msg.seen = true
         local prefix = msg.from or "?"
@@ -376,15 +425,35 @@ show_chat = function(target)
             suffix = suffix .. string.format(" %.0fdB", msg.snr)
         end]]
         local lbl = msg_list:Label {
-            border_width = 1, 
+            border_width = 1,
             pad_bottom = 6,
             text = prefix .. ": " .. msg.text,-- .. suffix,
             w = lvgl.PCT(100),
         }
         lbl:add_flag(lvgl.FLAG.CLICKABLE)
-        lbl:onevent(lvgl.EVENT.LONG_PRESSED, function()
-            show_msg_info(msg)
+        lbl:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+        lbl:set_style({border_color = "#FFFFFF"}, lvgl.STATE.FOCUS_KEY)
+
+        local function open_msg_menu()
+            if context_menu_open then return end
+            context_menu_open = true
+            show_msg_info(msg, function(m)
+                textArea.text = "@[" .. (m.from or "?") .. "] "
+            end, function()
+                context_menu_open = false
+                if in_msg_select then
+                    _nav_setup(msg_list, GRIDNAV_ROLLOVER, true)
+                    _nav_set_focused(lbl)
+                else
+                    _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+                end
+            end)
+        end
+
+        lbl:onevent(lvgl.EVENT.RELEASED, function()
+            if in_msg_select then open_msg_menu() end
         end)
+        lbl:onevent(lvgl.EVENT.LONG_PRESSED, open_msg_menu)
         return lbl
     end
 
@@ -440,13 +509,13 @@ show_chat = function(target)
     end
 
     -- Input row (textarea + send as direct children, wrap in bottom row)
-    local ta = body:Textarea {
+    textArea = body:Textarea {
         password_mode = false, one_line = true,
         w = lvgl.PCT(75), h = 34,
     }
 
     local function do_send()
-        local text = ta.text
+        local text = textArea.text
         if not text or #text == 0 then return end
         if target.type == "channel" then
             if target.idx == 0 then messages:broadcast(text)
@@ -456,10 +525,10 @@ show_chat = function(target)
         elseif target.type == "room" then
             messages:sendDirect(target.name, text)
         end
-        ta.text = ""
+        textArea.text = ""
     end
 
-    ta:onevent(lvgl.EVENT.KEY, function(obj, code)
+    textArea:onevent(lvgl.EVENT.KEY, function(obj, code)
         local indev = lvgl.indev.get_act()
         local key = indev:get_key()
         if key == lvgl.KEY.ENTER then do_send() end
@@ -467,7 +536,7 @@ show_chat = function(target)
 
     local send_btn = body:Button { w = lvgl.SIZE_CONTENT, h = 34 }
     send_btn:Label { text = "Send", align = lvgl.ALIGN.CENTER }
-    send_btn:onClicked(do_send)
+    send_btn:onevent(lvgl.EVENT.RELEASED,do_send)
 end
 
 
@@ -488,11 +557,11 @@ show_contacts = function()
     -- Top buttons (narrow, first row)
     local back_btn = body:Button { w = 45, h = 22 }
     back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
-    back_btn:onClicked(function() show_inbox() end)
+    back_btn:onevent(lvgl.EVENT.RELEASED,function() show_inbox() end)
 
     local clear_btn = body:Button { w = 50, h = 22 }
     clear_btn:Label { text = "Clear", align = lvgl.ALIGN.CENTER }
-    clear_btn:onClicked(function()
+    clear_btn:onevent(lvgl.EVENT.RELEASED,function()
         local overlay = root:Object {
             w = W, h = H, x = 0, y = 0,
             bg_opa = 200, border_width = 0, pad_all = 0,
@@ -519,7 +588,7 @@ show_contacts = function()
 
         local yes_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
         yes_btn:Label { text = "Yes", align = lvgl.ALIGN.CENTER }
-        yes_btn:onClicked(function()
+        yes_btn:onevent(lvgl.EVENT.RELEASED,function()
             pcall(_mesh_clear_contacts)
             overlay:delete()
             show_contacts()
@@ -527,7 +596,7 @@ show_contacts = function()
 
         local no_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
         no_btn:Label { text = "No", align = lvgl.ALIGN.CENTER }
-        no_btn:onClicked(function()
+        no_btn:onevent(lvgl.EVENT.RELEASED,function()
             overlay:delete()
         end)
     end)
@@ -572,7 +641,7 @@ show_contacts = function()
 
             local c_name = c.name
             local c_type = c.type
-            row:onClicked(function()
+            row:onevent(lvgl.EVENT.RELEASED,function()
                 if c_type == 1 then
                     show_chat({ type = "dm", name = c_name })
                 elseif c_type == 3 then
@@ -607,7 +676,7 @@ show_contacts = function()
             }
             local c_name = name
             local c_type = ctype
-            row:onClicked(function()
+            row:onevent(lvgl.EVENT.RELEASED,function()
                 if c_type == 1 then
                     show_chat({ type = "dm", name = c_name })
                 elseif c_type == 3 then
@@ -639,7 +708,7 @@ show_channels = function()
     -- Top row
     local back_btn = body:Button { w = 45, h = 22 }
     back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
-    back_btn:onClicked(function() show_inbox() end)
+    back_btn:onevent(lvgl.EVENT.RELEASED,function() show_inbox() end)
 
     -- Add channel input + button (narrow, share row)
     local ch_input = body:Textarea {
@@ -650,7 +719,7 @@ show_channels = function()
 
     local add_btn = body:Button { w = 50, h = 28 }
     add_btn:Label { text = "Add", align = lvgl.ALIGN.CENTER }
-    add_btn:onClicked(function()
+    add_btn:onevent(lvgl.EVENT.RELEASED,function()
         local name = ch_input.text
         if name and #name > 1 then
             local ok_ch, channels = pcall(_mesh_get_channels)
@@ -694,13 +763,13 @@ show_channels = function()
             align = lvgl.ALIGN.LEFT_MID,
         }
         local ch_copy = { type = "channel", idx = ch.idx, name = ch.name }
-        chat_btn:onClicked(function() show_chat(ch_copy) end)
+        chat_btn:onevent(lvgl.EVENT.RELEASED,function() show_chat(ch_copy) end)
 
         if ch.idx > 0 then
             local del_btn = row:Button { w = 50, h = 24 }
             del_btn:Label { text = "Del", align = lvgl.ALIGN.CENTER }
             local ch_idx = ch.idx
-            del_btn:onClicked(function()
+            del_btn:onevent(lvgl.EVENT.RELEASED,function()
                 _mesh_set_channel(ch_idx, "", "")
                 show_channels()
             end)
@@ -720,7 +789,7 @@ show_contact_detail = function(contact_name)
     -- Back button
     local back_btn = body:Button { w = 45, h = 22 }
     back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
-    back_btn:onClicked(function()
+    back_btn:onevent(lvgl.EVENT.RELEASED,function()
         if chat_target and chat_target.type == "dm" and chat_target.name == contact_name then
             show_chat(chat_target)
         else
@@ -761,7 +830,7 @@ show_contact_detail = function(contact_name)
     end
     local fav_btn = body:Button { w = 80, h = 26 }
     local fav_label = fav_btn:Label { text = get_fav_text(), align = lvgl.ALIGN.CENTER }
-    fav_btn:onClicked(function()
+    fav_btn:onevent(lvgl.EVENT.RELEASED,function()
         is_fav = not is_fav
         fav_label.text = get_fav_text()
         pcall(_mesh_set_contact_favorite, contact_name, is_fav)
@@ -771,26 +840,26 @@ show_contact_detail = function(contact_name)
     if contact.type == 1 then
         local dm_btn = body:Button { w = 55, h = 26 }
         dm_btn:Label { text = "DM", align = lvgl.ALIGN.CENTER }
-        dm_btn:onClicked(function() show_chat({ type = "dm", name = contact_name }) end)
+        dm_btn:onevent(lvgl.EVENT.RELEASED,function() show_chat({ type = "dm", name = contact_name }) end)
     end
 
     local share_btn = body:Button { w = 55, h = 26 }
     share_btn:Label { text = "Share", align = lvgl.ALIGN.CENTER }
-    share_btn:onClicked(function()
+    share_btn:onevent(lvgl.EVENT.RELEASED,function()
         local ok2 = pcall(_mesh_share_contact, contact_name)
         set_header(contact_name, ok2 and "Shared!" or "Failed")
     end)
 
     local rp_btn = body:Button { w = 60, h = 26 }
     rp_btn:Label { text = "RstPath", align = lvgl.ALIGN.CENTER }
-    rp_btn:onClicked(function()
+    rp_btn:onevent(lvgl.EVENT.RELEASED,function()
         pcall(_mesh_reset_path, contact_name)
         set_header(contact_name, "Path reset")
     end)
 
     local exp_btn = body:Button { w = 55, h = 26 }
     exp_btn:Label { text = "Export", align = lvgl.ALIGN.CENTER }
-    exp_btn:onClicked(function()
+    exp_btn:onevent(lvgl.EVENT.RELEASED,function()
         local card = _mesh_export_contact(contact_name)
         if card then
             print("BIZ CARD: " .. card)
@@ -802,7 +871,7 @@ show_contact_detail = function(contact_name)
 
     local rm_btn = body:Button { w = 60, h = 26 }
     rm_btn:Label { text = "Remove", align = lvgl.ALIGN.CENTER }
-    rm_btn:onClicked(function()
+    rm_btn:onevent(lvgl.EVENT.RELEASED,function()
         pcall(_mesh_remove_contact, contact_name)
         show_contacts()
     end)

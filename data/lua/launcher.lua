@@ -87,7 +87,7 @@ local function create_launcher(parent)
         local btn = body:Button{w = 140, h = 40}
         btn:Label{text = app.name, align = lvgl.ALIGN.CENTER}
 
-        btn:onClicked(function()
+        btn:onevent(lvgl.EVENT.RELEASED, function()
             topbar.pause()
             utils.loadingPopUpAdd(nil, app.name, function()
                 print("Launching app:", app.entrypoint, "dir:", app.dir)

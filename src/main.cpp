@@ -491,7 +491,11 @@ void gps_sync_restart() {
 volatile int trackball_click = 0;
 
 void IRAM_ATTR ISR_click() {
-  trackball_click++;
+  static uint32_t last_click_ms = 0;
+  uint32_t now = millis();
+  if (now - last_click_ms < 1) return;
+  last_click_ms = now;
+  trackball_click = 1;
 }
 
 // Trackball direction counters — each ISR fires on a FALLING edge pulse
@@ -851,14 +855,27 @@ static uint32_t last_key_time = 0;
 static lv_obj_t *nav_container = NULL;
 static lv_gridnav_ctrl_t nav_flags = LV_GRIDNAV_CTRL_NONE;
 static bool nav_gridnav_active = false;
+static lv_obj_t *pending_gridnav_remove = NULL;
+
+static void flush_pending_gridnav() {
+    if (pending_gridnav_remove) {
+        lv_gridnav_remove(pending_gridnav_remove);
+        pending_gridnav_remove = NULL;
+    }
+}
 
 static void nav_delete_cb(lv_event_t *e) {
-    if (lv_event_get_target(e) == nav_container) {
+    lv_obj_t *target = (lv_obj_t *)lv_event_get_target(e);
+    if (target == nav_container) {
         if (nav_gridnav_active) {
             lv_gridnav_remove(nav_container);
             nav_gridnav_active = false;
         }
         nav_container = NULL;
+    }
+    if (target == pending_gridnav_remove) {
+        lv_gridnav_remove(pending_gridnav_remove);
+        pending_gridnav_remove = NULL;
     }
 }
 
@@ -878,7 +895,10 @@ static lv_obj_t *nav_find_visible_child(lv_obj_t *cont) {
 }
 
 // LVGL keyboard read callback
+static bool trackball_btn_pressed = false;
+
 static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
+  flush_pending_gridnav();
   static bool was_pressed = false;
   uint32_t current_time = millis();
 
@@ -909,10 +929,11 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   bool key_from_trackball = false;
   if (!key_is_new) {
     if (trackball_click > 0) {
-      trackball_click--;
+      trackball_click = 0;
       last_key_code = LV_KEY_ENTER;
       key_is_new = true;
       key_from_trackball = true;
+      trackball_btn_pressed = true;
     } else if (trackball_up > 0) {
       trackball_up--;
       last_key_code = LV_KEY_UP;
@@ -976,6 +997,14 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     } else {
       data->key = last_key_code;
     }
+  } else if (trackball_btn_pressed) {
+    if (digitalRead(TDECK_TRACKBALL_CLICK) == LOW) {
+      data->state = LV_INDEV_STATE_PRESSED;
+      data->key = LV_KEY_ENTER;
+    } else {
+      data->state = LV_INDEV_STATE_RELEASED;
+      trackball_btn_pressed = false;
+    }
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
   }
@@ -1011,28 +1040,28 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 // }
 
 static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
-  data->state = LV_INDEV_STATE_RELEASED;
+  flush_pending_gridnav();
 
-  if (touch.isPressed()) {
-    uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
-    if (touched > 0) {
-      data->state = LV_INDEV_STATE_PRESSED;
-      data->point.x = x[0];
-      data->point.y = y[0];
-      last_activity_ms = millis();
-      if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
-      if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
+  uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
+  if (touched > 0) {
+    data->state = LV_INDEV_STATE_PRESSED;
+    data->point.x = x[0];
+    data->point.y = y[0];
+    last_activity_ms = millis();
+    if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
+    if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
 
-      if (nav_container && nav_gridnav_active) {
-        uint32_t cnt = lv_obj_get_child_count(nav_container);
-        for (uint32_t i = 0; i < cnt; i++) {
-          lv_obj_remove_state(lv_obj_get_child(nav_container, i),
-                              LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
-        }
-        lv_gridnav_remove(nav_container);
-        nav_gridnav_active = false;
+    if (nav_container && nav_gridnav_active) {
+      uint32_t cnt = lv_obj_get_child_count(nav_container);
+      for (uint32_t i = 0; i < cnt; i++) {
+        lv_obj_remove_state(lv_obj_get_child(nav_container, i),
+                            LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
       }
+      lv_gridnav_remove(nav_container);
+      nav_gridnav_active = false;
     }
+  } else {
+    data->state = LV_INDEV_STATE_RELEASED;
   }
 }
 
@@ -2781,8 +2810,11 @@ void setupLuaVGL() {
     luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
     if (!lobj || !lobj->obj) return 0;
     int flags = luaL_optinteger(L, 2, LV_GRIDNAV_CTRL_ROLLOVER);
+    bool preserve_scroll = lua_toboolean(L, 3);
 
-    if (nav_container) {
+    if (nav_container && nav_container != lobj->obj) {
+      pending_gridnav_remove = nav_container;
+    } else if (nav_container == lobj->obj && nav_gridnav_active) {
       lv_gridnav_remove(nav_container);
     }
 
@@ -2790,16 +2822,39 @@ void setupLuaVGL() {
     nav_flags = (lv_gridnav_ctrl_t)flags;
     nav_gridnav_active = true;
 
-    lv_gridnav_add(nav_container, nav_flags);
-    lv_group_add_obj(lv_group_get_default(), nav_container);
-    lv_group_focus_obj(nav_container);
+    if (preserve_scroll) {
+      lv_group_add_obj(lv_group_get_default(), nav_container);
+      lv_group_focus_obj(nav_container);
+      lv_gridnav_add(nav_container, nav_flags);
+      lv_obj_t *vis = nav_find_visible_child(nav_container);
+      if (vis) {
+        lv_gridnav_set_focused(nav_container, vis, LV_ANIM_OFF);
+      }
+    } else {
+      lv_gridnav_add(nav_container, nav_flags);
+      lv_group_add_obj(lv_group_get_default(), nav_container);
+      lv_group_focus_obj(nav_container);
+    }
 
     lv_obj_add_event_cb(nav_container, nav_delete_cb,
         (lv_event_code_t)(LV_EVENT_PREPROCESS | LV_EVENT_DELETE), NULL);
     return 0;
   });
 
+  lua_register(L, "_nav_set_focused", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj || !nav_container || !nav_gridnav_active) return 0;
+    lv_gridnav_set_focused(nav_container, lobj->obj, LV_ANIM_OFF);
+    return 0;
+  });
+
+  lua_register(L, "_nav_is_active", [](lua_State *L) -> int {
+    lua_pushboolean(L, nav_gridnav_active);
+    return 1;
+  });
+
   lua_register(L, "_nav_clear", [](lua_State *L) -> int {
+    flush_pending_gridnav();
     if (nav_container) {
       lv_gridnav_remove(nav_container);
       nav_container = NULL;
@@ -3380,6 +3435,7 @@ void setup() {
 
   // Set mirror xy
   touch.setMirrorXY(false, true);
+  touch.setInterruptMode(LOW_LEVEL_QUERY);
 
   // Initialize keyboard
   Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
