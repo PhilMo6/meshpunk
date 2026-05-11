@@ -515,6 +515,46 @@ void IRAM_ATTR ISR_trackball_right() { trackball_right++; }
 #define LILYGO_KB_SLAVE_ADDRESS 0x55
 #define LILYGO_KB_BRIGHTNESS_CMD 0x01
 #define LILYGO_KB_ALT_B_BRIGHTNESS_CMD 0x02
+#define LILYGO_KB_MODE_RAW_CMD 0x03
+#define LILYGO_KB_MODE_KEY_CMD 0x04
+
+// Keyboard matrix dimensions (from stock ESP32-C3 firmware)
+#define KB_COLS 5
+#define KB_ROWS 7
+
+// Modifier key positions in the matrix
+#define KB_MOD_SYM_COL    0
+#define KB_MOD_SYM_ROW    2
+#define KB_MOD_ALT_COL    0
+#define KB_MOD_ALT_ROW    4
+#define KB_MOD_LSHIFT_COL 1
+#define KB_MOD_LSHIFT_ROW 6
+#define KB_MOD_RSHIFT_COL 2
+#define KB_MOD_RSHIFT_ROW 3
+#define KB_KEY_ENTER_COL  3
+#define KB_KEY_ENTER_ROW  3
+#define KB_KEY_BS_COL     4
+#define KB_KEY_BS_ROW     3
+#define KB_KEY_SPACE_COL  0
+#define KB_KEY_SPACE_ROW  5
+
+// Normal character layer (col × row) — from stock C3 firmware Keyboard_ESP32C3.ino
+static const char kb_matrix[KB_COLS][KB_ROWS] = {
+  {'q','w',  0, 'a',  0, ' ',  0 },
+  {'e','s','d','p','x','z',  0 },
+  {'r','g','t',  0, 'v','c','f'},
+  {'u','h','y',  0, 'b','n','j'},
+  {'o','l','i',  0, '$','m','k'},
+};
+
+// Symbol character layer
+static const char kb_matrix_symbol[KB_COLS][KB_ROWS] = {
+  {'#','1',  0, '*',  0,   0, '0'},
+  {'2','4','5','@','8','7',  0 },
+  {'3','/',  '(',  0, '?','9','6'},
+  {'_',':',')',  0, '!',',',';'},
+  {'+','"','-',  0,   0, '.','\''},
+};
 
 // Data directory paths
 #define LUA_PATH "/lua/"
@@ -848,8 +888,16 @@ void setKeyboardDefaultBrightness(uint8_t value) {
 
 // Keyboard state tracking variables
 static uint32_t last_key_code = 0;
-static bool key_is_new = false;
-static uint32_t last_key_time = 0;
+static uint8_t prev_matrix[KB_COLS] = {0};
+static bool kb_key_state[128] = {0};
+static bool kb_key_prev[128] = {0};
+static uint32_t kb_key_press_time[128] = {0};
+static const uint32_t KEY_HOLD_THRESHOLD_MS = 400;
+static bool kb_shift_active = false;
+static bool kb_lshift_active = false;
+static bool kb_rshift_active = false;
+static bool kb_sym_active = false;
+static bool kb_alt_active = false;
 
 // Navigation controller state
 static lv_obj_t *nav_container = NULL;
@@ -899,66 +947,115 @@ static bool trackball_btn_pressed = false;
 
 static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   flush_pending_gridnav();
-  static bool was_pressed = false;
-  uint32_t current_time = millis();
 
-  // Read key from keyboard
-  char keyValue = 0;
-  Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
-  if (Wire.available() > 0) {
-    keyValue = Wire.read();
+  static uint32_t kb_mapped_key = 0;
+  bool any_new = false;
+  bool key_from_trackball = false;
 
-    if (keyValue != 0) {
-      // Check if this is a new key press or key has been held long enough for
-      // repeat
-      if (!was_pressed || (last_key_code != keyValue) ||
-          (current_time - last_key_time > 30)) {
+  // ── Read raw keyboard matrix (5 bytes) ──
+  uint8_t cur_matrix[KB_COLS] = {0};
+  Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, KB_COLS);
+  for (int c = 0; c < KB_COLS && Wire.available(); c++) {
+    cur_matrix[c] = Wire.read();
+  }
 
-        last_key_code = keyValue;
-        last_key_time = current_time;
-        key_is_new = true;
-        was_pressed = true;
-        last_activity_ms = current_time;
+  // ── Decode modifier key states ──
+  kb_lshift_active = cur_matrix[KB_MOD_LSHIFT_COL] & (1 << KB_MOD_LSHIFT_ROW);
+  kb_rshift_active = cur_matrix[KB_MOD_RSHIFT_COL] & (1 << KB_MOD_RSHIFT_ROW);
+  kb_shift_active = kb_lshift_active || kb_rshift_active;
+  kb_sym_active = cur_matrix[KB_MOD_SYM_COL] & (1 << KB_MOD_SYM_ROW);
+  kb_alt_active = cur_matrix[KB_MOD_ALT_COL] & (1 << KB_MOD_ALT_ROW);
+
+  // ── Snapshot previous key state and clear current ──
+  memcpy(kb_key_prev, kb_key_state, 128);
+  memset(kb_key_state, 0, 128);
+
+  // ── Resolve ALL pressed keys from matrix ──
+  uint32_t resolved_key = 0;
+
+  for (int c = 0; c < KB_COLS; c++) {
+    if (cur_matrix[c] == 0) continue;
+    for (int r = 0; r < KB_ROWS; r++) {
+      if (!(cur_matrix[c] & (1 << r))) continue;
+      if (c == KB_MOD_SYM_COL && r == KB_MOD_SYM_ROW) continue;
+      if (c == KB_MOD_ALT_COL && r == KB_MOD_ALT_ROW) continue;
+      if (c == KB_MOD_LSHIFT_COL && r == KB_MOD_LSHIFT_ROW) continue;
+      if (c == KB_MOD_RSHIFT_COL && r == KB_MOD_RSHIFT_ROW) continue;
+      if (c == 0 && r == 6) continue;
+
+      uint8_t ch = 0;
+      if (c == KB_KEY_ENTER_COL && r == KB_KEY_ENTER_ROW) {
+        ch = 0x0D;
+      } else if (c == KB_KEY_BS_COL && r == KB_KEY_BS_ROW) {
+        ch = 0x08;
+      } else {
+        ch = kb_sym_active ? kb_matrix_symbol[c][r] : kb_matrix[c][r];
+        if (ch == 0) continue;
+        if (kb_shift_active && ch >= 'a' && ch <= 'z') ch -= 32;
       }
-    } else {
-      was_pressed = false;
+
+      kb_key_state[ch] = true;
+      if (!kb_key_prev[ch]) {
+        kb_key_press_time[ch] = millis();
+      }
+
+      if (resolved_key == 0) {
+        if (ch == 0x0D) resolved_key = LV_KEY_ENTER;
+        else if (ch == 0x08) resolved_key = LV_KEY_BACKSPACE;
+        else resolved_key = ch;
+      }
     }
   }
 
-  // Check trackball directions and click if no keyboard key is pending
-  bool key_from_trackball = false;
-  if (!key_is_new) {
+  bool kb_active = (resolved_key != 0);
+
+  // ── LVGL state tracking (single-key for LVGL reporting) ──
+  if (kb_active) {
+    if (resolved_key != last_key_code) {
+      last_key_code = resolved_key;
+      kb_mapped_key = resolved_key;
+      any_new = true;
+      last_activity_ms = millis();
+    }
+  } else {
+    if (last_key_code != 0) last_key_code = 0;
+  }
+
+  memcpy(prev_matrix, cur_matrix, KB_COLS);
+
+  // ── Trackball read (only when keyboard idle) ──
+  if (!kb_active) {
     if (trackball_click > 0) {
       trackball_click = 0;
       last_key_code = LV_KEY_ENTER;
-      key_is_new = true;
+      any_new = true;
       key_from_trackball = true;
       trackball_btn_pressed = true;
     } else if (trackball_up > 0) {
       trackball_up--;
       last_key_code = LV_KEY_UP;
-      key_is_new = true;
+      any_new = true;
       key_from_trackball = true;
     } else if (trackball_down > 0) {
       trackball_down--;
       last_key_code = LV_KEY_DOWN;
-      key_is_new = true;
+      any_new = true;
       key_from_trackball = true;
     } else if (trackball_left > 0) {
       trackball_left--;
       last_key_code = LV_KEY_LEFT;
-      key_is_new = true;
+      any_new = true;
       key_from_trackball = true;
     } else if (trackball_right > 0) {
       trackball_right--;
       last_key_code = LV_KEY_RIGHT;
-      key_is_new = true;
+      any_new = true;
       key_from_trackball = true;
     }
     if (key_from_trackball) last_activity_ms = millis();
   }
 
-  // Re-enable gridnav only on trackball input, not keyboard typing
+  // ── Re-enable gridnav on trackball input ──
   if (key_from_trackball && nav_container && !nav_gridnav_active) {
     uint32_t cnt = lv_obj_get_child_count(nav_container);
     for (uint32_t i = 0; i < cnt; i++) {
@@ -974,29 +1071,19 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     }
   }
 
-  // Wake from timeout on any input
-  if (key_is_new) {
+  // ── Wake from timeout ──
+  if (any_new) {
     if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
     if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
   }
 
-  // Report key press to LVGL
-  if (key_is_new) {
+  // ── Report to LVGL ──
+  if (kb_active) {
     data->state = LV_INDEV_STATE_PRESSED;
-    key_is_new = false;
-
-    // Map special keys
-    if (last_key_code == 13) { // Enter
-      data->key = LV_KEY_ENTER;
-    } else if (last_key_code == 27) { // Escape
-      data->key = LV_KEY_ESC;
-    } else if (last_key_code == 8) { // Backspace
-      data->key = LV_KEY_BACKSPACE;
-    } else if (last_key_code == 9) { // Tab
-      data->key = LV_KEY_NEXT;
-    } else {
-      data->key = last_key_code;
-    }
+    data->key = kb_mapped_key;
+  } else if (any_new) {
+    data->state = LV_INDEV_STATE_PRESSED;
+    data->key = last_key_code;
   } else if (trackball_btn_pressed) {
     if (digitalRead(TDECK_TRACKBALL_CLICK) == LOW) {
       data->state = LV_INDEV_STATE_PRESSED;
@@ -1009,35 +1096,6 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     data->state = LV_INDEV_STATE_RELEASED;
   }
 }
-
-// Fixed touchpad_read_cb (commented out due to ghost touch issues - see plan for details)
-// static int16_t last_touch_x = 0, last_touch_y = 0;
-// static uint8_t release_count = 0;
-// static const uint8_t RELEASE_DEBOUNCE = 2;
-//
-// static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
-//   if (touch.isPressed()) {
-//     data->state = LV_INDEV_STATE_PRESSED;
-//     release_count = 0;
-//
-//     uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
-//     if (touched > 0) {
-//       last_touch_x = x[0];
-//       last_touch_y = y[0];
-//     }
-//     data->point.x = last_touch_x;
-//     data->point.y = last_touch_y;
-//   } else {
-//     release_count++;
-//     if (release_count >= RELEASE_DEBOUNCE) {
-//       data->state = LV_INDEV_STATE_RELEASED;
-//     } else {
-//       data->state = LV_INDEV_STATE_PRESSED;
-//       data->point.x = last_touch_x;
-//       data->point.y = last_touch_y;
-//     }
-//   }
-// }
 
 static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   flush_pending_gridnav();
@@ -2863,6 +2921,69 @@ void setupLuaVGL() {
     return 0;
   });
 
+  lua_register(L, "_kb_is_down", [](lua_State *L) -> int {
+    int key = luaL_checkinteger(L, 1);
+    lua_pushboolean(L, key >= 0 && key < 128 && kb_key_state[key]);
+    return 1;
+  });
+
+  lua_register(L, "_kb_just_pressed", [](lua_State *L) -> int {
+    int key = luaL_checkinteger(L, 1);
+    lua_pushboolean(L, key >= 0 && key < 128 && kb_key_state[key] && !kb_key_prev[key]);
+    return 1;
+  });
+
+  lua_register(L, "_kb_just_released", [](lua_State *L) -> int {
+    int key = luaL_checkinteger(L, 1);
+    lua_pushboolean(L, key >= 0 && key < 128 && !kb_key_state[key] && kb_key_prev[key]);
+    return 1;
+  });
+
+  lua_register(L, "_kb_is_held", [](lua_State *L) -> int {
+    int key = luaL_checkinteger(L, 1);
+    bool held = false;
+    if (key >= 0 && key < 128 && kb_key_state[key] && kb_key_press_time[key] > 0) {
+      held = (millis() - kb_key_press_time[key]) > KEY_HOLD_THRESHOLD_MS;
+    }
+    lua_pushboolean(L, held);
+    return 1;
+  });
+
+  lua_register(L, "_kb_hold_duration", [](lua_State *L) -> int {
+    int key = luaL_checkinteger(L, 1);
+    if (key >= 0 && key < 128 && kb_key_state[key] && kb_key_press_time[key] > 0) {
+      lua_pushinteger(L, millis() - kb_key_press_time[key]);
+    } else {
+      lua_pushinteger(L, 0);
+    }
+    return 1;
+  });
+
+  lua_register(L, "_kb_shift", [](lua_State *L) -> int {
+    lua_pushboolean(L, kb_shift_active);
+    return 1;
+  });
+
+  lua_register(L, "_kb_lshift", [](lua_State *L) -> int {
+    lua_pushboolean(L, kb_lshift_active);
+    return 1;
+  });
+
+  lua_register(L, "_kb_rshift", [](lua_State *L) -> int {
+    lua_pushboolean(L, kb_rshift_active);
+    return 1;
+  });
+
+  lua_register(L, "_kb_sym", [](lua_State *L) -> int {
+    lua_pushboolean(L, kb_sym_active);
+    return 1;
+  });
+
+  lua_register(L, "_kb_alt", [](lua_State *L) -> int {
+    lua_pushboolean(L, kb_alt_active);
+    return 1;
+  });
+
   lua_register(L, "_obj_move_foreground", [](lua_State *L) -> int {
     luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
     if (!lobj || !lobj->obj) return 0;
@@ -3446,6 +3567,12 @@ void setup() {
     // Set initial keyboard brightness
     setKeyboardDefaultBrightness(127);
     setKeyboardBrightness(kbd_brightness);
+
+    // Switch keyboard to raw matrix mode for hold detection
+    Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
+    Wire.write(LILYGO_KB_MODE_RAW_CMD);
+    Wire.endTransmission();
+    Serial.println("Keyboard switched to raw matrix mode");
   } else {
     Serial.println("T-Deck keyboard not found!");
   }

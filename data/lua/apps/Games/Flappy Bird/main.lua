@@ -436,6 +436,10 @@ end
 local function Background(root, bgEventCB)
     local bgLayer = screenCreate(root)
     bgLayer:add_flag(lvgl.FLAG.CLICKABLE)
+    bgLayer:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+    local group = lvgl.group.get_default()
+    group:add_obj(bgLayer)
+    lvgl.group.focus_obj(bgLayer)
 
     local bg = ImageScroll(bgLayer, IMAGE_PATH .. "bg_day.png", MOVE_SPEED * 0.4, 0)
     local pipes = Pipes(bgLayer)
