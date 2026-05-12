@@ -14,6 +14,9 @@ local M = {
     __onDirectMessage = nil,
     __onAnyMessage = nil,  -- fires for both channel and DM
     __onContactUpdate = nil,
+    __onDirectMessageFirst = nil,
+    __onMessageMention = nil,
+    __onMessageMentionFirst = nil,
     __history = {},
     __dm_history = {},
     __dm_threads = {},     -- grouped by contact name: {[name] = {msg, msg, ...}}
@@ -94,6 +97,18 @@ end
 
 function M:onContactUpdate(cb)
     M.__onContactUpdate = cb
+end
+
+function M:onDirectMessageFirst(cb)
+    M.__onDirectMessageFirst = cb
+end
+
+function M:onMessageMention(cb)
+    M.__onMessageMention = cb
+end
+
+function M:onMessageMentionFirst(cb)
+    M.__onMessageMentionFirst = cb
 end
 
 -- Send a public channel message via MeshCore
@@ -264,7 +279,7 @@ end
 -- Signature: __dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_idx)
 -- channel_idx: 0 = Public, 1..N = user-added channel slot, -1 = unknown/no match
 -- C++ has already persisted the message before calling us.
-function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_idx)
+function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_idx, is_mention)
     if channel_idx == nil then channel_idx = -1 end
     local msg = {
         from = from or "unknown",
@@ -292,6 +307,11 @@ function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_id
 
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
+    if is_mention then
+        msg.is_mention = true
+        if M.__onMessageMentionFirst then M.__onMessageMentionFirst(msg) end
+        if M.__onMessageMention then M.__onMessageMention(msg) end
+    end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
 end
 
@@ -319,6 +339,7 @@ function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi)
     end
     table.insert(M.__dm_threads[key], msg)
 
+    if M.__onDirectMessageFirst then M.__onDirectMessageFirst(msg) end
     if M.__onDirectMessage then M.__onDirectMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
 end

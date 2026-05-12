@@ -15,6 +15,7 @@
 #include "tdeck-pins.h"
 #include "meshpunk_sync.h"
 #include "Audio.h"
+#include "sound.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -107,11 +108,8 @@ static String  tz_setting_str = "auto";
 static bool   use_sd_pref = true;
 static String clock_fmt_str = "12";
 
-// ── Audio / Sound ──────────────────────────────────────────────────────────
+// ── Audio ─────────────────────────────────────────────────────────────────
 static Audio*    audio = nullptr;          // ESP32-audioI2S player, created in setup()
-static uint8_t   sound_volume    = 10;    // 0–21 (ESP32-audioI2S native range)
-static bool      sound_muted     = false;
-static bool      active_file_is_sd = false; // true while streaming from SD card
 
 // ── Keyboard Backlight ─────────────────────────────────────────────────────
 static uint8_t kbd_brightness = 200;  // 0–255, persisted
@@ -126,28 +124,9 @@ static uint32_t last_activity_ms     = 0;
 static bool     screen_timed_out     = false;
 static bool     kbd_timed_out        = false;
 
-// Sound object registry (dynamic, no fixed limit)
-struct SoundObject {
-    int       id;
-    enum Type { TONE, AUDIO_FILE } type;
-
-    // TONE fields
-    int16_t*  pcm_buffer;     // stereo interleaved 16-bit PCM in PSRAM
-    uint32_t  sample_count;   // total stereo frames
-    uint32_t  play_pos;       // read cursor
-    bool      tone_playing;
-    bool      tone_paused;
-
-    // FILE fields
-    fs::File* file;
-    bool      file_is_sd;
-    bool      file_paused;
-};
-
-static SoundObject** sound_objects  = nullptr;
-static int           sound_obj_count    = 0;
-static int           sound_obj_capacity = 0;
-static int           next_sound_id  = 1;
+// ── Notification Preferences ─────────────────────────────────────────────
+static bool     notify_kbd_enabled   = true;   // keyboard blink on DM / @mention
+static bool     notify_sound_enabled = true;   // melody on DM / @mention
 
 static int32_t tz_auto_offset_minutes() {
   if (!gps_location_valid_at_fix) return 0;
@@ -175,12 +154,14 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("use_sd=%d\n", use_sd_pref ? 1 : 0);
   f.printf("tz=%s\n", tz_setting_str.c_str());
   f.printf("clock_fmt=%s\n", clock_fmt_str.c_str());
-  f.printf("sound_vol=%d\n",   sound_volume);
-  f.printf("sound_muted=%d\n", sound_muted ? 1 : 0);
+  f.printf("sound_vol=%d\n",   sound_get_volume());
+  f.printf("sound_muted=%d\n", sound_get_muted() ? 1 : 0);
   f.printf("kbd_bright=%d\n", kbd_brightness);
   f.printf("disp_bright=%d\n", display_brightness);
   f.printf("screen_timeout=%d\n", screen_timeout_secs);
   f.printf("kbd_timeout=%d\n", kbd_timeout_secs);
+  f.printf("notify_kbd=%d\n", notify_kbd_enabled ? 1 : 0);
+  f.printf("notify_sound=%d\n", notify_sound_enabled ? 1 : 0);
   f.close();
   Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -233,9 +214,9 @@ static void firmware_prefs_load() {
       clock_fmt_str = (strcmp(val, "12") == 0) ? "12" : "24";
     } else if (strcmp(key, "sound_vol") == 0) {
       int v = atoi(val);
-      if (v >= 0 && v <= 21) sound_volume = (uint8_t)v;
+      if (v >= 0 && v <= 21) sound_set_volume((uint8_t)v);
     } else if (strcmp(key, "sound_muted") == 0) {
-      sound_muted = (atoi(val) == 1);
+      sound_set_muted(atoi(val) == 1);
     } else if (strcmp(key, "kbd_bright") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 255) kbd_brightness = (uint8_t)v;
@@ -248,6 +229,10 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "kbd_timeout") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 65535) kbd_timeout_secs = (uint16_t)v;
+    } else if (strcmp(key, "notify_kbd") == 0) {
+      notify_kbd_enabled = (atoi(val) == 1);
+    } else if (strcmp(key, "notify_sound") == 0) {
+      notify_sound_enabled = (atoi(val) == 1);
     }
   }
   f.close();
@@ -2526,13 +2511,6 @@ static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     return heap_caps_realloc(ptr, nsize, MALLOC_CAP_SPIRAM);
 }
 
-// Forward declarations for sound engine (defined after setupLuaVGL)
-static int  sound_create_tone(uint16_t freq_hz, uint16_t duration_ms);
-static int  sound_load_file(lua_State* L);
-static void sound_play(int id);
-static void sound_stop(int id);
-static void sound_pause(int id);
-static void sound_delete(int id);
 
 // Initialize LuaVGL
 void setupLuaVGL() {
@@ -2711,68 +2689,8 @@ void setupLuaVGL() {
     return 1;
   });
 
-  // ── Volume & mute ──────────────────────────────────────────────────────────
-  lua_register(L, "_sound_set_volume", [](lua_State* L) -> int {
-    int v = luaL_checkinteger(L, 1);
-    if (v < 0) v = 0; if (v > 21) v = 21;
-    sound_volume = (uint8_t)v;
-    if (!sound_muted) audio->setVolume(sound_volume);
-    firmware_prefs_save();
-    lua_pushinteger(L, sound_volume);
-    return 1;
-  });
-  lua_register(L, "_sound_get_volume", [](lua_State* L) -> int {
-    lua_pushinteger(L, sound_volume);
-    return 1;
-  });
-  lua_register(L, "_sound_get_muted", [](lua_State* L) -> int {
-    lua_pushboolean(L, sound_muted ? 1 : 0);
-    return 1;
-  });
-  lua_register(L, "_sound_set_muted", [](lua_State* L) -> int {
-    sound_muted = lua_toboolean(L, 1);
-    audio->setVolume(sound_muted ? 0 : sound_volume);
-    firmware_prefs_save();
-    lua_pushboolean(L, sound_muted ? 1 : 0);
-    return 1;
-  });
-  lua_register(L, "_sound_is_playing", [](lua_State* L) -> int {
-    bool playing = audio->isRunning();
-    if (!playing) {
-      for (int i = 0; i < sound_obj_count; i++)
-        if (sound_objects[i]->type == SoundObject::TONE && sound_objects[i]->tone_playing)
-          { playing = true; break; }
-    }
-    lua_pushboolean(L, playing ? 1 : 0);
-    return 1;
-  });
-
-  // ── Sound objects ───────────────────────────────────────────────────────────
-  lua_register(L, "_sound_generate_tone", [](lua_State* L) -> int {
-    int freq = luaL_checkinteger(L, 1);
-    int dur  = luaL_optinteger(L, 2, 200);
-    if (freq < 20) freq = 20; if (freq > 20000) freq = 20000;
-    if (dur  < 10) dur  = 10; if (dur  > 10000) dur  = 10000;
-    lua_pushinteger(L, sound_create_tone((uint16_t)freq, (uint16_t)dur));
-    return 1;
-  });
-  lua_register(L, "_sound_load_file", sound_load_file);
-  lua_register(L, "_sound_play", [](lua_State* L) -> int {
-    sound_play((int)luaL_checkinteger(L, 1));
-    return 0;
-  });
-  lua_register(L, "_sound_stop", [](lua_State* L) -> int {
-    sound_stop((int)luaL_checkinteger(L, 1));
-    return 0;
-  });
-  lua_register(L, "_sound_pause", [](lua_State* L) -> int {
-    sound_pause((int)luaL_checkinteger(L, 1));
-    return 0;
-  });
-  lua_register(L, "_sound_delete", [](lua_State* L) -> int {
-    sound_delete((int)luaL_checkinteger(L, 1));
-    return 0;
-  });
+  // ── Sound ──────────────────────────────────────────────────────────────────
+  sound_register_lua(L);
 
   // ── Keyboard backlight ────────────────────────────────────────────────────
   lua_register(L, "_kbd_set_brightness", [](lua_State* L) -> int {
@@ -2786,6 +2704,39 @@ void setupLuaVGL() {
   });
   lua_register(L, "_kbd_get_brightness", [](lua_State* L) -> int {
     lua_pushinteger(L, kbd_brightness);
+    return 1;
+  });
+  lua_register(L, "_kbd_set_brightness_temp", [](lua_State* L) -> int {
+    int v = luaL_checkinteger(L, 1);
+    if (v < 0) v = 0; if (v > 255) v = 255;
+    setKeyboardBrightness((uint8_t)v);
+    lua_pushinteger(L, v);
+    return 1;
+  });
+  lua_register(L, "_kbd_is_timed_out", [](lua_State* L) -> int {
+    lua_pushboolean(L, kbd_timed_out);
+    return 1;
+  });
+
+  // ── Notification preferences ────────────────────────────────────────────
+  lua_register(L, "_notify_kbd_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, notify_kbd_enabled);
+    return 1;
+  });
+  lua_register(L, "_notify_kbd_set", [](lua_State* L) -> int {
+    notify_kbd_enabled = lua_toboolean(L, 1);
+    firmware_prefs_save();
+    lua_pushboolean(L, notify_kbd_enabled);
+    return 1;
+  });
+  lua_register(L, "_notify_sound_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, notify_sound_enabled);
+    return 1;
+  });
+  lua_register(L, "_notify_sound_set", [](lua_State* L) -> int {
+    notify_sound_enabled = lua_toboolean(L, 1);
+    firmware_prefs_save();
+    lua_pushboolean(L, notify_sound_enabled);
     return 1;
   });
 
@@ -3238,191 +3189,6 @@ void setupLuaVGL() {
   return;
 }
 
-// ── Sound engine ───────────────────────────────────────────────────────────
-static const uint32_t TONE_SR = 44100;
-
-static void sound_obj_add(SoundObject* obj) {
-  if (sound_obj_count >= sound_obj_capacity) {
-    int new_cap = sound_obj_capacity == 0 ? 8 : sound_obj_capacity * 2;
-    sound_objects = (SoundObject**)realloc(sound_objects, new_cap * sizeof(SoundObject*));
-    sound_obj_capacity = new_cap;
-  }
-  sound_objects[sound_obj_count++] = obj;
-}
-
-static SoundObject* sound_obj_find(int id) {
-  for (int i = 0; i < sound_obj_count; i++)
-    if (sound_objects[i]->id == id) return sound_objects[i];
-  return nullptr;
-}
-
-static void sound_obj_remove(int id) {
-  for (int i = 0; i < sound_obj_count; i++) {
-    if (sound_objects[i]->id != id) continue;
-    SoundObject* obj = sound_objects[i];
-    if (obj->type == SoundObject::TONE && obj->pcm_buffer) {
-      free(obj->pcm_buffer);
-    }
-    if (obj->type == SoundObject::AUDIO_FILE && obj->file) {
-      obj->file->close();
-      delete obj->file;
-    }
-    delete obj;
-    sound_objects[i] = sound_objects[--sound_obj_count];
-    return;
-  }
-}
-
-static int sound_create_tone(uint16_t freq_hz, uint16_t duration_ms) {
-  const uint32_t SR = TONE_SR;
-  uint32_t frames = (SR * duration_ms) / 1000;
-  int16_t* buf = (int16_t*)ps_malloc(frames * 2 * sizeof(int16_t));
-  if (!buf) return -1;
-
-  const float omega = 2.0f * M_PI * freq_hz / SR;
-  const uint32_t fade = SR / 100; // 10ms fade-in/out
-  for (uint32_t i = 0; i < frames; i++) {
-    float env = 1.0f;
-    if (i < fade)           env = (float)i / fade;
-    else if (i >= frames - fade) env = (float)(frames - i) / fade;
-    int16_t s = (int16_t)(env * 16000.0f * sinf(omega * i));
-    buf[i * 2]     = s;
-    buf[i * 2 + 1] = s;
-  }
-
-  SoundObject* obj = new SoundObject{};
-  obj->id           = next_sound_id++;
-  obj->type         = SoundObject::TONE;
-  obj->pcm_buffer   = buf;
-  obj->sample_count = frames * 2;
-  obj->play_pos     = 0;
-  obj->tone_playing = false;
-  obj->tone_paused  = false;
-  sound_obj_add(obj);
-  return obj->id;
-}
-
-static int sound_load_file(lua_State* L) {
-  LuaFileHandle* fh = (LuaFileHandle*)luaL_checkudata(L, 1, "esp32_file");
-  if (!fh || !fh->file) {
-    lua_pushinteger(L, -1);
-    return 1;
-  }
-  SoundObject* obj = new SoundObject{};
-  obj->id          = next_sound_id++;
-  obj->type        = SoundObject::AUDIO_FILE;
-  obj->file        = fh->file;
-  obj->file_is_sd  = fh->is_sd;
-  obj->file_paused = false;
-  fh->file = nullptr;
-  sound_obj_add(obj);
-  lua_pushinteger(L, obj->id);
-  return 1;
-}
-
-static void sound_play(int id) {
-  SoundObject* obj = sound_obj_find(id);
-  if (!obj) return;
-  if (obj->type == SoundObject::TONE) {
-    obj->play_pos     = 0;
-    obj->tone_playing = true;
-    obj->tone_paused  = false;
-  } else {
-    audio->stopSong();
-    active_file_is_sd = false;
-    obj->file->seek(0);
-    obj->file_paused = false;
-    audio->connectToFile(*obj->file);
-    active_file_is_sd = obj->file_is_sd;
-  }
-}
-
-static void sound_stop(int id) {
-  SoundObject* obj = sound_obj_find(id);
-  if (!obj) return;
-  if (obj->type == SoundObject::TONE) {
-    obj->tone_playing = false;
-    obj->play_pos     = 0;
-  } else {
-    audio->stopSong();
-    active_file_is_sd = false;
-    obj->file_paused  = false;
-  }
-}
-
-static void sound_pause(int id) {
-  SoundObject* obj = sound_obj_find(id);
-  if (!obj) return;
-  if (obj->type == SoundObject::TONE) {
-    obj->tone_paused = !obj->tone_paused;
-  } else {
-    audio->pauseResume();
-    obj->file_paused = !obj->file_paused;
-  }
-}
-
-static void sound_delete(int id) {
-  sound_obj_remove(id);
-}
-
-static bool tone_sr_set = false;
-
-static void sound_tone_tick() {
-  if (audio->isRunning()) { tone_sr_set = false; return; }
-
-  bool any_active = false;
-  for (int i = 0; i < sound_obj_count; i++) {
-    SoundObject* o = sound_objects[i];
-    if (o->type == SoundObject::TONE && o->tone_playing && !o->tone_paused)
-      any_active = true;
-  }
-  if (!any_active) { tone_sr_set = false; return; }
-
-  if (!tone_sr_set) {
-    i2s_set_sample_rates(I2S_NUM_0, TONE_SR);
-    tone_sr_set = true;
-  }
-
-  const int CHUNK = 256;
-  int32_t mix[CHUNK * 2] = {};
-
-  for (int i = 0; i < sound_obj_count; i++) {
-    SoundObject* o = sound_objects[i];
-    if (o->type != SoundObject::TONE || !o->tone_playing || o->tone_paused) continue;
-    for (int s = 0; s < CHUNK * 2 && o->play_pos < o->sample_count; s++) {
-      mix[s] += o->pcm_buffer[o->play_pos++];
-    }
-    if (o->play_pos >= o->sample_count) {
-      o->tone_playing = false;
-      o->play_pos     = 0;
-    }
-  }
-
-  float vol_scale = sound_muted ? 0.0f : (float)sound_volume / 21.0f;
-  int16_t out[CHUNK * 2];
-  for (int s = 0; s < CHUNK * 2; s++)
-    out[s] = (int16_t)(constrain(mix[s], -32768, 32767) * vol_scale);
-  size_t written = 0;
-  i2s_write(I2S_NUM_0, out, sizeof(out), &written, pdMS_TO_TICKS(50));
-}
-
-void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
-  for (int i = 0; i < sound_obj_count; i++) {
-    SoundObject* o = sound_objects[i];
-    if (o->type != SoundObject::TONE || !o->tone_playing || o->tone_paused) continue;
-    for (uint16_t s = 0; s < len && o->play_pos < o->sample_count; s++) {
-      int32_t mixed = (int32_t)buff[s] + (int32_t)o->pcm_buffer[o->play_pos++];
-      buff[s] = (int16_t)constrain(mixed, -32768, 32767);
-    }
-    if (o->play_pos >= o->sample_count) {
-      o->tone_playing = false;
-      o->play_pos     = 0;
-    }
-  }
-  *continueI2S = true;
-}
-
-// ── End sound engine ───────────────────────────────────────────────────────
 
 volatile bool lora_packet_ready = false;
 
@@ -3580,8 +3346,9 @@ void setup() {
   // Initialize I2S audio output on T-Deck speaker
   audio = new Audio();
   audio->setPinout(TDECK_I2S_BCK, TDECK_I2S_WS, TDECK_I2S_DOUT);
-  audio->setVolume(sound_muted ? 0 : sound_volume);
-  Serial.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_volume, sound_muted ? 1 : 0);
+  sound_init(audio, firmware_prefs_save);
+  audio->setVolume(sound_get_muted() ? 0 : sound_get_volume());
+  Serial.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
 
   tft.fillScreen(TFT_GREEN);
 
@@ -3720,15 +3487,13 @@ void loop() {
   lv_timer_handler();
 
   // Audio: file streaming (SD needs SPI mutex)
-  if (active_file_is_sd) {
+  if (sound_file_is_sd()) {
     sd_spi_take();
     audio->loop();
     sd_spi_release();
   } else {
     audio->loop();
   }
-
-  sound_tone_tick();
 
   // GPS one-shot time sync runs on Core 1 (gps_task). Nothing to do here.
 

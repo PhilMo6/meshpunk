@@ -7,6 +7,7 @@
 // sd_spi_release() — release spi_bus_mutex after the SD file handle is closed.
 // sd_spi_take() is inline in meshpunk_sync.h (just SPI_LOCK); no extern decl needed.
 extern void sd_spi_release();
+extern PunkMesh the_mesh;
 
 // Storage helpers
 void PunkMesh::setStorage(fs::FS* fs, const char* prefix) {
@@ -59,6 +60,21 @@ static String storagePath(const String& prefix, const char* name) {
 
 // Punk<->Lua bridge
 
+static bool contains_mention(const char* text, const char* name) {
+    if (!text || !name || name[0] == '\0') return false;
+    size_t name_len = strlen(name);
+    const char* p = text;
+    while ((p = strchr(p, '@')) != NULL) {
+        p++;
+        if (*p == '[') {
+            p++;
+            if (strncasecmp(p, name, name_len) == 0 && p[name_len] == ']')
+                return true;
+        }
+    }
+    return false;
+}
+
 // Dispatch a channel (public) message to Lua with parsed sender name.
 // Called from the UI core (drain_rx_events) — the packet object is gone by
 // the time we run, so hops/direct come from the enqueued RxEvent.
@@ -87,8 +103,9 @@ void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_
     lua_pushnumber(L, snr);                     // arg6: snr
     lua_pushnumber(L, rssi);                    // arg7: rssi
     lua_pushinteger(L, channel_idx);            // arg8: channel_idx (-1 if unknown)
+    lua_pushboolean(L, contains_mention(text, the_mesh._prefs.node_name)); // arg9: is_mention
 
-    if (lua_pcall(L, 8, 0, 0) != LUA_OK) {
+    if (lua_pcall(L, 9, 0, 0) != LUA_OK) {
         Serial.printf("__dispatch failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }

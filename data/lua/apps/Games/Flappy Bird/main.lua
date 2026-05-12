@@ -1,4 +1,5 @@
 local lvgl = require("lvgl")
+local sound = require("lib/sound")
 
 -- Receive app directory from launcher (e.g. "L:/lua/apps/flappyBird")
 local app_dir = ...
@@ -65,6 +66,9 @@ function game:shutdown()
         pcall(function() if t.delete then t:delete() end end)
     end
     self.timers = {}
+
+    if self.gameover_snd then pcall(function() self.gameover_snd:delete() end); self.gameover_snd = nil end
+    if self.flap_snd then pcall(function() self.flap_snd:delete() end); self.flap_snd = nil end
 
     if self.scr then
         pcall(function() self.scr:delete() end)
@@ -493,6 +497,29 @@ local function entry()
     local scoreNow = 0
     local debouncing = false
 
+    -- Game over: chromatic descent, plays once
+    game.gameover_snd = sound.generateMelody({
+        {freq=659, ms=250}, {freq=0, ms=30},
+        {freq=622, ms=250}, {freq=0, ms=30},
+        {freq=587, ms=250}, {freq=0, ms=30},
+        {freq=523, ms=400}, {freq=0, ms=50},
+        {freq=494, ms=250}, {freq=0, ms=30},
+        {freq=440, ms=250}, {freq=0, ms=30},
+        {freq=392, ms=400}, {freq=0, ms=50},
+        {freq=330, ms=700},
+    }, { waveform = "square", attack = 10, decay = 80, sustain = 0.4, release = 100 })
+
+    -- Flap sound: 600ms to match 3-frame @ 5fps wing animation cycle
+    game.flap_snd = sound.generateTone(200, 600, {
+        end_freq = 100,
+        waveform = "triangle",
+        attack = 5,
+        decay = 150,
+        sustain = 0.0,
+        release = 50,
+    })
+    if game.flap_snd then game.flap_snd:setLoop(true) end
+
     local scoreLabel
     local function createScoreLabel()
         if not scoreLabel then
@@ -516,6 +543,7 @@ local function entry()
         pipes:start()
         bird:start()
         game.playing = true
+        if game.gameover_snd then game.gameover_snd:stop() end
         scoreNow = 0
         createScoreLabel()
     end
@@ -524,6 +552,8 @@ local function entry()
         if not game.running or not game.playing then return end
         debouncing = true
         game.playing = false
+        if game.flap_snd then game.flap_snd:stop() end
+        if game.gameover_snd then game.gameover_snd:play() end
         pipes:stop()
         bird:gameOver()
         if scoreNow > scoreBest then
@@ -599,7 +629,13 @@ local function entry()
 
     local bgEventCB = function(event)
         if not game.running or not game.playing then return end
-        if event == lvgl.EVENT.PRESSED then bird:pressed() else bird:released() end
+        if event == lvgl.EVENT.PRESSED then
+            bird:pressed()
+            if game.flap_snd then game.flap_snd:play() end
+        else
+            bird:released()
+            if game.flap_snd then game.flap_snd:stop() end
+        end
     end
 
     local birdMovedCB = function(x, y)

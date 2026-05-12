@@ -1,6 +1,7 @@
 local lvgl = require("lvgl")
 local clock_fmt = require("lib/clock_fmt")
 local messages = require("lib/mesh/messages")
+local sound = require("lib/sound")
 
 local M = {}
 
@@ -72,6 +73,35 @@ local sat_tick_max = 300
 local sat_tick = sat_tick_max - 15 --we want gps to update the first time after the gps has a fix
 local unread = 0
 local unread_label
+local blink_timer = nil
+local notify_melody = nil
+
+local function kbd_blink_notify()
+    if not _notify_kbd_get() then return end
+    if blink_timer then return end
+    local timed_out = _kbd_is_timed_out and _kbd_is_timed_out()
+    local saved = timed_out and 0 or _kbd_get_brightness()
+    local step = 0
+    blink_timer = lvgl.Timer{
+        period = 150,
+        cb = function(t)
+            step = step + 1
+            if step > 6 then
+                pcall(_kbd_set_brightness_temp, saved)
+                t:delete()
+                blink_timer = nil
+                return
+            end
+            local val = (step % 2 == 1) and 255 or 0
+            pcall(_kbd_set_brightness_temp, val)
+        end,
+    }
+end
+
+local function sound_notify()
+    if not _notify_sound_get() then return end
+    notify_melody:play()
+end
 
 function M.updateUnread()
     unread = messages:countUnread()
@@ -80,6 +110,13 @@ end
 
 function M.create()
     messages:loadPersisted()
+
+    notify_melody = sound.generateMelody({
+        {freq=523, ms=150}, {freq=0, ms=30},
+        {freq=659, ms=150}, {freq=0, ms=30},
+        {freq=784, ms=150}, {freq=0, ms=30},
+        {freq=1047, ms=300},
+    }, { attack = 5, decay = 30, sustain = 0.6, release = 30 })
 
     bar = lvgl.Object({
         flex = { flex_direction = "row", flex_wrap = "nowrap", justify_content = "space-between" },
@@ -96,6 +133,16 @@ function M.create()
     messages:onMessageFirst(function(msg)
         unread = unread + 1
         if not paused then unread_label:set{ text = unread .. M.mail_suffix } end
+    end)
+
+    messages:onDirectMessageFirst(function(msg)
+        kbd_blink_notify()
+        sound_notify()
+    end)
+
+    messages:onMessageMentionFirst(function(msg)
+        kbd_blink_notify()
+        sound_notify()
     end)
 
     updateTimer = lvgl.Timer{

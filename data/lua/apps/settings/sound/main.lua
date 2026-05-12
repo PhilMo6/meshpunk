@@ -163,11 +163,151 @@ btn_file:onClicked(function()
     end
 end)
 
+-- ── Waveforms ─────────────────────────────────────────────────────────────────
+content:Label { text = "-- Waveforms --", w = lvgl.PCT(100), h = 16 }
+
+local wave_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
+    w = lvgl.PCT(100),
+    h = lvgl.SIZE_CONTENT,
+    border_width = 0,
+    pad_all = 0,
+}
+wave_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local demo_tones = {}
+
+local wave_types = { "sine", "square", "saw", "triangle", "noise" }
+local wave_labels = { "Sine", "Square", "Saw", "Tri", "Noise" }
+for i, wf in ipairs(wave_types) do
+    local btn = wave_row:Button { w = lvgl.PCT(30), h = 30 }
+    btn:Label { text = wave_labels[i], align = lvgl.ALIGN.CENTER }
+    btn:onClicked(function()
+        local opts = nil
+        if wf ~= "sine" then opts = { waveform = wf } end
+        local t = sound.generateTone(440, 300, opts)
+        if t then
+            t:play()
+            demo_tones[#demo_tones + 1] = t
+            status.text = wave_labels[i] .. " wave"
+        end
+    end)
+end
+
+-- ── Effects ───────────────────────────────────────────────────────────────────
+content:Label { text = "-- Effects --", w = lvgl.PCT(100), h = 16 }
+
+local fx_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
+    w = lvgl.PCT(100),
+    h = lvgl.SIZE_CONTENT,
+    border_width = 0,
+    pad_all = 0,
+}
+fx_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local btn_adsr = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+btn_adsr:Label { text = "ADSR", align = lvgl.ALIGN.CENTER }
+btn_adsr:onClicked(function()
+    local t = sound.generateTone(440, 800, {
+        attack = 100, decay = 100, sustain = 0.5, release = 200
+    })
+    if t then
+        t:play()
+        demo_tones[#demo_tones + 1] = t
+        status.text = "ADSR envelope"
+    end
+end)
+
+local btn_sweep = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+btn_sweep:Label { text = "Sweep", align = lvgl.ALIGN.CENTER }
+btn_sweep:onClicked(function()
+    local t = sound.generateTone(200, 500, {
+        end_freq = 2000, sweep = "exp"
+    })
+    if t then
+        t:play()
+        demo_tones[#demo_tones + 1] = t
+        status.text = "Exp sweep"
+    end
+end)
+
+local btn_bell = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+btn_bell:Label { text = "Bell", align = lvgl.ALIGN.CENTER }
+btn_bell:onClicked(function()
+    local t = sound.generateTone(440, 1000, {
+        fm_ratio = 1.4, fm_index = 5,
+        attack = 5, decay = 200, sustain = 0.2, release = 300
+    })
+    if t then
+        t:play()
+        demo_tones[#demo_tones + 1] = t
+        status.text = "FM bell"
+    end
+end)
+
+local btn_epiano = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+btn_epiano:Label { text = "EPiano", align = lvgl.ALIGN.CENTER }
+btn_epiano:onClicked(function()
+    local t = sound.generateTone(440, 800, {
+        fm_ratio = 1.0, fm_index = 1.5,
+        attack = 10, decay = 150, sustain = 0.4, release = 200
+    })
+    if t then
+        t:play()
+        demo_tones[#demo_tones + 1] = t
+        status.text = "FM e-piano"
+    end
+end)
+
+-- ── Chord / Melody ────────────────────────────────────────────────────────────
+content:Label { text = "-- Chord / Melody --", w = lvgl.PCT(100), h = 16 }
+
+local cm_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
+    w = lvgl.PCT(100),
+    h = lvgl.SIZE_CONTENT,
+    border_width = 0,
+    pad_all = 0,
+}
+cm_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local btn_chord = cm_row:Button { w = lvgl.PCT(45), h = 30 }
+btn_chord:Label { text = "Chord", align = lvgl.ALIGN.CENTER }
+btn_chord:onClicked(function()
+    local t = sound.generateChord({262, 330, 392}, 600, {
+        attack = 20, decay = 100, sustain = 0.5, release = 150
+    })
+    if t then
+        t:play()
+        demo_tones[#demo_tones + 1] = t
+        status.text = "C major chord"
+    end
+end)
+
+local btn_melody = cm_row:Button { w = lvgl.PCT(45), h = 30 }
+btn_melody:Label { text = "Melody", align = lvgl.ALIGN.CENTER }
+btn_melody:onClicked(function()
+    local t = sound.generateMelody({
+        {freq=523, ms=150}, {freq=0, ms=30},
+        {freq=659, ms=150}, {freq=0, ms=30},
+        {freq=784, ms=150}, {freq=0, ms=30},
+        {freq=1047, ms=300},
+    }, { attack = 5, decay = 30, sustain = 0.6, release = 30 })
+    if t then
+        t:play()
+        demo_tones[#demo_tones + 1] = t
+        status.text = "C-E-G-C melody"
+    end
+end)
+
 -- Cleanup on back
 back_btn:onClicked(function()
     utils.loadingPopUpAdd(nil, "Home", function()
         if test_tone then test_tone:delete(); test_tone = nil end
         if test_file then test_file:delete(); test_file = nil end
+        for _, t in ipairs(demo_tones) do t:delete() end
+        demo_tones = {}
         root:delete()
         local launcher = require("launcher")
         launcher.create()
