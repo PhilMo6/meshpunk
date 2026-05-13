@@ -76,8 +76,7 @@ end
 local bar
 local paused = false
 local updateTimer
-local sat_tick = 0
-local sat_tick_max = 300
+local sat_tick_max = 150
 local sat_tick = sat_tick_max - 15 --we want gps to update the first time after the gps has a fix
 local unread = 0
 local unread_label
@@ -157,6 +156,7 @@ function M.create()
         sound_notify()
     end)
 
+    
     updateTimer = lvgl.Timer{
         period = 1000,
         cb = function(t)
@@ -167,6 +167,7 @@ function M.create()
                 if sat_tick >= sat_tick_max then
                     sat_tick = 0
                     sat_label:set{ text = render_sat_indicator() }
+                    battery_label:set{ text = render_battery_pct() }
                 end
             end)
             if not ok then t:delete() end
