@@ -405,15 +405,6 @@ show_chat = function(target)
         end
     end)
 
-    --[[
-    msg_list:onevent(lvgl.EVENT.SCROLL, function()
-        if in_msg_select and not _nav_is_active() then
-            in_msg_select = false
-            _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
-        end
-    end)
-]]
-
     local function render_msg(msg)
         msg.seen = true
         local prefix = msg.from or "?"
@@ -716,6 +707,7 @@ show_channels = function()
         text = "#",
         w = lvgl.PCT(50), h = 28,
     }
+    ch_input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
     local add_btn = body:Button { w = 50, h = 28 }
     add_btn:Label { text = "Add", align = lvgl.ALIGN.CENTER }

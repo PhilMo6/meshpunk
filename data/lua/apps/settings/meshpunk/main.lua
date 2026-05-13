@@ -181,6 +181,7 @@ local tz_input = tz_row:Textarea {
     end)(),
     w = lvgl.PCT(65), h = 30,
 }
+tz_input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
 local tz_save_btn = tz_row:Button { w = lvgl.PCT(30), h = 30 }
 tz_save_btn:Label { text = "Save", align = lvgl.ALIGN.CENTER }
