@@ -2569,6 +2569,11 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
   lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
 
+  lua_register(L, "_get_battery_mv", [](lua_State *L) -> int {
+    lua_pushinteger(L, board.getBattMilliVolts());
+    return 1;
+  });
+
   // Register Storage bridge functions
   lua_register(L, "_storage_get_info", lua_storage_get_info);
   lua_register(L, "_storage_set_use_sd", lua_storage_set_use_sd);
@@ -3274,6 +3279,18 @@ void setup() {
       if (!SD.exists(dir)) {
         SD.mkdir(dir);
         Serial.printf("[SD] Created %s\n", dir);
+      }
+    }
+
+    if (!LittleFS.exists("/firmware_prefs") && SD.exists("/meshpunk/firmware_prefs")) {
+      sd_spi_take();
+      bool ok = copyFile(SD, "/meshpunk/firmware_prefs", LittleFS, "/firmware_prefs");
+      sd_spi_release();
+      if (ok) {
+        Serial.println("[FW_PREFS] Imported from SD after reflash");
+        firmware_prefs_load();
+      } else {
+        Serial.println("[FW_PREFS] SD import failed, using defaults");
       }
     }
   } else {

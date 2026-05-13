@@ -6,7 +6,7 @@ local sound = require("lib/sound")
 local M = {}
 
 local function format_epoch(ts, fmt)
-    if not ts or ts < 1 then return "----/--/-- --:--:--" end
+    if not ts or ts < 1 then return "--:--:--" end
     local SECS_PER_DAY = 86400
     local days = math.floor(ts / SECS_PER_DAY)
     local rem = ts - days * SECS_PER_DAY
@@ -29,9 +29,9 @@ local function format_epoch(ts, fmt)
         local ampm = (hour < 12) and "AM" or "PM"
         local h12 = hour % 12
         if h12 == 0 then h12 = 12 end
-        return string.format("%02d/%02d/%02d %02d:%02d:%02d %s", m, d, y % 100, h12, min, sec, ampm)
+        return string.format("%02d:%02d:%02d %s", h12, min, sec, ampm)
     else
-        return string.format("%02d/%02d/%02d %02d:%02d:%02d", m, d, y % 100, hour, min, sec)
+        return string.format("%02d:%02d:%02d", hour, min, sec)
     end
 end
 
@@ -55,6 +55,14 @@ local function render_sat_indicator()
     else
         return sat_prefix .. " X"
     end
+end
+
+local function render_battery_pct()
+    local ok, mv = pcall(_get_battery_mv)
+    if not ok or not mv or mv <= 0 then return "?%" end
+    local pct = math.floor((mv - 3000) / 1200 * 100 + 0.5)
+    if pct < 0 then pct = 0 elseif pct > 100 then pct = 100 end
+    return pct .. "%"
 end
 
 local function render_time()
@@ -128,8 +136,12 @@ function M.create()
     unread_label = bar:Label{ text = "", h = 20 }
     M.updateUnread()
     local sat_label = bar:Label{ text = render_sat_indicator(), h = 20 }
-    local time_label = bar:Label{ text = render_time(), h = 20 }
+    
+    --the time label changes legnth by a couple pixels as time changes so give it a width so it does not move the flex grid
+    local time_label = bar:Label{ text = render_time(), h = 20 , w = 100 } 
 
+    local battery_label =  bar:Label{ text = render_battery_pct(), h = 20 }
+    
     messages:onMessageFirst(function(msg)
         unread = unread + 1
         if not paused then unread_label:set{ text = unread .. M.mail_suffix } end
