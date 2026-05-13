@@ -502,6 +502,7 @@ show_chat = function(target)
     -- Input row (textarea + send as direct children, wrap in bottom row)
     textArea = body:Textarea {
         password_mode = false, one_line = true,
+        max_length = 160,
         w = lvgl.PCT(75), h = 34,
     }
 
