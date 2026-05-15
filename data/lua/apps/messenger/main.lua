@@ -97,14 +97,13 @@ local function show_msg_info(msg, on_reply, on_dismiss)
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
 
     local box = overlay:Object {
-        w = W - 20, h = lvgl.SIZE_CONTENT,
+        w = W - 20, h = H - 20,
         align = lvgl.ALIGN.CENTER,
         bg_color = "#333333", radius = 6,
         border_width = 1, border_color = "#555555",
         pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    box:clear_flag(lvgl.FLAG.SCROLLABLE)
     _nav_setup(box, GRIDNAV_ROLLOVER)
 
     local function info_label(text)
@@ -113,11 +112,98 @@ local function show_msg_info(msg, on_reply, on_dismiss)
 
     info_label("-- Message Info --")
     info_label("From: " .. (msg.from or "?"))
+    local ci_btn = box:Button { w = 90, h = 22 }
+    ci_btn:Label { text = "Contact Info", align = lvgl.ALIGN.CENTER }
+    ci_btn:onevent(lvgl.EVENT.RELEASED, function()
+        overlay:delete()
+        if on_dismiss then on_dismiss() end
+        show_contact_detail(msg.from)
+    end)
     info_label("Time: " .. (msg.timestamp and utils.formatTime(msg.timestamp) or "?"))
     info_label("Hops: " .. (msg.hops or "?"))
     info_label("SNR: " .. (msg.snr and string.format("%.1f dB", msg.snr) or "N/A"))
     info_label("RSSI: " .. (msg.rssi and string.format("%.0f dBm", msg.rssi) or "N/A"))
     info_label("Route: " .. (msg.direct and "Direct" or "Flood"))
+
+    -- Message path button for all known routes
+    local paths_btn = box:Button { w = lvgl.PCT(38), h = 22 }
+    paths_btn:Label { text = "Paths", align = lvgl.ALIGN.CENTER }
+    paths_btn:onevent(lvgl.EVENT.RELEASED, function()
+        local overlay2 = root:Object {
+            w = W, h = H, x = 0, y = 0,
+            bg_color = "#000000", bg_opa = 128,
+            border_width = 0, pad_all = 0,
+        }
+        overlay2:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        local box2 = overlay2:Object {
+            w = W - 10, h = H - 20,
+            align = lvgl.ALIGN.CENTER,
+            bg_color = "#333333", radius = 6,
+            border_width = 1, border_color = "#555555",
+            pad_all = 6,
+            flex = { flex_direction = "column", flex_wrap = "nowrap" },
+        }
+        _nav_setup(box2, GRIDNAV_ROLLOVER)
+
+        box2:Label { text = "-- Message Paths --", w = lvgl.PCT(100) }
+
+        -- Single C++ call handles RAM buffer → persisted file fallback
+        local paths = nil
+        if msg.hash then
+            local peer = msg.peer or msg.to or msg.from
+            local ch = msg.is_dm and -1 or (msg.channel_idx or 0)
+            local ok2, result = pcall(_mesh_get_message_paths, msg.hash, ch, peer)
+            if ok2 and result and #result > 0 then
+                paths = result
+            end
+        end
+
+        if not paths or #paths == 0 then
+            if msg.path and #msg.path > 0 then
+                box2:Label { text = "1 path (first arrival only)", w = lvgl.PCT(100) }
+                local rc = msg.direct and "Direct" or table.concat(msg.path, " > ")
+                box2:Label {
+                    text = string.format("#1 h:%d snr:%.0f rssi:%.0f %s",
+                        msg.hops or 0, msg.snr or 0, msg.rssi or 0,
+                        msg.direct and "DIRECT" or "FLOOD"),
+                    w = lvgl.PCT(100),
+                }
+                box2:Label { text = "  " .. rc, w = lvgl.PCT(100) }
+            else
+                box2:Label { text = "No paths observed", w = lvgl.PCT(100) }
+            end
+        else
+            box2:Label { text = #paths .. " path(s) seen", w = lvgl.PCT(100) }
+
+            for i, rec in ipairs(paths) do
+                local rc = "Direct"
+                if not rec.direct and rec.path and #rec.path > 0 then
+                    rc = table.concat(rec.path, " > ")
+                elseif not rec.direct then
+                    rc = "Flood (no path)"
+                end
+
+                box2:Label {
+                    text = string.format("#%d h:%d snr:%.0f rssi:%.0f %s",
+                        i, rec.hops or 0, rec.snr or 0, rec.rssi or 0,
+                        rec.direct and "DIRECT" or "FLOOD"),
+                    w = lvgl.PCT(100),
+                }
+                box2:Label {
+                    text = "  " .. rc,
+                    w = lvgl.PCT(100),
+                }
+            end
+        end
+
+        local close_btn2 = box2:Button { w = lvgl.PCT(100), h = 26 }
+        close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+        close_btn2:onevent(lvgl.EVENT.RELEASED, function()
+            overlay2:delete()
+            _nav_setup(box, GRIDNAV_ROLLOVER)
+        end)
+    end)
 
     local btn_row = box:Object {
         flex = { flex_direction = "row", flex_wrap = "nowrap" },
@@ -770,25 +856,40 @@ show_channels = function()
     end
 end
 
--- ── CONTACT DETAIL VIEW ─────────────────────────────────────────
+-- ── CONTACT DETAIL POPUP ────────────────────────────────────────
 show_contact_detail = function(contact_name)
-    clear_view()
-    current_mode = "contact_detail"
-    set_header(contact_name, "")
+    -- Disable the view behind the popup so it can't receive events
+    local saved_view = current_view
+    if saved_view then saved_view:clear_flag(lvgl.FLAG.CLICKABLE) end
 
-    local body = gridnav_body(root, HEADER_H, H - HEADER_H)
-    current_view = body
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128,
+        border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-    -- Back button
-    local back_btn = body:Button { w = 45, h = 22 }
-    back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
-    back_btn:onevent(lvgl.EVENT.RELEASED,function()
-        if chat_target and chat_target.type == "dm" and chat_target.name == contact_name then
-            show_chat(chat_target)
-        else
-            show_contacts()
+    local function close_popup()
+        overlay:delete()
+        if saved_view then
+            saved_view:add_flag(lvgl.FLAG.CLICKABLE)
+            _nav_setup(saved_view, GRIDNAV_ROLLOVER)
         end
-    end)
+    end
+
+    local box = overlay:Object {
+        w = W - 20, h = H - 20,
+        align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555",
+        pad_all = 8,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    _nav_setup(box, GRIDNAV_ROLLOVER)
+
+    local function info_label(text)
+        box:Label { text = text, w = lvgl.PCT(100) }
+    end
 
     -- Find the contact
     local ok, contacts = pcall(_mesh_get_contacts)
@@ -800,15 +901,89 @@ show_contact_detail = function(contact_name)
     end
 
     if not contact then
-        body:Label { text = "Contact not found", w = lvgl.PCT(100), h = 20 }
+        info_label("-- Contact Info --")
+        info_label("Contact not found")
+        local close_btn = box:Button { w = lvgl.PCT(100), h = 26 }
+        close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+        close_btn:onevent(lvgl.EVENT.RELEASED, function() close_popup() end)
         return
     end
 
-    -- Info labels (not clickable, gridnav skips them)
-    body:Label { text = "Name: " .. contact.name, w = lvgl.PCT(100), h = 16 }
-    body:Label { text = "Type: " .. (contact.type_name or "?"), w = lvgl.PCT(100), h = 16 }
-    body:Label { text = "Path: " .. (contact.path_len >= 0 and (contact.path_len .. " hops") or "flood"), w = lvgl.PCT(100), h = 16 }
-    body:Label { text = "Key: " .. string.sub(contact.pubkey or "", 1, 16) .. "..", w = lvgl.PCT(100), h = 16 }
+    info_label("-- Contact Info --")
+    info_label("Name: " .. contact.name)
+    info_label("Type: " .. (contact.type_name or "?"))
+    info_label("Key: " .. string.sub(contact.pubkey or "", 1, 16) .. "..")
+
+    local path_row = box:Object {
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        w = lvgl.PCT(100), h = 26, border_width = 0, pad_all = 0,
+    }
+    path_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    path_row:Label {
+        text = "Path: " .. (contact.path_len >= 0 and (contact.path_len .. " hops") or "flood"),
+        w = lvgl.PCT(60),
+    }
+    local paths_btn = path_row:Button { w = lvgl.PCT(38), h = 22 }
+    paths_btn:Label { text = "Paths", align = lvgl.ALIGN.CENTER }
+    paths_btn:onevent(lvgl.EVENT.RELEASED, function()
+        local ok2, paths = pcall(_mesh_get_contact_paths, contact.pubkey)
+
+        local overlay2 = root:Object {
+            w = W, h = H, x = 0, y = 0,
+            bg_color = "#000000", bg_opa = 128,
+            border_width = 0, pad_all = 0,
+        }
+        overlay2:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        local box2 = overlay2:Object {
+            w = W - 10, h = H - 20,
+            align = lvgl.ALIGN.CENTER,
+            bg_color = "#333333", radius = 6,
+            border_width = 1, border_color = "#555555",
+            pad_all = 6,
+            flex = { flex_direction = "column", flex_wrap = "nowrap" },
+        }
+        _nav_setup(box2, GRIDNAV_ROLLOVER)
+
+        box2:Label { text = "-- Paths: " .. contact.name .. " --", w = lvgl.PCT(100) }
+
+        if not ok2 or not paths or #paths == 0 then
+            box2:Label { text = "No path data", w = lvgl.PCT(100) }
+        else
+            for i, rec in ipairs(paths) do
+                local chain = "Direct"
+                if not rec.direct and rec.path and #rec.path > 0 then
+                    chain = table.concat(rec.path, ">")
+                elseif not rec.direct then
+                    chain = "Flood"
+                end
+
+                box2:Label {
+                    text = string.format("#%d %s h:%d snr:%.0f rssi:%.0f",
+                        i, rec.source or "?", rec.hops or 0,
+                        rec.snr or 0, rec.rssi or 0),
+                    w = lvgl.PCT(100),
+                }
+                box2:Label {
+                    text = "  " .. chain,
+                    w = lvgl.PCT(100),
+                }
+                box2:Label {
+                    text = string.format("  ok:%d fail:%d %dms",
+                        rec.success or 0, rec.failure or 0,
+                        rec.trip_time_ms or 0),
+                    w = lvgl.PCT(100),
+                }
+            end
+        end
+
+        local close_btn2 = box2:Button { w = lvgl.PCT(100), h = 26 }
+        close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+        close_btn2:onevent(lvgl.EVENT.RELEASED, function()
+            overlay2:delete()
+            _nav_setup(box, GRIDNAV_ROLLOVER)
+        end)
+    end)
 
     -- Favourite toggle
     local is_fav = contact.favorite or false
@@ -821,52 +996,76 @@ show_contact_detail = function(contact_name)
         end
         return is_fav and "[x] Favorite" or "[ ] Favorite"
     end
-    local fav_btn = body:Button { w = 80, h = 26 }
+    local fav_btn = box:Button { w = 80, h = 26 }
     local fav_label = fav_btn:Label { text = get_fav_text(), align = lvgl.ALIGN.CENTER }
-    fav_btn:onevent(lvgl.EVENT.RELEASED,function()
+    fav_btn:onevent(lvgl.EVENT.RELEASED, function()
         is_fav = not is_fav
         fav_label.text = get_fav_text()
         pcall(_mesh_set_contact_favorite, contact_name, is_fav)
     end)
 
-    -- Action buttons (narrow, wrap in rows)
+    -- Action buttons in rows
+    local act_row1 = box:Object {
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
+    }
+    act_row1:clear_flag(lvgl.FLAG.SCROLLABLE)
+
     if contact.type == 1 then
-        local dm_btn = body:Button { w = 55, h = 26 }
+        local dm_btn = act_row1:Button { w = lvgl.PCT(48), h = 26 }
         dm_btn:Label { text = "DM", align = lvgl.ALIGN.CENTER }
-        dm_btn:onevent(lvgl.EVENT.RELEASED,function() show_chat({ type = "dm", name = contact_name }) end)
+        dm_btn:onevent(lvgl.EVENT.RELEASED, function()
+            close_popup()
+            show_chat({ type = "dm", name = contact_name })
+        end)
     end
 
-    local share_btn = body:Button { w = 55, h = 26 }
+    local share_btn = act_row1:Button { w = lvgl.PCT(48), h = 26 }
     share_btn:Label { text = "Share", align = lvgl.ALIGN.CENTER }
-    share_btn:onevent(lvgl.EVENT.RELEASED,function()
-        local ok2 = pcall(_mesh_share_contact, contact_name)
-        set_header(contact_name, ok2 and "Shared!" or "Failed")
+    share_btn:onevent(lvgl.EVENT.RELEASED, function()
+        pcall(_mesh_share_contact, contact_name)
+        set_header(contact_name, "Shared!")
     end)
 
-    local rp_btn = body:Button { w = 60, h = 26 }
+    local act_row2 = box:Object {
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
+    }
+    act_row2:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local rp_btn = act_row2:Button { w = lvgl.PCT(48), h = 26 }
     rp_btn:Label { text = "RstPath", align = lvgl.ALIGN.CENTER }
-    rp_btn:onevent(lvgl.EVENT.RELEASED,function()
+    rp_btn:onevent(lvgl.EVENT.RELEASED, function()
         pcall(_mesh_reset_path, contact_name)
         set_header(contact_name, "Path reset")
     end)
 
-    local exp_btn = body:Button { w = 55, h = 26 }
+    local exp_btn = act_row2:Button { w = lvgl.PCT(48), h = 26 }
     exp_btn:Label { text = "Export", align = lvgl.ALIGN.CENTER }
-    exp_btn:onevent(lvgl.EVENT.RELEASED,function()
+    exp_btn:onevent(lvgl.EVENT.RELEASED, function()
         local card = _mesh_export_contact(contact_name)
-        if card then
-            print("BIZ CARD: " .. card)
-            set_header(contact_name, "See serial")
-        else
-            set_header(contact_name, "No card data")
-        end
+        set_header(contact_name, card and "See serial" or "No card data")
+        if card then print("BIZ CARD: " .. card) end
     end)
 
-    local rm_btn = body:Button { w = 60, h = 26 }
+    local act_row3 = box:Object {
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
+    }
+    act_row3:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local rm_btn = act_row3:Button { w = lvgl.PCT(48), h = 26 }
     rm_btn:Label { text = "Remove", align = lvgl.ALIGN.CENTER }
-    rm_btn:onevent(lvgl.EVENT.RELEASED,function()
+    rm_btn:onevent(lvgl.EVENT.RELEASED, function()
+        close_popup()
         pcall(_mesh_remove_contact, contact_name)
-        show_contacts()
+        if current_mode == "contacts" then show_contacts() end
+    end)
+
+    local close_btn = act_row3:Button { w = lvgl.PCT(48), h = 26 }
+    close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+    close_btn:onevent(lvgl.EVENT.RELEASED, function()
+        close_popup()
     end)
 end
 

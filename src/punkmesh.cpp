@@ -75,10 +75,12 @@ static bool contains_mention(const char* text, const char* name) {
     return false;
 }
 
+static void push_path_table(lua_State* L, uint16_t path_len, const uint8_t* path);
+
 // Dispatch a channel (public) message to Lua with parsed sender name.
 // Called from the UI core (drain_rx_events) — the packet object is gone by
 // the time we run, so hops/direct come from the enqueued RxEvent.
-void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, int channel_idx) {
+void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, int channel_idx, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash) {
     lua_getglobal(L, "require");
     lua_pushstring(L, "lib/mesh/messages");
 
@@ -96,7 +98,7 @@ void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_
     }
 
     lua_pushstring(L, sender_name);             // arg1: from
-    lua_pushstring(L, text);                    // arg2: text (lua_pushstring copies internally)
+    lua_pushstring(L, text);                    // arg2: text
     lua_pushinteger(L, timestamp);              // arg3: timestamp
     lua_pushboolean(L, direct);                 // arg4: direct
     lua_pushinteger(L, hops);                   // arg5: hops
@@ -104,17 +106,25 @@ void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_
     lua_pushnumber(L, rssi);                    // arg7: rssi
     lua_pushinteger(L, channel_idx);            // arg8: channel_idx (-1 if unknown)
     lua_pushboolean(L, contains_mention(text, the_mesh._prefs.node_name)); // arg9: is_mention
+    push_path_table(L, path_len, path);         // arg10: path
+    if (pkt_hash) {                              // arg11: hash (hex string)
+        char hex[MAX_HASH_SIZE * 2 + 1];
+        mesh::Utils::toHex(hex, pkt_hash, MAX_HASH_SIZE);
+        lua_pushstring(L, hex);
+    } else {
+        lua_pushnil(L);
+    }
 
-    if (lua_pcall(L, 9, 0, 0) != LUA_OK) {
+    if (lua_pcall(L, 11, 0, 0) != LUA_OK) {
         Serial.printf("__dispatch failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }
 
-    lua_pop(L, 1); // pop module
+    lua_pop(L, 1);
 }
 
 // Dispatch a direct message to Lua. See channel variant above.
-void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi) {
+void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash) {
     lua_getglobal(L, "require");
     lua_pushstring(L, "lib/mesh/messages");
 
@@ -126,7 +136,6 @@ void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t
 
     lua_getfield(L, -1, "__dispatch_dm");
     if (!lua_isfunction(L, -1)) {
-        // __dispatch_dm not defined yet, fall back silently
         lua_pop(L, 2);
         return;
     }
@@ -138,13 +147,21 @@ void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t
     lua_pushinteger(L, hops);                   // arg5: hops
     lua_pushnumber(L, snr);                     // arg6: snr
     lua_pushnumber(L, rssi);                    // arg7: rssi
+    push_path_table(L, path_len, path);         // arg8: path
+    if (pkt_hash) {                              // arg9: hash (hex string)
+        char hex[MAX_HASH_SIZE * 2 + 1];
+        mesh::Utils::toHex(hex, pkt_hash, MAX_HASH_SIZE);
+        lua_pushstring(L, hex);
+    } else {
+        lua_pushnil(L);
+    }
 
-    if (lua_pcall(L, 7, 0, 0) != LUA_OK) {
+    if (lua_pcall(L, 9, 0, 0) != LUA_OK) {
         Serial.printf("__dispatch_dm failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }
 
-    lua_pop(L, 1); // pop module
+    lua_pop(L, 1);
 }
 
 void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contact_type) {
@@ -449,8 +466,18 @@ static String messages_dir(const String& prefix) {
     return prefix + "/messages";
 }
 
-static String channel_msg_path(const String& prefix, int ch_idx) {
-    return messages_dir(prefix) + "/ch_" + String(ch_idx) + ".log";
+static String channel_msg_path(const String& prefix, const char* ch_name) {
+    char safe[33];
+    sanitize_peer_name(ch_name, safe, sizeof(safe));
+    return messages_dir(prefix) + "/ch_" + String(safe) + ".log";
+}
+
+// Resolve channel name for a given index. Falls back to "ch<idx>" if unnamed.
+static String channel_name_for_idx(PunkMesh& mesh, int ch_idx) {
+    ChannelDetails cd;
+    if (mesh.getChannel(ch_idx, cd) && cd.name[0] != '\0')
+        return String(cd.name);
+    return String("ch") + String(ch_idx);
 }
 
 static String dm_msg_path(const String& prefix, const char* peer) {
@@ -467,11 +494,12 @@ static void ensure_messages_dir(fs::FS* fs, const String& prefix) {
     }
 }
 
-// Fill a StoredMsg from the common fields. Truncates long strings silently.
 static void fill_stored_msg(StoredMsg& m, int channel_idx, const char* from,
                             const char* peer, const char* text,
                             uint32_t timestamp, float snr, float rssi,
-                            uint8_t hops, bool direct, bool is_dm) {
+                            uint8_t hops, bool direct, bool is_dm,
+                            uint16_t path_len = 0, const uint8_t* path_data = nullptr,
+                            const uint8_t* pkt_hash = nullptr) {
     memset(&m, 0, sizeof(m));
     m.timestamp   = timestamp;
     m.snr         = snr;
@@ -482,25 +510,115 @@ static void fill_stored_msg(StoredMsg& m, int channel_idx, const char* from,
     if (from) strncpy(m.from, from, sizeof(m.from) - 1);
     if (peer) strncpy(m.peer, peer, sizeof(m.peer) - 1);
     if (text) strncpy(m.text, text, sizeof(m.text) - 1);
+    m.path_len = path_len;
+    if (path_data && path_len) {
+        uint8_t byte_len = ((path_len & 63) * ((path_len >> 6) + 1));
+        if (byte_len > MAX_PATH_SIZE) byte_len = MAX_PATH_SIZE;
+        memcpy(m.path, path_data, byte_len);
+    }
+    if (pkt_hash) {
+        memcpy(m.pkt_hash, pkt_hash, MAX_HASH_SIZE);
+        m.has_hash = true;
+    }
 }
 
-// Trim a message log file down to the last _max_messages records if it
-// has grown past ~2x the cap. Cheap no-op when under threshold.
-static void trim_msg_file(fs::FS* storage, const String& path, int cap) {
+// Push path hashes as a Lua table of hex strings.
+static void push_path_table(lua_State* L, uint16_t path_len, const uint8_t* path) {
+    lua_newtable(L);
+    uint8_t hash_size = (path_len >> 6) + 1;
+    uint8_t hash_count = path_len & 63;
+    char hex[7];
+    for (int j = 0; j < hash_count; j++) {
+        mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
+        lua_pushstring(L, hex);
+        lua_rawseti(L, -2, j + 1);
+    }
+}
+
+// ── Text-format message persistence ──────────────────────────────
+// Each record is a block of key=value lines terminated by "---".
+// Unknown keys are ignored on load (forward-compatible).
+
+static bool is_old_binary_file(fs::FS* storage, const String& path) {
+    File f = storage->open(path.c_str(), "r");
+    if (!f || f.size() == 0) { if (f) f.close(); return false; }
+    uint8_t first;
+    f.read(&first, 1);
+    f.close();
+    return !(first >= 0x20 && first <= 0x7E) && first != '\n' && first != '\r';
+}
+
+static void write_path_field(File& f, uint16_t path_len, const uint8_t* path) {
+    uint8_t hash_size = (path_len >> 6) + 1;
+    uint8_t hash_count = path_len & 63;
+    if (hash_count == 0) return;
+    f.print("path=");
+    char hex[7];
+    for (int j = 0; j < hash_count; j++) {
+        if (j > 0) f.print(",");
+        mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
+        f.print(hex);
+    }
+    f.print("\n");
+}
+
+static void write_rpath_line(File& f, uint16_t path_len, const uint8_t* path,
+                             float snr, float rssi, bool is_direct) {
+    uint8_t hash_size = (path_len >> 6) + 1;
+    uint8_t hash_count = path_len & 63;
+    f.print("rpath=");
+    char hex[7];
+    for (int j = 0; j < hash_count; j++) {
+        if (j > 0) f.print(",");
+        mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
+        f.print(hex);
+    }
+    f.printf(";%.2f;%.2f;%d\n", snr, rssi, is_direct ? 1 : 0);
+}
+
+static int count_text_records(File& f) {
+    f.seek(0);
+    int count = 0;
+    char line[256];
+    while (f.available()) {
+        int len = 0;
+        while (f.available() && len < (int)sizeof(line) - 1) {
+            char ch = f.read();
+            if (ch == '\n' || ch == '\r') break;
+            line[len++] = ch;
+        }
+        line[len] = '\0';
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') count++;
+    }
+    return count;
+}
+
+static void trim_msg_text_file(fs::FS* storage, const String& path, int cap) {
     if (!storage) return;
     File f = storage->open(path.c_str(), "r");
     if (!f) return;
-    size_t sz = f.size();
-    size_t rec = sizeof(StoredMsg);
-    size_t count = sz / rec;
-    size_t max_count = (size_t)(cap > 0 ? cap : 100) * 2;
+    int count = count_text_records(f);
+    int max_count = (cap > 0 ? cap : 100) * 2;
     if (count <= max_count) { f.close(); return; }
 
-    size_t keep = (size_t)(cap > 0 ? cap : 100);
-    size_t skip = count - keep;
-    f.seek(skip * rec);
+    int keep = cap > 0 ? cap : 100;
+    int skip = count - keep;
+    f.seek(0);
+    char line[256];
+    int skipped = 0;
+    while (f.available() && skipped < skip) {
+        int len = 0;
+        while (f.available() && len < (int)sizeof(line) - 1) {
+            char ch = f.read();
+            if (ch == '\n' || ch == '\r') break;
+            line[len++] = ch;
+        }
+        line[len] = '\0';
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') skipped++;
+    }
 
-    size_t remaining = keep * rec;
+    size_t keep_start = f.position();
+    size_t remaining = f.size() - keep_start;
     uint8_t* buf = (uint8_t*)malloc(remaining);
     if (!buf) { f.close(); return; }
     size_t got = f.read(buf, remaining);
@@ -514,47 +632,76 @@ static void trim_msg_file(fs::FS* storage, const String& path, int cap) {
     free(buf);
 }
 
-// Core append: one record written in "a" mode, then trim check.
-static void append_stored_msg(fs::FS* storage, const String& prefix,
-                              const String& path, const StoredMsg& m, int cap) {
+static void append_msg_text(fs::FS* storage, const String& prefix,
+                            const String& fpath, const StoredMsg& m, int cap) {
     if (!storage) return;
     bool is_sd = (storage != &LittleFS);
     if (is_sd) sd_spi_take();
     ensure_messages_dir(storage, prefix);
-    File f = storage->open(path.c_str(), "a", true);
+
+    if (storage->exists(fpath.c_str()) && is_old_binary_file(storage, fpath)) {
+        storage->remove(fpath.c_str());
+        Serial.printf("[STORAGE] Cleared old binary log: %s\n", fpath.c_str());
+    }
+
+    File f = storage->open(fpath.c_str(), "a", true);
     if (f) {
-        f.write((const uint8_t*)&m, sizeof(m));
+        f.printf("ts=%u\n", m.timestamp);
+        f.printf("from=%s\n", m.from);
+        if (m.peer[0]) f.printf("peer=%s\n", m.peer);
+        f.printf("text=%s\n", m.text);
+        f.printf("ch=%d\n", (int)m.channel_idx);
+        f.printf("hops=%d\n", (int)m.hops);
+        f.printf("snr=%.2f\n", m.snr);
+        f.printf("rssi=%.2f\n", m.rssi);
+        f.printf("direct=%d\n", (m.flags & 0x01) ? 1 : 0);
+        f.printf("dm=%d\n", (m.flags & 0x02) ? 1 : 0);
+        write_path_field(f, m.path_len, m.path);
+        if (m.has_hash) {
+            char hash_hex[MAX_HASH_SIZE * 2 + 1];
+            mesh::Utils::toHex(hash_hex, m.pkt_hash, MAX_HASH_SIZE);
+            f.printf("hash=%s\n", hash_hex);
+            write_rpath_line(f, m.path_len, m.path, m.snr, m.rssi,
+                             (m.flags & 0x01) != 0);
+        }
+        f.print("---\n");
         f.close();
     }
-    trim_msg_file(storage, path, cap);
+    trim_msg_text_file(storage, fpath, cap);
     if (is_sd) sd_spi_release();
 }
 
 void PunkMesh::appendChannelMessage(int channel_idx, const char* from, const char* text,
                                     uint32_t timestamp, float snr, float rssi,
-                                    uint8_t hops, bool direct) {
-    if (channel_idx < 0) return;  // unknown channel — don't persist
+                                    uint8_t hops, bool direct,
+                                    uint16_t path_len, const uint8_t* path,
+                                    const uint8_t* pkt_hash) {
+    if (channel_idx < 0) return;
     StoredMsg m;
     fill_stored_msg(m, channel_idx, from, /*peer*/ "", text,
-                    timestamp, snr, rssi, hops, direct, /*is_dm*/ false);
-    append_stored_msg(_storage, _storage_prefix,
-                      channel_msg_path(_storage_prefix, channel_idx),
-                      m, _max_messages);
+                    timestamp, snr, rssi, hops, direct, /*is_dm*/ false,
+                    path_len, path, pkt_hash);
+    String ch_name = channel_name_for_idx(*this, channel_idx);
+    append_msg_text(_storage, _storage_prefix,
+                    channel_msg_path(_storage_prefix, ch_name.c_str()),
+                    m, _max_messages);
 }
 
 void PunkMesh::appendDMMessage(const char* peer, const char* from, const char* text,
                                uint32_t timestamp, float snr, float rssi,
-                               uint8_t hops, bool direct) {
+                               uint8_t hops, bool direct,
+                               uint16_t path_len, const uint8_t* path,
+                               const uint8_t* pkt_hash) {
     if (!peer || peer[0] == '\0') return;
     StoredMsg m;
     fill_stored_msg(m, /*ch_idx*/ -1, from, peer, text,
-                    timestamp, snr, rssi, hops, direct, /*is_dm*/ true);
-    append_stored_msg(_storage, _storage_prefix,
-                      dm_msg_path(_storage_prefix, peer),
-                      m, _max_messages);
+                    timestamp, snr, rssi, hops, direct, /*is_dm*/ true,
+                    path_len, path, pkt_hash);
+    append_msg_text(_storage, _storage_prefix,
+                    dm_msg_path(_storage_prefix, peer),
+                    m, _max_messages);
 }
 
-// Push one StoredMsg as a Lua table on the top of the stack.
 static void push_stored_msg_table(lua_State* L, const StoredMsg& m) {
     lua_newtable(L);
     lua_pushstring(L, m.from);      lua_setfield(L, -2, "from");
@@ -567,27 +714,149 @@ static void push_stored_msg_table(lua_State* L, const StoredMsg& m) {
     lua_pushboolean(L, (m.flags & 0x01) != 0); lua_setfield(L, -2, "direct");
     lua_pushboolean(L, (m.flags & 0x02) != 0); lua_setfield(L, -2, "is_dm");
     lua_pushinteger(L, m.channel_idx); lua_setfield(L, -2, "channel_idx");
+    push_path_table(L, m.path_len, m.path);
+    lua_setfield(L, -2, "path");
+    if (m.has_hash) {
+        char hex[MAX_HASH_SIZE * 2 + 1];
+        mesh::Utils::toHex(hex, m.pkt_hash, MAX_HASH_SIZE);
+        lua_pushstring(L, hex);
+        lua_setfield(L, -2, "hash");
+    }
+    if (m.rpath_count > 0) {
+        lua_newtable(L);
+        for (int i = 0; i < m.rpath_count; i++) {
+            const ObservedPath& rp = m.rpaths[i];
+            lua_newtable(L);
+            push_path_table(L, rp.path_len, rp.path);
+            lua_setfield(L, -2, "path");
+            uint8_t hc = rp.path_len & 63;
+            lua_pushinteger(L, hc);
+            lua_setfield(L, -2, "hops");
+            lua_pushboolean(L, rp.is_direct);
+            lua_setfield(L, -2, "direct");
+            lua_pushnumber(L, rp.snr);
+            lua_setfield(L, -2, "snr");
+            lua_pushnumber(L, rp.rssi);
+            lua_setfield(L, -2, "rssi");
+            lua_rawseti(L, -2, i + 1);
+        }
+        lua_setfield(L, -2, "rpaths");
+    }
 }
 
-static int push_msg_file_to_lua(lua_State* L, fs::FS* storage, const String& path) {
+// Parse a "path=aa,bb,cc" value into path[] and return encoded path_len.
+static uint16_t parse_path_field(const char* val, uint8_t* path_out) {
+    if (!val || val[0] == '\0') return 0;
+    uint8_t count = 0;
+    const char* p = val;
+    while (*p && count < 63) {
+        const char* comma = strchr(p, ',');
+        size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
+        uint8_t hash_size = tok_len / 2;
+        if (hash_size == 0 || hash_size > 3) break;
+        for (size_t i = 0; i < hash_size; i++) {
+            char byte_hex[3] = { p[i*2], p[i*2+1], '\0' };
+            path_out[count * hash_size + i] = (uint8_t)strtoul(byte_hex, nullptr, 16);
+        }
+        count++;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    if (count == 0) return 0;
+    size_t first_tok_len = strchr(val, ',') ? (size_t)(strchr(val, ',') - val) : strlen(val);
+    uint8_t hash_size = first_tok_len / 2;
+    return ((hash_size - 1) << 6) | count;
+}
+
+static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath) {
     lua_newtable(L);
     if (!storage) return 1;
     bool is_sd = (storage != &LittleFS);
     if (is_sd) sd_spi_take();
-    if (!storage->exists(path.c_str())) {
+    if (!storage->exists(fpath.c_str())) {
         if (is_sd) sd_spi_release();
         return 1;
     }
-    File f = storage->open(path.c_str(), "r");
+    File f = storage->open(fpath.c_str(), "r");
     if (!f) {
         if (is_sd) sd_spi_release();
         return 1;
     }
+
     int idx = 1;
     StoredMsg m;
-    while (f.read((uint8_t*)&m, sizeof(m)) == sizeof(m)) {
-        push_stored_msg_table(L, m);
-        lua_rawseti(L, -2, idx++);
+    memset(&m, 0, sizeof(m));
+    char line[256];
+
+    while (f.available()) {
+        int len = 0;
+        while (f.available() && len < (int)sizeof(line) - 1) {
+            char ch = f.read();
+            if (ch == '\n' || ch == '\r') break;
+            line[len++] = ch;
+        }
+        line[len] = '\0';
+        if (len == 0) continue;
+
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+            push_stored_msg_table(L, m);
+            lua_rawseti(L, -2, idx++);
+            memset(&m, 0, sizeof(m));
+            continue;
+        }
+
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char* key = line;
+        const char* val = eq + 1;
+
+        if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
+        else if (strcmp(key, "from") == 0) strncpy(m.from, val, sizeof(m.from) - 1);
+        else if (strcmp(key, "peer") == 0) strncpy(m.peer, val, sizeof(m.peer) - 1);
+        else if (strcmp(key, "text") == 0) strncpy(m.text, val, sizeof(m.text) - 1);
+        else if (strcmp(key, "ch") == 0) m.channel_idx = (int8_t)atoi(val);
+        else if (strcmp(key, "hops") == 0) m.hops = (uint8_t)atoi(val);
+        else if (strcmp(key, "snr") == 0) m.snr = atof(val);
+        else if (strcmp(key, "rssi") == 0) m.rssi = atof(val);
+        else if (strcmp(key, "direct") == 0) { if (atoi(val)) m.flags |= 0x01; }
+        else if (strcmp(key, "dm") == 0) { if (atoi(val)) m.flags |= 0x02; }
+        else if (strcmp(key, "path") == 0) m.path_len = parse_path_field(val, m.path);
+        else if (strcmp(key, "hash") == 0) {
+            if (strlen(val) == MAX_HASH_SIZE * 2) {
+                mesh::Utils::fromHex(m.pkt_hash, MAX_HASH_SIZE, val);
+                m.has_hash = true;
+            }
+        }
+        else if (strcmp(key, "rpath") == 0 && m.rpath_count < MAX_PATHS_PER_MSG) {
+            // Format: hop_hashes;snr;rssi;direct
+            char rval[256];
+            strncpy(rval, val, sizeof(rval) - 1);
+            rval[sizeof(rval) - 1] = '\0';
+            char* semi1 = strchr(rval, ';');
+            if (semi1) {
+                *semi1 = '\0';
+                ObservedPath& rp = m.rpaths[m.rpath_count];
+                memset(&rp, 0, sizeof(rp));
+                rp.path_len = parse_path_field(rval, rp.path);
+                char* semi2 = strchr(semi1 + 1, ';');
+                if (semi2) {
+                    *semi2 = '\0';
+                    rp.snr = atof(semi1 + 1);
+                    char* semi3 = strchr(semi2 + 1, ';');
+                    if (semi3) {
+                        *semi3 = '\0';
+                        rp.rssi = atof(semi2 + 1);
+                        rp.is_direct = atoi(semi3 + 1) != 0;
+                    } else {
+                        rp.rssi = atof(semi2 + 1);
+                    }
+                } else {
+                    rp.snr = atof(semi1 + 1);
+                }
+                m.rpath_count++;
+            }
+        }
     }
     f.close();
     if (is_sd) sd_spi_release();
@@ -596,12 +865,13 @@ static int push_msg_file_to_lua(lua_State* L, fs::FS* storage, const String& pat
 
 int PunkMesh::pushChannelMessagesToLua(lua_State* L, int channel_idx) {
     if (channel_idx < 0) { lua_newtable(L); return 1; }
-    return push_msg_file_to_lua(L, _storage, channel_msg_path(_storage_prefix, channel_idx));
+    String ch_name = channel_name_for_idx(*this, channel_idx);
+    return read_msg_text_file(L, _storage, channel_msg_path(_storage_prefix, ch_name.c_str()));
 }
 
 int PunkMesh::pushDMMessagesToLua(lua_State* L, const char* peer) {
     if (!peer || peer[0] == '\0') { lua_newtable(L); return 1; }
-    return push_msg_file_to_lua(L, _storage, dm_msg_path(_storage_prefix, peer));
+    return read_msg_text_file(L, _storage, dm_msg_path(_storage_prefix, peer));
 }
 
 // Enumerate dm_*.log files and return an array of the real peer names
@@ -641,6 +911,98 @@ int PunkMesh::pushDMThreadNamesToLua(lua_State* L) {
         entry = root.openNextFile();
     }
     root.close();
+    if (is_sd) sd_spi_release();
+    return 1;
+}
+
+int PunkMesh::lookupPersistedPaths(lua_State* L, const char* hash_hex,
+                                    int channel_idx, const char* peer) {
+    lua_newtable(L);
+    if (!_storage || strlen(hash_hex) != MAX_HASH_SIZE * 2) return 1;
+
+    String fpath;
+    if (channel_idx >= 0) {
+        String ch_name = channel_name_for_idx(*this, channel_idx);
+        fpath = channel_msg_path(_storage_prefix, ch_name.c_str());
+    } else if (peer && peer[0]) {
+        fpath = dm_msg_path(_storage_prefix, peer);
+    } else {
+        return 1;
+    }
+
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    File f = _storage->open(fpath.c_str(), "r");
+    if (!f) { if (is_sd) sd_spi_release(); return 1; }
+
+    // Build target line to match
+    char target[6 + MAX_HASH_SIZE * 2 + 1];
+    snprintf(target, sizeof(target), "hash=%s", hash_hex);
+
+    char line[256];
+    bool found_hash = false;
+    int rpath_idx = 1;
+
+    while (f.available()) {
+        int len = 0;
+        while (f.available() && len < (int)sizeof(line) - 1) {
+            char ch = f.read();
+            if (ch == '\n' || ch == '\r') break;
+            line[len++] = ch;
+        }
+        line[len] = '\0';
+        if (len == 0) continue;
+
+        if (found_hash) {
+            if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-')
+                break;  // end of matching record
+            if (strncmp(line, "rpath=", 6) == 0) {
+                char rval[256];
+                strncpy(rval, line + 6, sizeof(rval) - 1);
+                rval[sizeof(rval) - 1] = '\0';
+                char* semi1 = strchr(rval, ';');
+                if (semi1) {
+                    *semi1 = '\0';
+                    uint8_t path_buf[MAX_PATH_SIZE];
+                    uint16_t path_len_enc = parse_path_field(rval, path_buf);
+                    float snr = 0, rssi = 0;
+                    bool is_direct = false;
+                    char* semi2 = strchr(semi1 + 1, ';');
+                    if (semi2) {
+                        *semi2 = '\0';
+                        snr = atof(semi1 + 1);
+                        char* semi3 = strchr(semi2 + 1, ';');
+                        if (semi3) {
+                            *semi3 = '\0';
+                            rssi = atof(semi2 + 1);
+                            is_direct = atoi(semi3 + 1) != 0;
+                        } else {
+                            rssi = atof(semi2 + 1);
+                        }
+                    } else {
+                        snr = atof(semi1 + 1);
+                    }
+                    lua_newtable(L);
+                    push_path_table(L, path_len_enc, path_buf);
+                    lua_setfield(L, -2, "path");
+                    lua_pushinteger(L, path_len_enc & 63);
+                    lua_setfield(L, -2, "hops");
+                    lua_pushboolean(L, is_direct);
+                    lua_setfield(L, -2, "direct");
+                    lua_pushnumber(L, snr);
+                    lua_setfield(L, -2, "snr");
+                    lua_pushnumber(L, rssi);
+                    lua_setfield(L, -2, "rssi");
+                    lua_rawseti(L, -2, rpath_idx++);
+                }
+            }
+        } else if (strcmp(line, target) == 0) {
+            found_hash = true;
+        }
+    }
+
+    f.close();
     if (is_sd) sd_spi_release();
     return 1;
 }
@@ -713,6 +1075,9 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
     Serial.println();
     Serial.printf("[MESH RX] Total contacts now: %d\n", getNumContacts() + (is_new ? 1 : 0));
 
+    recordPath(contact.id.pub_key, path_len, path,
+               last_rx_snr, last_rx_rssi, PATH_SRC_ADVERT, false);
+
     saveContacts();
 
     if (rx_event_queue) {
@@ -727,16 +1092,21 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
 void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
 {
     Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t)contact.out_path_len);
+    recordPath(contact.id.pub_key, contact.out_path_len, contact.out_path,
+               0, 0, PATH_SRC_PATH_UPDATE, true);
     saveContacts();
 }
 
 ContactInfo* PunkMesh::processAck(const uint8_t *data)
 {
     if (memcmp(data, &expected_ack_crc, 4) == 0)
-    { // got an ACK from recipient
-        Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
-        // NOTE: the same ACK can be received multiple times!
-        expected_ack_crc = 0; // reset our expected hash, now that we have received ACK
+    {
+        uint32_t rtt = _ms->getMillis() - last_msg_sent;
+        Serial.printf("   Got ACK! (round trip: %d millis)\n", rtt);
+        expected_ack_crc = 0;
+        if (curr_recipient) {
+            recordPathSuccess(curr_recipient->id.pub_key, rtt);
+        }
         return curr_recipient;
     }
     return nullptr;
@@ -764,7 +1134,20 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
     // Persist incoming DM — peer and from are both the sender for incoming.
     appendDMMessage(from.name, from.name, norm_text, sender_timestamp,
                     last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
-                    pkt->isRouteDirect());
+                    pkt->isRouteDirect(), pkt->path_len, pkt->path,
+                    _last_pkt_hash);
+
+    recordPath(from.id.pub_key, pkt->path_len, pkt->path,
+               last_rx_snr, last_rx_rssi, PATH_SRC_MSG_RX, pkt->isRouteDirect());
+
+    MsgPathEntry* mpe = findMsgPaths(_last_pkt_hash);
+    if (mpe) {
+        mpe->is_message   = true;
+        mpe->is_dm        = true;
+        mpe->channel_idx  = -1;
+        strncpy(mpe->peer, from.name, sizeof(mpe->peer) - 1);
+        mpe->peer[sizeof(mpe->peer) - 1] = '\0';
+    }
 
     // Hand off to the UI core via rx_event_queue. The UI loop on Core 0
     // picks this up in drain_rx_events() and calls into Lua there —
@@ -782,8 +1165,9 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
         ev.timestamp = sender_timestamp;
         ev.snr       = last_rx_snr;
         ev.rssi      = last_rx_rssi;
-        // Non-blocking. If the UI is behind, we'd rather drop than
-        // stall the mesh task.
+        ev.path_len  = pkt->path_len;
+        memcpy(ev.path, pkt->path, pkt->getPathByteLen());
+        memcpy(ev.pkt_hash, _last_pkt_hash, MAX_HASH_SIZE);
         if (xQueueSend(rx_event_queue, &ev, 0) != pdTRUE) {
             Serial.println("[MESH RX] WARNING: rx_event_queue full, dropping DM");
         }
@@ -828,7 +1212,16 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
     // Persist to disk (no-op if channel_idx < 0)
     appendChannelMessage(channel_idx, sender_name, norm_msg, timestamp,
                          last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
-                         pkt->isRouteDirect());
+                         pkt->isRouteDirect(), pkt->path_len, pkt->path,
+                         _last_pkt_hash);
+
+    MsgPathEntry* mpe = findMsgPaths(_last_pkt_hash);
+    if (mpe) {
+        mpe->is_message   = true;
+        mpe->is_dm        = false;
+        mpe->channel_idx  = (int8_t)channel_idx;
+        mpe->peer[0]      = '\0';
+    }
 
     // Hand off to UI core. See onMessageRecv for the why.
     if (rx_event_queue) {
@@ -844,6 +1237,9 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
         ev.timestamp = timestamp;
         ev.snr       = last_rx_snr;
         ev.rssi      = last_rx_rssi;
+        ev.path_len  = pkt->path_len;
+        memcpy(ev.path, pkt->path, pkt->getPathByteLen());
+        memcpy(ev.pkt_hash, _last_pkt_hash, MAX_HASH_SIZE);
         if (xQueueSend(rx_event_queue, &ev, 0) != pdTRUE) {
             Serial.println("[MESH RX] WARNING: rx_event_queue full, dropping channel msg");
         }
@@ -873,7 +1269,308 @@ uint32_t PunkMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8
 void PunkMesh::onSendTimeout()
 {
     Serial.println("   ERROR: timed out, no ACK.");
+    if (curr_recipient) {
+        recordPathFailure(curr_recipient->id.pub_key);
+    }
 }
+
+// ── Path history tracker ──────────────────────────────────────────
+
+static bool paths_equal(uint16_t a_len, const uint8_t* a_path,
+                        uint16_t b_len, const uint8_t* b_path) {
+    if (a_len != b_len) return false;
+    uint8_t byte_len = (a_len & 63) * ((a_len >> 6) + 1);
+    return memcmp(a_path, b_path, byte_len) == 0;
+}
+
+ContactPathHistory* PunkMesh::findOrCreatePathHistory(const uint8_t* pub_key) {
+    for (int i = 0; i < _path_history_count; i++) {
+        if (memcmp(_path_history[i].pub_key, pub_key, PUB_KEY_SIZE) == 0)
+            return &_path_history[i];
+    }
+    if (_path_history_count < MAX_PATH_CONTACTS) {
+        ContactPathHistory* h = &_path_history[_path_history_count++];
+        memset(h, 0, sizeof(*h));
+        memcpy(h->pub_key, pub_key, PUB_KEY_SIZE);
+        return h;
+    }
+    // Evict oldest entry
+    int oldest_idx = 0;
+    uint32_t oldest_ts = UINT32_MAX;
+    for (int i = 0; i < _path_history_count; i++) {
+        for (int j = 0; j < _path_history[i].count; j++) {
+            if (_path_history[i].records[j].timestamp < oldest_ts) {
+                oldest_ts = _path_history[i].records[j].timestamp;
+                oldest_idx = i;
+            }
+        }
+    }
+    ContactPathHistory* h = &_path_history[oldest_idx];
+    memset(h, 0, sizeof(*h));
+    memcpy(h->pub_key, pub_key, PUB_KEY_SIZE);
+    return h;
+}
+
+void PunkMesh::recordPath(const uint8_t* pub_key, uint16_t path_len,
+                          const uint8_t* path, float snr, float rssi,
+                          uint8_t source, bool is_direct) {
+    uint8_t hash_count = path_len & 63;
+    if (hash_count == 0 && source != PATH_SRC_PATH_UPDATE) return;
+
+    ContactPathHistory* h = findOrCreatePathHistory(pub_key);
+    if (!h) return;
+
+    uint32_t now = getRTCClock()->getCurrentTime();
+
+    for (int i = 0; i < h->count; i++) {
+        if (paths_equal(h->records[i].path_len, h->records[i].path, path_len, path)) {
+            h->records[i].timestamp = now;
+            if (snr != 0) h->records[i].snr = snr;
+            if (rssi != 0) h->records[i].rssi = rssi;
+            h->records[i].source = source;
+            h->records[i].is_direct = is_direct;
+            return;
+        }
+    }
+
+    PathRecord* slot;
+    if (h->count < MAX_PATH_RECORDS) {
+        slot = &h->records[h->count++];
+    } else {
+        int weakest = 0;
+        for (int i = 1; i < MAX_PATH_RECORDS; i++) {
+            if (h->records[i].success_count < h->records[weakest].success_count ||
+                (h->records[i].success_count == h->records[weakest].success_count &&
+                 h->records[i].timestamp < h->records[weakest].timestamp)) {
+                weakest = i;
+            }
+        }
+        slot = &h->records[weakest];
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->path_len = path_len;
+    uint8_t byte_len = hash_count * ((path_len >> 6) + 1);
+    if (byte_len > MAX_PATH_SIZE) byte_len = MAX_PATH_SIZE;
+    if (path) memcpy(slot->path, path, byte_len);
+    slot->timestamp = now;
+    slot->snr = snr;
+    slot->rssi = rssi;
+    slot->source = source;
+    slot->is_direct = is_direct;
+}
+
+void PunkMesh::recordPathSuccess(const uint8_t* pub_key, uint32_t trip_time_ms) {
+    ContactPathHistory* h = findOrCreatePathHistory(pub_key);
+    if (!h || !curr_recipient) return;
+
+    for (int i = 0; i < h->count; i++) {
+        if (paths_equal(h->records[i].path_len, h->records[i].path,
+                        curr_recipient->out_path_len, curr_recipient->out_path)) {
+            h->records[i].success_count++;
+            h->records[i].trip_time_ms = trip_time_ms;
+            h->records[i].timestamp = getRTCClock()->getCurrentTime();
+            return;
+        }
+    }
+    // Path not tracked yet — record it now
+    recordPath(pub_key, curr_recipient->out_path_len, curr_recipient->out_path,
+               0, 0, PATH_SRC_ACK, true);
+    // Set the success on the newly added record
+    for (int i = h->count - 1; i >= 0; i--) {
+        if (paths_equal(h->records[i].path_len, h->records[i].path,
+                        curr_recipient->out_path_len, curr_recipient->out_path)) {
+            h->records[i].success_count = 1;
+            h->records[i].trip_time_ms = trip_time_ms;
+            break;
+        }
+    }
+}
+
+void PunkMesh::recordPathFailure(const uint8_t* pub_key) {
+    ContactPathHistory* h = findOrCreatePathHistory(pub_key);
+    if (!h || !curr_recipient) return;
+
+    for (int i = 0; i < h->count; i++) {
+        if (paths_equal(h->records[i].path_len, h->records[i].path,
+                        curr_recipient->out_path_len, curr_recipient->out_path)) {
+            h->records[i].failure_count++;
+            return;
+        }
+    }
+}
+
+// ── Per-message multi-path tracking ──────────────────────────────
+
+MsgPathEntry* PunkMesh::findMsgPaths(const uint8_t* hash) {
+    for (int i = 0; i < _msg_path_count; i++) {
+        if (memcmp(_msg_paths[i].pkt_hash, hash, MAX_HASH_SIZE) == 0)
+            return &_msg_paths[i];
+    }
+    return nullptr;
+}
+
+MsgPathEntry* PunkMesh::recordMsgPath(const uint8_t* hash, uint16_t path_len,
+                                       const uint8_t* path, float snr,
+                                       float rssi, bool is_direct) {
+    MsgPathEntry* entry = findMsgPaths(hash);
+    if (!entry) {
+        entry = &_msg_paths[_msg_path_next];
+        memset(entry, 0, sizeof(*entry));
+        memcpy(entry->pkt_hash, hash, MAX_HASH_SIZE);
+        _msg_path_next = (_msg_path_next + 1) % MAX_MSG_PATH_ENTRIES;
+        if (_msg_path_count < MAX_MSG_PATH_ENTRIES) _msg_path_count++;
+    }
+
+    for (int i = 0; i < entry->path_count; i++) {
+        if (paths_equal(entry->paths[i].path_len, entry->paths[i].path,
+                        path_len, path)) {
+            if (snr > entry->paths[i].snr) entry->paths[i].snr = snr;
+            if (rssi > entry->paths[i].rssi) entry->paths[i].rssi = rssi;
+            return entry;
+        }
+    }
+
+    if (entry->path_count >= MAX_PATHS_PER_MSG) return entry;
+
+    ObservedPath* op = &entry->paths[entry->path_count++];
+    memset(op, 0, sizeof(*op));
+    op->path_len  = path_len;
+    op->snr       = snr;
+    op->rssi      = rssi;
+    op->is_direct = is_direct;
+    uint8_t byte_len = (path_len & 63) * ((path_len >> 6) + 1);
+    if (byte_len > MAX_PATH_SIZE) byte_len = MAX_PATH_SIZE;
+    if (path) memcpy(op->path, path, byte_len);
+
+    return entry;
+}
+
+void PunkMesh::persistExtraPath(const uint8_t* hash, const ObservedPath& op) {
+    if (!_storage) return;
+    MsgPathEntry* entry = findMsgPaths(hash);
+    if (!entry || !entry->is_message) return;
+
+    String fpath;
+    if (entry->is_dm)
+        fpath = dm_msg_path(_storage_prefix, entry->peer);
+    else {
+        String ch_name = channel_name_for_idx(*this, entry->channel_idx);
+        fpath = channel_msg_path(_storage_prefix, ch_name.c_str());
+    }
+
+    char hash_hex[MAX_HASH_SIZE * 2 + 1];
+    mesh::Utils::toHex(hash_hex, hash, MAX_HASH_SIZE);
+    String hash_line = String("hash=") + hash_hex;
+
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    File f = _storage->open(fpath.c_str(), "r");
+    if (!f) { if (is_sd) sd_spi_release(); return; }
+
+    size_t fsize = f.size();
+    uint8_t* buf = (uint8_t*)malloc(fsize);
+    if (!buf) { f.close(); if (is_sd) sd_spi_release(); return; }
+    f.read(buf, fsize);
+    f.close();
+
+    // Scan for the hash= line, then find its following --- delimiter
+    const char* data = (const char*)buf;
+    const char* found_hash = nullptr;
+    const char* p = data;
+    while (p < data + fsize) {
+        const char* eol = (const char*)memchr(p, '\n', fsize - (p - data));
+        if (!eol) eol = data + fsize;
+        size_t line_len = eol - p;
+        if (line_len == hash_line.length() &&
+            memcmp(p, hash_line.c_str(), line_len) == 0) {
+            found_hash = p;
+            break;
+        }
+        p = eol + 1;
+    }
+
+    if (!found_hash) { free(buf); if (is_sd) sd_spi_release(); return; }
+
+    // Find the --- after the hash line
+    p = found_hash;
+    const char* insert_pos = nullptr;
+    while (p < data + fsize) {
+        const char* eol = (const char*)memchr(p, '\n', fsize - (p - data));
+        if (!eol) eol = data + fsize;
+        size_t line_len = eol - p;
+        if (line_len == 3 && p[0] == '-' && p[1] == '-' && p[2] == '-') {
+            insert_pos = p;
+            break;
+        }
+        p = eol + 1;
+    }
+
+    if (!insert_pos) { free(buf); if (is_sd) sd_spi_release(); return; }
+
+    // Build the rpath line to insert
+    char rpath_buf[256];
+    int rlen = 0;
+    rlen += snprintf(rpath_buf + rlen, sizeof(rpath_buf) - rlen, "rpath=");
+    uint8_t hs = (op.path_len >> 6) + 1;
+    uint8_t hc = op.path_len & 63;
+    char hex[7];
+    for (int j = 0; j < hc; j++) {
+        if (j > 0) rpath_buf[rlen++] = ',';
+        mesh::Utils::toHex(hex, &op.path[j * hs], hs);
+        memcpy(rpath_buf + rlen, hex, hs * 2);
+        rlen += hs * 2;
+    }
+    rlen += snprintf(rpath_buf + rlen, sizeof(rpath_buf) - rlen,
+                     ";%.2f;%.2f;%d\n", op.snr, op.rssi, op.is_direct ? 1 : 0);
+
+    // Rewrite file: before insert_pos + rpath line + from insert_pos onward
+    File wf = _storage->open(fpath.c_str(), "w", true);
+    if (wf) {
+        size_t before = insert_pos - data;
+        wf.write(buf, before);
+        wf.write((const uint8_t*)rpath_buf, rlen);
+        wf.write(buf + before, fsize - before);
+        wf.close();
+    }
+    free(buf);
+    if (is_sd) sd_spi_release();
+}
+
+void PunkMesh::preRegisterSentHash(const uint8_t* hash, bool is_dm,
+                                    int8_t channel_idx, const char* peer) {
+    MsgPathEntry* entry = findMsgPaths(hash);
+    if (!entry) {
+        entry = &_msg_paths[_msg_path_next];
+        memset(entry, 0, sizeof(*entry));
+        memcpy(entry->pkt_hash, hash, MAX_HASH_SIZE);
+        _msg_path_next = (_msg_path_next + 1) % MAX_MSG_PATH_ENTRIES;
+        if (_msg_path_count < MAX_MSG_PATH_ENTRIES) _msg_path_count++;
+    }
+    entry->is_message  = true;
+    entry->is_dm       = is_dm;
+    entry->channel_idx = channel_idx;
+    entry->path_count  = 0;
+    if (peer) {
+        strncpy(entry->peer, peer, sizeof(entry->peer) - 1);
+        entry->peer[sizeof(entry->peer) - 1] = '\0';
+    } else {
+        entry->peer[0] = '\0';
+    }
+}
+
+void PunkMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis) {
+    pkt->calculatePacketHash(_last_tx_hash);
+    BaseChatMesh::sendFloodScoped(recipient, pkt, delay_millis);
+}
+
+void PunkMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
+    pkt->calculatePacketHash(_last_tx_hash);
+    BaseChatMesh::sendFloodScoped(channel, pkt, delay_millis);
+}
+
+// ─────────────────────────────────────────────────────────────────
 
 PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables)
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables)
@@ -1050,30 +1747,31 @@ void PunkMesh::begin()
     loadChannels();
 }
 
-  void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {
-        // Store radio info for Lua access
-        last_rx_snr = _radio->getLastSNR();
-        last_rx_rssi = _radio->getLastRSSI();
+void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {
+    last_rx_snr = _radio->getLastSNR();
+    last_rx_rssi = _radio->getLastRSSI();
 
-        Serial.println("[RADIO RX] ---- packet received ----");
-        Serial.printf("[RADIO RX] len=%d, type=%d, route=%s, payload_len=%d\n",
-            len, pkt->getPayloadType(),
-            pkt->isRouteDirect() ? "DIRECT" : "FLOOD",
-            pkt->payload_len);
-        Serial.printf("[RADIO RX] SNR=%d, RSSI=%d, score=%d\n",
-            (int)last_rx_snr,
-            (int)last_rx_rssi,
-            (int)(score*1000));
+    pkt->calculatePacketHash(_last_pkt_hash);
+    MsgPathEntry* entry = findMsgPaths(_last_pkt_hash);
+    uint8_t old_count = entry ? entry->path_count : 0;
 
-    //     if (pkt->getPayloadType() == PAYLOAD_TYPE_PATH || pkt->getPayloadType() == PAYLOAD_TYPE_REQ
-    //       || pkt->getPayloadType() == PAYLOAD_TYPE_RESPONSE || pkt->getPayloadType() == PAYLOAD_TYPE_TXT_MSG) {
-    //       Serial.printf(" [%02X -> %02X]\n", (uint32_t)pkt->payload[1], (uint32_t)pkt->payload[0]);
-    //     } else {
-    //       Serial.printf("\n");
-    //     }
-    //     f.close();
-    //   
-  }
+    recordMsgPath(_last_pkt_hash, pkt->path_len, pkt->path,
+                  last_rx_snr, last_rx_rssi, pkt->isRouteDirect());
+
+    entry = findMsgPaths(_last_pkt_hash);
+    if (entry && entry->is_message && entry->path_count > old_count) {
+        persistExtraPath(_last_pkt_hash,
+                         entry->paths[entry->path_count - 1]);
+    }
+
+    Serial.println("[RADIO RX] ---- packet received ----");
+    Serial.printf("[RADIO RX] len=%d, type=%d, route=%s, payload_len=%d\n",
+        len, pkt->getPayloadType(),
+        pkt->isRouteDirect() ? "DIRECT" : "FLOOD",
+        pkt->payload_len);
+    Serial.printf("[RADIO RX] SNR=%d, RSSI=%d, score=%d\n",
+        (int)last_rx_snr, (int)last_rx_rssi, (int)(score*1000));
+}
 
 static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
 {

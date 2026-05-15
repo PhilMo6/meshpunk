@@ -2,6 +2,7 @@
 #define MESHPUNK_SYNC_H
 
 #include <Arduino.h>
+#include <MeshCore.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
@@ -50,6 +51,9 @@ struct RxEvent {
   uint32_t timestamp;
   float    snr;
   float    rssi;
+  uint16_t path_len;
+  uint8_t  path[MAX_PATH_SIZE];
+  uint8_t  pkt_hash[MAX_HASH_SIZE];
 };
 
 struct TxCommand {

@@ -1445,15 +1445,29 @@ static int lua_mesh_send_public(lua_State *L) {
 
   Serial.printf("[MESH TX] sendGroupMessage returned %s\n", ok ? "true" : "false");
 
+  // Copy hash to local before unlocking — Core 1 can overwrite _last_tx_hash
+  // via sendFloodScoped (ACKs, relays) as soon as we release MESH_LOCK.
+  uint8_t local_hash[MAX_HASH_SIZE];
   if (ok) {
+    memcpy(local_hash, the_mesh._last_tx_hash, MAX_HASH_SIZE);
     // Persist local echo — Public is always channel slot 0
     the_mesh.appendChannelMessage(0, the_mesh._prefs.node_name, text, timestamp,
-                                  0.0f, 0.0f, 0, false);
+                                  0.0f, 0.0f, 0, false,
+                                  0, nullptr, local_hash);
+    // Pre-register so reflected copies get path-tracked
+    the_mesh.preRegisterSentHash(local_hash, false, 0, nullptr);
   }
   MESH_UNLOCK();
 
   lua_pushboolean(L, ok ? 1 : 0);
-  return 1;
+  if (ok) {
+    char hex[MAX_HASH_SIZE * 2 + 1];
+    mesh::Utils::toHex(hex, local_hash, MAX_HASH_SIZE);
+    lua_pushstring(L, hex);
+  } else {
+    lua_pushnil(L);
+  }
+  return 2;
 }
 
 // Send a direct message to a contact by name prefix
@@ -1489,13 +1503,28 @@ static int lua_mesh_send_direct(lua_State *L) {
   }
 
   // Persist local echo — peer is the recipient, from is us.
+  // Copy hash to local before unlocking — Core 1 can overwrite _last_tx_hash.
+  bool is_flood = (result == MSG_SEND_SENT_FLOOD);
+  uint8_t local_hash[MAX_HASH_SIZE];
+  if (is_flood) memcpy(local_hash, the_mesh._last_tx_hash, MAX_HASH_SIZE);
+
   the_mesh.appendDMMessage(recipient->name, the_mesh._prefs.node_name, text,
                            timestamp, 0.0f, 0.0f, 0,
-                           result == MSG_SEND_SENT_DIRECT);
+                           result == MSG_SEND_SENT_DIRECT,
+                           0, nullptr, is_flood ? local_hash : nullptr);
+  if (is_flood) {
+    the_mesh.preRegisterSentHash(local_hash, true, -1, recipient->name);
+  }
   MESH_UNLOCK();
 
   lua_pushboolean(L, 1);
-  lua_pushstring(L, result == MSG_SEND_SENT_DIRECT ? "direct" : "flood");
+  lua_pushstring(L, is_flood ? "flood" : "direct");
+  if (is_flood) {
+    char hex[MAX_HASH_SIZE * 2 + 1];
+    mesh::Utils::toHex(hex, local_hash, MAX_HASH_SIZE);
+    lua_pushstring(L, hex);
+    return 3;
+  }
   return 2;
 }
 
@@ -1580,12 +1609,160 @@ static int lua_mesh_get_contacts(lua_State *L) {
       lua_pushboolean(L, (c.flags & 0x01) != 0);
       lua_setfield(L, -2, "favorite");
 
+      // out_path as array of hex hashes
+      {
+        uint8_t hash_size = (c.out_path_len >> 6) + 1;
+        uint8_t hash_count = c.out_path_len & 63;
+        lua_newtable(L);
+        char h[7];
+        for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
+          mesh::Utils::toHex(h, &c.out_path[j * hash_size], hash_size);
+          lua_pushstring(L, h);
+          lua_rawseti(L, -2, j + 1);
+        }
+        lua_setfield(L, -2, "path");
+      }
+
       lua_rawseti(L, -2, idx++);
     }
   }
   MESH_UNLOCK();
 
   return 1;
+}
+
+static int lua_mesh_get_contact_paths(lua_State *L) {
+  const char *pubkey_hex = luaL_checkstring(L, 1);
+
+  uint8_t pub_key[PUB_KEY_SIZE];
+  mesh::Utils::fromHex(pub_key, PUB_KEY_SIZE, pubkey_hex);
+
+  lua_newtable(L);
+
+  MESH_LOCK();
+  ContactPathHistory *h = nullptr;
+  for (int i = 0; i < the_mesh._path_history_count; i++) {
+    if (memcmp(the_mesh._path_history[i].pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+      h = &the_mesh._path_history[i];
+      break;
+    }
+  }
+  if (h && h->count > 0) {
+    static const char *src_names[] = { "msg", "ack", "path_update", "advert" };
+    for (int i = 0; i < h->count; i++) {
+      PathRecord &r = h->records[i];
+      lua_newtable(L);
+
+      // path as array of hex hashes
+      {
+        uint8_t hash_size = (r.path_len >> 6) + 1;
+        uint8_t hash_count = r.path_len & 63;
+        lua_newtable(L);
+        char hex[7];
+        for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
+          mesh::Utils::toHex(hex, &r.path[j * hash_size], hash_size);
+          lua_pushstring(L, hex);
+          lua_rawseti(L, -2, j + 1);
+        }
+        lua_setfield(L, -2, "path");
+
+        lua_pushinteger(L, hash_count);
+        lua_setfield(L, -2, "hops");
+      }
+
+      lua_pushboolean(L, r.is_direct);
+      lua_setfield(L, -2, "direct");
+
+      lua_pushnumber(L, r.snr);
+      lua_setfield(L, -2, "snr");
+
+      lua_pushnumber(L, r.rssi);
+      lua_setfield(L, -2, "rssi");
+
+      lua_pushinteger(L, r.trip_time_ms);
+      lua_setfield(L, -2, "trip_time_ms");
+
+      lua_pushinteger(L, r.success_count);
+      lua_setfield(L, -2, "success");
+
+      lua_pushinteger(L, r.failure_count);
+      lua_setfield(L, -2, "failure");
+
+      lua_pushinteger(L, r.timestamp);
+      lua_setfield(L, -2, "timestamp");
+
+      int src_idx = r.source < 4 ? r.source : 0;
+      lua_pushstring(L, src_names[src_idx]);
+      lua_setfield(L, -2, "source");
+
+      lua_rawseti(L, -2, i + 1);
+    }
+  }
+  MESH_UNLOCK();
+
+  return 1;
+}
+
+// Get all observed paths for a message by hash.
+// Tries RAM buffer first; falls back to persisted log file.
+// Usage: _mesh_get_message_paths(hash_hex)                     -- RAM only
+//        _mesh_get_message_paths(hash_hex, channel_idx)        -- RAM → channel file
+//        _mesh_get_message_paths(hash_hex, -1, peer_name)      -- RAM → DM file
+static int lua_mesh_get_message_paths(lua_State *L) {
+  const char *hash_hex = luaL_checkstring(L, 1);
+  int channel_idx = luaL_optinteger(L, 2, 0);
+  const char *peer = luaL_optstring(L, 3, nullptr);
+
+  if (strlen(hash_hex) != MAX_HASH_SIZE * 2) {
+    lua_newtable(L);
+    return 1;
+  }
+  uint8_t hash[MAX_HASH_SIZE];
+  mesh::Utils::fromHex(hash, MAX_HASH_SIZE, hash_hex);
+
+  MESH_LOCK();
+
+  // Try RAM buffer first
+  MsgPathEntry *e = the_mesh.findMsgPaths(hash);
+  if (e && e->path_count > 0) {
+    lua_newtable(L);
+    for (int i = 0; i < e->path_count; i++) {
+      ObservedPath &op = e->paths[i];
+      lua_newtable(L);
+
+      uint8_t hash_size = (op.path_len >> 6) + 1;
+      uint8_t hop_count = op.path_len & 63;
+      lua_newtable(L);
+      char hex[7];
+      for (int j = 0; j < hop_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
+        mesh::Utils::toHex(hex, &op.path[j * hash_size], hash_size);
+        lua_pushstring(L, hex);
+        lua_rawseti(L, -2, j + 1);
+      }
+      lua_setfield(L, -2, "path");
+
+      lua_pushinteger(L, hop_count);
+      lua_setfield(L, -2, "hops");
+
+      lua_pushboolean(L, op.is_direct);
+      lua_setfield(L, -2, "direct");
+
+      lua_pushnumber(L, op.snr);
+      lua_setfield(L, -2, "snr");
+
+      lua_pushnumber(L, op.rssi);
+      lua_setfield(L, -2, "rssi");
+
+      lua_rawseti(L, -2, i + 1);
+    }
+    MESH_UNLOCK();
+    return 1;
+  }
+
+  // RAM miss — fall back to persisted log file
+  int r = the_mesh.lookupPersistedPaths(L, hash_hex, channel_idx, peer);
+  MESH_UNLOCK();
+  return r;
 }
 
 // Send self advertisement
@@ -1824,15 +2001,27 @@ static int lua_mesh_send_channel(lua_State *L) {
     timestamp, cd.channel, the_mesh._prefs.node_name, text, strlen(text)
   );
 
+  // Copy hash to local before unlocking — Core 1 can overwrite _last_tx_hash.
+  uint8_t local_hash[MAX_HASH_SIZE];
   if (ok) {
+    memcpy(local_hash, the_mesh._last_tx_hash, MAX_HASH_SIZE);
     // Persist local echo for this channel slot
     the_mesh.appendChannelMessage(ch_idx, the_mesh._prefs.node_name, text,
-                                  timestamp, 0.0f, 0.0f, 0, false);
+                                  timestamp, 0.0f, 0.0f, 0, false,
+                                  0, nullptr, local_hash);
+    the_mesh.preRegisterSentHash(local_hash, false, (int8_t)ch_idx, nullptr);
   }
   MESH_UNLOCK();
 
   lua_pushboolean(L, ok ? 1 : 0);
-  return 1;
+  if (ok) {
+    char hex[MAX_HASH_SIZE * 2 + 1];
+    mesh::Utils::toHex(hex, local_hash, MAX_HASH_SIZE);
+    lua_pushstring(L, hex);
+  } else {
+    lua_pushnil(L);
+  }
+  return 2;
 }
 
 // Remove a contact by name prefix
@@ -2562,6 +2751,8 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
   lua_register(L, "_mesh_get_rx_boost", lua_mesh_get_rx_boost);
   lua_register(L, "_mesh_set_rx_boost", lua_mesh_set_rx_boost);
+  lua_register(L, "_mesh_get_contact_paths", lua_mesh_get_contact_paths);
+  lua_register(L, "_mesh_get_message_paths", lua_mesh_get_message_paths);
 
   // Persistent message history APIs — available to any app, not just messenger
   lua_register(L, "_mesh_get_channel_messages", lua_mesh_get_channel_messages);
@@ -3472,8 +3663,8 @@ void setup() {
 // Forward decls for the Lua dispatchers that live in punkmesh.cpp.
 // These are called only from the UI core (Core 0) to preserve lua_State
 // single-threadedness.
-extern void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, int channel_idx);
-extern void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi);
+extern void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, int channel_idx, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash);
+extern void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash);
 extern void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contact_type);
 
 // Drain RX events posted by the mesh core. Runs every UI tick.
@@ -3485,11 +3676,13 @@ static void drain_rx_events() {
   while (budget-- > 0 && xQueueReceive(rx_event_queue, &ev, 0) == pdTRUE) {
     if (ev.kind == RxEvent::DIRECT_MSG) {
       lua_mesh_push_direct_message(L, ev.sender, ev.hops, ev.direct,
-                                   ev.timestamp, ev.text, ev.snr, ev.rssi);
+                                   ev.timestamp, ev.text, ev.snr, ev.rssi,
+                                   ev.path_len, ev.path, ev.pkt_hash);
     } else if (ev.kind == RxEvent::CHANNEL_MSG) {
       lua_mesh_push_channel_message(L, ev.sender, ev.hops, ev.direct,
                                     ev.timestamp, ev.text, ev.snr, ev.rssi,
-                                    ev.channel_idx);
+                                    ev.channel_idx, ev.path_len, ev.path,
+                                    ev.pkt_hash);
     } else if (ev.kind == RxEvent::CONTACT_UPDATE) {
       lua_mesh_push_contact_update(L, ev.sender, ev.hops);
     }

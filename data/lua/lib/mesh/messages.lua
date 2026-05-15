@@ -114,9 +114,9 @@ end
 -- Send a public channel message via MeshCore
 function M:broadcast(text)
     print("Broadcasting message: " .. text)
-    local ok, err = _mesh_send_public(text)
+    local ok, hash_hex = _mesh_send_public(text)
     if not ok then
-        print("Failed to send public message: " .. tostring(err))
+        print("Failed to send public message: " .. tostring(hash_hex))
         return false
     end
 
@@ -133,7 +133,8 @@ function M:broadcast(text)
         is_dm = false,
         channel_idx = 0,
         snr = 0,
-        rssi = 0
+        rssi = 0,
+        hash = hash_hex
     }
     table.insert(M.__history, msg)
     if not M.__channel_history[0] then M.__channel_history[0] = {} end
@@ -147,13 +148,14 @@ end
 
 -- Send a direct message to a contact by name prefix
 function M:sendDirect(name_prefix, text)
-    local ok, route = _mesh_send_direct(name_prefix, text)
+    local ok, route, hash_hex = _mesh_send_direct(name_prefix, text)
     if not ok then
         print("Failed to send DM: " .. tostring(route))
         return false
     end
 
     -- Local echo — C++ side already persisted it.
+    -- hash_hex is only present for flood-routed DMs (3rd return value).
     local info = _mesh_get_node_info()
     local msg = {
         from = info and info.name or "me",
@@ -164,7 +166,8 @@ function M:sendDirect(name_prefix, text)
         is_dm = true,
         to = name_prefix,
         snr = 0,
-        rssi = 0
+        rssi = 0,
+        hash = hash_hex
     }
     table.insert(M.__dm_history, msg)
     if not M.__dm_threads[name_prefix] then
@@ -180,9 +183,9 @@ end
 
 -- Send a message to a specific channel by index
 function M:sendToChannel(ch_idx, text)
-    local ok, err = _mesh_send_channel(ch_idx, text)
+    local ok, hash_hex = _mesh_send_channel(ch_idx, text)
     if not ok then
-        print("Failed to send to channel: " .. tostring(err))
+        print("Failed to send to channel: " .. tostring(hash_hex))
         return false
     end
 
@@ -199,7 +202,8 @@ function M:sendToChannel(ch_idx, text)
         is_dm = false,
         channel_idx = ch_idx,
         snr = 0,
-        rssi = 0
+        rssi = 0,
+        hash = hash_hex
     }
     if ch_idx == 0 then
         table.insert(M.__history, msg)
@@ -276,10 +280,11 @@ function M:getNodeInfo()
 end
 
 -- Called from C++ for channel messages
--- Signature: __dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_idx)
+-- Signature: __dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_idx, is_mention, path)
 -- channel_idx: 0 = Public, 1..N = user-added channel slot, -1 = unknown/no match
+-- path: array of hex relay hashes (may be nil or empty)
 -- C++ has already persisted the message before calling us.
-function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_idx, is_mention)
+function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_idx, is_mention, path, hash)
     if channel_idx == nil then channel_idx = -1 end
     local msg = {
         from = from or "unknown",
@@ -290,7 +295,9 @@ function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_id
         is_dm = false,
         snr = snr or 0,
         rssi = rssi or 0,
-        channel_idx = channel_idx
+        channel_idx = channel_idx,
+        path = path or {},
+        hash = hash
     }
 
     -- File into the right per-channel bucket. Public (idx 0) also feeds the
@@ -316,9 +323,10 @@ function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_id
 end
 
 -- Called from C++ for direct (private) messages
--- Signature: __dispatch_dm(from, text, timestamp, direct, hops, snr, rssi)
+-- Signature: __dispatch_dm(from, text, timestamp, direct, hops, snr, rssi, path)
+-- path: array of hex relay hashes (may be nil or empty)
 -- C++ has already persisted the message before calling us.
-function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi)
+function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi, path, hash)
     local msg = {
         from = from or "unknown",
         text = text,
@@ -327,7 +335,9 @@ function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi)
         hops = hops,
         is_dm = true,
         snr = snr or 0,
-        rssi = rssi or 0
+        rssi = rssi or 0,
+        path = path or {},
+        hash = hash
     }
 
     table.insert(M.__dm_history, msg)

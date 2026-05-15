@@ -47,23 +47,77 @@ struct MeshMessage {
 
 #define MAX_MESSAGES 64   // tweak as needed
 
-// Fixed-size on-disk record for persistent message history.
-// One StoredMsg per record; files are flat arrays of these.
+// ── Per-message multi-path tracking ─────────────────────────────
+#define MAX_MSG_PATH_ENTRIES 32
+#define MAX_PATHS_PER_MSG    8
+
+struct ObservedPath {
+  uint16_t path_len;
+  uint8_t  path[MAX_PATH_SIZE];
+  float    snr;
+  float    rssi;
+  bool     is_direct;
+};
+
+struct MsgPathEntry {
+  uint8_t       pkt_hash[MAX_HASH_SIZE];
+  uint8_t       path_count;
+  bool          is_message;
+  bool          is_dm;
+  int8_t        channel_idx;
+  char          peer[32];
+  ObservedPath  paths[MAX_PATHS_PER_MSG];
+};
+
+// In-memory message record. Persisted as human-readable key=value text
+// (see append_msg_text / read_msg_text_file in punkmesh.cpp).
 // Channel logs: <storage_prefix>/messages/ch_<idx>.log
 // DM logs:      <storage_prefix>/messages/dm_<sanitized_peer>.log
 struct StoredMsg {
-  uint32_t timestamp;    // 4
-  float    snr;          // 4
-  float    rssi;         // 4
-  int8_t   channel_idx;  // 1  — -1 for DM, 0..N for channel slot
-  uint8_t  hops;         // 1
-  uint8_t  flags;        // 1  — bit0=direct, bit1=is_dm
-  uint8_t  _pad;         // 1
-  char     from[32];     // 32 — sender display name ("me" == us for outgoing)
-  char     peer[32];     // 32 — for DMs, the OTHER party (thread key); empty for channels
-  char     text[128];    // 128 — null-padded, truncated if longer
-};                        // total: 208 bytes, fixed-size for easy trim
-static_assert(sizeof(StoredMsg) == 208, "StoredMsg size changed; disk format must bump");
+  uint32_t timestamp;
+  float    snr;
+  float    rssi;
+  int8_t   channel_idx;  // -1 for DM, 0..N for channel slot
+  uint8_t  hops;
+  uint8_t  flags;        // bit0=direct, bit1=is_dm
+  char     from[32];
+  char     peer[32];     // for DMs, the OTHER party (thread key); empty for channels
+  char     text[160];
+  uint16_t path_len;     // encoded: upper bits = hash size, lower 6 = hop count
+  uint8_t  path[MAX_PATH_SIZE];
+  uint8_t  pkt_hash[MAX_HASH_SIZE];
+  bool     has_hash;
+  uint8_t  rpath_count;
+  ObservedPath rpaths[MAX_PATHS_PER_MSG];
+};
+
+// ── Per-contact path history (in-memory, managed on radio core) ──
+#define MAX_PATH_RECORDS   8
+#define MAX_PATH_CONTACTS  32
+
+#define PATH_SRC_MSG_RX      0
+#define PATH_SRC_ACK         1
+#define PATH_SRC_PATH_UPDATE 2
+#define PATH_SRC_ADVERT      3
+
+struct PathRecord {
+  uint16_t path_len;
+  uint8_t  path[MAX_PATH_SIZE];
+  uint32_t timestamp;
+  uint32_t trip_time_ms;
+  float    snr;
+  float    rssi;
+  uint16_t success_count;
+  uint16_t failure_count;
+  uint8_t  source;       // PATH_SRC_*
+  bool     is_direct;
+};
+
+struct ContactPathHistory {
+  uint8_t  pub_key[PUB_KEY_SIZE];
+  uint8_t  count;
+  PathRecord records[MAX_PATH_RECORDS];
+};
 
 // Class declaration
 class PunkMesh : public BaseChatMesh, ContactVisitor
@@ -118,10 +172,38 @@ public:
   // `channel_idx < 0` on appendChannelMessage is a no-op (unknown channel).
   void appendChannelMessage(int channel_idx, const char* from, const char* text,
                             uint32_t timestamp, float snr, float rssi,
-                            uint8_t hops, bool direct);
+                            uint8_t hops, bool direct,
+                            uint16_t path_len = 0, const uint8_t* path = nullptr,
+                            const uint8_t* pkt_hash = nullptr);
   void appendDMMessage(const char* peer, const char* from, const char* text,
                        uint32_t timestamp, float snr, float rssi,
-                       uint8_t hops, bool direct);
+                       uint8_t hops, bool direct,
+                       uint16_t path_len = 0, const uint8_t* path = nullptr,
+                       const uint8_t* pkt_hash = nullptr);
+
+  // ── Per-contact path history ────────────────────────────────────
+  ContactPathHistory _path_history[MAX_PATH_CONTACTS];
+  int _path_history_count = 0;
+
+  ContactPathHistory* findOrCreatePathHistory(const uint8_t* pub_key);
+  void recordPath(const uint8_t* pub_key, uint16_t path_len, const uint8_t* path,
+                  float snr, float rssi, uint8_t source, bool is_direct);
+  void recordPathSuccess(const uint8_t* pub_key, uint32_t trip_time_ms);
+  void recordPathFailure(const uint8_t* pub_key);
+
+  // ── Per-message multi-path tracking ─────────────────────────────
+  uint8_t       _last_pkt_hash[MAX_HASH_SIZE];
+  uint8_t       _last_tx_hash[MAX_HASH_SIZE];   // hash of last packet sent via sendFloodScoped
+  MsgPathEntry  _msg_paths[MAX_MSG_PATH_ENTRIES];
+  int           _msg_path_next  = 0;
+  int           _msg_path_count = 0;
+
+  MsgPathEntry* findMsgPaths(const uint8_t* hash);
+  MsgPathEntry* recordMsgPath(const uint8_t* hash, uint16_t path_len,
+                              const uint8_t* path, float snr, float rssi,
+                              bool is_direct);
+  void persistExtraPath(const uint8_t* hash, const ObservedPath& op);
+  void preRegisterSentHash(const uint8_t* hash, bool is_dm, int8_t channel_idx, const char* peer);
 
   // Read paths. Each pushes a Lua table (array of message tables) and
   // returns 1 (the number of Lua stack values). Safe to call even if
@@ -129,6 +211,7 @@ public:
   int pushChannelMessagesToLua(lua_State* L, int channel_idx);
   int pushDMMessagesToLua(lua_State* L, const char* peer);
   int pushDMThreadNamesToLua(lua_State* L);
+  int lookupPersistedPaths(lua_State* L, const char* hash_hex, int channel_idx, const char* peer);
 
   void setClock(uint32_t timestamp);
   void importCard(const char *command);
@@ -143,6 +226,8 @@ public:
   void clearContacts() { resetContacts(); }
 
 protected:
+  void sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override;
+  void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
   void logRx(mesh::Packet *pkt, int len, float score) override;
   float getAirtimeBudgetFactor() const override;
   int calcRxDelay(float score, uint32_t air_time) const override;
