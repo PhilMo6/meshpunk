@@ -34,10 +34,10 @@
    STDLIB WRAPPER SETTINGS
  *=========================*/
 
-/* Use standard C malloc/free instead of LVGL's built-in 64KB pool.
- * On ESP32 with PSRAM, the system allocator routes large allocations
- * to the 8MB PSRAM automatically — no artificial memory limit. */
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CLIB
+/* Custom PSRAM allocator (implemented in src/lv_mem_psram.c).
+ * Routes all LVGL widget/style/object allocations to the 8MB PSRAM
+ * via heap_caps_malloc(), freeing internal SRAM for BLE/WiFi/DMA. */
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CUSTOM
 #define LV_USE_STDLIB_STRING    LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF   LV_STDLIB_CLIB
 
