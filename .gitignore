@@ -6,5 +6,6 @@
 .vscode/ipch
 .DS_Store
 Todo.txt
+docs
 meshpunk-*-merged.bin
 meshpunk-*-update.bin

@@ -10,8 +10,10 @@ Some features have been added or documented with the assistance of AI
 - Uses PlatformIO for easy building
 - Dual buffer display
 - Sound support
-- Touch and trackball controls
+- Touch and trackball nav controls
 - SD card support
+- BLE support for phone apps
+- Wifi support though no use yet
 - GPS automaticly gets time
 - Loads Lua scripts from the filesystem automaticly as apps
 - Integrates MeshCore networking

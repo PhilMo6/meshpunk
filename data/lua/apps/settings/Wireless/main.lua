@@ -1,0 +1,279 @@
+local lvgl  = require("lvgl")
+local utils = require("lib/utils")
+
+local wifi_avail = type(_wifi_get_enabled) == "function"
+local ble_avail  = type(_ble_get_enabled) == "function"
+
+local root = lvgl.Object()
+root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0 }
+root:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local content = root:Object {
+    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
+    border_width = 0, pad_all = 6,
+}
+_nav_setup(content, GRIDNAV_ROLLOVER)
+
+-- Title row
+local title_row = content:Object { w = lvgl.PCT(100), h = 26, border_width = 0, pad_all = 0 }
+title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+title_row:Label { text = "Wireless", align = lvgl.ALIGN.LEFT_MID }
+local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
+back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
+
+local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
+local timers = {}
+local scan_timer = nil
+
+-- ═══════════════════════════════════════════════════════════════════
+-- WiFi Section
+-- ═════════════════��═════════════════════════════════���═══════════════
+
+if wifi_avail then
+
+content:Label { text = "-- WiFi --", w = lvgl.PCT(100), h = 16 }
+
+local wifi_on = _wifi_get_enabled()
+local btn_wifi = content:Button { w = lvgl.PCT(60), h = 30 }
+local lbl_wifi = btn_wifi:Label { align = lvgl.ALIGN.CENTER }
+
+local function refresh_wifi_toggle()
+    wifi_on = _wifi_get_enabled()
+    lbl_wifi.text = wifi_on and "ON" or "OFF"
+end
+refresh_wifi_toggle()
+
+btn_wifi:onClicked(function()
+    _wifi_set_enabled(not wifi_on)
+    refresh_wifi_toggle()
+    status.text = "WiFi: " .. (wifi_on and "ON" or "OFF")
+end)
+
+-- WiFi status display
+local wifi_status_lbl = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
+
+local function refresh_wifi_status()
+    if not _wifi_get_enabled() then
+        wifi_status_lbl.text = "Disabled"
+        return
+    end
+    local st, ip, ssid = _wifi_status()
+    if st == "connected" then
+        wifi_status_lbl.text = ssid .. " (" .. ip .. ")"
+    elseif st == "idle" or st == "disconnected" then
+        wifi_status_lbl.text = "Not connected"
+    else
+        wifi_status_lbl.text = "Status: " .. st
+    end
+end
+refresh_wifi_status()
+
+-- Saved network display
+local creds = _wifi_get_saved_creds()
+local saved_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 0,
+}
+saved_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+local saved_lbl = saved_row:Label { text = "", align = lvgl.ALIGN.LEFT_MID }
+local forget_btn = saved_row:Button { w = 55, h = 24, align = lvgl.ALIGN.RIGHT_MID }
+forget_btn:Label { text = "Forget", align = lvgl.ALIGN.CENTER }
+
+local function refresh_saved()
+    creds = _wifi_get_saved_creds()
+    if creds.ssid and #creds.ssid > 0 then
+        saved_lbl.text = "Saved: " .. creds.ssid
+        forget_btn:clear_flag(lvgl.FLAG.HIDDEN)
+    else
+        saved_lbl.text = "No saved network"
+        forget_btn:add_flag(lvgl.FLAG.HIDDEN)
+    end
+end
+refresh_saved()
+
+forget_btn:onClicked(function()
+    _wifi_clear_creds()
+    _wifi_disconnect()
+    refresh_saved()
+    refresh_wifi_status()
+    status.text = "Network forgotten"
+end)
+
+-- Password input row
+local pass_row = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
+}
+pass_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+pass_row:add_flag(lvgl.FLAG.HIDDEN)
+
+local pass_input = pass_row:Textarea {
+    password_mode = true, one_line = true,
+    text = "", placeholder_text = "Password",
+    w = lvgl.PCT(60), h = 30,
+}
+pass_input:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+-- Scan button
+local scan_btn = content:Button { w = lvgl.PCT(60), h = 30 }
+scan_btn:Label { text = "Scan Networks", align = lvgl.ALIGN.CENTER }
+
+-- Scan results container
+local scan_container = content:Object {
+    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
+    border_width = 0, pad_all = 0,
+}
+scan_container:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local selected_ssid = ""
+local selected_secure = false
+
+local join_btn = pass_row:Button { w = 50, h = 28 }
+join_btn:Label { text = "Join", align = lvgl.ALIGN.CENTER }
+
+join_btn:onClicked(function()
+    local pass = pass_input.text or ""
+    if #selected_ssid == 0 then
+        status.text = "No network selected"
+        return
+    end
+    _wifi_save_creds(selected_ssid, pass)
+    _wifi_connect(selected_ssid, pass)
+    pass_row:add_flag(lvgl.FLAG.HIDDEN)
+    status.text = "Joining " .. selected_ssid .. "..."
+    refresh_saved()
+end)
+
+local function show_scan_results(results)
+    scan_container:clean()
+    if not results or #results == 0 then
+        scan_container:Label { text = "No networks found", w = lvgl.PCT(100), h = 16 }
+        return
+    end
+    for i = 1, math.min(#results, 8) do
+        local net = results[i]
+        local label_text = net.ssid
+        if net.secure then label_text = label_text .. " *" end
+        label_text = label_text .. " (" .. net.rssi .. "dB)"
+        local nbtn = scan_container:Button { w = lvgl.PCT(95), h = 26 }
+        nbtn:Label { text = label_text, align = lvgl.ALIGN.LEFT_MID }
+        nbtn:onClicked(function()
+            selected_ssid = net.ssid
+            selected_secure = net.secure
+            if net.secure then
+                pass_row:clear_flag(lvgl.FLAG.HIDDEN)
+                pass_input.text = ""
+                status.text = "Enter password for " .. net.ssid
+            else
+                pass_row:add_flag(lvgl.FLAG.HIDDEN)
+                _wifi_save_creds(net.ssid, "")
+                _wifi_connect(net.ssid, "")
+                status.text = "Joining " .. net.ssid .. "..."
+                refresh_saved()
+            end
+        end)
+    end
+end
+
+scan_btn:onClicked(function()
+    if not _wifi_get_enabled() then
+        status.text = "Enable WiFi first"
+        return
+    end
+    scan_container:clean()
+    scan_container:Label { text = "Scanning...", w = lvgl.PCT(100), h = 16 }
+    _wifi_scan_start()
+    if scan_timer then scan_timer:delete(); scan_timer = nil end
+    scan_timer = lvgl.Timer { period = 500, cb = function()
+        local results = _wifi_scan_results()
+        if results then
+            if scan_timer then scan_timer:delete(); scan_timer = nil end
+            show_scan_results(results)
+        end
+    end }
+end)
+
+-- Periodic WiFi status refresh
+local wifi_refresh_timer = lvgl.Timer { period = 2000, cb = function()
+    refresh_wifi_status()
+end }
+table.insert(timers, wifi_refresh_timer)
+
+end -- wifi_avail
+
+-- ═════════════════��═════════════════════════════════════════════════
+-- BLE Section
+-- ═══════════════════════════════════════════════════════════════════
+
+if ble_avail then
+
+content:Label { text = "-- BLE Companion --", w = lvgl.PCT(100), h = 16 }
+
+local ble_on = _ble_get_enabled()
+local btn_ble = content:Button { w = lvgl.PCT(60), h = 30 }
+local lbl_ble = btn_ble:Label { align = lvgl.ALIGN.CENTER }
+
+local function refresh_ble()
+    ble_on = _ble_get_enabled()
+    lbl_ble.text = ble_on and "ON" or "OFF"
+end
+refresh_ble()
+
+btn_ble:onClicked(function()
+    _ble_set_enabled(not ble_on)
+    refresh_ble()
+    status.text = "BLE: " .. (ble_on and "ON" or "OFF")
+end)
+
+-- Bond clear toggle
+content:Label { text = "Requires PIN re-entry on reconnect", w = lvgl.PCT(100), h = 16 }
+local bc_on = _ble_get_bond_clear()
+local btn_bc = content:Button { w = lvgl.PCT(60), h = 30 }
+local lbl_bc = btn_bc:Label { align = lvgl.ALIGN.CENTER }
+lbl_bc.text = bc_on and "Bond Clear: ON" or "Bond Clear: OFF"
+
+btn_bc:onClicked(function()
+    bc_on = not bc_on
+    _ble_set_bond_clear(bc_on)
+    lbl_bc.text = bc_on and "Bond Clear: ON" or "Bond Clear: OFF"
+end)
+
+-- Connection status
+local lbl_conn = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
+
+local function refresh_conn()
+    if not _ble_get_enabled() then
+        lbl_conn.text = "Disabled"
+    elseif _ble_is_connected() then
+        lbl_conn.text = "Connected"
+    else
+        lbl_conn.text = "Waiting for app..."
+    end
+end
+refresh_conn()
+
+local ble_timer = lvgl.Timer { period = 2000, cb = function() refresh_conn() end }
+table.insert(timers, ble_timer)
+
+end -- ble_avail
+
+-- ═══════════════════════════════════════════════════════════════════
+-- Back button
+-- ═══════════════════════════���═══════════════════════════════════════
+
+back_btn:onClicked(function()
+    for _, t in ipairs(timers) do
+        if t then pcall(function() t:delete() end) end
+    end
+    if scan_timer then pcall(function() scan_timer:delete() end) end
+    utils.loadingPopUpAdd(nil, "Home", function()
+        root:delete()
+        local launcher = require("launcher")
+        launcher.create()
+        return true
+    end)
+end)
+
+return root

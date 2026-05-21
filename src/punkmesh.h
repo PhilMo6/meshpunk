@@ -87,6 +87,8 @@ struct StoredMsg {
   uint8_t  path[MAX_PATH_SIZE];
   uint8_t  pkt_hash[MAX_HASH_SIZE];
   bool     has_hash;
+  uint8_t  sender_pub_key[6];
+  bool     has_pub_key;
   uint8_t  rpath_count;
   ObservedPath rpaths[MAX_PATHS_PER_MSG];
 };
@@ -162,10 +164,25 @@ public:
   void loadChannels();
   void saveChannels();
 
+  // ── Unified send + persist helpers ──────────────────────────
+  struct SendResult {
+    int code;              // MSG_SEND_FAILED / MSG_SEND_SENT_FLOOD / MSG_SEND_SENT_DIRECT
+    uint32_t expected_ack;
+    uint32_t est_timeout;
+    uint8_t tx_hash[MAX_HASH_SIZE];
+    bool has_hash;
+  };
+
+  SendResult sendAndPersistDM(ContactInfo& recipient, uint32_t timestamp,
+                              uint8_t attempt, const char* text);
+  bool sendAndPersistChannelMsg(int channel_idx, uint32_t timestamp,
+                                const char* text, int tlen,
+                                uint8_t* out_hash = nullptr);
+
   // ── Persistent message history ───────────────────────────────
-  // Max records kept per file (channel or DM). The file is compacted
-  // when it grows past ~2x this value.
-  int _max_messages = 100;
+  // Max records kept per file (channel or DM). Compaction fires at
+  // cap + 100 records and trims back to cap.
+  int _max_messages = 400;
   void setMaxMessages(int n);
 
   // Write paths (called from RX handlers and Lua send bindings).
@@ -179,7 +196,8 @@ public:
                        uint32_t timestamp, float snr, float rssi,
                        uint8_t hops, bool direct,
                        uint16_t path_len = 0, const uint8_t* path = nullptr,
-                       const uint8_t* pkt_hash = nullptr);
+                       const uint8_t* pkt_hash = nullptr,
+                       const uint8_t* sender_pub_key = nullptr);
 
   // ── Per-contact path history ────────────────────────────────────
   ContactPathHistory _path_history[MAX_PATH_CONTACTS];
@@ -212,6 +230,20 @@ public:
   int pushDMMessagesToLua(lua_State* L, const char* peer);
   int pushDMThreadNamesToLua(lua_State* L);
   int lookupPersistedPaths(lua_State* L, const char* hash_hex, int channel_idx, const char* peer);
+
+  bool hasConnectionToContact(const uint8_t* pub_key) { return hasConnectionTo(pub_key); }
+  void stopConnectionToContact(const uint8_t* pub_key) { stopConnection(pub_key); }
+  const uint8_t* getPrivateKey() const { return ((const uint8_t*)&self_id) + PUB_KEY_SIZE; }
+  bool saveIdentity();
+
+  // BLE sync: enumerate message files and read records.
+  static const int MAX_SYNC_FILES = 40;
+  static const int MAX_SYNC_PATH_LEN = 64;
+  int enumerateMessageFiles(char paths[][MAX_SYNC_PATH_LEN], int max_paths);
+  static int readOneStoredMsg(fs::FS* storage, const char* path,
+                              size_t offset, StoredMsg& m);
+  int readAllStoredMsgs(const char* path, StoredMsg* out, int max_count);
+  int readStoredMsgsSince(const char* path, uint32_t since, StoredMsg* out, int max_count);
 
   void setClock(uint32_t timestamp);
   void importCard(const char *command);

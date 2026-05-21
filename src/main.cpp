@@ -16,6 +16,7 @@
 #include "meshpunk_sync.h"
 #include "Audio.h"
 #include "sound.h"
+#include "ble_companion.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -79,7 +80,7 @@ SimpleMeshTables tables;
 
 ESP32Board board;
 PunkSX1262Wrapper radio_driver(radio, board);
-PunkMesh the_mesh(radio_driver, fast_rng, *new VolatileRTCClock(), tables); // TODO: test with 'rtc_clock' in target.cpp
+PunkMesh* the_mesh = nullptr;
 
 // One-shot GPS time sync: poll in loop() until first fix, then stop.
 static TinyGPSPlus gps_tinygps;
@@ -107,6 +108,11 @@ static String  tz_setting_str = "auto";
 // Firmware-level preferences (unified in /firmware_prefs)
 static bool   use_sd_pref = true;
 static String clock_fmt_str = "12";
+static bool   ble_enabled_pref = true;
+bool   ble_bond_clear_pref = false;
+static bool   wifi_enabled_pref = true;
+static String wifi_saved_ssid = "";
+static String wifi_saved_pass = "";
 
 // ── Audio ─────────────────────────────────────────────────────────────────
 static Audio*    audio = nullptr;          // ESP32-audioI2S player, created in setup()
@@ -162,6 +168,9 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("kbd_timeout=%d\n", kbd_timeout_secs);
   f.printf("notify_kbd=%d\n", notify_kbd_enabled ? 1 : 0);
   f.printf("notify_sound=%d\n", notify_sound_enabled ? 1 : 0);
+  f.printf("ble_enabled=%d\n", ble_enabled_pref ? 1 : 0);
+  f.printf("ble_bond_clear=%d\n", ble_bond_clear_pref ? 1 : 0);
+  f.printf("wifi_enabled=%d\n", wifi_enabled_pref ? 1 : 0);
   f.close();
   Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -171,6 +180,47 @@ static void firmware_prefs_save() {
   if (sd_mounted && use_sd_pref) {
     sd_spi_take();
     write_firmware_prefs(SD, "/meshpunk/firmware_prefs");
+    sd_spi_release();
+  }
+}
+
+static void write_wifi_creds(fs::FS& fs, const char* path) {
+  File f = fs.open(path, "w", true);
+  if (!f) { Serial.printf("[WIFI_CREDS] cannot write %s\n", path); return; }
+  f.println(wifi_saved_ssid.c_str());
+  f.println(wifi_saved_pass.c_str());
+  f.close();
+}
+
+static void wifi_creds_save() {
+  write_wifi_creds(LittleFS, "/wifi_creds");
+  if (sd_mounted && use_sd_pref) {
+    sd_spi_take();
+    write_wifi_creds(SD, "/meshpunk/wifi_creds");
+    sd_spi_release();
+  }
+}
+
+static void wifi_creds_load() {
+  File f = LittleFS.open("/wifi_creds", "r");
+  if (!f) return;
+  wifi_saved_ssid = f.readStringUntil('\n');
+  wifi_saved_ssid.trim();
+  wifi_saved_pass = f.readStringUntil('\n');
+  wifi_saved_pass.trim();
+  f.close();
+  if (wifi_saved_ssid.length() > 0) {
+    Serial.printf("[WIFI_CREDS] loaded SSID: %s\n", wifi_saved_ssid.c_str());
+  }
+}
+
+static void wifi_creds_clear() {
+  wifi_saved_ssid = "";
+  wifi_saved_pass = "";
+  LittleFS.remove("/wifi_creds");
+  if (sd_mounted && use_sd_pref) {
+    sd_spi_take();
+    SD.remove("/meshpunk/wifi_creds");
     sd_spi_release();
   }
 }
@@ -233,6 +283,12 @@ static void firmware_prefs_load() {
       notify_kbd_enabled = (atoi(val) == 1);
     } else if (strcmp(key, "notify_sound") == 0) {
       notify_sound_enabled = (atoi(val) == 1);
+    } else if (strcmp(key, "ble_enabled") == 0) {
+      ble_enabled_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "ble_bond_clear") == 0) {
+      ble_bond_clear_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "wifi_enabled") == 0) {
+      wifi_enabled_pref = (atoi(val) == 1);
     }
   }
   f.close();
@@ -412,7 +468,7 @@ void gps_sync_poll() {
     DateTime utc(gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                  gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second());
     MESH_LOCK();
-    the_mesh.getRTCClock()->setCurrentTime(utc.unixtime());
+    the_mesh->getRTCClock()->setCurrentTime(utc.unixtime());
     MESH_UNLOCK();
 
     gps_fix_acquired_ms = now;
@@ -1409,6 +1465,92 @@ static int lua_wifi_fetch(lua_State *L) {
   return 1; // Return the result table
 }
 
+static int lua_wifi_scan_start(lua_State *L) {
+  if (!wifi_enabled_pref) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  WiFi.scanNetworks(true);
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+static int lua_wifi_scan_results(lua_State *L) {
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_newtable(L);
+  if (n > 0) {
+    for (int i = 0; i < n && i < 16; i++) {
+      lua_newtable(L);
+      lua_pushstring(L, WiFi.SSID(i).c_str());
+      lua_setfield(L, -2, "ssid");
+      lua_pushinteger(L, WiFi.RSSI(i));
+      lua_setfield(L, -2, "rssi");
+      lua_pushboolean(L, WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+      lua_setfield(L, -2, "secure");
+      lua_rawseti(L, -2, i + 1);
+    }
+  }
+  WiFi.scanDelete();
+  return 1;
+}
+
+static int lua_wifi_get_enabled(lua_State *L) {
+  lua_pushboolean(L, wifi_enabled_pref);
+  return 1;
+}
+
+static int lua_wifi_set_enabled(lua_State *L) {
+  wifi_enabled_pref = lua_toboolean(L, 1);
+  if (wifi_enabled_pref) {
+    WiFi.mode(WIFI_STA);
+    if (wifi_saved_ssid.length() > 0) {
+      WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
+    }
+  } else {
+    WiFi.disconnect();
+    WiFi.mode(WIFI_OFF);
+  }
+  firmware_prefs_save();
+  return 0;
+}
+
+static int lua_wifi_get_saved_creds(lua_State *L) {
+  lua_newtable(L);
+  lua_pushstring(L, wifi_saved_ssid.c_str());
+  lua_setfield(L, -2, "ssid");
+  lua_pushboolean(L, wifi_saved_pass.length() > 0);
+  lua_setfield(L, -2, "has_password");
+  return 1;
+}
+
+static int lua_wifi_save_creds(lua_State *L) {
+  const char *ssid = luaL_checkstring(L, 1);
+  const char *pass = luaL_optstring(L, 2, "");
+  wifi_saved_ssid = ssid;
+  wifi_saved_pass = pass;
+  wifi_creds_save();
+  return 0;
+}
+
+static int lua_wifi_clear_creds(lua_State *L) {
+  wifi_creds_clear();
+  return 0;
+}
+
+static int lua_wifi_auto_connect(lua_State *L) {
+  if (wifi_enabled_pref && wifi_saved_ssid.length() > 0) {
+    WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
+    lua_pushboolean(L, 1);
+  } else {
+    lua_pushboolean(L, 0);
+  }
+  return 1;
+}
+
 // ── Mesh bridge: Lua → C++ ──────────────────────────────────────
 
 // Send a public/group channel message from Lua
@@ -1423,7 +1565,7 @@ static int lua_mesh_send_public(lua_State *L) {
   Serial.printf("[MESH TX] lua_mesh_send_public called, text=\"%s\"\n", text);
 
   MESH_LOCK();
-  if (!the_mesh._public) {
+  if (!the_mesh->_public) {
     MESH_UNLOCK();
     Serial.println("[MESH TX] ERROR: No public channel configured!");
     lua_pushboolean(L, 0);
@@ -1431,38 +1573,15 @@ static int lua_mesh_send_public(lua_State *L) {
     return 2;
   }
 
-  uint32_t timestamp = the_mesh.getRTCClock()->getCurrentTime();
-  Serial.printf("[MESH TX] Calling sendGroupMessage, timestamp=%u, sender=%s, text_len=%d\n",
-    timestamp, the_mesh._prefs.node_name, (int)strlen(text));
-
-  bool ok = the_mesh.sendGroupMessage(
-    timestamp,
-    the_mesh._public->channel,
-    the_mesh._prefs.node_name,
-    text,
-    strlen(text)
-  );
-
-  Serial.printf("[MESH TX] sendGroupMessage returned %s\n", ok ? "true" : "false");
-
-  // Copy hash to local before unlocking — Core 1 can overwrite _last_tx_hash
-  // via sendFloodScoped (ACKs, relays) as soon as we release MESH_LOCK.
-  uint8_t local_hash[MAX_HASH_SIZE];
-  if (ok) {
-    memcpy(local_hash, the_mesh._last_tx_hash, MAX_HASH_SIZE);
-    // Persist local echo — Public is always channel slot 0
-    the_mesh.appendChannelMessage(0, the_mesh._prefs.node_name, text, timestamp,
-                                  0.0f, 0.0f, 0, false,
-                                  0, nullptr, local_hash);
-    // Pre-register so reflected copies get path-tracked
-    the_mesh.preRegisterSentHash(local_hash, false, 0, nullptr);
-  }
+  uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
+  uint8_t tx_hash[MAX_HASH_SIZE];
+  bool ok = the_mesh->sendAndPersistChannelMsg(0, timestamp, text, strlen(text), tx_hash);
   MESH_UNLOCK();
 
   lua_pushboolean(L, ok ? 1 : 0);
   if (ok) {
     char hex[MAX_HASH_SIZE * 2 + 1];
-    mesh::Utils::toHex(hex, local_hash, MAX_HASH_SIZE);
+    mesh::Utils::toHex(hex, tx_hash, MAX_HASH_SIZE);
     lua_pushstring(L, hex);
   } else {
     lua_pushnil(L);
@@ -1479,7 +1598,7 @@ static int lua_mesh_send_direct(lua_State *L) {
   normalize_smart_quotes(raw, text, sizeof(text));
 
   MESH_LOCK();
-  ContactInfo *recipient = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *recipient = the_mesh->searchContactsByPrefix(name_prefix);
   if (!recipient) {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -1489,39 +1608,23 @@ static int lua_mesh_send_direct(lua_State *L) {
 
   uint32_t expected_ack = 0;
   uint32_t est_timeout = 0;
-  uint32_t timestamp = the_mesh.getRTCClock()->getCurrentTime();
+  uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
 
-  int result = the_mesh.sendMessage(
-    *recipient, timestamp, 0, text, expected_ack, est_timeout
-  );
+  auto r = the_mesh->sendAndPersistDM(*recipient, timestamp, 0, text);
+  MESH_UNLOCK();
 
-  if (result == MSG_SEND_FAILED) {
-    MESH_UNLOCK();
+  if (r.code == MSG_SEND_FAILED) {
     lua_pushboolean(L, 0);
     lua_pushstring(L, "Send failed");
     return 2;
   }
 
-  // Persist local echo — peer is the recipient, from is us.
-  // Copy hash to local before unlocking — Core 1 can overwrite _last_tx_hash.
-  bool is_flood = (result == MSG_SEND_SENT_FLOOD);
-  uint8_t local_hash[MAX_HASH_SIZE];
-  if (is_flood) memcpy(local_hash, the_mesh._last_tx_hash, MAX_HASH_SIZE);
-
-  the_mesh.appendDMMessage(recipient->name, the_mesh._prefs.node_name, text,
-                           timestamp, 0.0f, 0.0f, 0,
-                           result == MSG_SEND_SENT_DIRECT,
-                           0, nullptr, is_flood ? local_hash : nullptr);
-  if (is_flood) {
-    the_mesh.preRegisterSentHash(local_hash, true, -1, recipient->name);
-  }
-  MESH_UNLOCK();
-
+  bool is_flood = (r.code == MSG_SEND_SENT_FLOOD);
   lua_pushboolean(L, 1);
   lua_pushstring(L, is_flood ? "flood" : "direct");
-  if (is_flood) {
+  if (r.has_hash) {
     char hex[MAX_HASH_SIZE * 2 + 1];
-    mesh::Utils::toHex(hex, local_hash, MAX_HASH_SIZE);
+    mesh::Utils::toHex(hex, r.tx_hash, MAX_HASH_SIZE);
     lua_pushstring(L, hex);
     return 3;
   }
@@ -1534,41 +1637,102 @@ static int lua_mesh_get_node_info(lua_State *L) {
   lua_newtable(L);
 
   MESH_LOCK();
-  lua_pushstring(L, the_mesh._prefs.node_name);
+  lua_pushstring(L, the_mesh->_prefs.node_name);
   lua_setfield(L, -2, "name");
 
   // Public key as hex string
   char hex[PUB_KEY_SIZE * 2 + 1];
-  mesh::Utils::toHex(hex, the_mesh.self_id.pub_key, PUB_KEY_SIZE);
+  mesh::Utils::toHex(hex, the_mesh->self_id.pub_key, PUB_KEY_SIZE);
   lua_pushstring(L, hex);
   lua_setfield(L, -2, "pubkey");
 
-  lua_pushnumber(L, the_mesh._prefs.freq);
+  lua_pushnumber(L, the_mesh->_prefs.freq);
   lua_setfield(L, -2, "freq");
 
-  lua_pushinteger(L, the_mesh._prefs.tx_power_dbm);
+  lua_pushinteger(L, the_mesh->_prefs.tx_power_dbm);
   lua_setfield(L, -2, "tx_power");
 
-  lua_pushnumber(L, the_mesh._prefs.node_lat);
+  lua_pushnumber(L, the_mesh->_prefs.node_lat);
   lua_setfield(L, -2, "lat");
 
-  lua_pushnumber(L, the_mesh._prefs.node_lon);
+  lua_pushnumber(L, the_mesh->_prefs.node_lon);
   lua_setfield(L, -2, "lon");
 
-  lua_pushnumber(L, the_mesh._prefs.bandwidth);
+  lua_pushnumber(L, the_mesh->_prefs.bandwidth);
   lua_setfield(L, -2, "bandwidth");
 
-  lua_pushinteger(L, the_mesh._prefs.spreading_factor);
+  lua_pushinteger(L, the_mesh->_prefs.spreading_factor);
   lua_setfield(L, -2, "spreading_factor");
 
-  lua_pushinteger(L, the_mesh._prefs.coding_rate);
+  lua_pushinteger(L, the_mesh->_prefs.coding_rate);
   lua_setfield(L, -2, "coding_rate");
 
-  lua_pushboolean(L, the_mesh._prefs.contact_overwrite != 0);
+  lua_pushboolean(L, the_mesh->_prefs.contact_overwrite != 0);
   lua_setfield(L, -2, "contact_overwrite");
   MESH_UNLOCK();
 
   return 1;
+}
+
+static int lua_mesh_export_private_key(lua_State *L) {
+  MESH_LOCK();
+  char hex[PRV_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(hex, the_mesh->getPrivateKey(), PRV_KEY_SIZE);
+  hex[PRV_KEY_SIZE * 2] = '\0';
+  MESH_UNLOCK();
+  lua_pushstring(L, hex);
+  return 1;
+}
+
+static int lua_mesh_import_private_key(lua_State *L) {
+  const char* hex = luaL_checkstring(L, 1);
+  if (strlen(hex) != PRV_KEY_SIZE * 2) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "key must be 128 hex chars");
+    return 2;
+  }
+  uint8_t prv[PRV_KEY_SIZE];
+  if (!mesh::Utils::fromHex(prv, PRV_KEY_SIZE, hex)) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "invalid hex");
+    return 2;
+  }
+  if (!mesh::LocalIdentity::validatePrivateKey(prv)) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "key validation failed");
+    return 2;
+  }
+  MESH_LOCK();
+  the_mesh->self_id.readFrom(prv, PRV_KEY_SIZE);
+  bool ok = the_mesh->saveIdentity();
+  MESH_UNLOCK();
+  if (ok) {
+    delay(100);
+    ESP.restart();
+  }
+  lua_pushboolean(L, 0);
+  lua_pushstring(L, "file write failed");
+  return 2;
+}
+
+static int lua_mesh_generate_identity(lua_State *L) {
+  MESH_LOCK();
+  ((StdRNG*)the_mesh->getRNG())->begin(esp_random());
+  the_mesh->self_id = mesh::LocalIdentity(the_mesh->getRNG());
+  int count = 0;
+  while (count < 10 && (the_mesh->self_id.pub_key[0] == 0x00 || the_mesh->self_id.pub_key[0] == 0xFF)) {
+    the_mesh->self_id = mesh::LocalIdentity(the_mesh->getRNG());
+    count++;
+  }
+  bool ok = the_mesh->saveIdentity();
+  MESH_UNLOCK();
+  if (ok) {
+    delay(100);
+    ESP.restart();
+  }
+  lua_pushboolean(L, 0);
+  lua_pushstring(L, "file write failed");
+  return 2;
 }
 
 // Get contact list
@@ -1579,8 +1743,8 @@ static int lua_mesh_get_contacts(lua_State *L) {
   MESH_LOCK();
   ContactInfo c;
   int idx = 1;
-  for (int i = 0; i < the_mesh.getNumContacts(); i++) {
-    if (the_mesh.getContactByIdx(i, c)) {
+  for (int i = 0; i < the_mesh->getNumContacts(); i++) {
+    if (the_mesh->getContactByIdx(i, c)) {
       lua_newtable(L);
 
       lua_pushstring(L, c.name);
@@ -1603,7 +1767,7 @@ static int lua_mesh_get_contacts(lua_State *L) {
       lua_pushstring(L, hex);
       lua_setfield(L, -2, "pubkey");
 
-      lua_pushstring(L, the_mesh.getTypeName(c.type));
+      lua_pushstring(L, the_mesh->getTypeName(c.type));
       lua_setfield(L, -2, "type_name");
 
       lua_pushboolean(L, (c.flags & 0x01) != 0);
@@ -1641,9 +1805,9 @@ static int lua_mesh_get_contact_paths(lua_State *L) {
 
   MESH_LOCK();
   ContactPathHistory *h = nullptr;
-  for (int i = 0; i < the_mesh._path_history_count; i++) {
-    if (memcmp(the_mesh._path_history[i].pub_key, pub_key, PUB_KEY_SIZE) == 0) {
-      h = &the_mesh._path_history[i];
+  for (int i = 0; i < the_mesh->_path_history_count; i++) {
+    if (memcmp(the_mesh->_path_history[i].pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+      h = &the_mesh->_path_history[i];
       break;
     }
   }
@@ -1723,7 +1887,7 @@ static int lua_mesh_get_message_paths(lua_State *L) {
   MESH_LOCK();
 
   // Try RAM buffer first
-  MsgPathEntry *e = the_mesh.findMsgPaths(hash);
+  MsgPathEntry *e = the_mesh->findMsgPaths(hash);
   if (e && e->path_count > 0) {
     lua_newtable(L);
     for (int i = 0; i < e->path_count; i++) {
@@ -1760,7 +1924,7 @@ static int lua_mesh_get_message_paths(lua_State *L) {
   }
 
   // RAM miss — fall back to persisted log file
-  int r = the_mesh.lookupPersistedPaths(L, hash_hex, channel_idx, peer);
+  int r = the_mesh->lookupPersistedPaths(L, hash_hex, channel_idx, peer);
   MESH_UNLOCK();
   return r;
 }
@@ -1771,14 +1935,14 @@ static int lua_mesh_get_message_paths(lua_State *L) {
 static int lua_mesh_send_advert(lua_State *L) {
   const char *mode = luaL_optstring(L, 1, "flood");
   MESH_LOCK();
-  auto pkt = the_mesh.createSelfAdvert(the_mesh._prefs.node_name,
-                                       the_mesh._prefs.node_lat,
-                                       the_mesh._prefs.node_lon);
+  auto pkt = the_mesh->createSelfAdvert(the_mesh->_prefs.node_name,
+                                       the_mesh->_prefs.node_lat,
+                                       the_mesh->_prefs.node_lon);
   if (pkt) {
     if (strcmp(mode, "zerohop") == 0) {
-      the_mesh.sendZeroHop(pkt, (uint32_t)0);
+      the_mesh->sendZeroHop(pkt, (uint32_t)0);
     } else {
-      the_mesh.sendFlood(pkt, (uint32_t)0);
+      the_mesh->sendFlood(pkt, (uint32_t)0);
     }
   }
   MESH_UNLOCK();
@@ -1789,7 +1953,7 @@ static int lua_mesh_send_advert(lua_State *L) {
 // Get number of contacts
 static int lua_mesh_get_num_contacts(lua_State *L) {
   MESH_LOCK();
-  int n = the_mesh.getNumContacts();
+  int n = the_mesh->getNumContacts();
   MESH_UNLOCK();
   lua_pushinteger(L, n);
   return 1;
@@ -1810,48 +1974,48 @@ static int lua_mesh_set_config(lua_State *L) {
 
   MESH_LOCK();
   if (strcmp(key, "name") == 0) {
-    strncpy(the_mesh._prefs.node_name, value, sizeof(the_mesh._prefs.node_name) - 1);
-    the_mesh._prefs.node_name[sizeof(the_mesh._prefs.node_name) - 1] = '\0';
-    the_mesh.savePrefs();
-    Serial.printf("Node name set to: %s\n", the_mesh._prefs.node_name);
+    strncpy(the_mesh->_prefs.node_name, value, sizeof(the_mesh->_prefs.node_name) - 1);
+    the_mesh->_prefs.node_name[sizeof(the_mesh->_prefs.node_name) - 1] = '\0';
+    the_mesh->savePrefs();
+    Serial.printf("Node name set to: %s\n", the_mesh->_prefs.node_name);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "freq") == 0) {
-    the_mesh._prefs.freq = atof(value);
-    the_mesh.savePrefs();
-    Serial.printf("Frequency set to: %.3f (reboot to apply)\n", the_mesh._prefs.freq);
+    the_mesh->_prefs.freq = atof(value);
+    the_mesh->savePrefs();
+    Serial.printf("Frequency set to: %.3f (reboot to apply)\n", the_mesh->_prefs.freq);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "tx") == 0) {
-    the_mesh._prefs.tx_power_dbm = atoi(value);
-    the_mesh.savePrefs();
-    Serial.printf("TX power set to: %d dBm (reboot to apply)\n", the_mesh._prefs.tx_power_dbm);
+    the_mesh->_prefs.tx_power_dbm = atoi(value);
+    the_mesh->savePrefs();
+    Serial.printf("TX power set to: %d dBm (reboot to apply)\n", the_mesh->_prefs.tx_power_dbm);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "lat") == 0) {
-    the_mesh._prefs.node_lat = atof(value);
-    the_mesh.savePrefs();
+    the_mesh->_prefs.node_lat = atof(value);
+    the_mesh->savePrefs();
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "lon") == 0) {
-    the_mesh._prefs.node_lon = atof(value);
-    the_mesh.savePrefs();
+    the_mesh->_prefs.node_lon = atof(value);
+    the_mesh->savePrefs();
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "bw") == 0) {
-    the_mesh._prefs.bandwidth = atof(value);
-    the_mesh.savePrefs();
-    Serial.printf("Bandwidth set to: %.1f kHz (reboot to apply)\n", the_mesh._prefs.bandwidth);
+    the_mesh->_prefs.bandwidth = atof(value);
+    the_mesh->savePrefs();
+    Serial.printf("Bandwidth set to: %.1f kHz (reboot to apply)\n", the_mesh->_prefs.bandwidth);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "sf") == 0) {
-    the_mesh._prefs.spreading_factor = atoi(value);
-    the_mesh.savePrefs();
-    Serial.printf("Spreading factor set to: %d (reboot to apply)\n", the_mesh._prefs.spreading_factor);
+    the_mesh->_prefs.spreading_factor = atoi(value);
+    the_mesh->savePrefs();
+    Serial.printf("Spreading factor set to: %d (reboot to apply)\n", the_mesh->_prefs.spreading_factor);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "cr") == 0) {
-    the_mesh._prefs.coding_rate = atoi(value);
-    the_mesh.savePrefs();
-    Serial.printf("Coding rate set to: %d (reboot to apply)\n", the_mesh._prefs.coding_rate);
+    the_mesh->_prefs.coding_rate = atoi(value);
+    the_mesh->savePrefs();
+    Serial.printf("Coding rate set to: %d (reboot to apply)\n", the_mesh->_prefs.coding_rate);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "contact_overwrite") == 0) {
-    the_mesh._prefs.contact_overwrite = (atoi(value) != 0) ? 1 : 0;
-    the_mesh.savePrefs();
-    Serial.printf("Contact overwrite set to: %s\n", the_mesh._prefs.contact_overwrite ? "ON" : "OFF");
+    the_mesh->_prefs.contact_overwrite = (atoi(value) != 0) ? 1 : 0;
+    the_mesh->savePrefs();
+    Serial.printf("Contact overwrite set to: %s\n", the_mesh->_prefs.contact_overwrite ? "ON" : "OFF");
     lua_pushboolean(L, 1);
   } else {
     MESH_UNLOCK();
@@ -1876,7 +2040,7 @@ static int lua_mesh_get_channels(lua_State *L) {
   MESH_LOCK();
   for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
     ChannelDetails cd;
-    if (the_mesh.getChannel(i, cd)) {
+    if (the_mesh->getChannel(i, cd)) {
       // Check if channel has a non-empty name
       if (cd.name[0] != '\0') {
         lua_newtable(L);
@@ -1923,8 +2087,8 @@ static int lua_mesh_set_channel(lua_State *L) {
     // Delete channel: set empty name and zero secret
     ChannelDetails cd;
     memset(&cd, 0, sizeof(cd));
-    the_mesh.setChannel(ch_idx, cd);
-    the_mesh.saveChannels();
+    the_mesh->setChannel(ch_idx, cd);
+    the_mesh->saveChannels();
     MESH_UNLOCK();
     lua_pushboolean(L, 1);
     return 1;
@@ -1941,15 +2105,15 @@ static int lua_mesh_set_channel(lua_State *L) {
     mesh::Utils::sha256(hash, 32, (const uint8_t*)name, strlen(name));
     memcpy(cd.channel.secret, hash, 16);
     mesh::Utils::sha256(cd.channel.hash, sizeof(cd.channel.hash), cd.channel.secret, 16);
-    the_mesh.setChannel(ch_idx, cd);
-    the_mesh.saveChannels();
+    the_mesh->setChannel(ch_idx, cd);
+    the_mesh->saveChannels();
     MESH_UNLOCK();
     lua_pushboolean(L, 1);
     return 1;
   }
 
   // Normal channel with PSK
-  ChannelDetails *result = the_mesh.addChannel(name, psk);
+  ChannelDetails *result = the_mesh->addChannel(name, psk);
   if (!result) {
     // addChannel only works for new slots, try setChannel directly
     // Parse the base64 PSK manually
@@ -1966,14 +2130,14 @@ static int lua_mesh_set_channel(lua_State *L) {
       lua_pushstring(L, "Invalid PSK length (need 16 or 32 bytes)");
       return 2;
     }
-    bool ok = the_mesh.setChannel(ch_idx, cd);
-    if (ok) the_mesh.saveChannels();
+    bool ok = the_mesh->setChannel(ch_idx, cd);
+    if (ok) the_mesh->saveChannels();
     MESH_UNLOCK();
     lua_pushboolean(L, ok ? 1 : 0);
     return 1;
   }
 
-  the_mesh.saveChannels();
+  the_mesh->saveChannels();
   MESH_UNLOCK();
   lua_pushboolean(L, 1);
   return 1;
@@ -1988,35 +2152,15 @@ static int lua_mesh_send_channel(lua_State *L) {
   normalize_smart_quotes(raw, text, sizeof(text));
 
   MESH_LOCK();
-  ChannelDetails cd;
-  if (!the_mesh.getChannel(ch_idx, cd) || cd.name[0] == '\0') {
-    MESH_UNLOCK();
-    lua_pushboolean(L, 0);
-    lua_pushstring(L, "Channel not found");
-    return 2;
-  }
-
-  uint32_t timestamp = the_mesh.getRTCClock()->getCurrentTime();
-  bool ok = the_mesh.sendGroupMessage(
-    timestamp, cd.channel, the_mesh._prefs.node_name, text, strlen(text)
-  );
-
-  // Copy hash to local before unlocking — Core 1 can overwrite _last_tx_hash.
-  uint8_t local_hash[MAX_HASH_SIZE];
-  if (ok) {
-    memcpy(local_hash, the_mesh._last_tx_hash, MAX_HASH_SIZE);
-    // Persist local echo for this channel slot
-    the_mesh.appendChannelMessage(ch_idx, the_mesh._prefs.node_name, text,
-                                  timestamp, 0.0f, 0.0f, 0, false,
-                                  0, nullptr, local_hash);
-    the_mesh.preRegisterSentHash(local_hash, false, (int8_t)ch_idx, nullptr);
-  }
+  uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
+  uint8_t tx_hash[MAX_HASH_SIZE];
+  bool ok = the_mesh->sendAndPersistChannelMsg(ch_idx, timestamp, text, strlen(text), tx_hash);
   MESH_UNLOCK();
 
   lua_pushboolean(L, ok ? 1 : 0);
   if (ok) {
     char hex[MAX_HASH_SIZE * 2 + 1];
-    mesh::Utils::toHex(hex, local_hash, MAX_HASH_SIZE);
+    mesh::Utils::toHex(hex, tx_hash, MAX_HASH_SIZE);
     lua_pushstring(L, hex);
   } else {
     lua_pushnil(L);
@@ -2030,7 +2174,7 @@ static int lua_mesh_remove_contact(lua_State *L) {
   const char *name_prefix = luaL_checkstring(L, 1);
 
   MESH_LOCK();
-  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
   if (!c) {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -2038,8 +2182,8 @@ static int lua_mesh_remove_contact(lua_State *L) {
     return 2;
   }
 
-  bool ok = the_mesh.removeContact(*c);
-  if (ok) the_mesh.saveContacts();
+  bool ok = the_mesh->removeContact(*c);
+  if (ok) the_mesh->saveContacts();
   MESH_UNLOCK();
 
   lua_pushboolean(L, ok ? 1 : 0);
@@ -2050,8 +2194,8 @@ static int lua_mesh_remove_contact(lua_State *L) {
 // Usage: _mesh_clear_contacts()
 static int lua_mesh_clear_contacts(lua_State *L) {
   MESH_LOCK();
-  the_mesh.clearContacts();
-  the_mesh.saveContacts();
+  the_mesh->clearContacts();
+  the_mesh->saveContacts();
   MESH_UNLOCK();
   Serial.println("[MESH] All contacts cleared");
   lua_pushboolean(L, 1);
@@ -2064,7 +2208,7 @@ static int lua_mesh_reset_path(lua_State *L) {
   const char *name_prefix = luaL_checkstring(L, 1);
 
   MESH_LOCK();
-  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
   if (!c) {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -2072,8 +2216,8 @@ static int lua_mesh_reset_path(lua_State *L) {
     return 2;
   }
 
-  the_mesh.resetPathTo(*c);
-  the_mesh.saveContacts();
+  the_mesh->resetPathTo(*c);
+  the_mesh->saveContacts();
   MESH_UNLOCK();
 
   lua_pushboolean(L, 1);
@@ -2087,7 +2231,7 @@ static int lua_mesh_set_contact_favorite(lua_State *L) {
   bool fav = lua_toboolean(L, 2);
 
   MESH_LOCK();
-  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
   if (!c) {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -2097,7 +2241,7 @@ static int lua_mesh_set_contact_favorite(lua_State *L) {
 
   if (fav) c->flags |= 0x01;
   else     c->flags &= ~0x01;
-  the_mesh.saveContacts();
+  the_mesh->saveContacts();
   MESH_UNLOCK();
 
   lua_pushboolean(L, 1);
@@ -2110,7 +2254,7 @@ static int lua_mesh_export_contact(lua_State *L) {
   const char *name_prefix = luaL_checkstring(L, 1);
 
   MESH_LOCK();
-  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
   if (!c) {
     MESH_UNLOCK();
     lua_pushnil(L);
@@ -2119,7 +2263,7 @@ static int lua_mesh_export_contact(lua_State *L) {
   }
 
   uint8_t buf[256];
-  uint8_t len = the_mesh.exportContact(*c, buf);
+  uint8_t len = the_mesh->exportContact(*c, buf);
   MESH_UNLOCK();
   if (len == 0) {
     lua_pushnil(L);
@@ -2142,7 +2286,7 @@ static int lua_mesh_import_contact(lua_State *L) {
   const char *card = luaL_checkstring(L, 1);
 
   MESH_LOCK();
-  the_mesh.importCard(card);
+  the_mesh->importCard(card);
   MESH_UNLOCK();
   lua_pushboolean(L, 1);
   return 1;
@@ -2154,7 +2298,7 @@ static int lua_mesh_share_contact(lua_State *L) {
   const char *name_prefix = luaL_checkstring(L, 1);
 
   MESH_LOCK();
-  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
   if (!c) {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -2162,7 +2306,7 @@ static int lua_mesh_share_contact(lua_State *L) {
     return 2;
   }
 
-  bool ok = the_mesh.shareContactZeroHop(*c);
+  bool ok = the_mesh->shareContactZeroHop(*c);
   MESH_UNLOCK();
   lua_pushboolean(L, ok ? 1 : 0);
   return 1;
@@ -2175,7 +2319,7 @@ static int lua_mesh_login_room(lua_State *L) {
   const char *password = luaL_checkstring(L, 2);
 
   MESH_LOCK();
-  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
   if (!c) {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -2184,7 +2328,7 @@ static int lua_mesh_login_room(lua_State *L) {
   }
 
   uint32_t est_timeout = 0;
-  int result = the_mesh.sendLogin(*c, password, est_timeout);
+  int result = the_mesh->sendLogin(*c, password, est_timeout);
   MESH_UNLOCK();
 
   if (result == MSG_SEND_FAILED) {
@@ -2206,7 +2350,7 @@ static int lua_mesh_send_request(lua_State *L) {
   int req_type = luaL_checkinteger(L, 2);
 
   MESH_LOCK();
-  ContactInfo *c = the_mesh.searchContactsByPrefix(name_prefix);
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
   if (!c) {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -2216,7 +2360,7 @@ static int lua_mesh_send_request(lua_State *L) {
 
   uint32_t tag = 0;
   uint32_t est_timeout = 0;
-  int result = the_mesh.sendRequest(*c, (uint8_t)req_type, tag, est_timeout);
+  int result = the_mesh->sendRequest(*c, (uint8_t)req_type, tag, est_timeout);
   MESH_UNLOCK();
 
   if (result == MSG_SEND_FAILED) {
@@ -2236,8 +2380,8 @@ static int lua_mesh_get_rx_info(lua_State *L) {
   lua_newtable(L);
 
   MESH_LOCK();
-  float snr  = the_mesh.last_rx_snr;
-  float rssi = the_mesh.last_rx_rssi;
+  float snr  = the_mesh->last_rx_snr;
+  float rssi = the_mesh->last_rx_rssi;
   MESH_UNLOCK();
 
   lua_pushnumber(L, snr);
@@ -2266,8 +2410,8 @@ static int lua_mesh_set_rx_boost(lua_State *L) {
   radio_driver.setRxBoostedGainMode(en);
   SPI_UNLOCK();
 
-  the_mesh._prefs.rx_boost = en ? 1 : 0;
-  the_mesh.savePrefs();
+  the_mesh->_prefs.rx_boost = en ? 1 : 0;
+  the_mesh->savePrefs();
   Serial.printf("[RADIO] RX Boost preference saved: %d\n", en ? 1 : 0);
 
   return 0;
@@ -2281,7 +2425,7 @@ static int lua_mesh_set_rx_boost(lua_State *L) {
 static int lua_mesh_get_channel_messages(lua_State *L) {
   int ch_idx = luaL_checkinteger(L, 1);
   MESH_LOCK();
-  int n = the_mesh.pushChannelMessagesToLua(L, ch_idx);
+  int n = the_mesh->pushChannelMessagesToLua(L, ch_idx);
   MESH_UNLOCK();
   return n;
 }
@@ -2291,7 +2435,7 @@ static int lua_mesh_get_channel_messages(lua_State *L) {
 static int lua_mesh_get_dm_messages(lua_State *L) {
   const char *peer = luaL_checkstring(L, 1);
   MESH_LOCK();
-  int n = the_mesh.pushDMMessagesToLua(L, peer);
+  int n = the_mesh->pushDMMessagesToLua(L, peer);
   MESH_UNLOCK();
   return n;
 }
@@ -2300,7 +2444,7 @@ static int lua_mesh_get_dm_messages(lua_State *L) {
 // Usage: local names = _mesh_get_dm_threads()
 static int lua_mesh_get_dm_threads(lua_State *L) {
   MESH_LOCK();
-  int n = the_mesh.pushDMThreadNamesToLua(L);
+  int n = the_mesh->pushDMThreadNamesToLua(L);
   MESH_UNLOCK();
   return n;
 }
@@ -2310,7 +2454,7 @@ static int lua_mesh_get_dm_threads(lua_State *L) {
 static int lua_mesh_set_max_messages(lua_State *L) {
   int n = luaL_checkinteger(L, 1);
   MESH_LOCK();
-  the_mesh.setMaxMessages(n);
+  the_mesh->setMaxMessages(n);
   MESH_UNLOCK();
   lua_pushboolean(L, 1);
   return 1;
@@ -2325,7 +2469,7 @@ static int lua_storage_get_info(lua_State *L) {
 
   // Current active storage type
   MESH_LOCK();
-  bool is_sd = (the_mesh._storage != &LittleFS);
+  bool is_sd = (the_mesh->_storage != &LittleFS);
   MESH_UNLOCK();
   lua_pushstring(L, is_sd ? "SD" : "LittleFS");
   lua_setfield(L, -2, "type");
@@ -2385,8 +2529,8 @@ static int lua_storage_set_use_sd(lua_State *L) {
 
   // Determine source and destination
   MESH_LOCK();
-  fs::FS* oldFS = the_mesh._storage;
-  String oldPrefix = the_mesh._storage_prefix;
+  fs::FS* oldFS = the_mesh->_storage;
+  String oldPrefix = the_mesh->_storage_prefix;
   MESH_UNLOCK();
 
   fs::FS* newFS;
@@ -2422,7 +2566,7 @@ static int lua_storage_set_use_sd(lua_State *L) {
 
   // Switch active storage
   MESH_LOCK();
-  the_mesh.setStorage(newFS, newPrefix.c_str());
+  the_mesh->setStorage(newFS, newPrefix.c_str());
   MESH_UNLOCK();
 
   use_sd_pref = want_sd;
@@ -2711,7 +2855,7 @@ void setupLuaVGL() {
   }
 
   // Set Lua runtime on PunkMesh
-  the_mesh.lua_runtime = L;
+  the_mesh->lua_runtime = L;
 
   // Open standard Lua libraries
   luaL_openlibs(L);
@@ -2725,6 +2869,14 @@ void setupLuaVGL() {
   lua_register(L, "_wifi_status", lua_wifi_status);
   lua_register(L, "_wifi_disconnect", lua_wifi_disconnect);
   lua_register(L, "_wifi_fetch", lua_wifi_fetch);
+  lua_register(L, "_wifi_scan_start", lua_wifi_scan_start);
+  lua_register(L, "_wifi_scan_results", lua_wifi_scan_results);
+  lua_register(L, "_wifi_get_enabled", lua_wifi_get_enabled);
+  lua_register(L, "_wifi_set_enabled", lua_wifi_set_enabled);
+  lua_register(L, "_wifi_get_saved_creds", lua_wifi_get_saved_creds);
+  lua_register(L, "_wifi_save_creds", lua_wifi_save_creds);
+  lua_register(L, "_wifi_clear_creds", lua_wifi_clear_creds);
+  lua_register(L, "_wifi_auto_connect", lua_wifi_auto_connect);
 
   // Register Mesh bridge functions
   lua_register(L, "_mesh_send_public", lua_mesh_send_public);
@@ -2760,6 +2912,11 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
   lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
 
+  // Identity management
+  lua_register(L, "_mesh_export_private_key", lua_mesh_export_private_key);
+  lua_register(L, "_mesh_import_private_key", lua_mesh_import_private_key);
+  lua_register(L, "_mesh_generate_identity", lua_mesh_generate_identity);
+
   lua_register(L, "_get_battery_mv", [](lua_State *L) -> int {
     lua_pushinteger(L, board.getBattMilliVolts());
     return 1;
@@ -2784,7 +2941,7 @@ void setupLuaVGL() {
   // RTC epoch seconds (seeded from GPS once at boot, then free-running)
   lua_register(L, "_rtc_time", [](lua_State *L) -> int {
     MESH_LOCK();
-    lua_Integer t = (lua_Integer)the_mesh.getRTCClock()->getCurrentTime();
+    lua_Integer t = (lua_Integer)the_mesh->getRTCClock()->getCurrentTime();
     MESH_UNLOCK();
     lua_pushinteger(L, t);
     return 1;
@@ -2935,6 +3092,43 @@ void setupLuaVGL() {
     lua_pushboolean(L, notify_sound_enabled);
     return 1;
   });
+
+  // ── BLE companion ──────────────────────────────────────────────────────────
+#if BLE_COMPANION_ENABLED
+  lua_register(L, "_ble_get_enabled", [](lua_State* L) -> int {
+    lua_pushboolean(L, ble_enabled_pref);
+    return 1;
+  });
+  lua_register(L, "_ble_set_enabled", [](lua_State* L) -> int {
+    bool v = lua_toboolean(L, 1);
+    ble_enabled_pref = v;
+    MESH_LOCK();
+    if (v && !ble_serial) {
+      ble_companion_init_early();
+      ble_companion_start(*the_mesh);
+    } else if (!v && ble_serial) {
+      ble_companion_stop();
+    }
+    MESH_UNLOCK();
+    firmware_prefs_save();
+    lua_pushboolean(L, ble_enabled_pref);
+    return 1;
+  });
+  lua_register(L, "_ble_is_connected", [](lua_State* L) -> int {
+    lua_pushboolean(L, ble_companion && ble_companion->isConnected());
+    return 1;
+  });
+  lua_register(L, "_ble_get_bond_clear", [](lua_State* L) -> int {
+    lua_pushboolean(L, ble_bond_clear_pref);
+    return 1;
+  });
+  lua_register(L, "_ble_set_bond_clear", [](lua_State* L) -> int {
+    ble_bond_clear_pref = lua_toboolean(L, 1);
+    firmware_prefs_save();
+    lua_pushboolean(L, ble_bond_clear_pref);
+    return 1;
+  });
+#endif
 
   // ── Display backlight ─────────────────────────────────────────────────────
   lua_register(L, "_disp_set_brightness", [](lua_State* L) -> int {
@@ -3488,12 +3682,25 @@ void setup() {
     Serial.println("[SD] Card mount FAILED");
   }
 
+  // Allocate PunkMesh in PSRAM — frees ~115 KB of internal SRAM for BLE stack.
+  void* mesh_mem = heap_caps_malloc(sizeof(PunkMesh), MALLOC_CAP_SPIRAM);
+  the_mesh = new (mesh_mem) PunkMesh(radio_driver, fast_rng, *new VolatileRTCClock(), tables);
+  Serial.printf("[MESH] PunkMesh allocated in PSRAM (%u bytes)\n", sizeof(PunkMesh));
+
+#if BLE_COMPANION_ENABLED
+  if (ble_enabled_pref) {
+    ble_companion_init_early();
+  } else {
+    Serial.println("[BLE] Disabled by user preference");
+  }
+#endif
+
   // Decide which storage to use (use_sd_pref loaded by firmware_prefs_load)
   if (sd_mounted && use_sd_pref) {
-    the_mesh.setStorage(&SD, "/meshpunk");
+    the_mesh->setStorage(&SD, "/meshpunk");
     Serial.println("[SD] Mesh storage: SD:/meshpunk/");
   } else {
-    the_mesh.setStorage(&LittleFS, "");
+    the_mesh->setStorage(&LittleFS, "");
     if (sd_mounted) {
       Serial.println("[SD] SD available but user chose LittleFS");
     } else {
@@ -3501,9 +3708,20 @@ void setup() {
     }
   }
 
-  // Initialize WiFi in station mode
-  WiFi.mode(WIFI_STA);
-  Serial.println("WiFi initialized in station mode");
+  // Initialize WiFi
+  wifi_creds_load();
+  if (wifi_enabled_pref) {
+    WiFi.mode(WIFI_STA);
+    if (wifi_saved_ssid.length() > 0) {
+      WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
+      Serial.printf("WiFi auto-connecting to: %s\n", wifi_saved_ssid.c_str());
+    } else {
+      Serial.println("WiFi initialized in station mode (no saved network)");
+    }
+  } else {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("WiFi disabled by preference");
+  }
 
   // Set touch int input
   pinMode(BOARD_TOUCH_INT, INPUT);
@@ -3568,11 +3786,11 @@ void setup() {
 
   delay(100);
 
-  float freq = the_mesh.getFreqPref();
-  uint8_t tx_pwr = the_mesh.getTxPowerPref();
-  float bw = the_mesh.getBandwidthPref();
-  uint8_t sf = the_mesh.getSpreadingFactorPref();
-  uint8_t cr = the_mesh.getCodingRatePref();
+  float freq = the_mesh->getFreqPref();
+  uint8_t tx_pwr = the_mesh->getTxPowerPref();
+  float bw = the_mesh->getBandwidthPref();
+  uint8_t sf = the_mesh->getSpreadingFactorPref();
+  uint8_t cr = the_mesh->getCodingRatePref();
   Serial.printf("[RADIO] Setting freq=%.3f MHz, BW=%.0f kHz, SF=%d, CR=%d, TX=%d dBm\n", freq, bw, sf, cr, tx_pwr);
 
   state = radio.setFrequency(freq);
@@ -3597,24 +3815,24 @@ void setup() {
 
   Serial.println(F("===== MESHCORE INIT ====="));
   fast_rng.begin(123456); // fixed seed for testing
-  the_mesh.begin();
-  the_mesh.showWelcome();
+  the_mesh->begin();
+  the_mesh->showWelcome();
 
-  // Apply RX boost from prefs (loaded in the_mesh.begin())
-  if (the_mesh._prefs.rx_boost) {
+  // Apply RX boost from prefs (loaded in the_mesh->begin())
+  if (the_mesh->_prefs.rx_boost) {
     SPI_LOCK();
     radio_driver.setRxBoostedGainMode(true);
     SPI_UNLOCK();
     Serial.println("[RADIO] RX Boost restored from prefs: ON");
   }
 
-  Serial.printf("[MESH] Node name: %s\n", the_mesh._prefs.node_name);
-  Serial.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh._prefs.freq);
-  Serial.printf("[MESH] TX power pref: %d dBm\n", the_mesh._prefs.tx_power_dbm);
-  Serial.printf("[MESH] Contacts loaded: %d\n", the_mesh.getNumContacts());
-  Serial.printf("[MESH] Public channel: %s\n", the_mesh._public ? "YES" : "NO (PROBLEM!)");
+  Serial.printf("[MESH] Node name: %s\n", the_mesh->_prefs.node_name);
+  Serial.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh->_prefs.freq);
+  Serial.printf("[MESH] TX power pref: %d dBm\n", the_mesh->_prefs.tx_power_dbm);
+  Serial.printf("[MESH] Contacts loaded: %d\n", the_mesh->getNumContacts());
+  Serial.printf("[MESH] Public channel: %s\n", the_mesh->_public ? "YES" : "NO (PROBLEM!)");
   Serial.print("[MESH] Pub key: ");
-  mesh::Utils::printHex(Serial, the_mesh.self_id.pub_key, PUB_KEY_SIZE);
+  mesh::Utils::printHex(Serial, the_mesh->self_id.pub_key, PUB_KEY_SIZE);
   Serial.println();
 
   //Initialize the disply only after all other spi bus setup is finished
@@ -3650,6 +3868,14 @@ void setup() {
   pinMode(BOARD_BL_PIN, OUTPUT);
   setBrightness(display_brightness);
   last_activity_ms = millis();
+
+  // Start BLE companion interface before spawning mesh task, since
+  // ble_companion->loop() runs inside mesh_task_body on Core 1.
+#if BLE_COMPANION_ENABLED
+  if (ble_enabled_pref && ble_serial) {
+    ble_companion_start(*the_mesh);
+  }
+#endif
 
   // Hand off mesh + radio to Core 1 now that the_mesh, Lua, LVGL, and the
   // RX queue are all up. Must happen AFTER createUI / setupLuaVGL so that

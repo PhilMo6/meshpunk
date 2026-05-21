@@ -74,7 +74,7 @@ struct GpsEvent {
 // the mutexes/queues. Safe to call under normal Arduino init order.
 void meshpunk_sync_init();
 
-// Spawn the Core 1 mesh task. Call once after the_mesh.begin(), once the
+// Spawn the Core 1 mesh task. Call once after the_mesh->begin(), once the
 // radio is initialized and Lua is up. Defined in meshpunk_tasks.cpp.
 void meshpunk_spawn_mesh_task();
 

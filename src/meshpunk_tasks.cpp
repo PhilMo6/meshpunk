@@ -17,8 +17,10 @@
 
 #include "meshpunk_sync.h"
 #include "punkmesh.h"
+#include "ble_companion.h"
+#include <esp_heap_caps.h>
 
-extern PunkMesh the_mesh;
+extern PunkMesh* the_mesh;
 
 static TaskHandle_t s_mesh_task_handle = nullptr;
 
@@ -29,9 +31,24 @@ static void mesh_task_body(void *param) {
     // MESH_LOCK serializes against Lua bindings on Core 0. Short critical
     // section — dispatcher work is bounded per call.
     MESH_LOCK();
-    the_mesh.loop();
-    the_mesh.getRTCClock()->tick();
+    the_mesh->loop();
+    the_mesh->getRTCClock()->tick();
     MESH_UNLOCK();
+
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->loop();
+#endif
+
+    static uint32_t last_heap_log = 0;
+    uint32_t now = millis();
+    if (now - last_heap_log > 60000) {
+      last_heap_log = now;
+      Serial.printf("[HEAP] internal: %u free, %u largest block | PSRAM: %u free | min ever: %u\n",
+          heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+          heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+          esp_get_minimum_free_heap_size());
+    }
 
     // Yield so lower priority tasks (IDLE, watchdog) can run.
     // 2 ms tick keeps radio polling responsive without hogging Core 1.

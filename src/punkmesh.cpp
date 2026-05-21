@@ -1,13 +1,44 @@
 #include "punkmesh.h"
 #include <LittleFS.h>
 #include "meshpunk_sync.h"
+#include "ble_companion.h"
 
 // Shared-SPI-bus lock pair (defined in main.cpp).
 // sd_spi_take()    — acquire spi_bus_mutex before any SD operation.
 // sd_spi_release() — release spi_bus_mutex after the SD file handle is closed.
 // sd_spi_take() is inline in meshpunk_sync.h (just SPI_LOCK); no extern decl needed.
 extern void sd_spi_release();
-extern PunkMesh the_mesh;
+extern PunkMesh* the_mesh;
+
+// Forward declaration — defined further down with the other path helpers.
+static String messages_dir(const String& prefix);
+
+// Recover orphaned .tmp files left by interrupted compaction.
+static void recover_tmp_files(fs::FS* storage, const String& dir) {
+    if (!storage) return;
+    File root = storage->open(dir.c_str());
+    if (!root || !root.isDirectory()) return;
+
+    File entry = root.openNextFile();
+    while (entry) {
+        if (!entry.isDirectory()) {
+            String name = entry.name();
+            if (name.endsWith(".tmp")) {
+                String log_path = name.substring(0, name.length() - 4);
+                if (storage->exists(log_path.c_str())) {
+                    storage->remove(name.c_str());
+                    Serial.printf("[STORAGE] Removed stale tmp: %s\n", name.c_str());
+                } else {
+                    storage->rename(name.c_str(), log_path.c_str());
+                    Serial.printf("[STORAGE] Recovered tmp: %s -> %s\n",
+                                  name.c_str(), log_path.c_str());
+                }
+            }
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
+}
 
 // Storage helpers
 void PunkMesh::setStorage(fs::FS* fs, const char* prefix) {
@@ -15,6 +46,7 @@ void PunkMesh::setStorage(fs::FS* fs, const char* prefix) {
     _storage_prefix = String(prefix);
     Serial.printf("[STORAGE] Set to %s, prefix=\"%s\"\n",
         (fs == &LittleFS) ? "LittleFS" : "SD", prefix);
+    recover_tmp_files(_storage, messages_dir(_storage_prefix));
 }
 
 // Helper to build a full path with storage prefix
@@ -105,7 +137,7 @@ void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_
     lua_pushnumber(L, snr);                     // arg6: snr
     lua_pushnumber(L, rssi);                    // arg7: rssi
     lua_pushinteger(L, channel_idx);            // arg8: channel_idx (-1 if unknown)
-    lua_pushboolean(L, contains_mention(text, the_mesh._prefs.node_name)); // arg9: is_mention
+    lua_pushboolean(L, contains_mention(text, the_mesh->_prefs.node_name)); // arg9: is_mention
     push_path_table(L, path_len, path);         // arg10: path
     if (pkt_hash) {                              // arg11: hash (hex string)
         char hex[MAX_HASH_SIZE * 2 + 1];
@@ -257,10 +289,10 @@ void PunkMesh::loadContacts()
                 if (len == 0) continue;
 
                 // Parse tab-separated: pubkey_hex \t name \t type \t flags \t path_len \t advert_ts \t path_hex
-                char *fields[7];
+                char *fields[9];
                 int nf = 0;
                 fields[0] = line;
-                for (int i = 0; i < len && nf < 6; i++) {
+                for (int i = 0; i < len && nf < 8; i++) {
                     if (line[i] == '\t') {
                         line[i] = '\0';
                         fields[++nf] = &line[i + 1];
@@ -281,6 +313,8 @@ void PunkMesh::loadContacts()
                 if (nf >= 4) c.out_path_len = atoi(fields[4]);
                 if (nf >= 5) c.last_advert_timestamp = strtoul(fields[5], nullptr, 10);
                 if (nf >= 6) mesh::Utils::fromHex(c.out_path, 64, fields[6]);
+                if (nf >= 7) c.gps_lat = atol(fields[7]);
+                if (nf >= 8) c.gps_lon = atol(fields[8]);
                 c.lastmod = 0;
 
                 if (!addContact(c)) break;
@@ -312,9 +346,10 @@ void PunkMesh::saveContacts()
             char path_hex[129];
             mesh::Utils::toHex(path_hex, c.out_path, 64);
 
-            file.printf("%s\t%s\t%d\t%d\t%d\t%u\t%s\n",
+            file.printf("%s\t%s\t%d\t%d\t%d\t%u\t%s\t%d\t%d\n",
                 pubkey_hex, c.name, c.type, c.flags,
-                c.out_path_len, c.last_advert_timestamp, path_hex);
+                c.out_path_len, c.last_advert_timestamp, path_hex,
+                (int)c.gps_lat, (int)c.gps_lon);
         }
         file.close();
     }
@@ -499,7 +534,8 @@ static void fill_stored_msg(StoredMsg& m, int channel_idx, const char* from,
                             uint32_t timestamp, float snr, float rssi,
                             uint8_t hops, bool direct, bool is_dm,
                             uint16_t path_len = 0, const uint8_t* path_data = nullptr,
-                            const uint8_t* pkt_hash = nullptr) {
+                            const uint8_t* pkt_hash = nullptr,
+                            const uint8_t* pub_key = nullptr) {
     memset(&m, 0, sizeof(m));
     m.timestamp   = timestamp;
     m.snr         = snr;
@@ -519,6 +555,10 @@ static void fill_stored_msg(StoredMsg& m, int channel_idx, const char* from,
     if (pkt_hash) {
         memcpy(m.pkt_hash, pkt_hash, MAX_HASH_SIZE);
         m.has_hash = true;
+    }
+    if (pub_key) {
+        memcpy(m.sender_pub_key, pub_key, 6);
+        m.has_pub_key = true;
     }
 }
 
@@ -598,10 +638,9 @@ static void trim_msg_text_file(fs::FS* storage, const String& path, int cap) {
     File f = storage->open(path.c_str(), "r");
     if (!f) return;
     int count = count_text_records(f);
-    int max_count = (cap > 0 ? cap : 100) * 2;
+    int keep = cap > 0 ? cap : 400;
+    int max_count = keep + 100;
     if (count <= max_count) { f.close(); return; }
-
-    int keep = cap > 0 ? cap : 100;
     int skip = count - keep;
     f.seek(0);
     char line[256];
@@ -624,10 +663,16 @@ static void trim_msg_text_file(fs::FS* storage, const String& path, int cap) {
     size_t got = f.read(buf, remaining);
     f.close();
 
-    File wf = storage->open(path.c_str(), "w", true);
+    String tmp = path + ".tmp";
+    File wf = storage->open(tmp.c_str(), "w", true);
     if (wf) {
         wf.write(buf, got);
         wf.close();
+        storage->remove(path.c_str());
+        if (!storage->rename(tmp.c_str(), path.c_str())) {
+            Serial.printf("[STORAGE] rename failed: %s -> %s\n",
+                          tmp.c_str(), path.c_str());
+        }
     }
     free(buf);
 }
@@ -664,6 +709,11 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
             write_rpath_line(f, m.path_len, m.path, m.snr, m.rssi,
                              (m.flags & 0x01) != 0);
         }
+        if (m.has_pub_key) {
+            char pk_hex[13];
+            mesh::Utils::toHex(pk_hex, m.sender_pub_key, 6);
+            f.printf("pubkey=%s\n", pk_hex);
+        }
         f.print("---\n");
         f.close();
     }
@@ -691,12 +741,13 @@ void PunkMesh::appendDMMessage(const char* peer, const char* from, const char* t
                                uint32_t timestamp, float snr, float rssi,
                                uint8_t hops, bool direct,
                                uint16_t path_len, const uint8_t* path,
-                               const uint8_t* pkt_hash) {
+                               const uint8_t* pkt_hash,
+                               const uint8_t* sender_pub_key) {
     if (!peer || peer[0] == '\0') return;
     StoredMsg m;
     fill_stored_msg(m, /*ch_idx*/ -1, from, peer, text,
                     timestamp, snr, rssi, hops, direct, /*is_dm*/ true,
-                    path_len, path, pkt_hash);
+                    path_len, path, pkt_hash, sender_pub_key);
     append_msg_text(_storage, _storage_prefix,
                     dm_msg_path(_storage_prefix, peer),
                     m, _max_messages);
@@ -828,6 +879,10 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
                 m.has_hash = true;
             }
         }
+        else if (strcmp(key, "pubkey") == 0 && strlen(val) == 12) {
+            mesh::Utils::fromHex(m.sender_pub_key, 6, val);
+            m.has_pub_key = true;
+        }
         else if (strcmp(key, "rpath") == 0 && m.rpath_count < MAX_PATHS_PER_MSG) {
             // Format: hop_hashes;snr;rssi;direct
             char rval[256];
@@ -900,10 +955,25 @@ int PunkMesh::pushDMThreadNamesToLua(lua_State* L) {
             int slash = name.lastIndexOf('/');
             String base = (slash >= 0) ? name.substring(slash + 1) : name;
             if (base.startsWith("dm_") && base.endsWith(".log")) {
-                StoredMsg m;
-                if (entry.read((uint8_t*)&m, sizeof(m)) == sizeof(m)
-                    && m.peer[0] != '\0') {
-                    lua_pushstring(L, m.peer);
+                char line[256];
+                char peer[32] = {0};
+                while (entry.available()) {
+                    int len = 0;
+                    while (entry.available() && len < (int)sizeof(line) - 1) {
+                        char ch = entry.read();
+                        if (ch == '\n' || ch == '\r') break;
+                        line[len++] = ch;
+                    }
+                    line[len] = '\0';
+                    if (len == 0) continue;
+                    if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') break;
+                    if (strncmp(line, "peer=", 5) == 0) {
+                        strncpy(peer, line + 5, sizeof(peer) - 1);
+                        break;
+                    }
+                }
+                if (peer[0] != '\0') {
+                    lua_pushstring(L, peer);
                     lua_rawseti(L, -2, idx++);
                 }
             }
@@ -913,6 +983,161 @@ int PunkMesh::pushDMThreadNamesToLua(lua_State* L) {
     root.close();
     if (is_sd) sd_spi_release();
     return 1;
+}
+
+int PunkMesh::enumerateMessageFiles(char paths[][MAX_SYNC_PATH_LEN], int max_paths) {
+    if (!_storage || max_paths <= 0) return 0;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String dir = messages_dir(_storage_prefix);
+    File root = _storage->open(dir.c_str());
+    if (!root || !root.isDirectory()) {
+        if (is_sd) sd_spi_release();
+        return 0;
+    }
+
+    int count = 0;
+    File entry = root.openNextFile();
+    while (entry && count < max_paths) {
+        if (!entry.isDirectory()) {
+            String name = entry.name();
+            int slash = name.lastIndexOf('/');
+            String base = (slash >= 0) ? name.substring(slash + 1) : name;
+            if (base.endsWith(".log") &&
+                (base.startsWith("dm_") || base.startsWith("ch_"))) {
+                String full = dir + "/" + base;
+                strncpy(paths[count], full.c_str(), MAX_SYNC_PATH_LEN - 1);
+                paths[count][MAX_SYNC_PATH_LEN - 1] = '\0';
+                count++;
+            }
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
+    if (is_sd) sd_spi_release();
+    return count;
+}
+
+static bool read_one_record(File& f, StoredMsg& m) {
+    memset(&m, 0, sizeof(m));
+    char line[256];
+    bool has_data = false;
+
+    while (f.available()) {
+        int len = 0;
+        while (f.available() && len < (int)sizeof(line) - 1) {
+            char ch = f.read();
+            if (ch == '\n' || ch == '\r') break;
+            line[len++] = ch;
+        }
+        line[len] = '\0';
+        if (len == 0) continue;
+
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-')
+            return has_data;
+
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char* key = line;
+        const char* val = eq + 1;
+        has_data = true;
+
+        if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
+        else if (strcmp(key, "from") == 0) strncpy(m.from, val, sizeof(m.from) - 1);
+        else if (strcmp(key, "peer") == 0) strncpy(m.peer, val, sizeof(m.peer) - 1);
+        else if (strcmp(key, "text") == 0) strncpy(m.text, val, sizeof(m.text) - 1);
+        else if (strcmp(key, "ch") == 0) m.channel_idx = (int8_t)atoi(val);
+        else if (strcmp(key, "hops") == 0) m.hops = (uint8_t)atoi(val);
+        else if (strcmp(key, "snr") == 0) m.snr = atof(val);
+        else if (strcmp(key, "rssi") == 0) m.rssi = atof(val);
+        else if (strcmp(key, "direct") == 0) { if (atoi(val)) m.flags |= 0x01; }
+        else if (strcmp(key, "dm") == 0) { if (atoi(val)) m.flags |= 0x02; }
+        else if (strcmp(key, "path") == 0) m.path_len = parse_path_field(val, m.path);
+        else if (strcmp(key, "pubkey") == 0 && strlen(val) == 12) {
+            mesh::Utils::fromHex(m.sender_pub_key, 6, val);
+            m.has_pub_key = true;
+        }
+    }
+    return false;
+}
+
+int PunkMesh::readOneStoredMsg(fs::FS* storage, const char* path,
+                               size_t offset, StoredMsg& m) {
+    if (!storage) return -1;
+    bool is_sd = (storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    File f = storage->open(path, "r");
+    if (!f) {
+        if (is_sd) sd_spi_release();
+        return -1;
+    }
+    if (offset >= f.size()) {
+        f.close();
+        if (is_sd) sd_spi_release();
+        return -1;
+    }
+    f.seek(offset);
+
+    bool ok = read_one_record(f, m);
+    size_t end_pos = f.position();
+    f.close();
+    if (is_sd) sd_spi_release();
+    return ok ? (int)end_pos : -1;
+}
+
+int PunkMesh::readAllStoredMsgs(const char* path, StoredMsg* out, int max_count) {
+    if (!_storage || max_count <= 0) return 0;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    File f = _storage->open(path, "r");
+    if (!f) {
+        if (is_sd) sd_spi_release();
+        return 0;
+    }
+
+    int count = 0;
+    while (f.available() && count < max_count) {
+        StoredMsg m;
+        if (read_one_record(f, m))
+            out[count++] = m;
+        else
+            break;
+    }
+
+    f.close();
+    if (is_sd) sd_spi_release();
+    return count;
+}
+
+int PunkMesh::readStoredMsgsSince(const char* path, uint32_t since,
+                                  StoredMsg* out, int max_count) {
+    if (!_storage || max_count <= 0) return 0;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    File f = _storage->open(path, "r");
+    if (!f) {
+        if (is_sd) sd_spi_release();
+        return 0;
+    }
+
+    int count = 0;
+    while (f.available() && count < max_count) {
+        StoredMsg m;
+        if (read_one_record(f, m)) {
+            if (m.timestamp > since)
+                out[count++] = m;
+        } else
+            break;
+    }
+
+    f.close();
+    if (is_sd) sd_spi_release();
+    return count;
 }
 
 int PunkMesh::lookupPersistedPaths(lua_State* L, const char* hash_hex,
@@ -1087,6 +1312,10 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
         ev.hops = contact.type;
         xQueueSend(rx_event_queue, &ev, 0);
     }
+
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushAdvert(contact, is_new, path_len, path);
+#endif
 }
 
 void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
@@ -1095,6 +1324,9 @@ void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
     recordPath(contact.id.pub_key, contact.out_path_len, contact.out_path,
                0, 0, PATH_SRC_PATH_UPDATE, true);
     saveContacts();
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushPathUpdated(contact);
+#endif
 }
 
 ContactInfo* PunkMesh::processAck(const uint8_t *data)
@@ -1107,6 +1339,11 @@ ContactInfo* PunkMesh::processAck(const uint8_t *data)
         if (curr_recipient) {
             recordPathSuccess(curr_recipient->id.pub_key, rtt);
         }
+#if BLE_COMPANION_ENABLED
+        uint32_t ack_crc;
+        memcpy(&ack_crc, data, 4);
+        if (ble_companion) ble_companion->pushSendConfirmed(ack_crc, rtt);
+#endif
         return curr_recipient;
     }
     return nullptr;
@@ -1135,7 +1372,7 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
     appendDMMessage(from.name, from.name, norm_text, sender_timestamp,
                     last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
                     pkt->isRouteDirect(), pkt->path_len, pkt->path,
-                    _last_pkt_hash);
+                    _last_pkt_hash, from.id.pub_key);
 
     recordPath(from.id.pub_key, pkt->path_len, pkt->path,
                last_rx_snr, last_rx_rssi, PATH_SRC_MSG_RX, pkt->isRouteDirect());
@@ -1172,6 +1409,10 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
             Serial.println("[MESH RX] WARNING: rx_event_queue full, dropping DM");
         }
     }
+
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->queueReceivedDM(from, pkt, sender_timestamp, text);
+#endif
 }
 
 void PunkMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text)
@@ -1244,6 +1485,10 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
             Serial.println("[MESH RX] WARNING: rx_event_queue full, dropping channel msg");
         }
     }
+
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->queueReceivedChannelMsg(channel, pkt, timestamp, text, channel_idx);
+#endif
 }
 
 uint8_t PunkMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data, uint8_t len, uint8_t *reply)
@@ -1771,6 +2016,10 @@ void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {
         pkt->payload_len);
     Serial.printf("[RADIO RX] SNR=%d, RSSI=%d, score=%d\n",
         (int)last_rx_snr, (int)last_rx_rssi, (int)(score*1000));
+
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushLogRxData(pkt, last_rx_snr, last_rx_rssi);
+#endif
 }
 
 static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
@@ -1807,6 +2056,75 @@ void PunkMesh::savePrefs()
         sd_spi_release();
         writePrefsToFile(&LittleFS, "/node_prefs", _prefs);
     }
+}
+
+bool PunkMesh::saveIdentity() {
+    String idPath = storagePath(_storage_prefix, "/identity");
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+    File file = _storage->open(idPath.c_str(), "w", true);
+    bool ok = false;
+    if (file) {
+        ok = self_id.writeTo(file);
+        file.close();
+    }
+    if (is_sd) sd_spi_release();
+    if (is_sd) {
+        File lfs_file = LittleFS.open("/identity", "w", true);
+        if (lfs_file) {
+            self_id.writeTo(lfs_file);
+            lfs_file.close();
+        }
+    }
+    return ok;
+}
+
+PunkMesh::SendResult PunkMesh::sendAndPersistDM(ContactInfo& recipient,
+                                                  uint32_t timestamp,
+                                                  uint8_t attempt,
+                                                  const char* text) {
+    SendResult r;
+    r.expected_ack = 0;
+    r.est_timeout = 0;
+    r.has_hash = false;
+
+    r.code = sendMessage(recipient, timestamp, attempt, text,
+                         r.expected_ack, r.est_timeout);
+    if (r.code == MSG_SEND_FAILED) return r;
+
+    bool is_flood = (r.code == MSG_SEND_SENT_FLOOD);
+    if (is_flood) {
+        memcpy(r.tx_hash, _last_tx_hash, MAX_HASH_SIZE);
+        r.has_hash = true;
+    }
+
+    appendDMMessage(recipient.name, _prefs.node_name, text,
+                   timestamp, 0.0f, 0.0f, 0,
+                   r.code == MSG_SEND_SENT_DIRECT,
+                   0, nullptr, is_flood ? r.tx_hash : nullptr);
+    if (is_flood) {
+        preRegisterSentHash(r.tx_hash, true, -1, recipient.name);
+    }
+    return r;
+}
+
+bool PunkMesh::sendAndPersistChannelMsg(int channel_idx, uint32_t timestamp,
+                                         const char* text, int tlen,
+                                         uint8_t* out_hash) {
+    ChannelDetails cd;
+    if (!getChannel(channel_idx, cd) || cd.name[0] == '\0') return false;
+
+    bool ok = sendGroupMessage(timestamp, cd.channel,
+                               _prefs.node_name, text, tlen);
+    if (!ok) return false;
+
+    uint8_t local_hash[MAX_HASH_SIZE];
+    memcpy(local_hash, _last_tx_hash, MAX_HASH_SIZE);
+    appendChannelMessage(channel_idx, _prefs.node_name, text, timestamp,
+                        0.0f, 0.0f, 0, false, 0, nullptr, local_hash);
+    preRegisterSentHash(local_hash, false, (int8_t)channel_idx, nullptr);
+    if (out_hash) memcpy(out_hash, local_hash, MAX_HASH_SIZE);
+    return true;
 }
 
 void PunkMesh::showWelcome()
