@@ -99,11 +99,13 @@ static bool    gps_location_valid_at_fix = false;
 static double  gps_lng_at_fix = 0.0;
 static double  gps_lat_at_fix = 0.0;
 static bool    gps_time_fix_valid = false;   // true if last cycle got a time fix (not timeout)
+static bool    gps_manual_time_override = false;
 static uint32_t gps_sats_at_fix = 0;
 static uint32_t gps_hdop_at_fix = 0;        // HDOP * 100 (TinyGPSPlus integer representation)
 static bool    tz_is_auto = true;
 static int32_t tz_manual_minutes = 0;
 static String  tz_setting_str = "auto";
+static bool    dst_enabled = false;
 
 // Firmware-level preferences (unified in /firmware_prefs)
 static bool   use_sd_pref = true;
@@ -148,7 +150,8 @@ static int32_t tz_auto_offset_minutes() {
 }
 
 static int32_t tz_effective_offset_minutes() {
-  return tz_is_auto ? tz_auto_offset_minutes() : tz_manual_minutes;
+  int32_t base = tz_is_auto ? tz_auto_offset_minutes() : tz_manual_minutes;
+  return base + (dst_enabled ? 60 : 0);
 }
 
 extern bool sd_mounted;
@@ -160,6 +163,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("use_sd=%d\n", use_sd_pref ? 1 : 0);
   f.printf("tz=%s\n", tz_setting_str.c_str());
   f.printf("clock_fmt=%s\n", clock_fmt_str.c_str());
+  f.printf("dst=%d\n", dst_enabled ? 1 : 0);
   f.printf("sound_vol=%d\n",   sound_get_volume());
   f.printf("sound_muted=%d\n", sound_get_muted() ? 1 : 0);
   f.printf("kbd_bright=%d\n", kbd_brightness);
@@ -262,6 +266,8 @@ static void firmware_prefs_load() {
       }
     } else if (strcmp(key, "clock_fmt") == 0) {
       clock_fmt_str = (strcmp(val, "12") == 0) ? "12" : "24";
+    } else if (strcmp(key, "dst") == 0) {
+      dst_enabled = (atoi(val) == 1);
     } else if (strcmp(key, "sound_vol") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 21) sound_set_volume((uint8_t)v);
@@ -467,9 +473,13 @@ void gps_sync_poll() {
       && gps_tinygps.date.year() >= 2024) {
     DateTime utc(gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                  gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second());
-    MESH_LOCK();
-    the_mesh->getRTCClock()->setCurrentTime(utc.unixtime());
-    MESH_UNLOCK();
+    if (!gps_manual_time_override) {
+      MESH_LOCK();
+      the_mesh->getRTCClock()->setCurrentTime(utc.unixtime());
+      MESH_UNLOCK();
+    } else {
+      Serial.println("[GPS] Manual time override active; skipping RTC update.");
+    }
 
     gps_fix_acquired_ms = now;
     gps_time_fix_valid = true;
@@ -2997,6 +3007,18 @@ void setupLuaVGL() {
     return 2;
   });
 
+  lua_register(L, "_dst_get", [](lua_State *L) -> int {
+    lua_pushboolean(L, dst_enabled ? 1 : 0);
+    return 1;
+  });
+
+  lua_register(L, "_dst_set", [](lua_State *L) -> int {
+    dst_enabled = lua_toboolean(L, 1);
+    firmware_prefs_save();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
   // _gps_sync_start() — triggers a new GPS sync if one isn't already running.
   // Returns true if started, false if a sync is currently in progress.
   lua_register(L, "_gps_sync_start", [](lua_State *L) -> int {
@@ -3038,6 +3060,33 @@ void setupLuaVGL() {
     const char *v = luaL_checkstring(L, 1);
     clock_fmt_str = (strcmp(v, "12") == 0) ? "12" : "24";
     firmware_prefs_save();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  lua_register(L, "_rtc_set_time", [](lua_State *L) -> int {
+    lua_Integer ts = luaL_checkinteger(L, 1);
+    if (ts < 0) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    MESH_LOCK();
+    the_mesh->getRTCClock()->setCurrentTime((uint32_t)ts);
+    MESH_UNLOCK();
+    gps_manual_time_override = true;
+    Serial.printf("[RTC] Manual time set to %u UTC, GPS override enabled\n", (unsigned)ts);
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  lua_register(L, "_rtc_manual_override_get", [](lua_State *L) -> int {
+    lua_pushboolean(L, gps_manual_time_override ? 1 : 0);
+    return 1;
+  });
+
+  lua_register(L, "_rtc_manual_override_clear", [](lua_State *L) -> int {
+    gps_manual_time_override = false;
+    Serial.println("[RTC] Manual override cleared; GPS time updates re-enabled.");
     lua_pushboolean(L, 1);
     return 1;
   });
