@@ -248,47 +248,64 @@ local function entry()
         if overlayBox then overlayBox:delete(); overlayBox = nil end
     end
 
-    local function showOverlay(title, subtitle)
+    local function showOverlay(title, isGameOver)
         clearOverlay()
         overlayBox = scr:Object{
-            w = 220, h = 60,
+            w = 220, h = lvgl.SIZE_CONTENT,
             align = { type = lvgl.ALIGN.CENTER },
             bg_color = "#000000", bg_opa = lvgl.OPA(85),
             border_color = CLR_BORDER, border_width = 1,
             radius = 6, pad_all = 8,
+            flex = {
+                flex_direction = "row",
+                flex_wrap = "wrap",
+                justify_content = "center",
+            },
         }
         overlayBox:clear_flag(lvgl.FLAG.SCROLLABLE)
-        overlayBox:clear_flag(lvgl.FLAG.CLICKABLE)
 
         overlayBox:Label{
             text = title,
             text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
-            align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 2 },
+            w = lvgl.PCT(100), h = 30,
             text_color = CLR_TEXT,
         }
-        if subtitle then
+
+        if isGameOver then
             overlayBox:Label{
-                text = subtitle,
+                text = "Score: " .. scoreNow,
                 text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
-                align = { type = lvgl.ALIGN.BOTTOM_MID, y_ofs = -2 },
+                w = lvgl.PCT(100), h = 20,
                 text_color = CLR_DIM_TEXT,
             }
         end
-    end
 
-    -- ── Quit button ──
-    local quitBtn = scr:Label{
-        text = "Quit",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
-        align = { type = lvgl.ALIGN.BOTTOM_RIGHT, x_ofs = -4, y_ofs = -2 },
-        text_color = CLR_DIM_TEXT,
-    }
-    quitBtn:add_flag(lvgl.FLAG.CLICKABLE)
-    quitBtn:onevent(lvgl.EVENT.PRESSED, function()
-        game:shutdown()
-        local launcher = require("launcher")
-        launcher.create()
-    end)
+        local startBtn = overlayBox:Button{ w = lvgl.PCT(45), h = 28 }
+        startBtn:Label{
+            text = isGameOver and "Restart" or "Start",
+            align = lvgl.ALIGN.CENTER,
+        }
+        startBtn:onClicked(function()
+            snakeReset()
+            scoreNow = 0
+            scoreLabel:set{ text = "Score: 0" }
+            clearOverlay()
+            drawGame(game_canvas, snake, food)
+            game.playing = true
+        end)
+
+        local quitBtn = overlayBox:Button{ w = lvgl.PCT(45), h = 28 }
+        quitBtn:Label{ text = "Quit", align = lvgl.ALIGN.CENTER }
+        quitBtn:onClicked(function()
+            game:shutdown()
+            local launcher = require("launcher")
+            launcher.create()
+        end)
+
+        _gridnav_add(overlayBox, GRIDNAV_ROLLOVER)
+        local grp = lvgl.group.get_default()
+        grp:add_obj(overlayBox)
+    end
 
     -- ── Input handling ──
     scr:add_flag(lvgl.FLAG.CLICKABLE)
@@ -354,7 +371,7 @@ local function entry()
                 save_score(scoreBest)
                 bestLabel:set{ text = "Best: " .. scoreBest }
             end
-            showOverlay("Game Over", "Press trackball to restart")
+            showOverlay("Game Over", true)
             return
         end
 
@@ -368,7 +385,7 @@ local function entry()
                     save_score(scoreBest)
                     bestLabel:set{ text = "Best: " .. scoreBest }
                 end
-                showOverlay("Game Over", "Press trackball to restart")
+                showOverlay("Game Over", true)
                 return
             end
         end
@@ -407,7 +424,7 @@ local function entry()
     -- ── Initial state: menu ──
     snakeReset()
     drawGame(game_canvas, snake, food)
-    showOverlay("SNAKE", "Press trackball to start")
+    showOverlay("SNAKE", false)
 end
 
 entry()

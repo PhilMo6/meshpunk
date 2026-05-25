@@ -14,7 +14,7 @@ root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
 -- Scrollable content
 local content = root:Object {
-    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
     w = lvgl.HOR_RES(),
     h = lvgl.VER_RES(),
     y = 0,
@@ -22,23 +22,11 @@ local content = root:Object {
     pad_all = 6,
 }
 
-_nav_setup(content, GRIDNAV_ROLLOVER)
+_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
 
--- Title row
-local title_row = content:Object {
-    w = lvgl.PCT(100),
-    h = 26,
-    border_width = 0,
-    pad_all = 0,
-}
-title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-title_row:Label {
-    text = "Sound Settings",
-    align = lvgl.ALIGN.LEFT_MID,
-}
-
-local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
+-- Title
+content:Label { text = "Sound Settings", w = lvgl.PCT(70), h = 26 }
+local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 
 -- Status line
@@ -61,6 +49,7 @@ local bar_row = content:Object {
     pad_all = 0,
 }
 bar_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+bar_row:clear_flag(lvgl.FLAG.CLICKABLE)
 local segs = {}
 for i = 1, 21 do
     segs[i] = bar_row:Object { w = 13, h = 14, border_width = 1, pad_all = 0,bg_color = "#24ba24"}
@@ -78,23 +67,14 @@ local function refresh_ui()
 end
 refresh_ui()
 
--- +/- / Mute button row
-local btn_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100),
-    h = 34,
-    border_width = 0,
-    pad_all = 0,
-}
-btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local btn_dn = btn_row:Button { w = lvgl.PCT(28), h = 30 }
+-- Volume buttons as direct children
+local btn_dn = content:Button { w = lvgl.PCT(28), h = 30 }
 btn_dn:Label { text = "Vol -", align = lvgl.ALIGN.CENTER }
 
-local btn_up = btn_row:Button { w = lvgl.PCT(28), h = 30 }
+local btn_up = content:Button { w = lvgl.PCT(28), h = 30 }
 btn_up:Label { text = "Vol +", align = lvgl.ALIGN.CENTER }
 
-local btn_mute = btn_row:Button { w = lvgl.PCT(38), h = 30 }
+local btn_mute = content:Button { w = lvgl.PCT(38), h = 30 }
 local lbl_mute = btn_mute:Label { align = lvgl.ALIGN.CENTER }
 
 local function upd_mute_btn()
@@ -121,17 +101,8 @@ end)
 -- ── Test ──────────────────────────────────────────────────────────────────────
 content:Label { text = "-- Test --", w = lvgl.PCT(100), h = 16 }
 
-local test_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "wrap" },
-    w = lvgl.PCT(100),
-    h = 34,
-    border_width = 0,
-    pad_all = 0,
-}
-test_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
 local test_tone = nil
-local btn_tone = test_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_tone = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_tone:Label { text = "Test Tone", align = lvgl.ALIGN.CENTER }
 btn_tone:onClicked(function()
     if not test_tone then
@@ -146,7 +117,7 @@ btn_tone:onClicked(function()
 end)
 
 local test_file = nil
-local btn_file = test_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_file = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_file:Label { text = "Test File", align = lvgl.ALIGN.CENTER }
 btn_file:onClicked(function()
     if not test_file then
@@ -166,21 +137,12 @@ end)
 -- ── Waveforms ─────────────────────────────────────────────────────────────────
 content:Label { text = "-- Waveforms --", w = lvgl.PCT(100), h = 16 }
 
-local wave_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "wrap" },
-    w = lvgl.PCT(100),
-    h = lvgl.SIZE_CONTENT,
-    border_width = 0,
-    pad_all = 0,
-}
-wave_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
 local demo_tones = {}
 
 local wave_types = { "sine", "square", "saw", "triangle", "noise" }
 local wave_labels = { "Sine", "Square", "Saw", "Tri", "Noise" }
 for i, wf in ipairs(wave_types) do
-    local btn = wave_row:Button { w = lvgl.PCT(30), h = 30 }
+    local btn = content:Button { w = lvgl.PCT(30), h = 30 }
     btn:Label { text = wave_labels[i], align = lvgl.ALIGN.CENTER }
     btn:onClicked(function()
         local opts = nil
@@ -197,16 +159,7 @@ end
 -- ── Effects ───────────────────────────────────────────────────────────────────
 content:Label { text = "-- Effects --", w = lvgl.PCT(100), h = 16 }
 
-local fx_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "wrap" },
-    w = lvgl.PCT(100),
-    h = lvgl.SIZE_CONTENT,
-    border_width = 0,
-    pad_all = 0,
-}
-fx_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local btn_adsr = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_adsr = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_adsr:Label { text = "ADSR", align = lvgl.ALIGN.CENTER }
 btn_adsr:onClicked(function()
     local t = sound.generateTone(440, 800, {
@@ -219,7 +172,7 @@ btn_adsr:onClicked(function()
     end
 end)
 
-local btn_sweep = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_sweep = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_sweep:Label { text = "Sweep", align = lvgl.ALIGN.CENTER }
 btn_sweep:onClicked(function()
     local t = sound.generateTone(200, 500, {
@@ -232,7 +185,7 @@ btn_sweep:onClicked(function()
     end
 end)
 
-local btn_bell = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_bell = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_bell:Label { text = "Bell", align = lvgl.ALIGN.CENTER }
 btn_bell:onClicked(function()
     local t = sound.generateTone(440, 1000, {
@@ -246,7 +199,7 @@ btn_bell:onClicked(function()
     end
 end)
 
-local btn_epiano = fx_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_epiano = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_epiano:Label { text = "EPiano", align = lvgl.ALIGN.CENTER }
 btn_epiano:onClicked(function()
     local t = sound.generateTone(440, 800, {
@@ -263,16 +216,7 @@ end)
 -- ── Chord / Melody ────────────────────────────────────────────────────────────
 content:Label { text = "-- Chord / Melody --", w = lvgl.PCT(100), h = 16 }
 
-local cm_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "wrap" },
-    w = lvgl.PCT(100),
-    h = lvgl.SIZE_CONTENT,
-    border_width = 0,
-    pad_all = 0,
-}
-cm_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local btn_chord = cm_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_chord = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_chord:Label { text = "Chord", align = lvgl.ALIGN.CENTER }
 btn_chord:onClicked(function()
     local t = sound.generateChord({262, 330, 392}, 600, {
@@ -285,7 +229,7 @@ btn_chord:onClicked(function()
     end
 end)
 
-local btn_melody = cm_row:Button { w = lvgl.PCT(45), h = 30 }
+local btn_melody = content:Button { w = lvgl.PCT(45), h = 30 }
 btn_melody:Label { text = "Melody", align = lvgl.ALIGN.CENTER }
 btn_melody:onClicked(function()
     local t = sound.generateMelody({

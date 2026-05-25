@@ -252,16 +252,12 @@ show_browser = function()
         w = 220,
     }
 
-    local home_btn = hdr:Button {
-        w = 45, h = 22,
+    hdr:Label {
+        text = "#",
+        text_color = "#565f89",
         align = lvgl.ALIGN.RIGHT_MID,
+        w = 20,
     }
-    home_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
-    home_btn:onClicked(function()
-        root:delete()
-        local launcher = require("launcher")
-        launcher.create()
-    end)
 
     -- ── Scrollable file list ──
     local list = vw:Object {
@@ -274,6 +270,23 @@ show_browser = function()
             flex_direction = "column",
         },
     }
+    _nav_setup(list, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+
+    -- Home button at top of list
+    local home_btn = list:Button {
+        w = lvgl.PCT(100), h = 22,
+        bg_color = "#1a1b26",
+    }
+    home_btn:Label {
+        text = "< Home",
+        text_color = "#7aa2f7",
+        align = lvgl.ALIGN.LEFT_MID,
+    }
+    home_btn:onClicked(function()
+        root:delete()
+        local launcher = require("launcher")
+        launcher.create()
+    end)
 
     -- Parent directory entry
     if cur_path ~= "/" and cur_path ~= "" then
@@ -330,6 +343,16 @@ show_browser = function()
         }
     end
 
+    -- New File button at end of list
+    local new_btn = list:Button {
+        w = lvgl.PCT(100), h = 22,
+        bg_color = "#24283b",
+    }
+    new_btn:Label { text = "+ New File", text_color = "#9ece6a", align = lvgl.ALIGN.LEFT_MID }
+    new_btn:onClicked(function()
+        show_newfile()
+    end)
+
     -- ── Footer ──
     local ftr = vw:Object {
         w = W, h = STS_H,
@@ -339,15 +362,6 @@ show_browser = function()
         pad_all = 2, pad_left = 6,
     }
     ftr:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-    local new_btn = ftr:Button {
-        w = 75, h = 18,
-        align = lvgl.ALIGN.LEFT_MID,
-    }
-    new_btn:Label { text = "New File", align = lvgl.ALIGN.CENTER }
-    new_btn:onClicked(function()
-        show_newfile()
-    end)
 
     ftr:Label {
         text = #entries .. " items",
@@ -391,9 +405,10 @@ show_newfile = function()
         bg_color = "#16161e",
         border_width = 0,
         pad_all = 10,
-        flex = { flex_direction = "column" },
+        flex = { flex_direction = "row", flex_wrap = "wrap" },
     }
     body:clear_flag(lvgl.FLAG.SCROLLABLE)
+    _nav_setup(body, GRIDNAV_ROLLOVER)
 
     body:Label {
         text = "Dir: " .. cur_path,
@@ -447,19 +462,11 @@ show_newfile = function()
         end
     end
 
-    -- Button row
-    local btn_row = body:Object {
-        w = lvgl.PCT(100), h = 34,
-        border_width = 0, pad_all = 2,
-        flex = { flex_direction = "row" },
-    }
-    btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-    local create_btn = btn_row:Button { w = 80, h = 26 }
+    local create_btn = body:Button { w = 80, h = 26 }
     create_btn:Label { text = "Create", align = lvgl.ALIGN.CENTER }
     create_btn:onClicked(do_create)
 
-    local cancel_btn = btn_row:Button { w = 70, h = 26 }
+    local cancel_btn = body:Button { w = 70, h = 26 }
     cancel_btn:Label { text = "Cancel", align = lvgl.ALIGN.CENTER }
     cancel_btn:onClicked(function()
         show_browser()
@@ -525,6 +532,7 @@ show_editor = function(filepath)
         },
     }
     hdr:clear_flag(lvgl.FLAG.SCROLLABLE)
+    _nav_setup(hdr, GRIDNAV_ROLLOVER)
 
     -- Filename display (truncated if needed)
     local fn = bname(filepath)
@@ -575,6 +583,7 @@ show_editor = function(filepath)
                 pad_all = 10, border_width = 0,
             }
             err_root:clear_flag(lvgl.FLAG.SCROLLABLE)
+            _nav_setup(err_root, GRIDNAV_ROLLOVER)
 
             err_root:Label {
                 text = "Runtime Error",

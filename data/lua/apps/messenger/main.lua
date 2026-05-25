@@ -6,6 +6,7 @@
 local lvgl = require("lvgl")
 local messages = require("lib/mesh/messages")
 local utils = require("lib/utils")
+local gridnav_body = require("lib/gridnav_body")
 
 -- Persistence lives on the C++ PunkMesh side (respects _storage: LittleFS
 -- root or /meshpunk on SD), so any app can access the same message history.
@@ -23,19 +24,6 @@ local BODY_H = H - HEADER_H - INPUT_H
 -- Focus group for trackball navigation
 local group = lvgl.group.get_default()
 
--- Helper: create a gridnav-enabled body container
--- All interactive widgets must be DIRECT children of this container.
--- Gridnav spatially navigates between clickable children using arrow keys.
-local function gridnav_body(parent, y, h, flags)
-    local body = parent:Object {
-        flex = { flex_direction = "row", flex_wrap = "wrap" },
-        w = W, h = h, y = y,
-        border_width = 0, pad_all = 4,
-    }
-    body:clear_flag(lvgl.FLAG.SCROLLABLE)
-    _nav_setup(body, flags or GRIDNAV_ROLLOVER)
-    return body
-end
 
 -- Root container
 local root = lvgl.Object()
@@ -205,14 +193,8 @@ local function show_msg_info(msg, on_reply, on_dismiss)
         end)
     end)
 
-    local btn_row = box:Object {
-        flex = { flex_direction = "row", flex_wrap = "nowrap" },
-        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
-    }
-    btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
     if on_reply then
-        local reply_btn = btn_row:Button { w = lvgl.PCT(48), h = 26 }
+        local reply_btn = box:Button { w = lvgl.PCT(48), h = 26 }
         reply_btn:Label { text = "Reply", align = lvgl.ALIGN.CENTER }
         reply_btn:onevent(lvgl.EVENT.RELEASED,function()
             overlay:delete()
@@ -221,7 +203,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
         end)
     end
 
-    local close_btn = btn_row:Button { w = on_reply and lvgl.PCT(48) or lvgl.PCT(100), h = 26 }
+    local close_btn = box:Button { w = on_reply and lvgl.PCT(48) or lvgl.PCT(100), h = 26 }
     close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
     close_btn:onevent(lvgl.EVENT.RELEASED,function()
         overlay:delete()
@@ -658,13 +640,7 @@ show_contacts = function()
 
         box:Label { text = "Clear all contacts?", w = lvgl.PCT(100), h = 24 }
 
-        local btn_row = box:Object {
-            flex = { flex_direction = "row", flex_wrap = "nowrap" },
-            w = lvgl.PCT(100), h = 40, border_width = 0, pad_all = 4,
-        }
-        btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-        local yes_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+        local yes_btn = box:Button { w = lvgl.PCT(48), h = 32 }
         yes_btn:Label { text = "Yes", align = lvgl.ALIGN.CENTER }
         yes_btn:onevent(lvgl.EVENT.RELEASED,function()
             pcall(_mesh_clear_contacts)
@@ -672,7 +648,7 @@ show_contacts = function()
             show_contacts()
         end)
 
-        local no_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+        local no_btn = box:Button { w = lvgl.PCT(48), h = 32 }
         no_btn:Label { text = "No", align = lvgl.ALIGN.CENTER }
         no_btn:onevent(lvgl.EVENT.RELEASED,function()
             overlay:delete()
@@ -830,13 +806,7 @@ show_channels = function()
     if not ok or not channels then channels = {} end
 
     for _, ch in ipairs(channels) do
-        local row = body:Object {
-            flex = { flex_direction = "row", flex_wrap = "nowrap" },
-            w = lvgl.PCT(100), h = 24, border_width = 0, pad_all = 0,
-        }
-        row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-        local chat_btn = row:Button { w = lvgl.PCT(65), h = 24 }
+        local chat_btn = body:Button { w = ch.idx > 0 and lvgl.PCT(65) or lvgl.PCT(100), h = 24 }
         chat_btn:Label {
             text = ch.name .. (ch.has_key and " *" or ""),
             align = lvgl.ALIGN.LEFT_MID,
@@ -845,7 +815,7 @@ show_channels = function()
         chat_btn:onevent(lvgl.EVENT.RELEASED,function() show_chat(ch_copy) end)
 
         if ch.idx > 0 then
-            local del_btn = row:Button { w = 50, h = 24 }
+            local del_btn = body:Button { w = 50, h = 24 }
             del_btn:Label { text = "Del", align = lvgl.ALIGN.CENTER }
             local ch_idx = ch.idx
             del_btn:onevent(lvgl.EVENT.RELEASED,function()
@@ -914,16 +884,8 @@ show_contact_detail = function(contact_name)
     info_label("Type: " .. (contact.type_name or "?"))
     info_label("Key: " .. string.sub(contact.pubkey or "", 1, 16) .. "..")
 
-    local path_row = box:Object {
-        flex = { flex_direction = "row", flex_wrap = "nowrap" },
-        w = lvgl.PCT(100), h = 26, border_width = 0, pad_all = 0,
-    }
-    path_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-    path_row:Label {
-        text = "Path: " .. (contact.path_len >= 0 and (contact.path_len .. " hops") or "flood"),
-        w = lvgl.PCT(60),
-    }
-    local paths_btn = path_row:Button { w = lvgl.PCT(38), h = 22 }
+    info_label("Path: " .. (contact.path_len >= 0 and (contact.path_len .. " hops") or "flood"))
+    local paths_btn = box:Button { w = lvgl.PCT(38), h = 22 }
     paths_btn:Label { text = "Paths", align = lvgl.ALIGN.CENTER }
     paths_btn:onevent(lvgl.EVENT.RELEASED, function()
         local ok2, paths = pcall(_mesh_get_contact_paths, contact.pubkey)
@@ -1004,15 +966,9 @@ show_contact_detail = function(contact_name)
         pcall(_mesh_set_contact_favorite, contact_name, is_fav)
     end)
 
-    -- Action buttons in rows
-    local act_row1 = box:Object {
-        flex = { flex_direction = "row", flex_wrap = "nowrap" },
-        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
-    }
-    act_row1:clear_flag(lvgl.FLAG.SCROLLABLE)
-
+    -- Action buttons as direct children of box
     if contact.type == 1 then
-        local dm_btn = act_row1:Button { w = lvgl.PCT(48), h = 26 }
+        local dm_btn = box:Button { w = lvgl.PCT(48), h = 26 }
         dm_btn:Label { text = "DM", align = lvgl.ALIGN.CENTER }
         dm_btn:onevent(lvgl.EVENT.RELEASED, function()
             close_popup()
@@ -1020,27 +976,21 @@ show_contact_detail = function(contact_name)
         end)
     end
 
-    local share_btn = act_row1:Button { w = lvgl.PCT(48), h = 26 }
+    local share_btn = box:Button { w = lvgl.PCT(48), h = 26 }
     share_btn:Label { text = "Share", align = lvgl.ALIGN.CENTER }
     share_btn:onevent(lvgl.EVENT.RELEASED, function()
         pcall(_mesh_share_contact, contact_name)
         set_header(contact_name, "Shared!")
     end)
 
-    local act_row2 = box:Object {
-        flex = { flex_direction = "row", flex_wrap = "nowrap" },
-        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
-    }
-    act_row2:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-    local rp_btn = act_row2:Button { w = lvgl.PCT(48), h = 26 }
+    local rp_btn = box:Button { w = lvgl.PCT(48), h = 26 }
     rp_btn:Label { text = "RstPath", align = lvgl.ALIGN.CENTER }
     rp_btn:onevent(lvgl.EVENT.RELEASED, function()
         pcall(_mesh_reset_path, contact_name)
         set_header(contact_name, "Path reset")
     end)
 
-    local exp_btn = act_row2:Button { w = lvgl.PCT(48), h = 26 }
+    local exp_btn = box:Button { w = lvgl.PCT(48), h = 26 }
     exp_btn:Label { text = "Export", align = lvgl.ALIGN.CENTER }
     exp_btn:onevent(lvgl.EVENT.RELEASED, function()
         local card = _mesh_export_contact(contact_name)
@@ -1048,13 +998,7 @@ show_contact_detail = function(contact_name)
         if card then print("BIZ CARD: " .. card) end
     end)
 
-    local act_row3 = box:Object {
-        flex = { flex_direction = "row", flex_wrap = "nowrap" },
-        w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 2,
-    }
-    act_row3:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-    local rm_btn = act_row3:Button { w = lvgl.PCT(48), h = 26 }
+    local rm_btn = box:Button { w = lvgl.PCT(48), h = 26 }
     rm_btn:Label { text = "Remove", align = lvgl.ALIGN.CENTER }
     rm_btn:onevent(lvgl.EVENT.RELEASED, function()
         close_popup()
@@ -1062,7 +1006,7 @@ show_contact_detail = function(contact_name)
         if current_mode == "contacts" then show_contacts() end
     end)
 
-    local close_btn = act_row3:Button { w = lvgl.PCT(48), h = 26 }
+    local close_btn = box:Button { w = lvgl.PCT(48), h = 26 }
     close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
     close_btn:onevent(lvgl.EVENT.RELEASED, function()
         close_popup()

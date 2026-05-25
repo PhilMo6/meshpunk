@@ -612,9 +612,16 @@ local function entry()
             scoreImg:delete(); scoreImg = nil
 
             createScoreLabel()
+
+            local grp = lvgl.group.get_default()
+            grp:add_obj(bgLayer.bgLayer)
+            lvgl.group.focus_obj(bgLayer.bgLayer)
         end)
 
         quitBtn = createQuitBtn(sysLayer)
+        _gridnav_add(sysLayer, GRIDNAV_ROLLOVER)
+        local grp = lvgl.group.get_default()
+        grp:add_obj(sysLayer)
 
         local debTimer = lvgl.Timer {
             period = 1000,
@@ -685,10 +692,17 @@ local function entry()
         medal:set{ align = { type = lvgl.ALIGN.TOP_LEFT, y_ofs = 4, x_ofs = 4 } }
         createScoreLabel()
 
+        local grp = lvgl.group.get_default()
+        grp:add_obj(bgLayer.bgLayer)
+        lvgl.group.focus_obj(bgLayer.bgLayer)
+
         gameStart()
     end)
 
     quitBtn = createQuitBtn(sysLayer)
+    _gridnav_add(sysLayer, GRIDNAV_ROLLOVER)
+    local grp = lvgl.group.get_default()
+    grp:add_obj(sysLayer)
 end
 
 entry()

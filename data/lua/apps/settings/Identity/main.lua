@@ -6,17 +6,15 @@ root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
 local content = root:Object {
-    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
     border_width = 0, pad_all = 6,
 }
-_nav_setup(content, GRIDNAV_ROLLOVER)
+_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
 
--- Title row
-local title_row = content:Object { w = lvgl.PCT(100), h = 26, border_width = 0, pad_all = 0 }
-title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-title_row:Label { text = "Identity", align = lvgl.ALIGN.LEFT_MID }
-local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
+-- Title
+content:Label { text = "Identity", w = lvgl.PCT(70), h = 26 }
+local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 
 local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
@@ -66,22 +64,24 @@ btn_gen:onClicked(function()
     local box = overlay:Object {
         w = 280, h = 130, align = lvgl.ALIGN.CENTER,
         border_width = 1, pad_all = 10,
-        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+        flex = { flex_direction = "row", flex_wrap = "wrap" },
     }
     box:clear_flag(lvgl.FLAG.SCROLLABLE)
+    _gridnav_add(box, GRIDNAV_ROLLOVER)
+    local popup_group = lvgl.group.get_default()
+    popup_group:add_obj(box)
+
     box:Label { text = "WARNING", w = lvgl.PCT(100), h = 20 }
     box:Label { text = "Generate new identity?", w = lvgl.PCT(100), h = 18 }
     box:Label { text = "Old key is LOST forever!", w = lvgl.PCT(100), h = 18 }
-    local btn_row = box:Object {
-        flex = { flex_direction = "row", flex_wrap = "nowrap" },
-        w = lvgl.PCT(100), h = 40, border_width = 0, pad_all = 4,
-    }
-    btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-    local yes = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+
+    local yes = box:Button { w = lvgl.PCT(48), h = 32 }
     yes:Label { text = "Confirm", align = lvgl.ALIGN.CENTER }
-    local no = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+    local no = box:Button { w = lvgl.PCT(48), h = 32 }
     no:Label { text = "Cancel", align = lvgl.ALIGN.CENTER }
-    no:onClicked(function() overlay:delete() end)
+    no:onClicked(function()
+        overlay:delete()
+    end)
     yes:onClicked(function()
         overlay:delete()
         status.text = "Generating..."

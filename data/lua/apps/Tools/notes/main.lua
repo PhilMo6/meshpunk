@@ -11,13 +11,13 @@ local root = lvgl.Object {
     w = lvgl.HOR_RES(),
     h = lvgl.VER_RES(),
     flex = {
-        flex_direction = "column",
-        align_items = "stretch",
+        flex_direction = "row",
+        flex_wrap = "wrap",
     },
     bg_color = "#222",
     pad_all = 6,
 }
-
+_nav_setup(root, GRIDNAV_ROLLOVER)
 
 local ta = root:Textarea {
     text = "",
@@ -27,22 +27,8 @@ local ta = root:Textarea {
     border_width = 1,
     border_color = "#777",
     pad_all = 6,
-    expand = true,
-}
-ta:set {
     w = lvgl.PCT(100),
     h = lvgl.PCT(70),
-}
-
--- Footer
-local footer = root:Object {
-    flex = {
-        flex_direction = "row"
-    },
-    bg_color = "#222",
-    w = lvgl.PCT(100),
-    h = lvgl.PCT(30),
-    pad_all = 0,
 }
 
 -- Try to load from file
@@ -69,8 +55,8 @@ local function save_file()
     end
 end
 
-local save = footer:Button{w = lvgl.PCT(45), h = 40}
-save:Label{text = "Save", align = lvgl.ALIGN.CENTER}
+local save = root:Button { w = lvgl.PCT(45), h = 40 }
+save:Label { text = "Save", align = lvgl.ALIGN.CENTER }
 save:onClicked(save_file)
 
 -- save file then quit
@@ -81,8 +67,8 @@ local function quit_app()
     launcher.create()
 end
 
-local quit = footer:Button{w = lvgl.PCT(45), h = 40}
-quit:Label{text = "Quit", align = lvgl.ALIGN.CENTER}
+local quit = root:Button { w = lvgl.PCT(45), h = 40 }
+quit:Label { text = "Quit", align = lvgl.ALIGN.CENTER }
 quit:onClicked(quit_app)
 
 load_file()

@@ -24,10 +24,7 @@ end
 
 -- Scrollable content area with trackball navigation
 local content = root:Object {
-    flex = {
-        flex_direction = "column",
-        flex_wrap = "nowrap",
-    },
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
     w = lvgl.HOR_RES(),
     h = lvgl.VER_RES(),
     y = 0,
@@ -35,23 +32,11 @@ local content = root:Object {
     pad_all = 6,
 }
 
-_nav_setup(content, GRIDNAV_ROLLOVER)
+_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
 
--- Title row
-local title_row = content:Object {
-    w = lvgl.PCT(100),
-    h = 26,
-    border_width = 0,
-    pad_all = 0,
-}
-title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-title_row:Label {
-    text = "Radio Settings",
-    align = lvgl.ALIGN.LEFT_MID,
-}
-
-local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
+-- Title
+content:Label { text = "Radio Settings", w = lvgl.PCT(70), h = 26 }
+local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 back_btn:onClicked(function()
     utils.loadingPopUpAdd(nil, "Home", function()
@@ -85,27 +70,23 @@ local function show_restart_popup()
         align = lvgl.ALIGN.CENTER,
         border_width = 1,
         pad_all = 10,
-        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+        flex = { flex_direction = "row", flex_wrap = "wrap" },
     }
     box:clear_flag(lvgl.FLAG.SCROLLABLE)
+    _gridnav_add(box, GRIDNAV_ROLLOVER)
+    local popup_group = lvgl.group.get_default()
+    popup_group:add_obj(box)
 
     box:Label { text = "Settings saved.", w = lvgl.PCT(100), h = 20 }
     box:Label { text = "Restart to apply?", w = lvgl.PCT(100), h = 20 }
 
-    local btn_row = box:Object {
-        flex = { flex_direction = "row", flex_wrap = "nowrap" },
-        w = lvgl.PCT(100), h = 40,
-        border_width = 0, pad_all = 4,
-    }
-    btn_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-    local restart_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+    local restart_btn = box:Button { w = lvgl.PCT(48), h = 32 }
     restart_btn:Label { text = "Restart", align = lvgl.ALIGN.CENTER }
     restart_btn:onClicked(function()
         pcall(_system_reboot)
     end)
 
-    local wait_btn = btn_row:Button { w = lvgl.PCT(48), h = 32 }
+    local wait_btn = box:Button { w = lvgl.PCT(48), h = 32 }
     wait_btn:Label { text = "Wait", align = lvgl.ALIGN.CENTER }
     wait_btn:onClicked(function()
         overlay:delete()
@@ -240,20 +221,14 @@ for _, p in ipairs(presets) do
     preset_names[#preset_names + 1] = p.name
 end
 
-local preset_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-preset_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local preset_dd = preset_row:Dropdown {
+local preset_dd = content:Dropdown {
     options = table.concat(preset_names, "\n"),
     w = lvgl.PCT(65),
     h = 30,
     dir = lvgl.DIR.BOTTOM,
 }
 
-local preset_apply_btn = preset_row:Button { w = lvgl.PCT(30), h = 30 }
+local preset_apply_btn = content:Button { w = lvgl.PCT(30), h = 30 }
 preset_apply_btn:Label { text = "Load", align = lvgl.ALIGN.CENTER }
 
 preset_apply_btn:onClicked(function()
@@ -270,20 +245,14 @@ content:Label { text = "Key: " .. string.sub(info.pubkey or "", 1, 16) .. "...",
 local ok_boost, rx_boost = pcall(_mesh_get_rx_boost)
 local boost_enabled = (ok_boost and rx_boost) or false
 
-local boost_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-boost_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
 local function get_boost_text()
     return boost_enabled and "[x] RX Boost" or "[ ] RX Boost"
 end
 
-local boost_toggle_btn = boost_row:Button { w = lvgl.PCT(65), h = 30 }
+local boost_toggle_btn = content:Button { w = lvgl.PCT(65), h = 30 }
 local boost_label = boost_toggle_btn:Label { text = get_boost_text(), align = lvgl.ALIGN.CENTER }
 
-local boost_apply_btn = boost_row:Button { w = lvgl.PCT(30), h = 30 }
+local boost_apply_btn = content:Button { w = lvgl.PCT(30), h = 30 }
 boost_apply_btn:Label { text = "Apply", align = lvgl.ALIGN.CENTER }
 
 boost_toggle_btn:onClicked(function()
@@ -303,20 +272,14 @@ end)
 -- Contact Overwrite toggle
 local overwrite_enabled = info.contact_overwrite or false
 
-local overwrite_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-overwrite_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-
 local function get_overwrite_text()
     return overwrite_enabled and "[x] Contact Overwrite" or "[ ] Contact Overwrite"
 end
 
-local overwrite_toggle_btn = overwrite_row:Button { w = lvgl.PCT(65), h = 30 }
+local overwrite_toggle_btn = content:Button { w = lvgl.PCT(65), h = 30 }
 local overwrite_label = overwrite_toggle_btn:Label { text = get_overwrite_text(), align = lvgl.ALIGN.CENTER }
 
-local overwrite_apply_btn = overwrite_row:Button { w = lvgl.PCT(30), h = 30 }
+local overwrite_apply_btn = content:Button { w = lvgl.PCT(30), h = 30 }
 overwrite_apply_btn:Label { text = "Apply", align = lvgl.ALIGN.CENTER }
 
 overwrite_toggle_btn:onClicked(function()

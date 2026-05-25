@@ -577,7 +577,9 @@ showGameOver = function(winner)
         text_color = CLR_TEXT,
     }
 
-    _gridnav_add(overlayBox, 1)
+    _gridnav_add(overlayBox, GRIDNAV_ROLLOVER)
+    local grp = lvgl.group.get_default()
+    grp:add_obj(overlayBox)
 
     playBtn:onevent(lvgl.EVENT.CLICKED, function()
         if not game.running then return end
@@ -670,7 +672,9 @@ local function showMenu(scr)
         text_color = CLR_TEXT,
     }
 
-    _gridnav_add(menuBox, 1)
+    _gridnav_add(menuBox, GRIDNAV_ROLLOVER)
+    local grp = lvgl.group.get_default()
+    grp:add_obj(menuBox)
 
     spBtn:onevent(lvgl.EVENT.CLICKED, function()
         if not game.running then return end

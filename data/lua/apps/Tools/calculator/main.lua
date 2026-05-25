@@ -237,8 +237,27 @@ local function createBtn(parent, value)
     return btn
 end
 
+-- Back button as first grid cell
+local back_grid_btn = button_grid:Button {
+    w = lvgl.PCT(23), h = BTN_H,
+    radius = 6,
+    bg_color = CLR_DIGIT, bg_opa = 255,
+}
+back_grid_btn:Label {
+    text = "<",
+    text_font = lvgl.BUILTIN_FONT.MONTSERRAT_18,
+    text_color = CLR_TEXT,
+    align = lvgl.ALIGN.CENTER,
+}
+back_grid_btn:onClicked(function()
+    utils.loadingPopUpAdd(nil, "Home", function()
+        nav.goHome(root)
+        return true
+    end)
+end)
+
 for _, label in ipairs(buttons) do
     createBtn(button_grid, label)
 end
 
-_nav_setup(view, GRIDNAV_ROLLOVER)
+_nav_setup(button_grid, GRIDNAV_ROLLOVER)

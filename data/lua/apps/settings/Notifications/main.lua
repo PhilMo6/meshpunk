@@ -6,17 +6,15 @@ root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
 local content = root:Object {
-    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
     border_width = 0, pad_all = 6,
 }
 _nav_setup(content, GRIDNAV_ROLLOVER)
 
--- Title row
-local title_row = content:Object { w = lvgl.PCT(100), h = 26, border_width = 0, pad_all = 0 }
-title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-title_row:Label { text = "Notifications", align = lvgl.ALIGN.LEFT_MID }
-local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
+-- Title
+content:Label { text = "Notifications", w = lvgl.PCT(70), h = 26 }
+local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 
 local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }

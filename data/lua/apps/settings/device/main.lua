@@ -6,17 +6,15 @@ root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
 local content = root:Object {
-    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
     border_width = 0, pad_all = 6,
 }
-_nav_setup(content, GRIDNAV_ROLLOVER)
+_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
 
--- Title row
-local title_row = content:Object { w = lvgl.PCT(100), h = 26, border_width = 0, pad_all = 0 }
-title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-title_row:Label { text = "Device Settings", align = lvgl.ALIGN.LEFT_MID }
-local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
+-- Title
+content:Label { text = "Device Settings", w = lvgl.PCT(70), h = 26 }
+local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 
 local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
@@ -33,6 +31,7 @@ local disp_bar = content:Object {
     w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
 }
 disp_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
+disp_bar:clear_flag(lvgl.FLAG.CLICKABLE)
 local dsegs = {}
 for i = 1, DISP_SEGS do
     dsegs[i] = disp_bar:Object { w = 16, h = 14, border_width = 1, pad_all = 0, bg_color = "#24ba24"}
@@ -49,15 +48,9 @@ local function refresh_disp()
 end
 refresh_disp()
 
-local disp_btns = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-disp_btns:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local disp_dn = disp_btns:Button { w = lvgl.PCT(45), h = 30 }
+local disp_dn = content:Button { w = lvgl.PCT(45), h = 30 }
 disp_dn:Label { text = "Screen -", align = lvgl.ALIGN.CENTER }
-local disp_up = disp_btns:Button { w = lvgl.PCT(45), h = 30 }
+local disp_up = content:Button { w = lvgl.PCT(45), h = 30 }
 disp_up:Label { text = "Screen +", align = lvgl.ALIGN.CENTER }
 
 disp_dn:onClicked(function()
@@ -75,20 +68,15 @@ end)
 
 -- ── Screen Timeout ──────────────────────────────────────────────────────────
 content:Label { text = "Timeout (sec, 0=never):", w = lvgl.PCT(100), h = 16 }
-local scr_to_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-scr_to_row:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local scr_to_input = scr_to_row:Textarea {
+local scr_to_input = content:Textarea {
     password_mode = false, one_line = true,
     text = tostring(_screen_timeout_get()),
     w = lvgl.PCT(50), h = 30,
 }
 scr_to_input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local scr_to_btn = scr_to_row:Button { w = lvgl.PCT(40), h = 30 }
+local scr_to_btn = content:Button { w = lvgl.PCT(40), h = 30 }
 scr_to_btn:Label { text = "Set", align = lvgl.ALIGN.CENTER }
 scr_to_btn:onClicked(function()
     local v = tonumber(scr_to_input.text)
@@ -113,6 +101,7 @@ local kbd_bar = content:Object {
     w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
 }
 kbd_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
+kbd_bar:clear_flag(lvgl.FLAG.CLICKABLE)
 local ksegs = {}
 for i = 1, KBD_SEGS do
     ksegs[i] = kbd_bar:Object { w = 30, h = 14, border_width = 1, pad_all = 0 , bg_color = "#24ba24" }
@@ -130,15 +119,9 @@ local function refresh_kbd()
 end
 refresh_kbd()
 
-local kbd_btns = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-kbd_btns:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-local kbd_dn = kbd_btns:Button { w = lvgl.PCT(45), h = 30 }
+local kbd_dn = content:Button { w = lvgl.PCT(45), h = 30 }
 kbd_dn:Label { text = "Light -", align = lvgl.ALIGN.CENTER }
-local kbd_up = kbd_btns:Button { w = lvgl.PCT(45), h = 30 }
+local kbd_up = content:Button { w = lvgl.PCT(45), h = 30 }
 kbd_up:Label { text = "Light +", align = lvgl.ALIGN.CENTER }
 
 kbd_dn:onClicked(function()
@@ -156,20 +139,15 @@ end)
 
 -- ── Keyboard Timeout ────────────────────────────────────────────────────────
 content:Label { text = "Timeout (sec, 0=never):", w = lvgl.PCT(100), h = 16 }
-local kbd_to_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-kbd_to_row:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local kbd_to_input = kbd_to_row:Textarea {
+local kbd_to_input = content:Textarea {
     password_mode = false, one_line = true,
     text = tostring(_kbd_timeout_get()),
     w = lvgl.PCT(50), h = 30,
 }
 kbd_to_input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local kbd_to_btn = kbd_to_row:Button { w = lvgl.PCT(40), h = 30 }
+local kbd_to_btn = content:Button { w = lvgl.PCT(40), h = 30 }
 kbd_to_btn:Label { text = "Set", align = lvgl.ALIGN.CENTER }
 kbd_to_btn:onClicked(function()
     local v = tonumber(kbd_to_input.text)

@@ -9,17 +9,15 @@ root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
 local content = root:Object {
-    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    flex = { flex_direction = "row", flex_wrap = "wrap" },
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
     border_width = 0, pad_all = 6,
 }
-_nav_setup(content, GRIDNAV_ROLLOVER)
+_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
 
--- Title row
-local title_row = content:Object { w = lvgl.PCT(100), h = 26, border_width = 0, pad_all = 0 }
-title_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-title_row:Label { text = "Wireless", align = lvgl.ALIGN.LEFT_MID }
-local back_btn = title_row:Button { w = 50, h = 22, align = lvgl.ALIGN.RIGHT_MID }
+-- Title
+content:Label { text = "Wireless", w = lvgl.PCT(70), h = 26 }
+local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 
 local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
@@ -28,7 +26,7 @@ local scan_timer = nil
 
 -- ═══════════════════════════════════════════════════════════════════
 -- WiFi Section
--- ═════════════════��═════════════════════════════════���═══════════════
+-- ═══════════════════════════════════════════════════════════════════
 
 if wifi_avail then
 
@@ -69,15 +67,10 @@ local function refresh_wifi_status()
 end
 refresh_wifi_status()
 
--- Saved network display
+-- Saved network
 local creds = _wifi_get_saved_creds()
-local saved_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 30, border_width = 0, pad_all = 0,
-}
-saved_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-local saved_lbl = saved_row:Label { text = "", align = lvgl.ALIGN.LEFT_MID }
-local forget_btn = saved_row:Button { w = 55, h = 24, align = lvgl.ALIGN.RIGHT_MID }
+local saved_lbl = content:Label { text = "", w = lvgl.PCT(60), h = 24 }
+local forget_btn = content:Button { w = 55, h = 24 }
 forget_btn:Label { text = "Forget", align = lvgl.ALIGN.CENTER }
 
 local function refresh_saved()
@@ -100,38 +93,31 @@ forget_btn:onClicked(function()
     status.text = "Network forgotten"
 end)
 
--- Password input row
-local pass_row = content:Object {
-    flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 34, border_width = 0, pad_all = 0,
-}
-pass_row:clear_flag(lvgl.FLAG.SCROLLABLE)
-pass_row:add_flag(lvgl.FLAG.HIDDEN)
-
-local pass_input = pass_row:Textarea {
+-- Password input + Join (direct children, hidden initially)
+local pass_input = content:Textarea {
     password_mode = true, one_line = true,
     text = "", placeholder_text = "Password",
     w = lvgl.PCT(60), h = 30,
 }
 pass_input:clear_flag(lvgl.FLAG.SCROLLABLE)
+pass_input:add_flag(lvgl.FLAG.HIDDEN)
 
--- Scan button
-local scan_btn = content:Button { w = lvgl.PCT(60), h = 30 }
-scan_btn:Label { text = "Scan Networks", align = lvgl.ALIGN.CENTER }
-
--- Scan results container
-local scan_container = content:Object {
-    flex = { flex_direction = "column", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
-    border_width = 0, pad_all = 0,
-}
-scan_container:clear_flag(lvgl.FLAG.SCROLLABLE)
+local join_btn = content:Button { w = 50, h = 28 }
+join_btn:Label { text = "Join", align = lvgl.ALIGN.CENTER }
+join_btn:add_flag(lvgl.FLAG.HIDDEN)
 
 local selected_ssid = ""
 local selected_secure = false
 
-local join_btn = pass_row:Button { w = 50, h = 28 }
-join_btn:Label { text = "Join", align = lvgl.ALIGN.CENTER }
+local function show_pass_row()
+    pass_input:clear_flag(lvgl.FLAG.HIDDEN)
+    join_btn:clear_flag(lvgl.FLAG.HIDDEN)
+end
+
+local function hide_pass_row()
+    pass_input:add_flag(lvgl.FLAG.HIDDEN)
+    join_btn:add_flag(lvgl.FLAG.HIDDEN)
+end
 
 join_btn:onClicked(function()
     local pass = pass_input.text or ""
@@ -141,9 +127,39 @@ join_btn:onClicked(function()
     end
     _wifi_save_creds(selected_ssid, pass)
     _wifi_connect(selected_ssid, pass)
-    pass_row:add_flag(lvgl.FLAG.HIDDEN)
+    hide_pass_row()
     status.text = "Joining " .. selected_ssid .. "..."
     refresh_saved()
+end)
+
+-- Scan button
+local scan_btn = content:Button { w = lvgl.PCT(60), h = 30 }
+scan_btn:Label { text = "Scan Networks", align = lvgl.ALIGN.CENTER }
+
+-- Scan results container (click-to-enter pattern)
+local scan_container = content:Object {
+    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
+    border_width = 0, pad_all = 0,
+}
+scan_container:clear_flag(lvgl.FLAG.SCROLLABLE)
+scan_container:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+
+local in_scan_select = false
+
+scan_container:onevent(lvgl.EVENT.RELEASED, function()
+    if in_scan_select then return end
+    in_scan_select = true
+    _nav_setup(scan_container, GRIDNAV_ROLLOVER)
+end)
+
+scan_container:onevent(lvgl.EVENT.KEY, function()
+    local indev = lvgl.indev.get_act()
+    local key = indev:get_key()
+    if key == 113 then -- 'q' key
+        in_scan_select = false
+        _nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+    end
 end)
 
 local function show_scan_results(results)
@@ -162,12 +178,14 @@ local function show_scan_results(results)
         nbtn:onClicked(function()
             selected_ssid = net.ssid
             selected_secure = net.secure
+            in_scan_select = false
+            _nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
             if net.secure then
-                pass_row:clear_flag(lvgl.FLAG.HIDDEN)
+                show_pass_row()
                 pass_input.text = ""
                 status.text = "Enter password for " .. net.ssid
             else
-                pass_row:add_flag(lvgl.FLAG.HIDDEN)
+                hide_pass_row()
                 _wifi_save_creds(net.ssid, "")
                 _wifi_connect(net.ssid, "")
                 status.text = "Joining " .. net.ssid .. "..."
@@ -203,7 +221,7 @@ table.insert(timers, wifi_refresh_timer)
 
 end -- wifi_avail
 
--- ═════════════════��═════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════
 -- BLE Section
 -- ═══════════════════════════════════════════════════════════════════
 
@@ -261,7 +279,7 @@ end -- ble_avail
 
 -- ═══════════════════════════════════════════════════════════════════
 -- Back button
--- ═══════════════════════════���═══════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════
 
 back_btn:onClicked(function()
     for _, t in ipairs(timers) do
