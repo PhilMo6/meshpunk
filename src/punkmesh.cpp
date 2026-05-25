@@ -337,6 +337,7 @@ void PunkMesh::saveContacts()
     {
         ContactsIterator iter;
         ContactInfo c;
+        int count = 0;
 
         while (iter.hasNext(this, c))
         {
@@ -350,6 +351,13 @@ void PunkMesh::saveContacts()
                 pubkey_hex, c.name, c.type, c.flags,
                 c.out_path_len, c.last_advert_timestamp, path_hex,
                 (int)c.gps_lat, (int)c.gps_lon);
+
+            if (is_sd && ++count % 50 == 0) {
+                file.flush();
+                sd_spi_release();
+                vTaskDelay(1);
+                sd_spi_take();
+            }
         }
         file.close();
     }
@@ -835,6 +843,7 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
     }
 
     int idx = 1;
+    int line_count = 0;
     StoredMsg m;
     memset(&m, 0, sizeof(m));
     char line[256];
@@ -848,6 +857,13 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
         }
         line[len] = '\0';
         if (len == 0) continue;
+
+        // Yield every 100 lines to prevent task watchdog timeout on large log files
+        if (is_sd && ++line_count % 100 == 0) {
+            sd_spi_release();
+            vTaskDelay(1);
+            sd_spi_take();
+        }
 
         if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
             push_stored_msg_table(L, m);
@@ -947,6 +963,7 @@ int PunkMesh::pushDMThreadNamesToLua(lua_State* L) {
     }
 
     int idx = 1;
+    int iter = 0;
     File entry = root.openNextFile();
     while (entry) {
         if (!entry.isDirectory()) {
@@ -977,6 +994,12 @@ int PunkMesh::pushDMThreadNamesToLua(lua_State* L) {
                     lua_rawseti(L, -2, idx++);
                 }
             }
+        }
+        // Yield every 10 files to prevent task watchdog timeout
+        if (is_sd && ++iter % 10 == 0) {
+            sd_spi_release();
+            vTaskDelay(1);
+            sd_spi_take();
         }
         entry = root.openNextFile();
     }

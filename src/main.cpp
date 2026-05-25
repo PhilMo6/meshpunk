@@ -758,15 +758,6 @@ static int lua_io_open(lua_State *L) {
     }
   }
 
-  Serial.print("io.open: ");
-  Serial.print(filename);
-  Serial.print(" -> ");
-  Serial.print(use_sd ? "SD" : "LittleFS");
-  Serial.print(":");
-  Serial.print(actual_path);
-  Serial.print(" mode: ");
-  Serial.println(mode);
-
   const char *fs_mode;
   if (strcmp(mode, "r") == 0) {
     fs_mode = "r";
@@ -2613,9 +2604,7 @@ static int lua_list_dir(lua_State *L) {
   File entry = root.openNextFile();
   while (entry) {
     if (entry.isDirectory()) {
-      // entry.name() may return full path or just name depending on core version
       const char *name = pathBasename(entry.name());
-      Serial.printf("[FS] _list_dir: found dir: raw='%s' name='%s'\n", entry.name(), name);
       if (name[0] != '\0') {
         lua_pushstring(L, name);
         lua_rawseti(L, -2, idx++);
@@ -2641,31 +2630,39 @@ static int lua_list_dir_sd(lua_State *L) {
     return 1; // return empty table
   }
 
+  MESH_LOCK();
   sd_spi_take();
   File root = SD.open(path);
+
   if (!root || !root.isDirectory()) {
     Serial.printf("[FS] _list_dir_sd: cannot open %s\n", path);
     sd_spi_release();
+    MESH_UNLOCK();
     return 1;
   }
 
   File entry = root.openNextFile();
+  int iter = 0;
   while (entry) {
     if (entry.isDirectory()) {
       const char *name = pathBasename(entry.name());
-      Serial.printf("[FS] _list_dir_sd: found dir: raw='%s' name='%s'\n", entry.name(), name);
       if (name[0] != '\0') {
         lua_pushstring(L, name);
         lua_rawseti(L, -2, idx++);
       }
     }
+    sd_spi_release();
+    vTaskDelay(1);
+    sd_spi_take();
     entry = root.openNextFile();
+    iter++;
   }
   root.close();
 
   sd_spi_release();
+  MESH_UNLOCK();
 
-  Serial.printf("[FS] _list_dir_sd(%s): found %d dirs\n", path, idx - 1);
+  Serial.printf("[FS] _list_dir_sd(%s): found %d dirs, scanned %d entries\n", path, idx - 1, iter);
   return 1;
 }
 
@@ -2724,15 +2721,18 @@ static int lua_list_all_sd(lua_State *L) {
     return 1;
   }
 
+  MESH_LOCK();
   sd_spi_take();
   File root = SD.open(path);
   if (!root || !root.isDirectory()) {
     Serial.printf("[FS] _list_all_sd: cannot open %s\n", path);
     sd_spi_release();
+    MESH_UNLOCK();
     return 1;
   }
 
   File entry = root.openNextFile();
+  int iter = 0;
   while (entry) {
     lua_newtable(L);
 
@@ -2753,10 +2753,16 @@ static int lua_list_all_sd(lua_State *L) {
     }
 
     entry = root.openNextFile();
+    if (++iter % 20 == 0) {
+      sd_spi_release();
+      vTaskDelay(1);
+      sd_spi_take();
+    }
   }
   root.close();
 
   sd_spi_release();
+  MESH_UNLOCK();
 
   Serial.printf("[FS] _list_all_sd(%s): found %d entries\n", path, idx - 1);
   return 1;
