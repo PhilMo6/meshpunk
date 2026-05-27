@@ -193,6 +193,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     Serial.printf("[BLE] App '%s' connected\n", app_name);
 
     _iter_started = false;
+    _sync_active = true;
 
     freeSyncFrames();
     _msg_sync.file_count = _mesh.enumerateMessageFiles(
@@ -316,6 +317,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         save_sync_timestamp(_mesh, _msg_sync.most_recent_ts);
       freeSyncFrames();
       _msg_sync.active = false;
+      _sync_active = false;
       out_frame[0] = RESP_CODE_NO_MORE_MESSAGES;
       _serial.writeFrame(out_frame, 1);
     }
@@ -911,7 +913,7 @@ void BleCompanionHandler::queueReceivedDM(const ContactInfo& from,
                                            mesh::Packet* pkt,
                                            uint32_t timestamp,
                                            const char* text) {
-  if (_serial.isConnected()) {
+  if (_serial.isConnected() && !_sync_active) {
     uint8_t push[1] = { PUSH_CODE_MSG_WAITING };
     _serial.writeFrame(push, 1);
   }
@@ -922,7 +924,7 @@ void BleCompanionHandler::queueReceivedChannelMsg(const mesh::GroupChannel& chan
                                                     uint32_t timestamp,
                                                     const char* text,
                                                     int channel_idx) {
-  if (_serial.isConnected()) {
+  if (_serial.isConnected() && !_sync_active) {
     uint8_t push[1] = { PUSH_CODE_MSG_WAITING };
     _serial.writeFrame(push, 1);
   }
@@ -930,7 +932,7 @@ void BleCompanionHandler::queueReceivedChannelMsg(const mesh::GroupChannel& chan
 
 void BleCompanionHandler::pushAdvert(const ContactInfo& contact, bool is_new,
                                       uint8_t path_len, const uint8_t* path) {
-  if (!_serial.isConnected()) return;
+  if (!_serial.isConnected() || _sync_active) return;
 
   if (is_new) {
     writeContactRespFrame(PUSH_CODE_NEW_ADVERT, contact);
@@ -943,7 +945,7 @@ void BleCompanionHandler::pushAdvert(const ContactInfo& contact, bool is_new,
 }
 
 void BleCompanionHandler::pushSendConfirmed(uint32_t ack_crc, uint32_t trip_time_ms) {
-  if (!_serial.isConnected()) return;
+  if (!_serial.isConnected() || _sync_active) return;
 
   for (int j = 0; j < EXPECTED_ACK_TABLE_SIZE; j++) {
     if (expected_ack_table[j].ack == ack_crc && expected_ack_table[j].ack != 0) {
@@ -959,7 +961,7 @@ void BleCompanionHandler::pushSendConfirmed(uint32_t ack_crc, uint32_t trip_time
 }
 
 void BleCompanionHandler::pushPathUpdated(const ContactInfo& contact) {
-  if (!_serial.isConnected()) return;
+  if (!_serial.isConnected() || _sync_active) return;
 
   uint8_t buf[2 + PUB_KEY_SIZE];
   int i = 0;
@@ -970,7 +972,7 @@ void BleCompanionHandler::pushPathUpdated(const ContactInfo& contact) {
 }
 
 void BleCompanionHandler::pushLogRxData(mesh::Packet* pkt, float snr, float rssi) {
-  if (!_serial.isConnected()) return;
+  if (!_serial.isConnected() || _sync_active) return;
   int raw_len = pkt->getRawLength();
   if (raw_len > (int)MAX_FRAME_SIZE - 3) return;
 

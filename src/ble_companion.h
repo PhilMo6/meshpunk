@@ -171,6 +171,7 @@ private:
   uint8_t out_frame[MAX_FRAME_SIZE + 1];
 
   MsgSyncState _msg_sync;
+  bool _sync_active = false;
 
   AckTableEntry expected_ack_table[EXPECTED_ACK_TABLE_SIZE];
   int next_ack_idx;

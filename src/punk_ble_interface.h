@@ -3,7 +3,6 @@
 #if BLE_COMPANION_ENABLED
 
 #include <helpers/esp32/SerialBLEInterface.h>
-#include <esp_gap_ble_api.h>
 
 extern bool ble_bond_clear_pref;
 
@@ -23,9 +22,10 @@ protected:
       params.max_int = 40;   // 50ms
       params.latency = 4;    // skip up to 4 events during idle
       params.timeout = 600;  // 6s    (units of 10ms)
-      esp_err_t err = esp_ble_gap_update_conn_params(&params);
-      Serial.printf("[BLE] Conn param update request: %s\n",
-                    err == ESP_OK ? "sent" : "failed");
+      esp_ble_gap_update_conn_params(&params);
+    } else {
+      // Bond mismatch — clear stale bond so next attempt re-pairs cleanly
+      esp_ble_remove_bond_device(cmpl.bd_addr);
     }
     SerialBLEInterface::onAuthenticationComplete(cmpl);
   }
