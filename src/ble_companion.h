@@ -53,12 +53,31 @@ struct StoredMsg;
 #define CMD_GET_CONTACT_BY_KEY        30
 #define CMD_GET_CHANNEL               31
 #define CMD_SET_CHANNEL               32
+#define CMD_SIGN_START                33
+#define CMD_SIGN_DATA                 34
+#define CMD_SIGN_FINISH               35
 #define CMD_SEND_TRACE_PATH           36
 #define CMD_SET_DEVICE_PIN            37
 #define CMD_SET_OTHER_PARAMS          38
+#define CMD_SEND_TELEMETRY_REQ        39
+#define CMD_GET_CUSTOM_VARS           40
+#define CMD_SET_CUSTOM_VAR            41
 #define CMD_GET_ADVERT_PATH           42
 #define CMD_GET_TUNING_PARAMS         43
+#define CMD_SEND_BINARY_REQ           50
 #define CMD_FACTORY_RESET             51
+#define CMD_SEND_PATH_DISCOVERY_REQ   52
+#define CMD_SET_FLOOD_SCOPE_KEY       54
+#define CMD_SEND_CONTROL_DATA         55
+#define CMD_GET_STATS                 56
+#define CMD_SEND_ANON_REQ             57
+#define CMD_SET_AUTOADD_CONFIG        58
+#define CMD_GET_AUTOADD_CONFIG        59
+#define CMD_GET_ALLOWED_REPEAT_FREQ   60
+#define CMD_SET_PATH_HASH_MODE        61
+#define CMD_SEND_CHANNEL_DATA         62
+#define CMD_SET_DEFAULT_FLOOD_SCOPE   63
+#define CMD_GET_DEFAULT_FLOOD_SCOPE   64
 #define CMD_GENERATE_IDENTITY         70
 
 // ── Response codes (device → app) ─────────���──────────────────────
@@ -79,16 +98,33 @@ struct StoredMsg;
 #define RESP_CODE_DEVICE_INFO         13
 #define RESP_CODE_PRIVATE_KEY         14
 #define RESP_CODE_DISABLED            15
-#define RESP_CODE_ADVERT_PATH         22
-#define RESP_CODE_TUNING_PARAMS       23
+#define RESP_CODE_SIGN_START              19
+#define RESP_CODE_SIGNATURE               20
+#define RESP_CODE_CUSTOM_VARS             21
+#define RESP_CODE_ADVERT_PATH             22
+#define RESP_CODE_TUNING_PARAMS           23
+#define RESP_CODE_STATS                   24
+#define RESP_CODE_AUTOADD_CONFIG          25
+#define RESP_ALLOWED_REPEAT_FREQ          26
+#define RESP_CODE_CHANNEL_DATA_RECV       27
+#define RESP_CODE_DEFAULT_FLOOD_SCOPE     28
 
 // ── Push codes (device → app, async) ─────────────────────────────
 #define PUSH_CODE_ADVERT              0x80
 #define PUSH_CODE_PATH_UPDATED        0x81
 #define PUSH_CODE_SEND_CONFIRMED      0x82
 #define PUSH_CODE_MSG_WAITING         0x83
-#define PUSH_CODE_LOG_RX_DATA         0x88
-#define PUSH_CODE_NEW_ADVERT          0x8A
+#define PUSH_CODE_LOGIN_SUCCESS       0x85
+#define PUSH_CODE_LOGIN_FAIL          0x86
+#define PUSH_CODE_STATUS_RESPONSE     0x87
+#define PUSH_CODE_RAW_DATA                0x84
+#define PUSH_CODE_LOG_RX_DATA             0x88
+#define PUSH_CODE_TRACE_DATA              0x89
+#define PUSH_CODE_NEW_ADVERT              0x8A
+#define PUSH_CODE_TELEMETRY_RESPONSE      0x8B
+#define PUSH_CODE_BINARY_RESPONSE         0x8C
+#define PUSH_CODE_PATH_DISCOVERY_RESPONSE 0x8D
+#define PUSH_CODE_CONTROL_DATA            0x8E
 
 // ── Error codes ──────────────────────────────────────────────────
 #define ERR_CODE_UNSUPPORTED_CMD      1
@@ -97,6 +133,20 @@ struct StoredMsg;
 #define ERR_CODE_BAD_STATE            4
 #define ERR_CODE_FILE_IO_ERROR        5
 #define ERR_CODE_ILLEGAL_ARG          6
+
+// ── Stats sub-types ─────────────────────────────────────────────
+#define STATS_TYPE_CORE    0
+#define STATS_TYPE_RADIO   1
+#define STATS_TYPE_PACKETS 2
+
+// ── Signing ─────────────────────────────────────────────────────
+#define MAX_SIGN_DATA_LEN  (8 * 1024)
+
+// ── Channel data ────────────────────────────────────────────────
+#define MAX_CHANNEL_DATA_LENGTH  (MAX_FRAME_SIZE - 9)
+
+// ── Telemetry request type ──────────────────────────────────────
+#define REQ_TYPE_GET_TELEMETRY_DATA  0x03
 
 // ── ACK tracking ─────────────────────────────────────────────────
 #define EXPECTED_ACK_TABLE_SIZE       8
@@ -126,6 +176,9 @@ struct MsgSyncState {
   SyncFrame* frames;
   int frame_count;
   int frame_idx;
+  // Targeted sync: set by push methods when a single file changed
+  char pending_file[MAX_PATH_LEN];
+  bool has_pending_file;
 };
 
 class BleCompanionHandler {
@@ -140,10 +193,22 @@ public:
                         uint32_t timestamp, const char* text);
   void queueReceivedChannelMsg(const mesh::GroupChannel& channel, mesh::Packet* pkt,
                                 uint32_t timestamp, const char* text, int channel_idx);
+  void queueCliResponse(const ContactInfo& from, mesh::Packet* pkt,
+                         uint32_t timestamp, const char* text);
   void pushAdvert(const ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path);
   void pushSendConfirmed(uint32_t ack_crc, uint32_t trip_time_ms);
   void pushPathUpdated(const ContactInfo& contact);
   void pushLogRxData(mesh::Packet* pkt, float snr, float rssi);
+  void pushContactResponse(const ContactInfo& contact, const uint8_t* data, uint8_t len);
+  void pushRawData(mesh::Packet* pkt, float snr, float rssi);
+  void pushTraceData(mesh::Packet* pkt, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                     const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len);
+  void pushControlData(mesh::Packet* pkt, float snr, float rssi);
+  void pushChannelDataRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt,
+                           uint16_t data_type, const uint8_t* data, size_t data_len);
+  bool checkPendingDiscovery(ContactInfo& contact, uint8_t* in_path, uint8_t in_path_len,
+                             uint8_t* out_path, uint8_t out_path_len,
+                             uint8_t extra_type, uint8_t* extra, uint8_t extra_len);
 
   bool isConnected() const { return _serial.isConnected(); }
 
@@ -155,8 +220,11 @@ private:
   void writeContactRespFrame(uint8_t code, const ContactInfo& contact);
 
   int buildSyncFrame(const StoredMsg& m, uint8_t* frame);
+  bool loadFileFrames(const char* path);
   bool loadNextFileFrames();
   void freeSyncFrames();
+  void saveWatermarkNow();
+  void startFullSync();
 
   PunkMesh& _mesh;
   SerialBLEInterface& _serial;
@@ -171,10 +239,20 @@ private:
   uint8_t out_frame[MAX_FRAME_SIZE + 1];
 
   MsgSyncState _msg_sync;
-  bool _sync_active = false;
 
   AckTableEntry expected_ack_table[EXPECTED_ACK_TABLE_SIZE];
   int next_ack_idx;
+
+  uint32_t pending_login;
+  uint32_t pending_status;
+  uint32_t pending_telemetry;
+  uint32_t pending_discovery;
+  uint32_t pending_req;
+
+  uint8_t* sign_data;
+  uint32_t sign_data_len;
+
+  void clearPendingReqs() { pending_login = pending_status = pending_telemetry = pending_discovery = pending_req = 0; }
 };
 
 // Global lifecycle functions

@@ -529,6 +529,17 @@ static String dm_msg_path(const String& prefix, const char* peer) {
     return messages_dir(prefix) + "/dm_" + String(safe) + ".log";
 }
 
+// Public wrappers so BLE companion can build paths for targeted sync
+// without needing access to the static sanitize_peer_name helper.
+String PunkMesh::channelMsgPath(int channel_idx) {
+    String name = channel_name_for_idx(*this, channel_idx);
+    return channel_msg_path(_storage_prefix, name.c_str());
+}
+
+String PunkMesh::dmMsgPath(const char* peer) {
+    return dm_msg_path(_storage_prefix, peer);
+}
+
 static void ensure_messages_dir(fs::FS* fs, const String& prefix) {
     if (!fs) return;
     String dir = messages_dir(prefix);
@@ -1440,6 +1451,9 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
 
 void PunkMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text)
 {
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->queueCliResponse(from, pkt, sender_timestamp, text);
+#endif
 }
 void PunkMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const uint8_t *sender_prefix, const char *text)
 {
@@ -1521,7 +1535,53 @@ uint8_t PunkMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_t
 
 void PunkMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len)
 {
-    // not supported
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushContactResponse(contact, data, len);
+#endif
+}
+
+void PunkMesh::onControlDataRecv(mesh::Packet* packet)
+{
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushControlData(packet, _radio->getLastSNR(), _radio->getLastRSSI());
+#endif
+}
+
+void PunkMesh::onRawDataRecv(mesh::Packet* packet)
+{
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushRawData(packet, _radio->getLastSNR(), _radio->getLastRSSI());
+#endif
+}
+
+void PunkMesh::onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                           const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len)
+{
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushTraceData(packet, tag, auth_code, flags, path_snrs, path_hashes, path_len);
+#endif
+}
+
+void PunkMesh::onChannelDataRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt,
+                                 uint16_t data_type, const uint8_t* data, size_t data_len)
+{
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->pushChannelDataRecv(channel, pkt, data_type, data, data_len);
+#endif
+}
+
+bool PunkMesh::onContactPathRecv(ContactInfo& contact, uint8_t* in_path, uint8_t in_path_len,
+                                 uint8_t* out_path, uint8_t out_path_len, uint8_t extra_type,
+                                 uint8_t* extra, uint8_t extra_len)
+{
+#if BLE_COMPANION_ENABLED
+    if (ble_companion && ble_companion->checkPendingDiscovery(contact, in_path, in_path_len,
+            out_path, out_path_len, extra_type, extra, extra_len)) {
+        return false;
+    }
+#endif
+    return BaseChatMesh::onContactPathRecv(contact, in_path, in_path_len, out_path, out_path_len,
+                                           extra_type, extra, extra_len);
 }
 
 uint32_t PunkMesh::calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const
@@ -1846,12 +1906,16 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
     // defaults
     memset(&_prefs, 0, sizeof(_prefs));
     _prefs.airtime_factor = 2.0; // one third
-    strcpy(_prefs.node_name, "NONAME");
+    strcpy(_prefs.node_name, "Meshpunk T-deck");
     _prefs.freq = LORA_FREQ;
     _prefs.tx_power_dbm = LORA_TX_POWER;
     _prefs.bandwidth = LORA_BW;
     _prefs.spreading_factor = LORA_SF;
     _prefs.coding_rate = LORA_CR;
+    _prefs.ble_pin = BLE_PIN_CODE;
+    _prefs.path_hash_mode = 0;
+    _prefs.autoadd_config = 0;
+    _prefs.autoadd_max_hops = 0;
 
     command[0] = 0;
     curr_recipient = NULL;
@@ -1990,6 +2054,17 @@ void PunkMesh::begin()
                 else if (strcmp(key, "lon") == 0) _prefs.node_lon = atof(val);
                 else if (strcmp(key, "contact_overwrite") == 0) _prefs.contact_overwrite = atoi(val);
                 else if (strcmp(key, "rx_boost") == 0) _prefs.rx_boost = atoi(val);
+                else if (strcmp(key, "ble_pin") == 0) _prefs.ble_pin = strtoul(val, NULL, 10);
+                else if (strcmp(key, "path_hash_mode") == 0) _prefs.path_hash_mode = atoi(val);
+                else if (strcmp(key, "autoadd_config") == 0) _prefs.autoadd_config = atoi(val);
+                else if (strcmp(key, "autoadd_max_hops") == 0) _prefs.autoadd_max_hops = atoi(val);
+                else if (strcmp(key, "default_scope_name") == 0) strncpy(_prefs.default_scope_name, val, 30);
+                else if (strcmp(key, "default_scope_key") == 0) {
+                    for (int dk = 0; dk < 16 && val[dk*2] && val[dk*2+1]; dk++) {
+                        char hex[3] = { val[dk*2], val[dk*2+1], 0 };
+                        _prefs.default_scope_key[dk] = (uint8_t)strtoul(hex, NULL, 16);
+                    }
+                }
             }
             file.close();
             Serial.printf("[STORAGE] Loaded prefs from %s (name=%s, freq=%.3f)\n",
@@ -2060,6 +2135,16 @@ static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
         file.printf("lon=%.6f\n", p.node_lon);
         file.printf("contact_overwrite=%d\n", p.contact_overwrite);
         file.printf("rx_boost=%d\n", p.rx_boost);
+        file.printf("ble_pin=%u\n", p.ble_pin);
+        file.printf("path_hash_mode=%d\n", p.path_hash_mode);
+        file.printf("autoadd_config=%d\n", p.autoadd_config);
+        file.printf("autoadd_max_hops=%d\n", p.autoadd_max_hops);
+        if (p.default_scope_name[0]) {
+            file.printf("default_scope_name=%s\n", p.default_scope_name);
+            file.print("default_scope_key=");
+            for (int dk = 0; dk < 16; dk++) file.printf("%02x", p.default_scope_key[dk]);
+            file.print("\n");
+        }
         file.close();
         Serial.printf("[STORAGE] Prefs saved to %s\n", path);
     } else {

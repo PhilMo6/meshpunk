@@ -35,6 +35,13 @@ struct NodePrefs
   uint8_t coding_rate;
   uint8_t contact_overwrite;
   uint8_t rx_boost;
+  // v3 fields
+  uint32_t ble_pin;
+  uint8_t path_hash_mode;
+  uint8_t autoadd_config;
+  uint8_t autoadd_max_hops;
+  char default_scope_name[31];
+  uint8_t default_scope_key[16];
 };
 
 struct MeshMessage {
@@ -233,6 +240,7 @@ public:
 
   bool hasConnectionToContact(const uint8_t* pub_key) { return hasConnectionTo(pub_key); }
   void stopConnectionToContact(const uint8_t* pub_key) { stopConnection(pub_key); }
+  bool startConnectionToContact(const ContactInfo& contact, uint16_t keep_alive_secs) { return startConnection(contact, keep_alive_secs); }
   const uint8_t* getPrivateKey() const { return ((const uint8_t*)&self_id) + PUB_KEY_SIZE; }
   bool saveIdentity();
 
@@ -245,6 +253,10 @@ public:
   int readAllStoredMsgs(const char* path, StoredMsg* out, int max_count);
   int readStoredMsgsSince(const char* path, uint32_t since, StoredMsg* out, int max_count);
 
+  // Path helpers (used by BLE companion for targeted sync)
+  String channelMsgPath(int channel_idx);
+  String dmMsgPath(const char* peer);
+
   void setClock(uint32_t timestamp);
   void importCard(const char *command);
 
@@ -253,6 +265,11 @@ public:
   float getBandwidthPref() const;
   uint8_t getSpreadingFactorPref() const;
   uint8_t getCodingRatePref() const;
+
+  // Stats wrappers for BLE companion
+  int getRadioNoiseFloor() const { return _radio->getNoiseFloor(); }
+  uint16_t getErrorFlags() const { return _err_flags; }
+  uint8_t getQueueLength() const { return (uint8_t)_mgr->getOutboundTotal(); }
 
   bool shouldOverwriteWhenFull() const override { return _prefs.contact_overwrite != 0; }
   void clearContacts() { resetContacts(); }
@@ -276,6 +293,16 @@ protected:
   void onSendTimeout() override;
   uint32_t calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const override;
   uint32_t calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t path_len) const override;
+
+  void onControlDataRecv(mesh::Packet* packet) override;
+  void onRawDataRecv(mesh::Packet* packet) override;
+  void onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                   const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len) override;
+  void onChannelDataRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint16_t data_type,
+                         const uint8_t* data, size_t data_len) override;
+  bool onContactPathRecv(ContactInfo& contact, uint8_t* in_path, uint8_t in_path_len,
+                         uint8_t* out_path, uint8_t out_path_len, uint8_t extra_type,
+                         uint8_t* extra, uint8_t extra_len) override;
 
   void onContactVisit(const ContactInfo &contact) override;
 
