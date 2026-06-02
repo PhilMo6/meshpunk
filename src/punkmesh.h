@@ -35,13 +35,15 @@ struct NodePrefs
   uint8_t coding_rate;
   uint8_t contact_overwrite;
   uint8_t rx_boost;
-  // v3 fields
   uint32_t ble_pin;
   uint8_t path_hash_mode;
   uint8_t autoadd_config;
   uint8_t autoadd_max_hops;
   char default_scope_name[31];
   uint8_t default_scope_key[16];
+  uint8_t msg_repeat_enabled;
+  uint8_t msg_repeat_max;
+  uint8_t msg_repeat_interval_secs;
 };
 
 struct MeshMessage {
@@ -126,6 +128,24 @@ struct ContactPathHistory {
   uint8_t  pub_key[PUB_KEY_SIZE];
   uint8_t  count;
   PathRecord records[MAX_PATH_RECORDS];
+};
+
+#define MAX_PENDING_REPEATS 4
+#define MAX_REPEAT_HISTORY  8
+
+struct PendingRepeat {
+  uint8_t header;
+  uint8_t payload[MAX_PACKET_PAYLOAD];
+  uint16_t payload_len;
+  uint8_t pkt_hash[MAX_HASH_SIZE];
+  uint8_t attempts_remaining;
+  unsigned long next_retry_time;
+  bool active;
+};
+
+struct RepeatOutcome {
+  uint8_t pkt_hash[MAX_HASH_SIZE];
+  uint8_t status; // 2=confirmed, 3=exhausted
 };
 
 // Class declaration
@@ -229,6 +249,16 @@ public:
                               bool is_direct);
   void persistExtraPath(const uint8_t* hash, const ObservedPath& op);
   void preRegisterSentHash(const uint8_t* hash, bool is_dm, int8_t channel_idx, const char* peer);
+
+  // ── Message repeat (retransmit until echo heard) ────────────────
+  PendingRepeat  _pending_repeats[MAX_PENDING_REPEATS];
+  RepeatOutcome  _repeat_history[MAX_REPEAT_HISTORY];
+  int            _repeat_history_next = 0;
+
+  void registerPendingRepeat(const uint8_t* hash, uint8_t header,
+                             const uint8_t* payload, uint16_t payload_len);
+  void checkPendingRepeats();
+  int  getRepeatStatus(const uint8_t* hash);
 
   // Read paths. Each pushes a Lua table (array of message tables) and
   // returns 1 (the number of Lua stack values). Safe to call even if

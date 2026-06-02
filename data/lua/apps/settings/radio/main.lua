@@ -296,4 +296,56 @@ overwrite_apply_btn:onClicked(function()
     end
 end)
 
+-- ── Message Repeat ──
+content:Label { text = "-- Message Repeat --", w = lvgl.PCT(100), h = 16 }
+
+local ok_rep, rep_cfg = pcall(_mesh_get_msg_repeat)
+if not ok_rep or not rep_cfg then rep_cfg = { enabled = false, max_repeats = 3, interval = 30 } end
+
+local repeat_enabled = rep_cfg.enabled or false
+
+local function get_repeat_text()
+    return repeat_enabled and "[x] Msg Repeat" or "[ ] Msg Repeat"
+end
+
+local repeat_toggle_btn = content:Button { w = lvgl.PCT(65), h = 30 }
+local repeat_label = repeat_toggle_btn:Label { text = get_repeat_text(), align = lvgl.ALIGN.CENTER }
+
+local repeat_apply_btn = content:Button { w = lvgl.PCT(30), h = 30 }
+repeat_apply_btn:Label { text = "Apply", align = lvgl.ALIGN.CENTER }
+
+repeat_toggle_btn:onClicked(function()
+    repeat_enabled = not repeat_enabled
+    repeat_label.text = get_repeat_text()
+end)
+
+content:Label { text = "Max Repeats:", w = lvgl.PCT(45), h = 20 }
+local rep_max_input = content:Textarea {
+    password_mode = false,
+    one_line = true,
+    w = lvgl.PCT(50), h = 30,
+    text = tostring(rep_cfg.max_repeats or 3),
+    max_length = 2,
+}
+
+content:Label { text = "Interval (s):", w = lvgl.PCT(45), h = 20 }
+local rep_int_input = content:Textarea {
+    password_mode = false,
+    one_line = true,
+    w = lvgl.PCT(50), h = 30,
+    text = tostring(rep_cfg.interval or 30),
+    max_length = 2,
+}
+
+repeat_apply_btn:onClicked(function()
+    local max_r = tonumber(rep_max_input.text) or 3
+    local intv  = tonumber(rep_int_input.text) or 30
+    local ok_set, err = pcall(_mesh_set_msg_repeat, repeat_enabled, max_r, intv)
+    if ok_set then
+        status_label.text = "Msg Repeat: " .. (repeat_enabled and "ON" or "OFF")
+    else
+        status_label.text = "Error: " .. tostring(err)
+    end
+end)
+
 return root

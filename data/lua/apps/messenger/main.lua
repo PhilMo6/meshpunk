@@ -513,6 +513,44 @@ show_chat = function(target)
             if in_msg_select then open_msg_menu() end
         end)
         lbl:onevent(lvgl.EVENT.LONG_PRESSED, open_msg_menu)
+
+        if msg.hash and msg.hops == 0 then
+            local ok_rs, rs = pcall(_mesh_get_repeat_status, msg.hash)
+            if ok_rs and rs == 1 then
+                local rep_lbl = msg_list:Label {
+                    text = "repeating...",
+                    text_color = "#AAAAAA",
+                    w = lvgl.PCT(100), h = 14,
+                    pad_bottom = 2,
+                }
+                local poll_hash = msg.hash
+                local timer
+                timer = lvgl.Timer {
+                    period = 3000,
+                    cb = function()
+                        local ok_poll, poll_err = pcall(function()
+                            local ok2, st = pcall(_mesh_get_repeat_status, poll_hash)
+                            if not ok2 or st == 0 then
+                                if timer then timer:delete(); timer = nil end
+                                rep_lbl:delete()
+                                return
+                            end
+                            if st == 2 then
+                                rep_lbl.text = "repeated"
+                                if timer then timer:delete(); timer = nil end
+                            elseif st == 3 then
+                                rep_lbl.text = "no echo"
+                                if timer then timer:delete(); timer = nil end
+                            end
+                        end)
+                        if not ok_poll and timer then
+                            timer:delete(); timer = nil
+                        end
+                    end,
+                }
+            end
+        end
+
         return lbl
     end
 

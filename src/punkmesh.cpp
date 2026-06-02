@@ -1890,12 +1890,127 @@ void PunkMesh::preRegisterSentHash(const uint8_t* hash, bool is_dm,
 
 void PunkMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis) {
     pkt->calculatePacketHash(_last_tx_hash);
+
+    uint8_t saved_header = pkt->header;
+    uint8_t saved_payload[MAX_PACKET_PAYLOAD];
+    uint16_t saved_len = pkt->payload_len;
+    if (_prefs.msg_repeat_enabled) {
+        memcpy(saved_payload, pkt->payload, pkt->payload_len);
+    }
+
     BaseChatMesh::sendFloodScoped(recipient, pkt, delay_millis);
+
+    if (_prefs.msg_repeat_enabled) {
+        registerPendingRepeat(_last_tx_hash, saved_header, saved_payload, saved_len);
+    }
 }
 
 void PunkMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
     pkt->calculatePacketHash(_last_tx_hash);
+
+    uint8_t saved_header = pkt->header;
+    uint8_t saved_payload[MAX_PACKET_PAYLOAD];
+    uint16_t saved_len = pkt->payload_len;
+    if (_prefs.msg_repeat_enabled) {
+        memcpy(saved_payload, pkt->payload, pkt->payload_len);
+    }
+
     BaseChatMesh::sendFloodScoped(channel, pkt, delay_millis);
+
+    if (_prefs.msg_repeat_enabled) {
+        registerPendingRepeat(_last_tx_hash, saved_header, saved_payload, saved_len);
+    }
+}
+
+// ── Message repeat ───────────────────────────────────────────────
+
+void PunkMesh::registerPendingRepeat(const uint8_t* hash, uint8_t header,
+                                     const uint8_t* payload, uint16_t payload_len) {
+    int slot = -1;
+    for (int i = 0; i < MAX_PENDING_REPEATS; i++) {
+        if (!_pending_repeats[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < MAX_PENDING_REPEATS; i++) {
+            if (_pending_repeats[i].next_retry_time < _pending_repeats[slot].next_retry_time)
+                slot = i;
+        }
+    }
+
+    PendingRepeat& pr = _pending_repeats[slot];
+    pr.header = header;
+    memcpy(pr.payload, payload, payload_len);
+    pr.payload_len = payload_len;
+    memcpy(pr.pkt_hash, hash, MAX_HASH_SIZE);
+    pr.attempts_remaining = _prefs.msg_repeat_max;
+    pr.next_retry_time = millis() + (unsigned long)_prefs.msg_repeat_interval_secs * 1000UL;
+    pr.active = true;
+
+    Serial.printf("[MSG REPEAT] registered, %d retries, interval %ds\n",
+                  pr.attempts_remaining, _prefs.msg_repeat_interval_secs);
+}
+
+void PunkMesh::checkPendingRepeats() {
+    unsigned long now = millis();
+    for (int i = 0; i < MAX_PENDING_REPEATS; i++) {
+        PendingRepeat& pr = _pending_repeats[i];
+        if (!pr.active) continue;
+
+        MsgPathEntry* mpe = findMsgPaths(pr.pkt_hash);
+        if (mpe && mpe->path_count > 0) {
+            pr.active = false;
+            RepeatOutcome& ro = _repeat_history[_repeat_history_next];
+            memcpy(ro.pkt_hash, pr.pkt_hash, MAX_HASH_SIZE);
+            ro.status = 2;
+            _repeat_history_next = (_repeat_history_next + 1) % MAX_REPEAT_HISTORY;
+            Serial.println("[MSG REPEAT] echo heard, confirmed");
+            continue;
+        }
+
+        if (now < pr.next_retry_time) continue;
+
+        if (pr.attempts_remaining == 0) {
+            pr.active = false;
+            RepeatOutcome& ro = _repeat_history[_repeat_history_next];
+            memcpy(ro.pkt_hash, pr.pkt_hash, MAX_HASH_SIZE);
+            ro.status = 3;
+            _repeat_history_next = (_repeat_history_next + 1) % MAX_REPEAT_HISTORY;
+            Serial.println("[MSG REPEAT] exhausted, no echo heard");
+            continue;
+        }
+
+        auto pkt = obtainNewPacket();
+        if (!pkt) continue;
+
+        pkt->header = pr.header;
+        memcpy(pkt->payload, pr.payload, pr.payload_len);
+        pkt->payload_len = pr.payload_len;
+        sendFlood(pkt, (uint32_t)0);
+
+        pr.attempts_remaining--;
+        pr.next_retry_time = now + (unsigned long)_prefs.msg_repeat_interval_secs * 1000UL;
+
+        Serial.printf("[MSG REPEAT] retransmit, %d remaining\n", pr.attempts_remaining);
+    }
+}
+
+int PunkMesh::getRepeatStatus(const uint8_t* hash) {
+    for (int i = 0; i < MAX_PENDING_REPEATS; i++) {
+        if (_pending_repeats[i].active &&
+            memcmp(_pending_repeats[i].pkt_hash, hash, MAX_HASH_SIZE) == 0) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < MAX_REPEAT_HISTORY; i++) {
+        if (memcmp(_repeat_history[i].pkt_hash, hash, MAX_HASH_SIZE) == 0 &&
+            _repeat_history[i].status != 0) {
+            return _repeat_history[i].status;
+        }
+    }
+    MsgPathEntry* mpe = findMsgPaths(hash);
+    if (mpe && mpe->path_count > 0) return 2;
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1916,6 +2031,12 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
     _prefs.path_hash_mode = 0;
     _prefs.autoadd_config = 0;
     _prefs.autoadd_max_hops = 0;
+    _prefs.msg_repeat_enabled = 0;
+    _prefs.msg_repeat_max = 3;
+    _prefs.msg_repeat_interval_secs = 30;
+
+    memset(_pending_repeats, 0, sizeof(_pending_repeats));
+    memset(_repeat_history, 0, sizeof(_repeat_history));
 
     command[0] = 0;
     curr_recipient = NULL;
@@ -2065,6 +2186,9 @@ void PunkMesh::begin()
                         _prefs.default_scope_key[dk] = (uint8_t)strtoul(hex, NULL, 16);
                     }
                 }
+                else if (strcmp(key, "msg_repeat_enabled") == 0) _prefs.msg_repeat_enabled = atoi(val);
+                else if (strcmp(key, "msg_repeat_max") == 0) _prefs.msg_repeat_max = atoi(val);
+                else if (strcmp(key, "msg_repeat_interval") == 0) _prefs.msg_repeat_interval_secs = atoi(val);
             }
             file.close();
             Serial.printf("[STORAGE] Loaded prefs from %s (name=%s, freq=%.3f)\n",
@@ -2139,6 +2263,9 @@ static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
         file.printf("path_hash_mode=%d\n", p.path_hash_mode);
         file.printf("autoadd_config=%d\n", p.autoadd_config);
         file.printf("autoadd_max_hops=%d\n", p.autoadd_max_hops);
+        file.printf("msg_repeat_enabled=%d\n", p.msg_repeat_enabled);
+        file.printf("msg_repeat_max=%d\n", p.msg_repeat_max);
+        file.printf("msg_repeat_interval=%d\n", p.msg_repeat_interval_secs);
         if (p.default_scope_name[0]) {
             file.printf("default_scope_name=%s\n", p.default_scope_name);
             file.print("default_scope_key=");
@@ -2538,6 +2665,7 @@ void PunkMesh::handleCommand(const char *command)
 void PunkMesh::loop()
 {
     BaseChatMesh::loop();
+    if (_prefs.msg_repeat_enabled) checkPendingRepeats();
 
     int len = strlen(command);
     while (Serial.available() && len < sizeof(command) - 1)

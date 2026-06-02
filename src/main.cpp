@@ -2418,6 +2418,51 @@ static int lua_mesh_set_rx_boost(lua_State *L) {
   return 0;
 }
 
+// ── Message repeat settings bridge ───────────────────────────────
+
+static int lua_mesh_get_msg_repeat(lua_State *L) {
+  lua_newtable(L);
+  lua_pushboolean(L, the_mesh->_prefs.msg_repeat_enabled);
+  lua_setfield(L, -2, "enabled");
+  lua_pushinteger(L, the_mesh->_prefs.msg_repeat_max);
+  lua_setfield(L, -2, "max_repeats");
+  lua_pushinteger(L, the_mesh->_prefs.msg_repeat_interval_secs);
+  lua_setfield(L, -2, "interval");
+  return 1;
+}
+
+static int lua_mesh_set_msg_repeat(lua_State *L) {
+  bool en = lua_toboolean(L, 1);
+  int max_rep = luaL_optinteger(L, 2, 3);
+  int interval = luaL_optinteger(L, 3, 30);
+  if (max_rep < 1) max_rep = 1;
+  if (max_rep > 10) max_rep = 10;
+  if (interval < 5) interval = 5;
+  if (interval > 60) interval = 60;
+
+  the_mesh->_prefs.msg_repeat_enabled = en ? 1 : 0;
+  the_mesh->_prefs.msg_repeat_max = (uint8_t)max_rep;
+  the_mesh->_prefs.msg_repeat_interval_secs = (uint8_t)interval;
+  the_mesh->savePrefs();
+  return 0;
+}
+
+static int lua_mesh_get_repeat_status(lua_State *L) {
+  const char *hex = luaL_checkstring(L, 1);
+  uint8_t hash[MAX_HASH_SIZE];
+  memset(hash, 0, MAX_HASH_SIZE);
+  size_t hlen = strlen(hex);
+  for (size_t i = 0; i < hlen / 2 && i < MAX_HASH_SIZE; i++) {
+    char hb[3] = { hex[i*2], hex[i*2+1], 0 };
+    hash[i] = (uint8_t)strtoul(hb, NULL, 16);
+  }
+  MESH_LOCK();
+  int status = the_mesh->getRepeatStatus(hash);
+  MESH_UNLOCK();
+  lua_pushinteger(L, status);
+  return 1;
+}
+
 // ── Persistent message history bridge ────────────────────────────
 
 // Read all stored messages for a channel slot.
@@ -2921,6 +2966,9 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_set_rx_boost", lua_mesh_set_rx_boost);
   lua_register(L, "_mesh_get_contact_paths", lua_mesh_get_contact_paths);
   lua_register(L, "_mesh_get_message_paths", lua_mesh_get_message_paths);
+  lua_register(L, "_mesh_get_msg_repeat", lua_mesh_get_msg_repeat);
+  lua_register(L, "_mesh_set_msg_repeat", lua_mesh_set_msg_repeat);
+  lua_register(L, "_mesh_get_repeat_status", lua_mesh_get_repeat_status);
 
   // Persistent message history APIs — available to any app, not just messenger
   lua_register(L, "_mesh_get_channel_messages", lua_mesh_get_channel_messages);
