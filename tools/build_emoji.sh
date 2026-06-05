@@ -1,36 +1,41 @@
 #!/usr/bin/env bash
-# build_emoji.sh — convert Noto emoji PNGs into the meshpunk .bin format.
+# build_emoji.sh — convert Noto emoji PNGs into a single meshpunk emoji blob.
 #
-# Usage: bash tools/build_emoji.sh <in_dir> <out_dir> [size]
-#   in_dir:  folder of Noto PNGs (filenames like "emoji_u1f600.png")
-#   out_dir: destination for "<hex>.bin" files (no emoji_u prefix)
-#   size:    optional pixel size, default 16
+# Usage: bash tools/build_emoji.sh <in_dir> <out_file> [size]
+#   in_dir:   folder of Noto PNGs (filenames like "emoji_u1f600.png")
+#   out_file: destination blob file (e.g., "data/emojis.bin")
+#   size:     optional pixel size, default 16
 #
-# Output format (matches the runtime loader in src/emoji_font.c):
-#   bytes  0- 3   magic 'MEMO' (ASCII M,E,M,O)
-#   bytes  4- 5   width  (u16 LE)
-#   bytes  6- 7   height (u16 LE)
-#   byte   8      color format (LV_COLOR_FORMAT_ARGB8888 = 0x10)
-#   bytes  9-10   stride (u16 LE) = width * 4
-#   bytes 11-15   reserved (zero)
-#   bytes 16-..   raw premultiplied BGRA pixel data (LVGL ARGB8888 memory order)
+# Requires ImageMagick ('magick' command).
+#
+# Output blob format (matches the runtime loader in src/emoji_font.cpp):
+#   Header (16 bytes):
+#     [0..3]   magic 'EMJB'
+#     [4..5]   version  (u16 LE) = 1
+#     [6..7]   pixel_size (u16 LE)
+#     [8..11]  entry count (u32 LE)
+#     [12..15] reserved (zero)
+#   Index (count * 4 bytes):
+#     sorted array of Unicode codepoints (u32 LE each)
+#   Data (count * pixel_size^2 * 4 bytes):
+#     raw premultiplied BGRA pixels, one block per codepoint (same order as index)
 
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <in_dir> <out_dir> [size]" >&2
+  echo "usage: $0 <in_dir> <out_file> [size]" >&2
   exit 1
 fi
 
 IN_DIR="$1"
-OUT_DIR="$2"
+OUT_FILE="$2"
 SIZE="${3:-16}"
 
 if [[ ! -d "$IN_DIR" ]]; then
   echo "error: input dir '$IN_DIR' not found" >&2
   exit 1
 fi
-mkdir -p "$OUT_DIR"
+mkdir -p "$(dirname "$OUT_FILE")"
 
 if ! command -v magick >/dev/null 2>&1; then
   echo "error: ImageMagick 'magick' not on PATH" >&2
@@ -38,7 +43,7 @@ if ! command -v magick >/dev/null 2>&1; then
 fi
 
 STRIDE=$((SIZE * 4))
-EXPECTED_BYTES=$((16 + STRIDE * SIZE))
+PIXEL_BYTES=$((STRIDE * SIZE))
 
 # Codepoints that should never ship — they combine, don't render standalone.
 is_skipped_hex() {
@@ -51,7 +56,7 @@ is_skipped_hex() {
   return 1
 }
 
-# Pack one unsigned int as N little-endian bytes to stdout via printf %b.
+# Pack one unsigned int as N little-endian bytes to stdout.
 emit_le() {
   local val="$1"
   local n="$2"
@@ -63,14 +68,12 @@ emit_le() {
   printf '%b' "$out"
 }
 
-write_header() {
-  printf 'MEMO'            # magic
-  emit_le "$SIZE"   2      # width
-  emit_le "$SIZE"   2      # height
-  printf '%b' '\x10'       # cf = ARGB8888
-  emit_le "$STRIDE" 2      # stride
-  printf '%b' '\x00\x00\x00\x00\x00'  # reserved
-}
+TMPDIR_WORK="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_WORK"' EXIT
+
+# Manifest: one line per emoji, "decimal_codepoint hex_codepoint"
+MANIFEST="$TMPDIR_WORK/manifest.txt"
+: > "$MANIFEST"
 
 COUNT=0
 SKIPPED=0
@@ -92,14 +95,11 @@ for src in "$IN_DIR"/emoji_u*.png; do
     continue
   fi
 
-  out="$OUT_DIR/${stem}.bin"
-  tmp="$(mktemp)"
+  tmp="$TMPDIR_WORK/${stem}.raw"
 
   # ImageMagick: resize, premultiply alpha, and emit headerless raw BGRA bytes.
   # LVGL's LV_COLOR_FORMAT_ARGB8888 is byte-order B,G,R,A in memory (it's a
-  # little-endian 0xAARRGGBB uint32), so we emit BGRA not RGBA. Writing to
-  # stdout with "...:-" avoids the colon-in-path issue Windows ImageMagick
-  # has with drive letters.
+  # little-endian 0xAARRGGBB uint32), so we emit BGRA not RGBA.
   magick "$src" \
     -resize "${SIZE}x${SIZE}" \
     -background none \
@@ -109,23 +109,43 @@ for src in "$IN_DIR"/emoji_u*.png; do
     "BGRA:-" > "$tmp"
 
   pixel_bytes=$(wc -c < "$tmp")
-  want=$((STRIDE * SIZE))
-  if [[ "$pixel_bytes" -ne "$want" ]]; then
-    echo "warning: $src produced $pixel_bytes bytes, expected $want; skipping" >&2
+  if [[ "$pixel_bytes" -ne "$PIXEL_BYTES" ]]; then
+    echo "warning: $src produced $pixel_bytes bytes, expected $PIXEL_BYTES; skipping" >&2
     rm -f "$tmp"
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
 
-  { write_header; cat "$tmp"; } > "$out"
-  rm -f "$tmp"
-
-  final_bytes=$(wc -c < "$out")
-  if [[ "$final_bytes" -ne "$EXPECTED_BYTES" ]]; then
-    echo "warning: $out is $final_bytes bytes, expected $EXPECTED_BYTES" >&2
-  fi
-
+  dec=$((16#$stem))
+  echo "$dec $stem" >> "$MANIFEST"
   COUNT=$((COUNT + 1))
 done
 
-echo "built $COUNT .bin files in $OUT_DIR (skipped $SKIPPED, expected ${EXPECTED_BYTES} bytes each)"
+echo "converted $COUNT emojis (skipped $SKIPPED)"
+
+# Sort by codepoint (numeric)
+SORTED="$TMPDIR_WORK/sorted.txt"
+sort -n "$MANIFEST" > "$SORTED"
+
+# Write the blob
+{
+  # Header (16 bytes)
+  printf 'EMJB'                           # [0..3]  magic
+  emit_le 1       2                       # [4..5]  version
+  emit_le "$SIZE" 2                       # [6..7]  pixel_size
+  emit_le "$COUNT" 4                      # [8..11] count
+  printf '%b' '\x00\x00\x00\x00'         # [12..15] reserved
+
+  # Index: sorted codepoints (u32 LE each)
+  while IFS=' ' read -r dec hex; do
+    emit_le "$dec" 4
+  done < "$SORTED"
+
+  # Data: pixel blocks in same order as index
+  while IFS=' ' read -r dec hex; do
+    cat "$TMPDIR_WORK/${hex}.raw"
+  done < "$SORTED"
+} > "$OUT_FILE"
+
+total_bytes=$(wc -c < "$OUT_FILE")
+echo "wrote $OUT_FILE ($total_bytes bytes, $COUNT emojis at ${SIZE}x${SIZE})"

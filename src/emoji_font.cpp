@@ -1,5 +1,4 @@
 #include "emoji_font.h"
-#include "meshpunk_sync.h"
 
 #include <cstdio>
 #include <cstring>
@@ -13,24 +12,40 @@
 namespace {
 
 constexpr uint32_t EMOJI_MIN_CODEPOINT = 0x2600u;
-constexpr const char * EMOJI_PATH_PREFIX = "S:/emoji/";
+constexpr const char * EMOJI_BLOB_PATH = "L:/emojis.bin";
 
-// Cache: first time an emoji is seen we read the .bin from SD, copy the raw
-// pixels into PSRAM, and build a persistent lv_image_dsc_t. Returning that
-// struct from path_cb makes LVGL treat the src as LV_IMAGE_SRC_VARIABLE —
-// subsequent lookups and draws read directly from PSRAM, never hitting SD.
+// Blob file format (see tools/build_emoji.sh):
+//   Header (16 bytes):
+//     [0..3]   'EMJB' magic
+//     [4..5]   version  u16 LE
+//     [6..7]   pixel_size u16 LE
+//     [8..11]  entry count u32 LE
+//     [12..15] reserved
+//   Index (count * 4 bytes):
+//     sorted codepoints, u32 LE each
+//   Data (count * pixel_size^2 * 4 bytes):
+//     raw premultiplied BGRA pixels, same order as index
+constexpr uint8_t EMJB_MAGIC[4] = {'E', 'M', 'J', 'B'};
+
+// ---- Blob state (initialized on first emoji access) -----------------------
+
+struct EmojiBlob {
+    lv_fs_file_t file;
+    bool         open       = false;
+    bool         failed     = false;   // true if init was attempted and failed
+    uint16_t     pixel_size = 0;
+    uint32_t     count      = 0;
+    uint32_t   * codepoints = nullptr; // sorted array, count entries
+    uint32_t     data_off   = 0;       // byte offset where pixel data starts
+    uint32_t     entry_size = 0;       // bytes per emoji = pixel_size^2 * 4
+};
+
+EmojiBlob s_blob;
+
+// ---- Cache (same as before — PSRAM hash table of loaded descriptors) ------
+
 constexpr uint32_t EMOJI_CACHE_CAP   = 256u;          // must be power of two
 constexpr uint32_t EMOJI_CACHE_EMPTY = 0xFFFFFFFFu;
-
-// .bin header layout (see tools/build_emoji.sh):
-//   [0..3]   'MEMO'
-//   [4..5]   width   u16 LE
-//   [6..7]   height  u16 LE
-//   [8]      color format (LV_COLOR_FORMAT_ARGB8888 = 0x10)
-//   [9..10]  stride  u16 LE
-//   [11..15] reserved
-constexpr uint32_t MEMO_HEADER_SIZE    = 16u;
-constexpr uint8_t  MEMO_MAGIC[4]       = {'M', 'E', 'M', 'O'};
 
 struct EmojiCacheEntry {
     uint32_t codepoint;
@@ -86,13 +101,23 @@ bool cache_insert(uint32_t cp, lv_image_dsc_t * dsc)
     return false;
 }
 
+// ---- Helpers --------------------------------------------------------------
+
 inline uint16_t rd_u16_le(const uint8_t * p)
 {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
 }
 
+inline uint32_t rd_u32_le(const uint8_t * p)
+{
+    return static_cast<uint32_t>(p[0])
+         | (static_cast<uint32_t>(p[1]) << 8)
+         | (static_cast<uint32_t>(p[2]) << 16)
+         | (static_cast<uint32_t>(p[3]) << 24);
+}
+
 // Near-zero-width sentinel. Returned instead of nullptr for codepoints we
-// want to swallow (combining modifiers + missing .bin files) so LVGL treats
+// want to swallow (combining modifiers + missing entries) so LVGL treats
 // the glyph as resolved and doesn't walk to the montserrat fallback, which
 // would render its LV_USE_FONT_PLACEHOLDER box (tofu).
 //
@@ -118,74 +143,123 @@ void blank_dsc_init_once()
     s_blank_dsc_inited = true;
 }
 
-// Read the .bin straight into PSRAM. The file already stores premultiplied
-// BGRA at the right size, so there's no decoder, no resize, no color swap.
-lv_image_dsc_t * load_bin_to_psram(uint32_t cp)
+// ---- Blob loading ---------------------------------------------------------
+
+// Open the blob file and read the header + codepoint index into RAM.
+// Called once on first emoji access; the file handle stays open for seeks.
+bool blob_init_once()
 {
-    char path[48];
-    std::snprintf(path, sizeof(path), "%s%x.bin", EMOJI_PATH_PREFIX,
-                  static_cast<unsigned>(cp));
+    if (s_blob.open)   return true;
+    if (s_blob.failed) return false;
 
-    lv_fs_file_t f;
-    SPI_LOCK();
-    if (lv_fs_open(&f, path, LV_FS_MODE_RD) != LV_FS_RES_OK) {
-        SPI_UNLOCK();
-        return nullptr;
+    if (lv_fs_open(&s_blob.file, EMOJI_BLOB_PATH, LV_FS_MODE_RD) != LV_FS_RES_OK) {
+        s_blob.failed = true;
+        return false;
     }
 
-    uint8_t header[MEMO_HEADER_SIZE];
+    // Read 16-byte header
+    uint8_t hdr[16];
     uint32_t br = 0;
-    if (lv_fs_read(&f, header, MEMO_HEADER_SIZE, &br) != LV_FS_RES_OK ||
-        br != MEMO_HEADER_SIZE ||
-        std::memcmp(header, MEMO_MAGIC, 4) != 0) {
-        lv_fs_close(&f);
-        SPI_UNLOCK();
-        return nullptr;
+    if (lv_fs_read(&s_blob.file, hdr, 16, &br) != LV_FS_RES_OK || br != 16 ||
+        std::memcmp(hdr, EMJB_MAGIC, 4) != 0) {
+        lv_fs_close(&s_blob.file);
+        s_blob.failed = true;
+        return false;
     }
 
-    uint16_t w      = rd_u16_le(&header[4]);
-    uint16_t h      = rd_u16_le(&header[6]);
-    uint8_t  cf     = header[8];
-    uint16_t stride = rd_u16_le(&header[9]);
+    s_blob.pixel_size = rd_u16_le(&hdr[6]);
+    s_blob.count      = rd_u32_le(&hdr[8]);
+    s_blob.entry_size = static_cast<uint32_t>(s_blob.pixel_size) * s_blob.pixel_size * 4u;
 
-    uint32_t data_size = static_cast<uint32_t>(stride) * h;
-    if (data_size == 0) {
-        lv_fs_close(&f);
-        SPI_UNLOCK();
-        return nullptr;
+    if (s_blob.count == 0 || s_blob.entry_size == 0) {
+        lv_fs_close(&s_blob.file);
+        s_blob.failed = true;
+        return false;
     }
+
+    // Read codepoint index into PSRAM
+    uint32_t idx_bytes = s_blob.count * 4u;
+    s_blob.codepoints = static_cast<uint32_t *>(
+        heap_caps_malloc(idx_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!s_blob.codepoints) {
+        lv_fs_close(&s_blob.file);
+        s_blob.failed = true;
+        return false;
+    }
+
+    if (lv_fs_read(&s_blob.file, s_blob.codepoints, idx_bytes, &br) != LV_FS_RES_OK ||
+        br != idx_bytes) {
+        heap_caps_free(s_blob.codepoints);
+        s_blob.codepoints = nullptr;
+        lv_fs_close(&s_blob.file);
+        s_blob.failed = true;
+        return false;
+    }
+
+    s_blob.data_off = 16u + idx_bytes;
+    s_blob.open = true;
+    return true;
+}
+
+// Binary search the sorted codepoint index. Returns index or -1.
+int32_t blob_find(uint32_t cp)
+{
+    int32_t lo = 0;
+    int32_t hi = static_cast<int32_t>(s_blob.count) - 1;
+    while (lo <= hi) {
+        int32_t mid = lo + (hi - lo) / 2;
+        uint32_t v = s_blob.codepoints[mid];
+        if (v == cp) return mid;
+        if (v < cp) lo = mid + 1;
+        else        hi = mid - 1;
+    }
+    return -1;
+}
+
+// Load one emoji's pixel data from the blob into PSRAM.
+lv_image_dsc_t * load_emoji_from_blob(uint32_t cp)
+{
+    if (!blob_init_once()) return nullptr;
+
+    int32_t idx = blob_find(cp);
+    if (idx < 0) return nullptr;
+
+    uint32_t offset = s_blob.data_off + static_cast<uint32_t>(idx) * s_blob.entry_size;
+
+    if (lv_fs_seek(&s_blob.file, offset, LV_FS_SEEK_SET) != LV_FS_RES_OK)
+        return nullptr;
 
     auto * pixels = static_cast<uint8_t *>(
-        heap_caps_malloc(data_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        heap_caps_malloc(s_blob.entry_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     auto * out = static_cast<lv_image_dsc_t *>(
         heap_caps_malloc(sizeof(lv_image_dsc_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!pixels || !out) {
         if (pixels) heap_caps_free(pixels);
         if (out)    heap_caps_free(out);
-        lv_fs_close(&f);
-        SPI_UNLOCK();
         return nullptr;
     }
 
-    if (lv_fs_read(&f, pixels, data_size, &br) != LV_FS_RES_OK || br != data_size) {
+    uint32_t br = 0;
+    if (lv_fs_read(&s_blob.file, pixels, s_blob.entry_size, &br) != LV_FS_RES_OK ||
+        br != s_blob.entry_size) {
         heap_caps_free(pixels);
         heap_caps_free(out);
-        lv_fs_close(&f);
-        SPI_UNLOCK();
         return nullptr;
     }
-    lv_fs_close(&f);
-    SPI_UNLOCK();
+
+    uint16_t stride = s_blob.pixel_size * 4u;
 
     lv_memzero(out, sizeof(*out));
-    out->header.w      = w;
-    out->header.h      = h;
-    out->header.cf     = static_cast<lv_color_format_t>(cf);
+    out->header.w      = s_blob.pixel_size;
+    out->header.h      = s_blob.pixel_size;
+    out->header.cf     = LV_COLOR_FORMAT_ARGB8888;
     out->header.stride = stride;
     out->data          = pixels;
-    out->data_size     = data_size;
+    out->data_size     = s_blob.entry_size;
     return out;
 }
+
+// ---- imgfont callback -----------------------------------------------------
 
 const void * emoji_path_cb(const lv_font_t * font,
                            uint32_t unicode, uint32_t unicode_next,
@@ -201,8 +275,7 @@ const void * emoji_path_cb(const lv_font_t * font,
 
     blank_dsc_init_once();
 
-    // Non-rendering combining codepoints — no glyph, and hitting SD for each
-    // stalls rendering on emoji-heavy labels. Returning the zero-width blank
+    // Non-rendering combining codepoints — returning the zero-width blank
     // (instead of nullptr) prevents LVGL from walking to montserrat and
     // drawing a placeholder tofu box.
     if (unicode == 0xFE0F) return &s_blank_dsc;                        // VS-16
@@ -218,18 +291,14 @@ const void * emoji_path_cb(const lv_font_t * font,
 
     if (auto * cached = cache_lookup(unicode)) return cached;
 
-    auto * fresh = load_bin_to_psram(unicode);
-    // Missing .bin on SD (or OOM) — cache the miss so we never retry this
-    // codepoint on SD. Subsequent lookups will hit the cache and return
-    // the blank immediately instead of blocking on a doomed SD open.
+    auto * fresh = load_emoji_from_blob(unicode);
+    // Missing entry (or OOM) — cache the miss so we never retry this
+    // codepoint. Subsequent lookups return the blank immediately.
     if (!fresh) {
         cache_insert(unicode, &s_blank_dsc);
         return &s_blank_dsc;
     }
 
-    // cache_insert failing means the table is full — we still return the
-    // loaded dsc so the glyph renders. Subsequent lookups will reload (the
-    // leak is bounded: once full, the working set is stable).
     (void)cache_insert(unicode, fresh);
     return fresh;
 }
@@ -241,7 +310,7 @@ extern "C" bool emoji_preload(uint32_t codepoint)
     cache_init_once();
     if (auto *cached = cache_lookup(codepoint))
         return cached != &s_blank_dsc;
-    auto *fresh = load_bin_to_psram(codepoint);
+    auto *fresh = load_emoji_from_blob(codepoint);
     if (!fresh) {
         cache_insert(codepoint, &s_blank_dsc);
         return false;
