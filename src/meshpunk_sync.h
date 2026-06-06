@@ -84,4 +84,8 @@ void meshpunk_spawn_gps_task();
 // Wake the GPS task early from its inter-cycle sleep (manual trigger).
 void gps_notify_wake();
 
+// When true, mesh_task pauses its loop body (radio/BLE processing).
+// Set by elf_host during module execution to isolate Core 1 activity.
+extern volatile bool mesh_task_paused;
+
 #endif

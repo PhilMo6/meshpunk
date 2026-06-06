@@ -1,0 +1,7 @@
+{
+  "name": "elf_loader",
+  "version": "0.1.0",
+  "description": "Minimal ELF dynamic loader for ESP32-S3 PSRAM",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

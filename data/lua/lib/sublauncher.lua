@@ -83,25 +83,66 @@ local function create(app_dir)
 
         btn:onClicked(function()
             topbar.pause()
+            local step = 0
+            local compiled_chunk = nil
+            local deferred_init = nil
             utils.loadingPopUpAdd(nil, app.name, function()
-                print("Launching:", app.entrypoint, "dir:", app.dir)
+                step = step + 1
 
-                local success, err
-                if app.source == "sd" and type(_dofile_sd) == "function" then
-                    success, err = pcall(_dofile_sd, app.entrypoint, app.dir)
-                else
-                    success, err = pcall(function()
+                -- Step 1: compile / load the app
+                if step == 1 then
+                    print("Launching:", app.entrypoint, "dir:", app.dir)
+                    if app.source == "sd" and type(_dofile_sd) == "function" then
+                        local success, err = pcall(_dofile_sd, app.entrypoint, app.dir)
+                        if not success then
+                            print("Error launching:", err)
+                            return true
+                        end
+                        body:delete()
+                        return true
+                    else
                         local chunk, load_err = loadfile(app.entrypoint)
-                        if not chunk then return error(load_err) end
-                        chunk(app.dir)
-                    end)
+                        if not chunk then
+                            print("Error launching:", load_err)
+                            return true
+                        end
+                        compiled_chunk = chunk
+                        return false
+                    end
                 end
 
-                if not success then
-                    print("Error launching:", err)
-                else
+                -- Step 2: execute the compiled chunk
+                if step == 2 and compiled_chunk then
+                    local success, result = pcall(compiled_chunk, app.dir)
+                    compiled_chunk = nil
+                    if not success then
+                        print("Error launching:", result)
+                        return true
+                    end
+                    if type(result) == "function" then
+                        deferred_init = result
+                        return false
+                    end
                     body:delete()
+                    return true
                 end
+
+                -- Step 3+: app-specific deferred init steps
+                if deferred_init then
+                    local ok, done = pcall(deferred_init)
+                    if not ok then
+                        print("Error in deferred init:", done)
+                        return true
+                    end
+                    if done then
+                        deferred_init = nil
+                        body:delete()
+                        return true
+                    end
+                    return false
+                end
+
+                body:delete()
                 return true
             end)
         end)

@@ -37,6 +37,14 @@ static bool tone_sr_set = false;
 
 static TaskHandle_t      s_sound_task  = nullptr;
 static SemaphoreHandle_t s_sound_mutex = nullptr;
+static volatile bool     s_sound_suspended = false;  // I2S halted for native module
+
+// ── External audio ring buffer (mono 11025 Hz → upsampled to 44100 Hz stereo) ─
+#define EXTERN_RING_SIZE 4096
+static int16_t s_extern_ring[EXTERN_RING_SIZE];
+static volatile int s_extern_head = 0;
+static volatile int s_extern_tail = 0;
+#define EXTERN_UPSAMPLE 4  // 11025 * 4 = 44100
 
 static void sound_task_body(void* param);
 
@@ -50,6 +58,51 @@ void sound_init(Audio* audio_ptr, void (*prefs_save_fn)()) {
         sound_task_body, "sound_task",
         8 * 1024, nullptr, 3, &s_sound_task, 1
     );
+}
+
+// ── Suspend / resume (for native-module takeover) ───────────────────────────────
+
+void sound_suspend() {
+    if (s_sound_suspended) return;
+    s_sound_suspended = true;
+    // Stop any file playback so audio->loop() (Core 0) won't touch I2S either.
+    if (s_audio && s_audio->isRunning()) s_audio->stopSong();
+    // Let the sound task observe the flag and leave any in-flight i2s_write.
+    vTaskDelay(pdMS_TO_TICKS(30));
+    // Halt the I2S peripheral + DMA so its TX-EOF ISR stops firing while the
+    // CPU that services audio is handed to the module.
+    i2s_stop(I2S_NUM_0);
+}
+
+void sound_resume() {
+    if (!s_sound_suspended) return;
+    i2s_start(I2S_NUM_0);
+    tone_sr_set = false;          // force sample-rate reprogram on next tone
+    s_sound_suspended = false;
+}
+
+// ── External audio ring buffer ────────────────────────────────────────────────
+
+void sound_extern_push(const int16_t* samples, int count) {
+    bool was_empty = (s_extern_head == s_extern_tail);
+    for (int i = 0; i < count; i++) {
+        int next = (s_extern_head + 1) % EXTERN_RING_SIZE;
+        if (next == s_extern_tail) break; // full — drop newest
+        s_extern_ring[s_extern_head] = samples[i];
+        s_extern_head = next;
+    }
+    // Wake the sound task immediately when new data arrives after the ring
+    // was empty — otherwise it sleeps for up to 50ms, causing choppy audio.
+    if (was_empty && s_sound_task)
+        xTaskNotifyGive(s_sound_task);
+}
+
+bool sound_extern_active(void) {
+    return s_extern_head != s_extern_tail;
+}
+
+void sound_extern_flush(void) {
+    s_extern_tail = s_extern_head;
 }
 
 // ── Accessors ─────────────────────────────────────────────────────────────────
@@ -630,6 +683,12 @@ static void sound_task_body(void* param) {
     const int CHUNK = 256;
 
     for (;;) {
+        // Parked while a native module owns the device (I2S is stopped).
+        if (s_sound_suspended) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         if (s_audio->isRunning()) {
             tone_sr_set = false;
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -638,15 +697,19 @@ static void sound_task_body(void* param) {
 
         xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
 
-        bool any_active = false;
+        bool any_tones = false;
         for (int i = 0; i < sound_obj_count; i++) {
             SoundObject* o = sound_objects[i];
             if (o->type == SoundObject::TONE && o->tone_playing && !o->tone_paused)
-                any_active = true;
+                any_tones = true;
         }
 
-        if (!any_active) {
-            tone_sr_set = false;
+        bool has_extern = sound_extern_active();
+
+        if (!any_tones && !has_extern) {
+            // Don't reset tone_sr_set here — the ring buffer goes briefly empty
+            // between Doom tic pushes, and reconfiguring I2S every wake cycle
+            // causes audible DMA glitches.  Only the Audio-library path resets it.
             xSemaphoreGive(s_sound_mutex);
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
             continue;
@@ -657,6 +720,7 @@ static void sound_task_body(void* param) {
             tone_sr_set = true;
         }
 
+        // ── Mix tones ───────────────────────────────────────────────
         int32_t mix[CHUNK * 2] = {};
         for (int i = 0; i < sound_obj_count; i++) {
             SoundObject* o = sound_objects[i];
@@ -671,6 +735,40 @@ static void sound_task_body(void* param) {
         }
 
         xSemaphoreGive(s_sound_mutex);
+
+        // ── Mix external audio (Doom SFX etc.) ──────────────────────
+        // Read from the 11025 Hz mono ring buffer; upsample 4x to
+        // 44100 Hz stereo using linear interpolation.
+        {
+            static int16_t s_prev_extern = 0;
+            int avail = (s_extern_head - s_extern_tail + EXTERN_RING_SIZE)
+                        % EXTERN_RING_SIZE;
+            int needed = CHUNK / EXTERN_UPSAMPLE; // 256/4 = 64 input samples
+            int n = (avail < needed) ? avail : needed;
+            int tail = s_extern_tail;
+
+            int16_t samp[64]; // CHUNK / EXTERN_UPSAMPLE
+            for (int i = 0; i < n; i++) {
+                samp[i] = s_extern_ring[tail];
+                tail = (tail + 1) % EXTERN_RING_SIZE;
+            }
+            s_extern_tail = tail;
+
+            for (int i = 0; i < n; i++) {
+                int16_t prev = (i == 0) ? s_prev_extern : samp[i - 1];
+                int16_t cur  = samp[i];
+                for (int j = 0; j < EXTERN_UPSAMPLE; j++) {
+                    int32_t out = (int32_t)prev
+                                + ((int32_t)(cur - prev) * j) / EXTERN_UPSAMPLE;
+                    int idx = (i * EXTERN_UPSAMPLE + j) * 2;
+                    if (idx + 1 < CHUNK * 2) {
+                        mix[idx]     += (int16_t)out;
+                        mix[idx + 1] += (int16_t)out;
+                    }
+                }
+            }
+            if (n > 0) s_prev_extern = samp[n - 1];
+        }
 
         float vol_scale = sound_muted ? 0.0f : (float)sound_volume / 21.0f;
         int16_t out[CHUNK * 2];

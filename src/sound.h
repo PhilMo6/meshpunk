@@ -62,6 +62,29 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S);
 
 void sound_register_lua(lua_State* L);
 
+// Suspend/resume I2S audio while a full-screen native module (e.g. the Doom
+// ELF) takes over the device. Audio is serviced from Core 0 (audio->loop()) and
+// Core 1 (sound_task); when the module monopolizes Core 0 the I2S TX DMA would
+// otherwise keep cycling unattended, its completion ISR firing into stale state.
+// sound_suspend() parks the sound task and halts the I2S peripheral + DMA;
+// sound_resume() restarts it. Mirrors mesh_task pausing / LVGL suspension.
+void sound_suspend();
+void sound_resume();
+
+// ── External audio (native modules like Doom) ────────────────────────────────
+
+// Push mono 11025Hz PCM samples into the mixing ring buffer. Called from
+// Core 0 by the loaded module; the sound task on Core 1 upsamples to
+// 44100Hz stereo and mixes them alongside notification tones. Volume and
+// mute controls apply automatically.
+void sound_extern_push(const int16_t* samples, int count);
+
+// True if there are samples waiting in the external ring buffer.
+bool sound_extern_active(void);
+
+// Flush the external ring buffer (call on module exit).
+void sound_extern_flush(void);
+
 // ── State accessors ───────────────────────────────────────────────────────────
 
 uint8_t sound_get_volume();

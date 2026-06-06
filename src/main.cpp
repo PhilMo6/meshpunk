@@ -17,6 +17,8 @@
 #include "Audio.h"
 #include "sound.h"
 #include "ble_companion.h"
+#include "elf_host.h"
+#include "meshpunk_fs.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -744,67 +746,31 @@ static int lua_io_open(lua_State *L) {
   const char *filename = luaL_checkstring(L, 1);
   const char *mode = luaL_optstring(L, 2, "r");
 
-  bool use_sd = false;
-  const char *actual_path = filename;
-
-  // Parse drive letter prefix
-  if (filename[0] != '\0' && filename[1] == ':') {
-    if (filename[0] == 'S' || filename[0] == 's') {
-      use_sd = true;
-      actual_path = filename + 2;
-    } else if (filename[0] == 'L' || filename[0] == 'l') {
-      use_sd = false;
-      actual_path = filename + 2;
-    }
-  }
-
-  const char *fs_mode;
-  if (strcmp(mode, "r") == 0) {
-    fs_mode = "r";
-  } else if (strcmp(mode, "w") == 0) {
-    fs_mode = "w";
-  // Added append mode support
-  } else if (strcmp(mode, "a") == 0) {
-    fs_mode = "a";
-  } else {
+  // Validate mode
+  if (strcmp(mode, "r") != 0 && strcmp(mode, "w") != 0 && strcmp(mode, "a") != 0) {
     lua_pushnil(L);
     lua_pushstring(L, "Only 'r', 'w', and 'a' modes supported");
     return 2;
   }
 
-  if (use_sd) {
-    if (!sd_mounted) {
-      lua_pushnil(L);
-      lua_pushstring(L, "SD card not mounted");
-      return 2;
-    }
-
-    sd_spi_take();
-    fs::File f = SD.open(actual_path, fs_mode);
-    sd_spi_release();
-    if (!f) {
-      lua_pushnil(L);
-      lua_pushstring(L, "Failed to open file on SD");
-      return 2;
-    }
-
-    fs::File *file = new fs::File(f);
-    LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
-    ud->file = file;
-    ud->is_sd = true;
-  } else {
-    fs::File f = LittleFS.open(actual_path, fs_mode);
-    if (!f) {
-      lua_pushnil(L);
-      lua_pushstring(L, "Failed to open file");
-      return 2;
-    }
-
-    fs::File *file = new fs::File(f);
-    LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
-    ud->file = file;
-    ud->is_sd = false;
+  // Lua io.open defaults to LittleFS (L:) when no prefix given
+  MeshpunkFile mf = meshpunk_open(filename, mode, /*default_sd=*/false);
+  if (!mf.valid) {
+    lua_pushnil(L);
+    lua_pushstring(L, mf.is_sd ? "Failed to open file on SD"
+                                : "Failed to open file");
+    return 2;
   }
+
+  // meshpunk_open holds the SPI lock for SD files. The Lua file handle
+  // tracks is_sd so the read/write/close methods release it properly.
+  // Release the SPI lock now — Lua file ops re-acquire per-call.
+  if (mf.is_sd) sd_spi_release();
+
+  fs::File *file = new fs::File(mf.file);
+  LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
+  ud->file = file;
+  ud->is_sd = mf.is_sd;
 
   luaL_getmetatable(L, "esp32_file");
   lua_setmetatable(L, -2);
@@ -926,6 +892,14 @@ void setKeyboardDefaultBrightness(uint8_t value) {
   Wire.write(LILYGO_KB_ALT_B_BRIGHTNESS_CMD);
   Wire.write(value);
   Wire.endTransmission();
+}
+
+// Reset inactivity timer and restore backlights — called after a native module
+// exits so the screen/keyboard don't appear timed-out to the user.
+void wake_activity() {
+  last_activity_ms = millis();
+  if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
+  if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
 }
 
 // Keyboard state tracking variables
@@ -3148,6 +3122,9 @@ void setupLuaVGL() {
   // ── Sound ──────────────────────────────────────────────────────────────────
   sound_register_lua(L);
 
+  // ── ELF module loader ─────────────────────────────────────────────────────
+  elf_host_register_lua(L);
+
   // ── Keyboard backlight ────────────────────────────────────────────────────
   lua_register(L, "_kbd_set_brightness", [](lua_State* L) -> int {
     int v = luaL_checkinteger(L, 1);
@@ -3499,9 +3476,28 @@ void setupLuaVGL() {
 
   lua_newtable(L);
 
-  // file:read()
+  // file:read([mode]) — read(n) for n bytes (binary-safe), read("*a")/read() for all
   lua_pushcfunction(L, [](lua_State *L) -> int {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
+
+    // f:read(n) — read n bytes
+    if (lua_isnumber(L, 2)) {
+      int n = (int)lua_tointeger(L, 2);
+      if (n <= 0) { lua_pushstring(L, ""); return 1; }
+      uint8_t *buf = (uint8_t *)malloc(n);
+      if (!buf) { lua_pushnil(L); return 1; }
+      if (ud->is_sd) sd_spi_take();
+      int got = ud->file->read(buf, n);
+      if (ud->is_sd) sd_spi_release();
+      if (got > 0)
+        lua_pushlstring(L, (const char *)buf, got);
+      else
+        lua_pushnil(L);
+      free(buf);
+      return 1;
+    }
+
+    // f:read("*a") or f:read() — read entire file
     if (ud->is_sd) sd_spi_take();
     String content = ud->file->readString();
     if (ud->is_sd) sd_spi_release();

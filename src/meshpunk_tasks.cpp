@@ -23,11 +23,19 @@
 extern PunkMesh* the_mesh;
 
 static TaskHandle_t s_mesh_task_handle = nullptr;
+volatile bool mesh_task_paused = false;
 
 static void mesh_task_body(void *param) {
   Serial.printf("[TASK] mesh_task starting on core=%d\n", xPortGetCoreID());
 
   for (;;) {
+    // When paused (e.g. during ELF module execution), skip all work
+    // but keep yielding so the watchdog is fed.
+    if (mesh_task_paused) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
     // MESH_LOCK serializes against Lua bindings on Core 0. Short critical
     // section — dispatcher work is bounded per call.
     MESH_LOCK();
