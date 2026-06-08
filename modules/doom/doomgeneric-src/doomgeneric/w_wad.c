@@ -77,7 +77,11 @@ unsigned int W_LumpNameHash(const char *s)
 
     for (i=0; i < 8 && s[i] != '\0'; ++i)
     {
-        result = ((result << 5) ^ result ) ^ toupper((int)s[i]);
+        // Inline uppercase — toupper() via _ctype_ table may not work
+        // correctly in the ELF module environment
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        result = ((result << 5) ^ result ) ^ c;
     }
 
     return result;

@@ -18,6 +18,7 @@
 #include <esp_rom_sys.h>   // esp_rom_printf — safe to call from exception context
 #include <soc/timer_group_reg.h>  // TG1 MWDT (interrupt watchdog) register access
 #include <lvgl.h>
+#include <math.h>
 #include <setjmp.h>
 #include <ctype.h>
 #include <strings.h>
@@ -110,6 +111,13 @@ static bool prev_key_state[INPUT_STATE_SIZE] = {0};
 static bool esc_held = false;
 static uint32_t esc_hold_start = 0;
 #define ESC_EXIT_HOLD_MS 1500
+
+// Trackball momentum state
+static float trk_vel_x = 0, trk_vel_y = 0;
+static float trk_impulse  = 1.5f;   // velocity added per ISR tick
+static float trk_friction = 0.82f;  // multiplied each poll cycle
+static float trk_thresh   = 0.4f;   // below this, key released
+static bool  trk_momentum = true;   // false = legacy one-tick-per-poll
 
 // ---------------------------------------------------------------------------
 // Data-driven keymap: T-Deck physical key → Doom keycode.
@@ -231,11 +239,39 @@ static void poll_input() {
     // Shift state
     if (shift) cur_state[0x80] = true; // pseudo-code for shift
 
-    // Trackball
-    if (trackball_up > 0)    { trackball_up--;    cur_state[0x81] = true; }
-    if (trackball_down > 0)  { trackball_down--;  cur_state[0x82] = true; }
-    if (trackball_left > 0)  { trackball_left--;  cur_state[0x83] = true; }
-    if (trackball_right > 0) { trackball_right--; cur_state[0x84] = true; }
+    // Trackball — momentum or legacy mode
+    if (trk_momentum) {
+        // Accumulate all pending ISR ticks into velocity
+        int up = trackball_up;    trackball_up = 0;
+        int dn = trackball_down;  trackball_down = 0;
+        int lt = trackball_left;  trackball_left = 0;
+        int rt = trackball_right; trackball_right = 0;
+
+        trk_vel_y -= up * trk_impulse;
+        trk_vel_y += dn * trk_impulse;
+        trk_vel_x -= lt * trk_impulse;
+        trk_vel_x += rt * trk_impulse;
+
+        // Apply friction
+        trk_vel_x *= trk_friction;
+        trk_vel_y *= trk_friction;
+
+        // Snap to zero below threshold
+        if (fabsf(trk_vel_x) < trk_thresh) trk_vel_x = 0;
+        if (fabsf(trk_vel_y) < trk_thresh) trk_vel_y = 0;
+
+        // Report as held keys while velocity is above threshold
+        if (trk_vel_y < -trk_thresh) cur_state[0x81] = true;  // up
+        if (trk_vel_y >  trk_thresh) cur_state[0x82] = true;  // down
+        if (trk_vel_x < -trk_thresh) cur_state[0x83] = true;  // left
+        if (trk_vel_x >  trk_thresh) cur_state[0x84] = true;  // right
+    } else {
+        // Legacy: one tick per poll cycle
+        if (trackball_up > 0)    { trackball_up--;    cur_state[0x81] = true; }
+        if (trackball_down > 0)  { trackball_down--;  cur_state[0x82] = true; }
+        if (trackball_left > 0)  { trackball_left--;  cur_state[0x83] = true; }
+        if (trackball_right > 0) { trackball_right--; cur_state[0x84] = true; }
+    }
     if (trackball_click > 0) { trackball_click = 0; cur_state[0x85] = true; }
 
     // Edge detection: look up each key in the keymap table.
@@ -564,6 +600,11 @@ void psram_free(void* ptr) {
     free(ptr);
 }
 
+// Query how much PSRAM is available for the module to allocate.
+uint32_t host_psram_largest_free(void) {
+    return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -631,6 +672,7 @@ static const elf_symbol_t host_exports[] = {
     { "free",               (void*)psram_free },
     { "calloc",             (void*)psram_calloc },
     { "realloc",            (void*)psram_realloc },
+    { "host_psram_largest_free", (void*)host_psram_largest_free },
 
     // C library: math/utility
     { "abs",                (void*)(int(*)(int))abs },
@@ -678,8 +720,10 @@ static const elf_symbol_t host_exports[] = {
 // Module task stack. Internal RAM, not PSRAM: a task stack must stay
 // accessible while the cache is disabled (e.g. during flash writes) and the
 // module does file I/O. 32KB gives Doom's recursive BSP traversal ample room.
+// We try 64KB first for maximum headroom, falling back to 48KB or 32KB if
+// the device doesn't have enough contiguous internal RAM available.
 // (ESP-IDF stack sizes are in bytes — StackType_t is 1 byte.)
-#define ELF_TASK_STACK_BYTES (64 * 1024)
+static const uint32_t ELF_TASK_STACK_CANDIDATES[] = { 64*1024, 48*1024, 32*1024 };
 
 struct elf_run_ctx {
     elf_module_t*     mod;
@@ -793,11 +837,9 @@ static void elf_set_core1_handlers(bool install) {
 static void elf_run_task(void* param) {
     elf_run_ctx* ctx = (elf_run_ctx*)param;
 
-    // Report this task's stack window so a fault's SP can be checked against it
-    // (rules stack overflow in or out: if the fault SP < base, we overflowed).
+    // Report current SP so a fault address can be compared against the stack range.
     uint32_t sp_top = (uint32_t)__builtin_frame_address(0);
-    Serial.printf("[elf_host] elf_run task stack: top~0x%x base~0x%x size=%u\n",
-                  sp_top, sp_top - ELF_TASK_STACK_BYTES, (unsigned)ELF_TASK_STACK_BYTES);
+    Serial.printf("[elf_host] elf_run task started, SP~0x%x\n", sp_top);
 
     // Intercept module faults on Core 0 (Core 1 is set up separately by caller).
     elf_install_handlers(0);
@@ -874,10 +916,12 @@ static int lua_launch_elf(lua_State* L) {
 
     // Check for -keymap argument; fall back to defaults
     const char* keymap_str = NULL;
+    const char* trkball_str = NULL;
     for (int i = 0; i < argc - 1; i++) {
         if (strcmp(argv[i], "-keymap") == 0) {
             keymap_str = argv[i + 1];
-            break;
+        } else if (strcmp(argv[i], "-trkball") == 0) {
+            trkball_str = argv[i + 1];
         }
     }
     if (keymap_str) {
@@ -885,6 +929,26 @@ static int lua_launch_elf(lua_State* L) {
         Serial.printf("[elf_host] custom keymap loaded (%d chars)\n", (int)strlen(keymap_str));
     } else {
         load_default_keymap();
+    }
+
+    // Parse trackball momentum settings: "enabled,impulse*10,friction*100,threshold*10"
+    // e.g. "1,15,82,4" → enabled=true, impulse=1.5, friction=0.82, threshold=0.4
+    trk_vel_x = trk_vel_y = 0;
+    if (trkball_str) {
+        int en = 1, imp = 15, fri = 82, thr = 4;
+        sscanf(trkball_str, "%d,%d,%d,%d", &en, &imp, &fri, &thr);
+        trk_momentum = (en != 0);
+        trk_impulse  = imp / 10.0f;
+        trk_friction = fri / 100.0f;
+        trk_thresh   = thr / 10.0f;
+        Serial.printf("[elf_host] trackball: momentum=%d impulse=%.1f friction=%.2f thresh=%.1f\n",
+                      trk_momentum, trk_impulse, trk_friction, trk_thresh);
+    } else {
+        // Defaults
+        trk_momentum = true;
+        trk_impulse  = 1.5f;
+        trk_friction = 0.82f;
+        trk_thresh   = 0.4f;
     }
 
     // Start tracking module PSRAM allocations so we can free them on exit
@@ -915,18 +979,33 @@ static int lua_launch_elf(lua_State* L) {
         // (the UI core; LVGL is suspended and mesh is paused, so Core 0 is
         // free). This loopTask blocks until the module returns — IDLE0 still
         // runs between the module's per-frame yields, feeding the watchdog.
+        // Try progressively smaller stacks until one fits in available RAM.
         SemaphoreHandle_t done = xSemaphoreCreateBinary();
         elf_run_ctx ctx = { mod, argc, argv, -1, done };
         TaskHandle_t task = nullptr;
-        BaseType_t ok = done ? xTaskCreatePinnedToCore(
-            elf_run_task, "elf_run", ELF_TASK_STACK_BYTES,
-            &ctx, 1 /* priority == loopTask */, &task, 0 /* Core 0 */) : pdFAIL;
+        BaseType_t ok = pdFAIL;
+        uint32_t stack_used = 0;
+        if (done) {
+            for (uint32_t candidate : ELF_TASK_STACK_CANDIDATES) {
+                ok = xTaskCreatePinnedToCore(
+                    elf_run_task, "elf_run", candidate,
+                    &ctx, 1 /* priority == loopTask */, &task, 0 /* Core 0 */);
+                if (ok == pdPASS) {
+                    stack_used = candidate;
+                    Serial.printf("[elf_host] task created with %uKB stack\n", candidate / 1024);
+                    break;
+                }
+                Serial.printf("[elf_host] %uKB stack failed, trying smaller...\n", candidate / 1024);
+            }
+        }
         if (ok == pdPASS) {
             xSemaphoreTake(done, portMAX_DELAY); // wait for module to return
             result = ctx.result;
             Serial.printf("[elf_host] module returned %d\n", result);
         } else {
-            Serial.println("[elf_host] FAILED to create module task (out of internal RAM?)");
+            result = -2; // distinct from -1 (module ran but exit() called)
+            Serial.printf("[elf_host] FAILED to create module task — largest internal block: %u bytes\n",
+                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         }
         if (done) vSemaphoreDelete(done);
         elf_unload(mod);

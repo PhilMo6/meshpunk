@@ -55,8 +55,12 @@
 #include <CoreFoundation/CFUserNotification.h>
 #endif
 
-#define DEFAULT_RAM 4 /* MiB — reduced for ESP32-S3 PSRAM */
-#define MIN_RAM     2  /* MiB */
+// Zone allocation: grab as much PSRAM as we can, leaving a reserve for
+// non-zone allocations (lumpinfo, hash table, misc) that happen after zone init.
+// Empirically only ~54KB of non-zone PSRAM is needed, so 128KB is generous.
+#define ZONE_RESERVE_KB   128       /* leave this much free after zone alloc */
+#define DEFAULT_RAM_KB    (5*1024)  /* default/max zone size to attempt (5MB) */
+#define MIN_RAM_KB        (2*1024)  /* absolute minimum zone size (2MB) */
 
 
 typedef struct atexit_listentry_s atexit_listentry_t;
@@ -88,78 +92,85 @@ void I_Tactile(int on, int off, int total)
 {
 }
 
-// Zone memory auto-allocation function that allocates the zone size
-// by trying progressively smaller zone sizes until one is found that
-// works.
+// Zone memory auto-allocation: query the host for the largest free PSRAM
+// block, then allocate (largest - reserve).  Falls back to progressively
+// smaller attempts if the first one fails.
 
-static byte *AutoAllocMemory(int *size, int default_ram, int min_ram)
+extern uint32_t host_psram_largest_free(void);
+
+static byte *AutoAllocMemory(int *size, int default_kb, int min_kb)
 {
-    byte *zonemem;
+    byte *zonemem = NULL;
 
-    // Allocate the zone memory.  This loop tries progressively smaller
-    // zone sizes until a size is found that can be allocated.
-    // If we used the -mb command line parameter, only the parameter
-    // provided is accepted.
+    // Ask the host how much contiguous PSRAM is actually available
+    uint32_t largest = host_psram_largest_free();
+    uint32_t reserve = ZONE_RESERVE_KB * 1024;
+    int try_bytes;
 
-    zonemem = NULL;
+    if (largest > reserve + (uint32_t)(min_kb * 1024))
+    {
+        // Target: largest block minus reserve, rounded down to 64KB boundary
+        try_bytes = (int)((largest - reserve) & ~(64*1024 - 1));
+    }
+    else
+    {
+        try_bytes = default_kb * 1024;
+    }
 
+    // Try progressively smaller until one succeeds
     while (zonemem == NULL)
     {
-        // We need a reasonable minimum amount of RAM to start.
-
-        if (default_ram < min_ram)
+        if (try_bytes < min_kb * 1024)
         {
-            I_Error("Unable to allocate %i MiB of RAM for zone", default_ram);
+            I_Error("Unable to allocate zone memory (need %dKB, largest=%u)",
+                    min_kb, (unsigned)host_psram_largest_free());
         }
 
-        // Try to allocate the zone memory.
-
-        *size = default_ram * 1024 * 1024;
-
-        printf("Z_Init: trying %d MiB (%d bytes)...\n", default_ram, *size);
-        zonemem = malloc(*size);
+        printf("Z_Init: trying %d.%d MiB (%d bytes, avail=%u)...\n",
+               try_bytes / (1024*1024),
+               (try_bytes % (1024*1024)) * 10 / (1024*1024),
+               try_bytes, (unsigned)largest);
+        zonemem = malloc(try_bytes);
         printf("Z_Init: malloc returned %p\n", zonemem);
-
-        // Failed to allocate?  Reduce zone size until we reach a size
-        // that is acceptable.
 
         if (zonemem == NULL)
         {
-            default_ram -= 1;
+            try_bytes -= 64 * 1024; // step down 64KB
         }
     }
 
+    *size = try_bytes;
     return zonemem;
 }
 
 byte *I_ZoneBase (int *size)
 {
     byte *zonemem;
-    int min_ram, default_ram;
+    int min_kb, default_kb;
     int p;
 
     //!
     // @arg <mb>
     //
-    // Specify the heap size, in MiB (default 16).
+    // Specify the heap size, in MiB.
     //
 
     p = M_CheckParmWithArgs("-mb", 1);
 
     if (p > 0)
     {
-        default_ram = atoi(myargv[p+1]);
-        min_ram = default_ram;
+        default_kb = atoi(myargv[p+1]) * 1024;
+        min_kb = default_kb;
     }
     else
     {
-        default_ram = DEFAULT_RAM;
-        min_ram = MIN_RAM;
+        default_kb = DEFAULT_RAM_KB;
+        min_kb = MIN_RAM_KB;
     }
 
-    zonemem = AutoAllocMemory(size, default_ram, min_ram);
+    zonemem = AutoAllocMemory(size, default_kb, min_kb);
 
-    printf("zone memory: %p, %x allocated for zone\n", 
+    printf("zone memory: %p, %x allocated for zone\n",
            zonemem, *size);
 
     return zonemem;

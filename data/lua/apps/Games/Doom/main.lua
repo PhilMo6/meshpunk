@@ -180,6 +180,18 @@ end
 -- Audio toggle state
 local sfx_enabled = true
 
+-- Trackball momentum settings
+local trk_momentum = true     -- enable momentum mode
+local trk_impulse  = 15       -- impulse * 10 (1.5 → 15)
+local trk_friction = 82       -- friction * 100 (0.82 → 82)
+local trk_thresh   = 4        -- threshold * 10 (0.4 → 4)
+
+-- Build the -trkball argument string
+local function build_trkball_string()
+    return string.format("%d,%d,%d,%d",
+        trk_momentum and 1 or 0, trk_impulse, trk_friction, trk_thresh)
+end
+
 -- Save bindings + settings to config file
 local function save_config()
     local f = io.open(CFG_PATH, "w")
@@ -191,6 +203,10 @@ local function save_config()
         f:write(a.id .. "=" .. k1 .. "," .. k2 .. "\n")
     end
     f:write(string.format("sfx=%d\n", sfx_enabled and 1 or 0))
+    f:write(string.format("trk_momentum=%d\n", trk_momentum and 1 or 0))
+    f:write(string.format("trk_impulse=%d\n", trk_impulse))
+    f:write(string.format("trk_friction=%d\n", trk_friction))
+    f:write(string.format("trk_thresh=%d\n", trk_thresh))
     if #found_wads > 0 then
         f:write("wad=" .. found_wads[selected_wad].name .. "\n")
     end
@@ -216,6 +232,11 @@ local function load_config()
         end
         local setting, val = line:match("^(%a+)=([01])$")
         if setting == "sfx" then sfx_enabled = (val == "1") end
+        if setting == "trk_momentum" then trk_momentum = (val == "1") end
+        local trk_key, trk_val = line:match("^(trk_%a+)=(%d+)$")
+        if trk_key == "trk_impulse" then trk_impulse = tonumber(trk_val) end
+        if trk_key == "trk_friction" then trk_friction = tonumber(trk_val) end
+        if trk_key == "trk_thresh" then trk_thresh = tonumber(trk_val) end
         local wname = line:match("^wad=(.+)$")
         if wname then selected_wad_name = wname end
         local bname = line:match("^basewad=(.+)$")
@@ -248,6 +269,7 @@ local scr
 local function create_main_screen() end
 local function create_controls_screen() end
 local function create_bind_screen(action_idx, slot) end
+local function create_input_screen() end
 
 -- All available keys for binding (sorted for display)
 local BINDABLE_KEYS = {}
@@ -428,11 +450,21 @@ create_main_screen = function()
                 end
                 args[#args + 1] = "-keymap"
                 args[#args + 1] = km
+                args[#args + 1] = "-trkball"
+                args[#args + 1] = build_trkball_string()
                 local ok, result = _launch_elf(table.unpack(args))
-                if ok then
-                    status:set{ text = "Returned: " .. tostring(result) }
+                if not ok then
+                    status:set{ text = "ELF load failed" }
+                elseif result == 0 then
+                    status:set{ text = "Ready to launch" }
+                elseif result == -2 then
+                    status:set{ text = "Failed to start (low RAM?)" }
+                elseif result == -1 then
+                    status:set{ text = "Doom crashed (not enough RAM?)" }
+                elseif result == 1 then
+                    status:set{ text = "Doom error (bad WAD?)" }
                 else
-                    status:set{ text = "Failed: " .. tostring(result) }
+                    status:set{ text = "Exit code: " .. tostring(result) }
                 end
             end
         }
@@ -538,7 +570,7 @@ create_controls_screen = function()
     }
     btnBar:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-    local defBtn = btnBar:Button{ w = 75, h = 26 }
+    local defBtn = btnBar:Button{ w = 70, h = 26 }
     defBtn:Label{ text = "Defaults", text_font = font, align = lvgl.ALIGN.CENTER }
     defBtn:onClicked(function()
         load_defaults()
@@ -546,7 +578,11 @@ create_controls_screen = function()
         create_controls_screen()
     end)
 
-    local backBtn = btnBar:Button{ w = 60, h = 26 }
+    local inputBtn = btnBar:Button{ w = 60, h = 26 }
+    inputBtn:Label{ text = "Input", text_font = font, align = lvgl.ALIGN.CENTER }
+    inputBtn:onClicked(function() create_input_screen() end)
+
+    local backBtn = btnBar:Button{ w = 50, h = 26 }
     backBtn:Label{ text = "Back", text_font = font, align = lvgl.ALIGN.CENTER }
     backBtn:onClicked(function() create_main_screen() end)
 
@@ -626,6 +662,148 @@ create_bind_screen = function(action_idx, slot)
     local grp = lvgl.group.get_default()
     grp:add_obj(list)
     grp:add_obj(cancelBtn)
+end
+
+-- ============================================================
+-- Input settings screen (trackball momentum tuning)
+-- ============================================================
+create_input_screen = function()
+    if scr then scr:delete() end
+
+    scr = lvgl.Object(nil, {
+        w = W, h = H,
+        bg_color = "#000000", bg_opa = lvgl.OPA(255),
+        border_width = 0, pad_all = 0,
+    })
+    scr:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    scr:Label{
+        text = "INPUT SETTINGS",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        text_color = "#FF4444",
+        align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 4 },
+    }
+
+    local font = lvgl.BUILTIN_FONT.MONTSERRAT_12
+    local list = scr:Object{
+        w = W - 4, h = H - 54,
+        align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 22 },
+        bg_opa = 0, border_width = 0,
+        pad_left = 4, pad_right = 4, pad_top = 2, pad_bottom = 2,
+        flex = { flex_direction = "column", row_gap = 4 },
+    }
+
+    -- Helper: create a row with label + value button (< value >)
+    local function setting_row(parent, label, get_text, on_left, on_right)
+        local row = parent:Object{
+            w = lvgl.PCT(100), h = 26,
+            bg_opa = 0, border_width = 0, pad_all = 0,
+            flex = { flex_direction = "row", cross_place = "center" },
+        }
+        row:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        row:Label{
+            text = label,
+            text_font = font,
+            text_color = "#CCCCCC",
+            w = 120,
+        }
+
+        local valBtn = row:Button{ w = 130, h = 24 }
+        local valLbl = valBtn:Label{
+            text = get_text(),
+            text_font = font,
+            align = lvgl.ALIGN.CENTER,
+        }
+        valBtn:onClicked(function()
+            on_right()
+            valLbl:set{ text = get_text() }
+            save_config()
+        end)
+        -- Long press cycles backward (not all LVGL builds support this, but it's there)
+        return valBtn
+    end
+
+    -- Momentum toggle
+    setting_row(list, "Momentum",
+        function() return trk_momentum and "< ON >" or "< OFF >" end,
+        function() trk_momentum = not trk_momentum end,
+        function() trk_momentum = not trk_momentum end
+    )
+
+    -- Impulse (sensitivity): 5..30, step 1 → displayed as x/10
+    setting_row(list, "Sensitivity",
+        function() return string.format("< %.1f >", trk_impulse / 10) end,
+        function() trk_impulse = math.max(5, trk_impulse - 1) end,
+        function()
+            trk_impulse = trk_impulse + 1
+            if trk_impulse > 30 then trk_impulse = 5 end
+        end
+    )
+
+    -- Friction: 50..95, step 2 → displayed as x/100
+    setting_row(list, "Friction",
+        function() return string.format("< %.2f >", trk_friction / 100) end,
+        function() trk_friction = math.max(50, trk_friction - 2) end,
+        function()
+            trk_friction = trk_friction + 2
+            if trk_friction > 95 then trk_friction = 50 end
+        end
+    )
+
+    -- Threshold: 2..10, step 1 → displayed as x/10
+    setting_row(list, "Dead Zone",
+        function() return string.format("< %.1f >", trk_thresh / 10) end,
+        function() trk_thresh = math.max(2, trk_thresh - 1) end,
+        function()
+            trk_thresh = trk_thresh + 1
+            if trk_thresh > 10 then trk_thresh = 2 end
+        end
+    )
+
+    -- Info label
+    list:Label{
+        text = "Sensitivity: impulse per tick\n"
+             .. "Friction: decay rate (lower=faster stop)\n"
+             .. "Dead Zone: min velocity to register",
+        text_font = font,
+        text_color = "#666666",
+        w = lvgl.PCT(100),
+    }
+
+    -- Bottom buttons
+    local btnBar = scr:Object{
+        w = W, h = 28,
+        align = { type = lvgl.ALIGN.BOTTOM_MID, y_ofs = 0 },
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = {
+            flex_direction = "row",
+            justify_content = "center",
+            column_gap = 8,
+        },
+    }
+    btnBar:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local resetBtn = btnBar:Button{ w = 65, h = 26 }
+    resetBtn:Label{ text = "Reset", text_font = font, align = lvgl.ALIGN.CENTER }
+    resetBtn:onClicked(function()
+        trk_momentum = true
+        trk_impulse = 15
+        trk_friction = 82
+        trk_thresh = 4
+        save_config()
+        create_input_screen()
+    end)
+
+    local backBtn = btnBar:Button{ w = 60, h = 26 }
+    backBtn:Label{ text = "Back", text_font = font, align = lvgl.ALIGN.CENTER }
+    backBtn:onClicked(function() create_controls_screen() end)
+
+    _gridnav_add(list, GRIDNAV_ROLLOVER)
+    _gridnav_add(btnBar, GRIDNAV_ROLLOVER)
+    local grp = lvgl.group.get_default()
+    grp:add_obj(list)
+    grp:add_obj(btnBar)
 end
 
 -- ============================================================
