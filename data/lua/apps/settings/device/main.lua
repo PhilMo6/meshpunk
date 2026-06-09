@@ -159,6 +159,110 @@ kbd_to_btn:onClicked(function()
     status.text = "Kbd timeout: " .. math.floor(v) .. "s"
 end)
 
+-- ── Trackball Sensitivity ────────────────────────────────────────────────────
+content:Label { text = "-- Trackball --", w = lvgl.PCT(100), h = 16 }
+
+local TRK_STEP = 25
+local TRK_MAX  = 500
+local TRK_SEGS = 20
+local trk_val = _trackball_sensitivity_get()
+local trk_label = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
+
+local trk_bar = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
+    pad_column = 1,
+}
+trk_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
+trk_bar:clear_flag(lvgl.FLAG.CLICKABLE)
+local tsegs = {}
+for i = 1, TRK_SEGS do
+    tsegs[i] = trk_bar:Object { w = 12, h = 14, border_width = 1, pad_all = 0, bg_color = "#24ba24" }
+    tsegs[i]:clear_flag(lvgl.FLAG.SCROLLABLE)
+    tsegs[i]:clear_flag(lvgl.FLAG.CLICKABLE)
+end
+
+local function refresh_trk()
+    trk_val = _trackball_sensitivity_get()
+    trk_label.text = "Sensitivity: " .. trk_val .. "ms"
+    local filled = math.min(TRK_SEGS, math.floor(trk_val / TRK_STEP + 0.5))
+    for i = 1, TRK_SEGS do
+        tsegs[i]:set { bg_opa = (i <= filled) and 255 or 40 }
+    end
+end
+refresh_trk()
+
+local trk_dn = content:Button { w = lvgl.PCT(45), h = 30 }
+trk_dn:Label { text = "Faster", align = lvgl.ALIGN.CENTER }
+local trk_up = content:Button { w = lvgl.PCT(45), h = 30 }
+trk_up:Label { text = "Slower", align = lvgl.ALIGN.CENTER }
+
+trk_dn:onClicked(function()
+    local v = math.max(0, trk_val - TRK_STEP)
+    _trackball_sensitivity_set(v)
+    refresh_trk()
+    status.text = "Trackball: " .. _trackball_sensitivity_get() .. "ms"
+end)
+trk_up:onClicked(function()
+    local v = math.min(TRK_MAX, trk_val + TRK_STEP)
+    _trackball_sensitivity_set(v)
+    refresh_trk()
+    status.text = "Trackball: " .. _trackball_sensitivity_get() .. "ms"
+end)
+
+-- ── Trackball Roll ───────────────────────────────────────────────────────────
+local ROLL_STEP = 1
+local ROLL_MAX  = 25
+local ROLL_SEGS = 25
+local roll_val = _trackball_roll_get()
+local roll_label = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
+
+local roll_bar = content:Object {
+    flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
+    pad_column = 1,
+}
+roll_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
+roll_bar:clear_flag(lvgl.FLAG.CLICKABLE)
+local rsegs = {}
+for i = 1, ROLL_SEGS do
+    rsegs[i] = roll_bar:Object { w = 8, h = 14, border_width = 1, pad_all = 0, bg_color = "#24ba24" }
+    rsegs[i]:clear_flag(lvgl.FLAG.SCROLLABLE)
+    rsegs[i]:clear_flag(lvgl.FLAG.CLICKABLE)
+end
+
+local function refresh_roll()
+    roll_val = _trackball_roll_get()
+    if roll_val == 0 then
+        roll_label.text = "Roll: off"
+    else
+        roll_label.text = "Roll: " .. roll_val .. "ms"
+    end
+    local filled = math.min(roll_val, ROLL_MAX)
+    for i = 1, ROLL_SEGS do
+        rsegs[i]:set { bg_opa = (i <= filled) and 255 or 40 }
+    end
+end
+refresh_roll()
+
+local roll_dn = content:Button { w = lvgl.PCT(45), h = 30 }
+roll_dn:Label { text = "Less", align = lvgl.ALIGN.CENTER }
+local roll_up = content:Button { w = lvgl.PCT(45), h = 30 }
+roll_up:Label { text = "More", align = lvgl.ALIGN.CENTER }
+
+roll_dn:onClicked(function()
+    local v = math.max(0, roll_val - ROLL_STEP)
+    _trackball_roll_set(v)
+    refresh_roll()
+    status.text = "Roll: " .. (roll_val == 0 and "off" or (roll_val .. "ms"))
+end)
+roll_up:onClicked(function()
+    local v = math.min(ROLL_MAX, roll_val + ROLL_STEP)
+    _trackball_roll_set(v)
+    refresh_roll()
+    status.text = "Roll: " .. _trackball_roll_get() .. "ms"
+end)
+
 -- ── Back ─────────────────────────────────────────────────────────────────────
 back_btn:onClicked(function()
     utils.loadingPopUpAdd(nil, "Home", function()

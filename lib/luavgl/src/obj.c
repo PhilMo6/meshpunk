@@ -93,6 +93,7 @@ static int luavgl_obj_delete(lua_State *L)
     lua_pushlightuserdata(L, child);
     lua_rawget(L, LUA_REGISTRYINDEX);
     if (lua_isnoneornil(L, -1)) {
+      lua_pop(L, 1);
       continue;
     }
 

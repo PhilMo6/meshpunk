@@ -9,12 +9,12 @@
 - Touch and trackball nav controls
 - SD card support
 - BLE support for phone apps
-- WiFi support (not yet utilized)
+- WiFi support
 - GPS automatically gets time
 - Loads Lua scripts from the filesystem automatically as apps
 - Integrates MeshCore networking
 - Emoji support
-- Map app with offline tile caching and mesh contact markers
+- Map app with offline tile caching
 - Lua games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of development)
 - Elf file loader
 - Doom! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
@@ -34,6 +34,29 @@
 
 Optional. Download and place doom wad files onto the sd card in either /doom or /meshpunk/apps/Games/doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
 
+## Map App
+
+The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. Tiles are downloaded over WiFi, converted to RGB565 `.bin` format, and cached on SD card for offline use.
+
+- Map app Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `h` | Center on home (own GPS position) |
+| `q` | Quit (close popup first if open) |
+| `o` / `+` | Zoom in |
+| `i` / `-` | Zoom out |
+| `Space` | Stop scrolling |
+| `Enter` | Select contact at center / stop scrolling |
+| Trackball | Pan the map |
+
+- Pre-cache Downloads
+
+Press the **DL** button (visible when WiFi and SD are available) to bulk-download tiles for offline use. Choose an area size and zoom range, then download. Tiles are written atomically to SD so interrupted downloads won't leave corrupt files.
+
+- Contact Selection
+
+Long-press on a contact marker (touchscreen) or center the trackball on one and press Enter to view contact details including name, type, distance, hop count, and last seen time.
 
 ## Project Structure
 
@@ -73,6 +96,16 @@ Optional. Download and place doom wad files onto the sd card in either /doom or 
 
 You must close the serial monitor before uploadfs or it wont work.
 
+## Navigation
+
+The device supports three input methods for navigating the UI:
+
+- **Trackball** — roll to move focus between elements, click to select
+- **WASD keys** — `W`/`A`/`S`/`D` mirror trackball directions (up/left/down/right). When a text input is focused, WASD type normally instead
+- **Touchscreen** — tap to interact with elements directly
+
+Trackball and WASD share a configurable sensitivity setting (Device Settings → Trackball) that controls the minimum time between accepted direction inputs (0–500ms).
+
 ## Usage
 
 The example loads the `launcher.lua` script from the filesystem and displays a simple launcher UI. You can edit the Lua scripts in your IDE with proper syntax highlighting and then upload just the filesystem to quickly iterate on your UI design.
@@ -90,30 +123,6 @@ You can create additional Lua scripts in the `/data/lua` directory. Scripts can 
 ```lua
 local utils = require('utils')
 ```
-
-## Map App
-
-The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. Tiles are downloaded over WiFi, converted to RGB565 `.bin` format, and cached on SD card for offline use.
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `h` | Center on home (own GPS position) |
-| `q` | Quit (close popup first if open) |
-| `o` / `+` | Zoom in |
-| `i` / `-` | Zoom out |
-| `Space` | Stop scrolling |
-| `Enter` | Select contact at center / stop scrolling |
-| Trackball | Pan the map |
-
-### Pre-cache Downloads
-
-Press the **DL** button (visible when WiFi and SD are available) to bulk-download tiles for offline use. Choose an area size and zoom range, then download. Tiles are written atomically to SD so interrupted downloads won't leave corrupt files.
-
-### Contact Selection
-
-Long-press on a contact marker (touchscreen) or center the trackball on one and press Enter to view contact details including name, type, distance, hop count, and last seen time.
 
 ## PRs
 

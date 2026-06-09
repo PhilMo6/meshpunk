@@ -133,6 +133,10 @@ static uint8_t display_brightness = 16;  // 0–16, persisted
 // ── Inactivity Timeouts ───────────────────────────────────────────────────
 static uint16_t screen_timeout_secs  = 60;  // 0 = never, persisted
 static uint16_t kbd_timeout_secs     = 55;  // 0 = never, persisted
+
+// ── Trackball Sensitivity ────────────────────────────────────────────────
+static uint16_t trackball_sensitivity_ms = 75;  // ms between accepted direction pulses, persisted
+static uint16_t trackball_roll_ms = 0;                   // drain interval: 0 = instant (no momentum), persisted
 static uint32_t last_activity_ms     = 0;
 static bool     screen_timed_out     = false;
 static bool     kbd_timed_out        = false;
@@ -180,6 +184,8 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("ble_enabled=%d\n", ble_enabled_pref ? 1 : 0);
   f.printf("ble_bond_clear=%d\n", ble_bond_clear_pref ? 1 : 0);
   f.printf("wifi_enabled=%d\n", wifi_enabled_pref ? 1 : 0);
+  f.printf("trackball_sens=%d\n", trackball_sensitivity_ms);
+  f.printf("trackball_roll=%d\n", trackball_roll_ms);
   f.close();
   Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -301,6 +307,12 @@ static void firmware_prefs_load() {
       ble_bond_clear_pref = (atoi(val) == 1);
     } else if (strcmp(key, "wifi_enabled") == 0) {
       wifi_enabled_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "trackball_sens") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 500) trackball_sensitivity_ms = (uint16_t)v;
+    } else if (strcmp(key, "trackball_roll") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 500) trackball_roll_ms = (uint16_t)v;
     }
   }
   f.close();
@@ -927,23 +939,20 @@ static lv_obj_t *pending_gridnav_remove = NULL;
 
 static void flush_pending_gridnav() {
     if (pending_gridnav_remove) {
-        lv_gridnav_remove(pending_gridnav_remove);
+        if (lv_obj_is_valid(pending_gridnav_remove)) {
+            lv_gridnav_remove(pending_gridnav_remove);
+        }
         pending_gridnav_remove = NULL;
     }
 }
 
-static void nav_delete_cb(lv_event_t *e) {
-    lv_obj_t *target = (lv_obj_t *)lv_event_get_target(e);
-    if (target == nav_container) {
-        if (nav_gridnav_active) {
-            lv_gridnav_remove(nav_container);
-            nav_gridnav_active = false;
-        }
+// Detect stale nav_container (freed by app deletion).
+// Gridnav's own LV_EVENT_DELETE handler cleans up its resources automatically;
+// we only need to null our C++ globals.
+static void nav_check_valid() {
+    if (nav_container && !lv_obj_is_valid(nav_container)) {
         nav_container = NULL;
-    }
-    if (target == pending_gridnav_remove) {
-        lv_gridnav_remove(pending_gridnav_remove);
-        pending_gridnav_remove = NULL;
+        nav_gridnav_active = false;
     }
 }
 
@@ -967,6 +976,7 @@ static bool trackball_btn_pressed = false;
 
 static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   flush_pending_gridnav();
+  nav_check_valid();
 
   static uint32_t kb_mapped_key = 0;
   bool any_new = false;
@@ -1029,6 +1039,18 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 
   bool kb_active = (resolved_key != 0);
 
+  // ── WASD intercept — treat as direction, not character (unless typing) ──
+  uint32_t wasd_dir = 0;
+  lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
+  bool typing = focused && lv_obj_is_valid(focused) && lv_obj_check_type(focused, &lv_textarea_class);
+  if (!typing) {
+    if      (resolved_key == 'w') wasd_dir = LV_KEY_UP;
+    else if (resolved_key == 'a') wasd_dir = LV_KEY_LEFT;
+    else if (resolved_key == 's') wasd_dir = LV_KEY_DOWN;
+    else if (resolved_key == 'd') wasd_dir = LV_KEY_RIGHT;
+    if (wasd_dir) kb_active = false;
+  }
+
   // ── LVGL state tracking (single-key for LVGL reporting) ──
   if (kb_active) {
     if (resolved_key != last_key_code) {
@@ -1043,7 +1065,7 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 
   memcpy(prev_matrix, cur_matrix, KB_COLS);
 
-  // ── Trackball read (only when keyboard idle) ──
+  // ── Direction navigation — WASD + trackball, shared sensitivity ──
   if (!kb_active) {
     if (trackball_click > 0) {
       trackball_click = 0;
@@ -1051,32 +1073,47 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       any_new = true;
       key_from_trackball = true;
       trackball_btn_pressed = true;
-    } else if (trackball_up > 0) {
-      trackball_up--;
-      last_key_code = LV_KEY_UP;
-      any_new = true;
-      key_from_trackball = true;
-    } else if (trackball_down > 0) {
-      trackball_down--;
-      last_key_code = LV_KEY_DOWN;
-      any_new = true;
-      key_from_trackball = true;
-    } else if (trackball_left > 0) {
-      trackball_left--;
-      last_key_code = LV_KEY_LEFT;
-      any_new = true;
-      key_from_trackball = true;
-    } else if (trackball_right > 0) {
-      trackball_right--;
-      last_key_code = LV_KEY_RIGHT;
-      any_new = true;
-      key_from_trackball = true;
+    } else {
+      uint32_t nav_dir = wasd_dir;
+      if (!nav_dir) {
+        if      (trackball_up > 0)    nav_dir = LV_KEY_UP;
+        else if (trackball_down > 0)  nav_dir = LV_KEY_DOWN;
+        else if (trackball_left > 0)  nav_dir = LV_KEY_LEFT;
+        else if (trackball_right > 0) nav_dir = LV_KEY_RIGHT;
+      }
+
+      if (nav_dir) {
+        static uint32_t last_nav_ms = 0;
+        uint32_t now = millis();
+        uint16_t interval = (!wasd_dir && trackball_roll_ms > 0)
+                            ? trackball_roll_ms : trackball_sensitivity_ms;
+        if (now - last_nav_ms >= interval) {
+          last_nav_ms = now;
+          if (!wasd_dir) {
+            if (trackball_roll_ms > 0) {
+              if      (nav_dir == LV_KEY_UP)    trackball_up--;
+              else if (nav_dir == LV_KEY_DOWN)  trackball_down--;
+              else if (nav_dir == LV_KEY_LEFT)  trackball_left--;
+              else if (nav_dir == LV_KEY_RIGHT) trackball_right--;
+            } else {
+              if      (nav_dir == LV_KEY_UP)    trackball_up = 0;
+              else if (nav_dir == LV_KEY_DOWN)  trackball_down = 0;
+              else if (nav_dir == LV_KEY_LEFT)  trackball_left = 0;
+              else if (nav_dir == LV_KEY_RIGHT) trackball_right = 0;
+            }
+          }
+          last_key_code = nav_dir;
+          kb_mapped_key = nav_dir;
+          any_new = true;
+          key_from_trackball = true;
+        }
+      }
     }
     if (key_from_trackball) last_activity_ms = millis();
   }
 
   // ── Re-enable gridnav on trackball input ──
-  if (key_from_trackball && nav_container && !nav_gridnav_active) {
+  if (key_from_trackball && nav_container && lv_obj_is_valid(nav_container) && !nav_gridnav_active) {
     uint32_t cnt = lv_obj_get_child_count(nav_container);
     for (uint32_t i = 0; i < cnt; i++) {
       lv_obj_remove_state(lv_obj_get_child(nav_container, i),
@@ -1119,6 +1156,7 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 
 static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   flush_pending_gridnav();
+  nav_check_valid();
 
   uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
   if (touched > 0) {
@@ -3539,6 +3577,32 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // ── Trackball sensitivity ───────────────────────────────────────────────
+  lua_register(L, "_trackball_sensitivity_set", [](lua_State* L) -> int {
+    int v = luaL_checkinteger(L, 1);
+    if (v < 0) v = 0; if (v > 500) v = 500;
+    trackball_sensitivity_ms = (uint16_t)v;
+    firmware_prefs_save();
+    lua_pushinteger(L, trackball_sensitivity_ms);
+    return 1;
+  });
+  lua_register(L, "_trackball_sensitivity_get", [](lua_State* L) -> int {
+    lua_pushinteger(L, trackball_sensitivity_ms);
+    return 1;
+  });
+  lua_register(L, "_trackball_roll_set", [](lua_State* L) -> int {
+    int v = luaL_checkinteger(L, 1);
+    if (v < 0) v = 0; if (v > 500) v = 500;
+    trackball_roll_ms = (uint16_t)v;
+    firmware_prefs_save();
+    lua_pushinteger(L, trackball_roll_ms);
+    return 1;
+  });
+  lua_register(L, "_trackball_roll_get", [](lua_State* L) -> int {
+    lua_pushinteger(L, trackball_roll_ms);
+    return 1;
+  });
+
   // Register gridnav bridge
   // Usage: _gridnav_add(obj, flags)
   //   flags: 0=none, 1=rollover, 2=scroll_first
@@ -3575,6 +3639,12 @@ void setupLuaVGL() {
     int flags = luaL_optinteger(L, 2, LV_GRIDNAV_CTRL_ROLLOVER);
     bool preserve_scroll = lua_toboolean(L, 3);
 
+    // Clean up stale nav_container (already freed by app deletion)
+    if (nav_container && !lv_obj_is_valid(nav_container)) {
+      nav_container = NULL;
+      nav_gridnav_active = false;
+    }
+
     if (nav_container && nav_container != lobj->obj) {
       pending_gridnav_remove = nav_container;
     } else if (nav_container == lobj->obj && nav_gridnav_active) {
@@ -3599,8 +3669,12 @@ void setupLuaVGL() {
       lv_group_focus_obj(nav_container);
     }
 
-    lv_obj_add_event_cb(nav_container, nav_delete_cb,
-        (lv_event_code_t)(LV_EVENT_PREPROCESS | LV_EVENT_DELETE), NULL);
+    // No nav_delete_cb registration — gridnav's own LV_EVENT_DELETE handler
+    // cleans up its resources. Adding a second DELETE handler caused a crash:
+    // when nav_delete_cb fired first (preprocess) and called lv_gridnav_remove(),
+    // it modified the event array while lv_event_send was iterating it with
+    // cached pointers, causing a stale-pointer read (0xbaad5678).
+    // nav_check_valid() in keyboard/touch callbacks detects the freed container.
     return 0;
   });
 
@@ -3618,6 +3692,7 @@ void setupLuaVGL() {
 
   lua_register(L, "_nav_clear", [](lua_State *L) -> int {
     flush_pending_gridnav();
+    nav_check_valid();
     if (nav_container) {
       lv_gridnav_remove(nav_container);
       nav_container = NULL;
