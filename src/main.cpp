@@ -73,6 +73,9 @@ int luaL_loadfilex(lua_State *L, const char *filename, const char *mode) {
   }
 }
 
+extern "C" unsigned lodepng_decode32(unsigned char **out, unsigned *w, unsigned *h,
+                                     const unsigned char *in, size_t insize);
+
 // Radio
 RADIO_CLASS radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
 
@@ -204,6 +207,7 @@ static void wifi_creds_save() {
     sd_spi_take();
     write_wifi_creds(SD, "/meshpunk/wifi_creds");
     sd_spi_release();
+    Serial.println("[WIFI_CREDS] Saved to SD");
   }
 }
 
@@ -1440,6 +1444,79 @@ static int lua_wifi_fetch(lua_State *L) {
   return 1; // Return the result table
 }
 
+// _wifi_download_file(url, filepath) -> {success=bool, error=string|nil, size=int|nil}
+// Downloads binary data directly to a file, bypassing Lua strings (which truncate at null bytes).
+// filepath uses S:/L: prefix convention (see meshpunk_fs).
+static int lua_wifi_download_file(lua_State *L) {
+  const char *url = luaL_checkstring(L, 1);
+  const char *filepath = luaL_checkstring(L, 2);
+
+  lua_newtable(L);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "success");
+    lua_pushstring(L, "WiFi not connected");
+    lua_setfield(L, -2, "error");
+    return 1;
+  }
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("User-Agent", "meshpunk/1.0");
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "success");
+    if (httpCode > 0) {
+      char msg[48];
+      snprintf(msg, sizeof(msg), "HTTP %d", httpCode);
+      lua_pushstring(L, msg);
+    } else {
+      lua_pushstring(L, http.errorToString(httpCode).c_str());
+    }
+    lua_setfield(L, -2, "error");
+    http.end();
+    return 1;
+  }
+
+  int len = http.getSize();
+  WiFiClient *stream = http.getStreamPtr();
+
+  MeshpunkFile mf = meshpunk_open(filepath, "w", false);
+  if (!mf.valid) {
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "success");
+    lua_pushstring(L, "Failed to open file for writing");
+    lua_setfield(L, -2, "error");
+    http.end();
+    return 1;
+  }
+
+  uint8_t buf[1024];
+  int total = 0;
+  while (http.connected() && (len > 0 || len == -1)) {
+    int avail = stream->available();
+    if (avail <= 0) { delay(1); continue; }
+    int toRead = (avail < (int)sizeof(buf)) ? avail : (int)sizeof(buf);
+    int rd = stream->readBytes(buf, toRead);
+    if (rd <= 0) break;
+    mf.file.write(buf, rd);
+    total += rd;
+    if (len > 0) len -= rd;
+  }
+
+  meshpunk_close(mf);
+  http.end();
+
+  lua_pushboolean(L, 1);
+  lua_setfield(L, -2, "success");
+  lua_pushinteger(L, total);
+  lua_setfield(L, -2, "size");
+  return 1;
+}
+
 static int lua_wifi_scan_start(lua_State *L) {
   if (!wifi_enabled_pref) {
     lua_pushboolean(L, 0);
@@ -1761,6 +1838,11 @@ static int lua_mesh_get_contacts(lua_State *L) {
         }
         lua_setfield(L, -2, "path");
       }
+
+      lua_pushnumber(L, c.gps_lat / 1000000.0);
+      lua_setfield(L, -2, "lat");
+      lua_pushnumber(L, c.gps_lon / 1000000.0);
+      lua_setfield(L, -2, "lon");
 
       lua_rawseti(L, -2, idx++);
     }
@@ -2788,6 +2870,20 @@ static int lua_list_all_sd(lua_State *L) {
 }
 
 // Check if a file exists on SD card
+// _mkdir_sd(path) — create a directory on SD (no-op if it already exists)
+static int lua_mkdir_sd(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+  if (!sd_mounted) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  sd_spi_take();
+  bool ok = SD.exists(path) || SD.mkdir(path);
+  sd_spi_release();
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
 // Usage: local exists = _file_exists_sd("/meshpunk/apps/myapp/main.lua")
 static int lua_file_exists_sd(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
@@ -2802,6 +2898,193 @@ static int lua_file_exists_sd(lua_State *L) {
 
   lua_pushboolean(L, exists ? 1 : 0);
   return 1;
+}
+
+// Persistent RGB565 conversion buffer — allocated once, reused across calls.
+// Eliminates hundreds of 128KB alloc/free cycles during bulk tile downloads
+// that fragment PSRAM and eventually cause decode failures.
+static uint16_t *s_rgb565_buf = nullptr;
+static const uint32_t RGB565_BUF_SIZE = 256 * 256 * 2;  // 131072 bytes
+
+// _png_to_bin(src_path, dst_path) -> bool
+// Decodes a PNG and writes an LVGL RGB565 .bin file.
+// Paths use S:/L: prefix convention (meshpunk_fs).
+static int lua_png_to_bin(lua_State *L) {
+  const char *src_path = luaL_checkstring(L, 1);
+  const char *dst_path = luaL_checkstring(L, 2);
+
+  Serial.printf("[png2bin] src=%s dst=%s psram_free=%u largest=%u\n",
+                src_path, dst_path,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+
+  // Allocate persistent RGB565 buffer on first call
+  if (!s_rgb565_buf) {
+    s_rgb565_buf = (uint16_t *)heap_caps_malloc(RGB565_BUF_SIZE,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_rgb565_buf) {
+      Serial.println("[png2bin] FAIL: initial rgb565 buffer alloc");
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+  }
+
+  // Bail early if PSRAM is too fragmented for lodepng decode.
+  // Decode needs ~256KB contiguous for ARGB8888 + ~192KB for scanlines.
+  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  if (largest < 512 * 1024) {
+    Serial.printf("[png2bin] SKIP: PSRAM fragmented (largest=%u)\n", (unsigned)largest);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  uint32_t png_size = 0;
+  void *png_data = meshpunk_read_all(src_path, &png_size, false);
+  if (!png_data) {
+    Serial.println("[png2bin] FAIL: meshpunk_read_all returned NULL");
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  // IMPORTANT: this is LVGL's *patched* lodepng. lodepng_decode32() does NOT
+  // return a raw pixel buffer like upstream — it returns an lv_draw_buf_t*
+  // (ARGB8888). The pixels live in decoded->data, and the whole thing must be
+  // released with lv_draw_buf_destroy() (struct + data are separate allocs).
+  // Treating it as a raw buffer leaks the ~256KB data block every call.
+  lv_draw_buf_t *decoded = nullptr;
+  unsigned w = 0, h = 0;
+  unsigned err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
+                                  (const unsigned char *)png_data, png_size);
+
+  // err 83 = lodepng alloc failure. The decode briefly needs a ~256KB (ARGB8888)
+  // plus ~192KB (scanline) contiguous block. If the RGB565 tile cache has
+  // fragmented PSRAM, that can fail despite ample total free memory. Last-resort:
+  // drop the whole image cache to coalesce free space and retry once (dropped
+  // tiles transparently re-load from their .bin). The Map app also proactively
+  // evicts off-screen / old-zoom tiles, so this should rarely fire.
+  if (err == 83 && !decoded) {
+    Serial.printf("[png2bin] err=83 frag fallback: drop cache (largest=%u)\n",
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    lv_image_cache_drop(NULL);
+    err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
+                           (const unsigned char *)png_data, png_size);
+  }
+
+  heap_caps_free(png_data);
+  if (err || !decoded) {
+    Serial.printf("[png2bin] FAIL: lodepng err=%u decoded=%p psram_free=%u\n",
+                  err, (void *)decoded,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (decoded) lv_draw_buf_destroy(decoded);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  Serial.printf("[png2bin] decoded %ux%u\n", w, h);
+
+  // decoded->data is ARGB8888 in byte order R,G,B,A (lodepng_convert /
+  // rgba8ToPixel), stride = 4*w (contiguous). Pack to native little-endian
+  // RGB565: LVGL v9 byte-swaps the whole framebuffer at flush for
+  // LV_COLOR_16_SWAP, so image data itself stays little-endian (matches
+  // the reference scripts/LVGLImage.py output).
+  const uint8_t *argb = (const uint8_t *)decoded->data;
+  if (!argb) {
+    Serial.println("[png2bin] FAIL: decoded->data is NULL");
+    lv_draw_buf_destroy(decoded);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  uint32_t pixel_count = (uint32_t)w * h;
+  uint16_t stride = (uint16_t)(w * 2);
+  uint32_t data_size = (uint32_t)stride * h;
+
+  if (data_size > RGB565_BUF_SIZE) {
+    Serial.printf("[png2bin] FAIL: tile %ux%u exceeds buffer\n", w, h);
+    lv_draw_buf_destroy(decoded);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  uint16_t *rgb565 = s_rgb565_buf;  // reuse persistent buffer
+
+  for (uint32_t i = 0; i < pixel_count; i++) {
+    uint8_t r = argb[i * 4 + 0];
+    uint8_t g = argb[i * 4 + 1];
+    uint8_t b = argb[i * 4 + 2];
+    rgb565[i] = ((uint16_t)(r >> 3) << 11) |
+                ((uint16_t)(g >> 2) << 5)  |
+                (uint16_t)(b >> 3);
+  }
+  lv_draw_buf_destroy(decoded);
+
+  lv_image_header_t hdr;
+  lv_memzero(&hdr, sizeof(hdr));
+  hdr.magic  = LV_IMAGE_HEADER_MAGIC;
+  hdr.cf     = LV_COLOR_FORMAT_RGB565;
+  hdr.w      = w;
+  hdr.h      = h;
+  hdr.stride = stride;
+
+  // Atomic write: write to .tmp first, then rename to final path.
+  // If the device resets mid-write, only the .tmp exists and tile_cached
+  // (which checks for .bin) never sees it — no corrupt tiles.
+  char tmp_path[256];
+  snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dst_path);
+
+  MeshpunkFile mf = meshpunk_open(tmp_path, "w", false);
+  if (!mf.valid) {
+    Serial.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  size_t hw = mf.file.write((const uint8_t *)&hdr, sizeof(hdr));
+  size_t dw = mf.file.write((const uint8_t *)rgb565, data_size);
+  meshpunk_close(mf);
+
+  // Strip S: prefix for raw SD API calls
+  const char *tmp_sd = (strncmp(tmp_path, "S:", 2) == 0) ? tmp_path + 2 : tmp_path;
+  const char *dst_sd = (strncmp(dst_path, "S:", 2) == 0) ? dst_path + 2 : dst_path;
+
+  if (hw != sizeof(hdr) || dw != data_size) {
+    Serial.printf("[png2bin] FAIL: short write hdr=%u/%u data=%u/%u\n",
+                  (unsigned)hw, (unsigned)sizeof(hdr), (unsigned)dw, (unsigned)data_size);
+    sd_spi_take();
+    SD.remove(tmp_sd);
+    sd_spi_release();
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  // Rename .tmp -> final .bin
+  sd_spi_take();
+  bool renamed = SD.rename(tmp_sd, dst_sd);
+  sd_spi_release();
+
+  if (!renamed) {
+    Serial.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_sd, dst_sd);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// _lvgl_image_cache_drop([src]) -> nil
+// Evict decoded image(s) from LVGL's image cache to free PSRAM. With no/nil
+// argument, drops the entire cache. With a path string (e.g. an "S:/...bin"
+// tile), drops just that image (matched by string). Used by the Map app to
+// release off-screen and stale-zoom tiles so decoded tiles don't accumulate
+// and fragment PSRAM.
+static int lua_lvgl_image_cache_drop(lua_State *L) {
+  if (lua_isnoneornil(L, 1)) {
+    lv_image_cache_drop(NULL);
+  } else {
+    const char *src = luaL_checkstring(L, 1);
+    lv_image_cache_drop(src);
+  }
+  return 0;
 }
 
 // Load and execute a Lua file from the SD card
@@ -2904,6 +3187,7 @@ void setupLuaVGL() {
   lua_register(L, "_wifi_status", lua_wifi_status);
   lua_register(L, "_wifi_disconnect", lua_wifi_disconnect);
   lua_register(L, "_wifi_fetch", lua_wifi_fetch);
+  lua_register(L, "_wifi_download_file", lua_wifi_download_file);
   lua_register(L, "_wifi_scan_start", lua_wifi_scan_start);
   lua_register(L, "_wifi_scan_results", lua_wifi_scan_results);
   lua_register(L, "_wifi_get_enabled", lua_wifi_get_enabled);
@@ -3425,6 +3709,9 @@ void setupLuaVGL() {
 
   lua_register(L, "_list_dir_sd", lua_list_dir_sd);
   lua_register(L, "_file_exists_sd", lua_file_exists_sd);
+  lua_register(L, "_mkdir_sd", lua_mkdir_sd);
+  lua_register(L, "_png_to_bin", lua_png_to_bin);
+  lua_register(L, "_lvgl_image_cache_drop", lua_lvgl_image_cache_drop);
   lua_register(L, "_dofile_sd", lua_dofile_sd);
   lua_register(L, "_list_all", lua_list_all);
   lua_register(L, "_list_all_sd", lua_list_all_sd);
@@ -3777,6 +4064,13 @@ void setup() {
         Serial.println("[FW_PREFS] SD import failed, using defaults");
       }
     }
+
+    if (!LittleFS.exists("/wifi_creds") && SD.exists("/meshpunk/wifi_creds")) {
+      sd_spi_take();
+      bool ok = copyFile(SD, "/meshpunk/wifi_creds", LittleFS, "/wifi_creds");
+      sd_spi_release();
+      Serial.printf("[WIFI_CREDS] %s from SD after reflash\n", ok ? "Imported" : "Import FAILED");
+    }
   } else {
     Serial.println("[SD] Card mount FAILED");
   }
@@ -3807,7 +4101,6 @@ void setup() {
     }
   }
 
-  // Initialize WiFi
   wifi_creds_load();
   if (wifi_enabled_pref) {
     WiFi.mode(WIFI_STA);

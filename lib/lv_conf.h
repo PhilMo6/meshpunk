@@ -131,7 +131,7 @@
 /*Default cache size in bytes.
  *Used by image decoders such as `lv_lodepng` to keep the decoded image in the memory.
  *With PSRAM available we can cache decoded images to avoid re-decoding each frame.*/
-#define LV_CACHE_DEF_SIZE       (512 * 1024)
+#define LV_CACHE_DEF_SIZE       (3072 * 1024)
 
 #define LV_IMAGE_HEADER_CACHE_DEF_CNT 32
 #define LV_GRADIENT_MAX_STOPS   2
@@ -347,7 +347,7 @@
     #define LV_GIF_CACHE_DECODE_DATA 0
 #endif
 
-#define LV_BIN_DECODER_RAM_LOAD 0
+#define LV_BIN_DECODER_RAM_LOAD 1
 #define LV_USE_RLE 0
 #define LV_USE_QRCODE 0
 #define LV_USE_BARCODE 0

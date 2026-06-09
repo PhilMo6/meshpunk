@@ -4,6 +4,12 @@
 #include "../../core/lv_global.h"
 #include <SPI.h>
 #include "SD.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
+extern SemaphoreHandle_t spi_bus_mutex;
+static inline void lv_sd_spi_take()    { if (spi_bus_mutex) xSemaphoreTakeRecursive(spi_bus_mutex, portMAX_DELAY); }
+static inline void lv_sd_spi_release() { if (spi_bus_mutex) xSemaphoreGiveRecursive(spi_bus_mutex); }
 
 typedef struct SdFile {
     File file;
@@ -82,7 +88,9 @@ static void * fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode)
     else if(mode == (LV_FS_MODE_WR | LV_FS_MODE_RD))
         flags = FILE_WRITE;
 
+    lv_sd_spi_take();
     File file = SD.open(path, flags);
+    lv_sd_spi_release();
     if(!file) {
         return NULL;
     }
@@ -102,7 +110,9 @@ static lv_fs_res_t fs_close(lv_fs_drv_t * drv, void * file_p)
 {
     LV_UNUSED(drv);
     SdFile * lf = (SdFile *)file_p;
+    lv_sd_spi_take();
     lf->file.close();
+    lv_sd_spi_release();
     delete lf;
 
     return LV_FS_RES_OK;
@@ -121,7 +131,9 @@ static lv_fs_res_t fs_read(lv_fs_drv_t * drv, void * file_p, void * buf, uint32_
 {
     LV_UNUSED(drv);
     SdFile * lf = (SdFile *)file_p;
+    lv_sd_spi_take();
     *br = lf->file.read((uint8_t *)buf, btr);
+    lv_sd_spi_release();
 
     return (int32_t)(*br) < 0 ? LV_FS_RES_UNKNOWN : LV_FS_RES_OK;
 }
@@ -139,7 +151,9 @@ static lv_fs_res_t fs_write(lv_fs_drv_t * drv, void * file_p, const void * buf, 
 {
     LV_UNUSED(drv);
     SdFile * lf = (SdFile *)file_p;
+    lv_sd_spi_take();
     *bw = lf->file.write((uint8_t *)buf, btw);
+    lv_sd_spi_release();
 
     return (int32_t)(*bw) < 0 ? LV_FS_RES_UNKNOWN : LV_FS_RES_OK;
 }
@@ -165,7 +179,9 @@ static lv_fs_res_t fs_seek(lv_fs_drv_t * drv, void * file_p, uint32_t pos, lv_fs
 
     SdFile * lf = (SdFile *)file_p;
 
+    lv_sd_spi_take();
     int rc = lf->file.seek(pos, mode);
+    lv_sd_spi_release();
 
     return rc < 0 ? LV_FS_RES_UNKNOWN : LV_FS_RES_OK;
 }
@@ -182,7 +198,9 @@ static lv_fs_res_t fs_tell(lv_fs_drv_t * drv, void * file_p, uint32_t * pos_p)
     LV_UNUSED(drv);
     SdFile * lf = (SdFile *)file_p;
 
+    lv_sd_spi_take();
     *pos_p = lf->file.position();
+    lv_sd_spi_release();
 
     return (int32_t)(*pos_p) < 0 ? LV_FS_RES_UNKNOWN : LV_FS_RES_OK;
 }

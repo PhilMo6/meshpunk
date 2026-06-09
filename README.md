@@ -14,6 +14,7 @@
 - Loads Lua scripts from the filesystem automatically as apps
 - Integrates MeshCore networking
 - Emoji support
+- Map app with offline tile caching and mesh contact markers
 - Lua games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of development)
 - Elf file loader
 - Doom! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
@@ -89,6 +90,30 @@ You can create additional Lua scripts in the `/data/lua` directory. Scripts can 
 ```lua
 local utils = require('utils')
 ```
+
+## Map App
+
+The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. Tiles are downloaded over WiFi, converted to RGB565 `.bin` format, and cached on SD card for offline use.
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `h` | Center on home (own GPS position) |
+| `q` | Quit (close popup first if open) |
+| `o` / `+` | Zoom in |
+| `i` / `-` | Zoom out |
+| `Space` | Stop scrolling |
+| `Enter` | Select contact at center / stop scrolling |
+| Trackball | Pan the map |
+
+### Pre-cache Downloads
+
+Press the **DL** button (visible when WiFi and SD are available) to bulk-download tiles for offline use. Choose an area size and zoom range, then download. Tiles are written atomically to SD so interrupted downloads won't leave corrupt files.
+
+### Contact Selection
+
+Long-press on a contact marker (touchscreen) or center the trackball on one and press Enter to view contact details including name, type, distance, hop count, and last seen time.
 
 ## PRs
 
