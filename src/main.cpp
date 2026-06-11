@@ -127,6 +127,15 @@ static Audio*    audio = nullptr;          // ESP32-audioI2S player, created in 
 // ── Keyboard Backlight ─────────────────────────────────────────────────────
 static uint8_t kbd_brightness = 200;  // 0–255, persisted
 
+// ── Keyboard sym behavior ───────────────────────────────────────────────────
+// false = sym is a plain hold modifier. true = a clean tap of sym (press and
+// release with nothing typed in between) latches the symbol layer until the
+// next tap, while holding sym still works as a momentary modifier. Persisted.
+static bool kb_sym_toggle_pref = false;
+static bool kb_sym_latched = false;
+static bool kb_sym_phys_prev = false;
+static bool kb_sym_used_while_held = false;
+
 // ── Display Backlight ──────────────────────────────────────────────────────
 static uint8_t display_brightness = 16;  // 0–16, persisted
 
@@ -186,6 +195,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("wifi_enabled=%d\n", wifi_enabled_pref ? 1 : 0);
   f.printf("trackball_sens=%d\n", trackball_sensitivity_ms);
   f.printf("trackball_roll=%d\n", trackball_roll_ms);
+  f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
   f.close();
   Serial.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -313,6 +323,8 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "trackball_roll") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 500) trackball_roll_ms = (uint16_t)v;
+    } else if (strcmp(key, "sym_toggle") == 0) {
+      kb_sym_toggle_pref = (atoi(val) == 1);
     }
   }
   f.close();
@@ -993,8 +1005,24 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   kb_lshift_active = cur_matrix[KB_MOD_LSHIFT_COL] & (1 << KB_MOD_LSHIFT_ROW);
   kb_rshift_active = cur_matrix[KB_MOD_RSHIFT_COL] & (1 << KB_MOD_RSHIFT_ROW);
   kb_shift_active = kb_lshift_active || kb_rshift_active;
-  kb_sym_active = cur_matrix[KB_MOD_SYM_COL] & (1 << KB_MOD_SYM_ROW);
   kb_alt_active = cur_matrix[KB_MOD_ALT_COL] & (1 << KB_MOD_ALT_ROW);
+
+  // sym: plain hold by default. In toggle mode a clean tap (press + release
+  // with nothing typed during the hold) latches the symbol layer until the
+  // next tap; holding sym while typing still works as a momentary modifier.
+  bool sym_phys = cur_matrix[KB_MOD_SYM_COL] & (1 << KB_MOD_SYM_ROW);
+  if (kb_sym_toggle_pref) {
+    if (sym_phys && !kb_sym_phys_prev) {
+      kb_sym_used_while_held = false;             // new hold begins
+    } else if (!sym_phys && kb_sym_phys_prev && !kb_sym_used_while_held) {
+      kb_sym_latched = !kb_sym_latched;           // clean tap — toggle latch
+    }
+    kb_sym_active = sym_phys || kb_sym_latched;
+  } else {
+    kb_sym_active = sym_phys;
+    kb_sym_latched = false;
+  }
+  kb_sym_phys_prev = sym_phys;
 
   // ── Snapshot previous key state and clear current ──
   memcpy(kb_key_prev, kb_key_state, 128);
@@ -1011,7 +1039,9 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       if (c == KB_MOD_ALT_COL && r == KB_MOD_ALT_ROW) continue;
       if (c == KB_MOD_LSHIFT_COL && r == KB_MOD_LSHIFT_ROW) continue;
       if (c == KB_MOD_RSHIFT_COL && r == KB_MOD_RSHIFT_ROW) continue;
-      if (c == 0 && r == 6) continue;
+      // (0,6) is the mic key: no normal-layer character (the ch==0 check
+      // below keeps the bare press dead), but its symbol layer is '0' —
+      // it must flow through so sym+mic can type the digit zero.
 
       uint8_t ch = 0;
       if (c == KB_KEY_ENTER_COL && r == KB_KEY_ENTER_ROW) {
@@ -1028,6 +1058,7 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       if (!kb_key_prev[ch]) {
         kb_key_press_time[ch] = millis();
       }
+      if (sym_phys) kb_sym_used_while_held = true;  // hold was used — not a tap
 
       if (resolved_key == 0) {
         if (ch == 0x0D) resolved_key = LV_KEY_ENTER;
@@ -1485,6 +1516,33 @@ static int lua_wifi_fetch(lua_State *L) {
 // _wifi_download_file(url, filepath) -> {success=bool, error=string|nil, size=int|nil}
 // Downloads binary data directly to a file, bypassing Lua strings (which truncate at null bytes).
 // filepath uses S:/L: prefix convention (see meshpunk_fs).
+//
+// The HTTPClient (and its TLS session) persists between calls: consecutive
+// downloads from the same host reuse the socket and skip DNS + TCP + TLS
+// setup (~1-2s per https request — the bulk of a map tile's total cost).
+// Call _wifi_download_end() when a burst finishes to drop the socket and
+// free the TLS buffers (~45KB internal RAM).
+static HTTPClient *s_dl_http = nullptr;
+static uint8_t *s_dl_buf = nullptr;  // PSRAM transfer buffer, allocated once
+static const size_t DL_BUF_SIZE = 4096;
+
+static void wifi_dl_client_close() {
+  if (!s_dl_http) return;
+  s_dl_http->setReuse(false);  // make end() actually drop the socket
+  s_dl_http->end();
+  delete s_dl_http;
+  s_dl_http = nullptr;
+}
+
+static bool wifi_dl_client_open(const char *url) {
+  if (!s_dl_http) {
+    s_dl_http = new HTTPClient();
+    s_dl_http->setUserAgent("meshpunk/1.0");
+    s_dl_http->setReuse(true);
+  }
+  return s_dl_http->begin(url);
+}
+
 static int lua_wifi_download_file(lua_State *L) {
   const char *url = luaL_checkstring(L, 1);
   const char *filepath = luaL_checkstring(L, 2);
@@ -1492,6 +1550,7 @@ static int lua_wifi_download_file(lua_State *L) {
   lua_newtable(L);
 
   if (WiFi.status() != WL_CONNECTED) {
+    wifi_dl_client_close();
     lua_pushboolean(L, 0);
     lua_setfield(L, -2, "success");
     lua_pushstring(L, "WiFi not connected");
@@ -1499,10 +1558,37 @@ static int lua_wifi_download_file(lua_State *L) {
     return 1;
   }
 
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("User-Agent", "meshpunk/1.0");
-  int httpCode = http.GET();
+  if (!s_dl_buf) {
+    s_dl_buf = (uint8_t *)heap_caps_malloc(DL_BUF_SIZE,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_dl_buf) {
+      lua_pushboolean(L, 0);
+      lua_setfield(L, -2, "success");
+      lua_pushstring(L, "Buffer alloc failed");
+      lua_setfield(L, -2, "error");
+      return 1;
+    }
+  }
+
+  if (!wifi_dl_client_open(url)) {
+    wifi_dl_client_close();
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "success");
+    lua_pushstring(L, "Bad URL");
+    lua_setfield(L, -2, "error");
+    return 1;
+  }
+
+  int httpCode = s_dl_http->GET();
+
+  // Negative code on a kept-alive client usually means the server closed the
+  // idle socket — rebuild the connection and retry once.
+  if (httpCode < 0) {
+    wifi_dl_client_close();
+    if (wifi_dl_client_open(url)) {
+      httpCode = s_dl_http->GET();
+    }
+  }
 
   if (httpCode != 200) {
     lua_pushboolean(L, 0);
@@ -1512,15 +1598,15 @@ static int lua_wifi_download_file(lua_State *L) {
       snprintf(msg, sizeof(msg), "HTTP %d", httpCode);
       lua_pushstring(L, msg);
     } else {
-      lua_pushstring(L, http.errorToString(httpCode).c_str());
+      lua_pushstring(L, s_dl_http->errorToString(httpCode).c_str());
     }
     lua_setfield(L, -2, "error");
-    http.end();
+    s_dl_http->end();
     return 1;
   }
 
-  int len = http.getSize();
-  WiFiClient *stream = http.getStreamPtr();
+  int len = s_dl_http->getSize();
+  WiFiClient *stream = s_dl_http->getStreamPtr();
 
   MeshpunkFile mf = meshpunk_open(filepath, "w", false);
   if (!mf.valid) {
@@ -1528,31 +1614,62 @@ static int lua_wifi_download_file(lua_State *L) {
     lua_setfield(L, -2, "success");
     lua_pushstring(L, "Failed to open file for writing");
     lua_setfield(L, -2, "error");
-    http.end();
+    s_dl_http->end();
     return 1;
   }
 
-  uint8_t buf[1024];
   int total = 0;
-  while (http.connected() && (len > 0 || len == -1)) {
+  uint32_t deadline = millis() + 20000;  // hard stop for stalled transfers
+  while (len > 0 || len == -1) {
+    if ((int32_t)(millis() - deadline) >= 0) break;
     int avail = stream->available();
-    if (avail <= 0) { delay(1); continue; }
-    int toRead = (avail < (int)sizeof(buf)) ? avail : (int)sizeof(buf);
-    int rd = stream->readBytes(buf, toRead);
+    if (avail <= 0) {
+      if (!s_dl_http->connected()) break;
+      delay(1);
+      continue;
+    }
+    int toRead = (avail < (int)DL_BUF_SIZE) ? avail : (int)DL_BUF_SIZE;
+    int rd = stream->readBytes(s_dl_buf, toRead);
     if (rd <= 0) break;
-    mf.file.write(buf, rd);
+    mf.file.write(s_dl_buf, rd);
     total += rd;
     if (len > 0) len -= rd;
   }
 
   meshpunk_close(mf);
-  http.end();
+
+  if (len > 0) {
+    // Short read: deadline hit or connection lost mid-body. The file is
+    // truncated and the keep-alive framing is unusable — drop the socket and
+    // report failure so the caller can retry.
+    wifi_dl_client_close();
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "success");
+    lua_pushstring(L, "Truncated download");
+    lua_setfield(L, -2, "error");
+    return 1;
+  }
+
+  if (len == -1) {
+    // No Content-Length: body was read until close/stall, so this connection
+    // can't be trusted for another request.
+    wifi_dl_client_close();
+  } else {
+    s_dl_http->end();  // keeps the socket alive when the server allows reuse
+  }
 
   lua_pushboolean(L, 1);
   lua_setfield(L, -2, "success");
   lua_pushinteger(L, total);
   lua_setfield(L, -2, "size");
   return 1;
+}
+
+// _wifi_download_end() — close the persistent download connection and free
+// its TLS buffers. Call when a download burst finishes; no-op when closed.
+static int lua_wifi_download_end(lua_State *L) {
+  wifi_dl_client_close();
+  return 0;
 }
 
 static int lua_wifi_scan_start(lua_State *L) {
@@ -1826,67 +1943,192 @@ static int lua_mesh_generate_identity(lua_State *L) {
 }
 
 // Get contact list
-// Usage from Lua: local contacts = _mesh_get_contacts()
-static int lua_mesh_get_contacts(lua_State *L) {
+// Push one contact as a Lua table (shared by the live and union caches).
+static void push_contact_table(lua_State *L, const ContactInfo &c, bool archived) {
   lua_newtable(L);
 
+  lua_pushstring(L, c.name);
+  lua_setfield(L, -2, "name");
+
+  lua_pushinteger(L, c.type);
+  lua_setfield(L, -2, "type");
+
+  lua_pushinteger(L, c.out_path_len);
+  lua_setfield(L, -2, "path_len");
+
+  lua_pushinteger(L, c.last_advert_timestamp);
+  lua_setfield(L, -2, "last_seen");
+
+  lua_pushinteger(L, c.lastmod);
+  lua_setfield(L, -2, "lastmod");
+
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
+  lua_pushstring(L, hex);
+  lua_setfield(L, -2, "pubkey");
+
+  lua_pushstring(L, the_mesh->getTypeName(c.type));
+  lua_setfield(L, -2, "type_name");
+
+  lua_pushboolean(L, (c.flags & 0x01) != 0);
+  lua_setfield(L, -2, "favorite");
+
+  // out_path as array of hex hashes
+  {
+    uint8_t hash_size = (c.out_path_len >> 6) + 1;
+    uint8_t hash_count = c.out_path_len & 63;
+    lua_newtable(L);
+    char h[7];
+    for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
+      mesh::Utils::toHex(h, &c.out_path[j * hash_size], hash_size);
+      lua_pushstring(L, h);
+      lua_rawseti(L, -2, j + 1);
+    }
+    lua_setfield(L, -2, "path");
+  }
+
+  lua_pushnumber(L, c.gps_lat / 1000000.0);
+  lua_setfield(L, -2, "lat");
+  lua_pushnumber(L, c.gps_lon / 1000000.0);
+  lua_setfield(L, -2, "lon");
+
+  if (archived) {
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "archived");
+  }
+}
+
+// Usage from Lua: local contacts = _mesh_get_contacts([include_archived])
+//
+// Cached: rebuilding ~500 contact tables (pubkey hex, path arrays, ...)
+// costs ~10ms under MESH_LOCK, and the Map app asks on every marker redraw.
+// PunkMesh bumps contacts_generation on every mutation (they all funnel
+// through saveContacts), so between changes this returns a cheap copy of a
+// cached master table. The OUTER array is fresh per call — callers may
+// table.sort it in place (Messenger does) — while the per-contact subtables
+// are shared with the cache and must be treated as read-only. A 10s TTL
+// backstops any mutation path that might miss the generation bump (e.g.
+// BLE companion ops run outside MESH_LOCK, so a bump could in theory race).
+//
+// With include_archived = true the result also contains archived contacts
+// (those evicted from the live table or removed; marked archived=true),
+// deduped by pubkey with the live entry winning. That variant has its own
+// cached master keyed on both generation counters.
+static int s_contacts_ref = LUA_NOREF;       // live-only master
+static uint32_t s_contacts_gen = 0;
+static uint32_t s_contacts_built_ms = 0;
+static int s_contacts_count = 0;
+
+static int s_union_ref = LUA_NOREF;          // live + archived master
+static uint32_t s_union_gen = 0;
+static uint32_t s_union_arch_gen = 0;
+static uint32_t s_union_built_ms = 0;
+static int s_union_count = 0;
+
+static int lua_mesh_get_contacts(lua_State *L) {
+  bool include_archived = lua_toboolean(L, 1);
+
+  int ref;
+  int count;
+
   MESH_LOCK();
-  ContactInfo c;
-  int idx = 1;
-  for (int i = 0; i < the_mesh->getNumContacts(); i++) {
-    if (the_mesh->getContactByIdx(i, c)) {
+  if (!include_archived) {
+    uint32_t gen = the_mesh->contacts_generation;
+    bool fresh = (s_contacts_ref != LUA_NOREF) && (gen == s_contacts_gen) &&
+                 (millis() - s_contacts_built_ms < 10000);
+    if (!fresh) {
       lua_newtable(L);
 
-      lua_pushstring(L, c.name);
-      lua_setfield(L, -2, "name");
-
-      lua_pushinteger(L, c.type);
-      lua_setfield(L, -2, "type");
-
-      lua_pushinteger(L, c.out_path_len);
-      lua_setfield(L, -2, "path_len");
-
-      lua_pushinteger(L, c.last_advert_timestamp);
-      lua_setfield(L, -2, "last_seen");
-
-      lua_pushinteger(L, c.lastmod);
-      lua_setfield(L, -2, "lastmod");
-
-      char hex[PUB_KEY_SIZE * 2 + 1];
-      mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
-      lua_pushstring(L, hex);
-      lua_setfield(L, -2, "pubkey");
-
-      lua_pushstring(L, the_mesh->getTypeName(c.type));
-      lua_setfield(L, -2, "type_name");
-
-      lua_pushboolean(L, (c.flags & 0x01) != 0);
-      lua_setfield(L, -2, "favorite");
-
-      // out_path as array of hex hashes
-      {
-        uint8_t hash_size = (c.out_path_len >> 6) + 1;
-        uint8_t hash_count = c.out_path_len & 63;
-        lua_newtable(L);
-        char h[7];
-        for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
-          mesh::Utils::toHex(h, &c.out_path[j * hash_size], hash_size);
-          lua_pushstring(L, h);
-          lua_rawseti(L, -2, j + 1);
+      ContactInfo c;
+      int idx = 1;
+      for (int i = 0; i < the_mesh->getNumContacts(); i++) {
+        if (the_mesh->getContactByIdx(i, c)) {
+          push_contact_table(L, c, false);
+          lua_rawseti(L, -2, idx++);
         }
-        lua_setfield(L, -2, "path");
       }
 
-      lua_pushnumber(L, c.gps_lat / 1000000.0);
-      lua_setfield(L, -2, "lat");
-      lua_pushnumber(L, c.gps_lon / 1000000.0);
-      lua_setfield(L, -2, "lon");
-
-      lua_rawseti(L, -2, idx++);
+      if (s_contacts_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, s_contacts_ref);
+      }
+      s_contacts_count = idx - 1;
+      s_contacts_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // pops the master
+      s_contacts_gen = gen;
+      s_contacts_built_ms = millis();
     }
+    ref = s_contacts_ref;
+    count = s_contacts_count;
+  } else {
+    uint32_t gen = the_mesh->contacts_generation;
+    uint32_t agen = the_mesh->archive_generation;
+    bool fresh = (s_union_ref != LUA_NOREF) && (gen == s_union_gen) &&
+                 (agen == s_union_arch_gen) &&
+                 (millis() - s_union_built_ms < 10000);
+    if (!fresh) {
+      the_mesh->ensureArchiveLoaded();
+      lua_newtable(L);
+
+      ContactInfo c;
+      int idx = 1;
+      for (int i = 0; i < the_mesh->getNumContacts(); i++) {
+        if (the_mesh->getContactByIdx(i, c)) {
+          push_contact_table(L, c, false);
+          lua_rawseti(L, -2, idx++);
+        }
+      }
+      // Archived entries not currently live (live wins by pubkey — also
+      // self-heals entries left behind when a contact re-adverted back in).
+      for (int i = 0; i < the_mesh->num_archived; i++) {
+        if (!the_mesh->lookupContactByPubKey(the_mesh->archived[i].id.pub_key,
+                                             PUB_KEY_SIZE)) {
+          push_contact_table(L, the_mesh->archived[i], true);
+          lua_rawseti(L, -2, idx++);
+        }
+      }
+
+      if (s_union_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, s_union_ref);
+      }
+      s_union_count = idx - 1;
+      s_union_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // pops the master
+      s_union_gen = gen;
+      s_union_arch_gen = agen;
+      s_union_built_ms = millis();
+    }
+    ref = s_union_ref;
+    count = s_union_count;
   }
   MESH_UNLOCK();
 
+  // Hand out a fresh outer array sharing the cached per-contact tables.
+  lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+  lua_createtable(L, count, 0);
+  for (int i = 1; i <= count; i++) {
+    lua_rawgeti(L, -2, i);
+    lua_rawseti(L, -2, i);
+  }
+  lua_remove(L, -2);  // drop the master, leave the copy
+  return 1;
+}
+
+// _mesh_readd_contact(pubkey_hex) -> bool
+// Move an archived contact back into the live mesh table (route reset to
+// flood; it re-establishes on the next path exchange).
+static int lua_mesh_readd_contact(lua_State *L) {
+  const char *pubkey_hex = luaL_checkstring(L, 1);
+
+  uint8_t pub_key[PUB_KEY_SIZE];
+  if (strlen(pubkey_hex) < PUB_KEY_SIZE * 2 ||
+      !mesh::Utils::fromHex(pub_key, PUB_KEY_SIZE, pubkey_hex)) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  MESH_LOCK();
+  bool ok = the_mesh->readdArchivedContact(pub_key);
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, ok ? 1 : 0);
   return 1;
 }
 
@@ -2277,6 +2519,8 @@ static int lua_mesh_remove_contact(lua_State *L) {
     return 2;
   }
 
+  // Preserve in the archive before removal so it can be re-added later
+  the_mesh->archiveContact(*c);
   bool ok = the_mesh->removeContact(*c);
   if (ok) the_mesh->saveContacts();
   MESH_UNLOCK();
@@ -2944,15 +3188,40 @@ static int lua_file_exists_sd(lua_State *L) {
 static uint16_t *s_rgb565_buf = nullptr;
 static const uint32_t RGB565_BUF_SIZE = 256 * 256 * 2;  // 131072 bytes
 
-// _png_to_bin(src_path, dst_path) -> bool
-// Decodes a PNG and writes an LVGL RGB565 .bin file.
-// Paths use S:/L: prefix convention (meshpunk_fs).
-static int lua_png_to_bin(lua_State *L) {
-  const char *src_path = luaL_checkstring(L, 1);
-  const char *dst_path = luaL_checkstring(L, 2);
+// Serializes conversions: the Core-1 fetch worker and the legacy _png_to_bin
+// Lua binding (Core 0) share s_rgb565_buf. Created from the Lua thread before
+// the worker can exist, so creation never races.
+static SemaphoreHandle_t s_convert_mutex = nullptr;
+static void ensure_convert_mutex() {
+  if (!s_convert_mutex) s_convert_mutex = xSemaphoreCreateMutex();
+}
+struct ConvertLock {
+  explicit ConvertLock(SemaphoreHandle_t m) : m_(m) {
+    if (m_) xSemaphoreTake(m_, portMAX_DELAY);
+  }
+  ~ConvertLock() {
+    if (m_) xSemaphoreGive(m_);
+  }
+  SemaphoreHandle_t m_;
+};
 
-  Serial.printf("[png2bin] src=%s dst=%s psram_free=%u largest=%u\n",
-                src_path, dst_path,
+// Core PNG -> .bin conversion: decode a PNG from memory, pack native
+// little-endian RGB565, write dst_path atomically. Shared by _png_to_bin
+// (file source, LVGL thread) and the Core-1 tile fetch worker (network
+// source). Does NOT free png_data — the caller owns it.
+// Returns nullptr on success, else a stage string:
+//   "frag"   PSRAM too fragmented to decode. The caller may drop the LVGL
+//            image cache *on the LVGL thread* and retry once.
+//   "oom" | "decode" | "sd"
+// allow_lvgl_cache_drop: pass true only on the LVGL thread —
+// lv_image_cache_drop() is not thread-safe and must never run on Core 1.
+static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
+                                  const char *dst_path,
+                                  bool allow_lvgl_cache_drop) {
+  ConvertLock lock(s_convert_mutex);
+
+  Serial.printf("[png2bin] dst=%s psram_free=%u largest=%u\n",
+                dst_path,
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 
@@ -2962,8 +3231,7 @@ static int lua_png_to_bin(lua_State *L) {
                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_rgb565_buf) {
       Serial.println("[png2bin] FAIL: initial rgb565 buffer alloc");
-      lua_pushboolean(L, 0);
-      return 1;
+      return "oom";
     }
   }
 
@@ -2972,16 +3240,7 @@ static int lua_png_to_bin(lua_State *L) {
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
   if (largest < 512 * 1024) {
     Serial.printf("[png2bin] SKIP: PSRAM fragmented (largest=%u)\n", (unsigned)largest);
-    lua_pushboolean(L, 0);
-    return 1;
-  }
-
-  uint32_t png_size = 0;
-  void *png_data = meshpunk_read_all(src_path, &png_size, false);
-  if (!png_data) {
-    Serial.println("[png2bin] FAIL: meshpunk_read_all returned NULL");
-    lua_pushboolean(L, 0);
-    return 1;
+    return "frag";
   }
 
   // IMPORTANT: this is LVGL's *patched* lodepng. lodepng_decode32() does NOT
@@ -2992,7 +3251,7 @@ static int lua_png_to_bin(lua_State *L) {
   lv_draw_buf_t *decoded = nullptr;
   unsigned w = 0, h = 0;
   unsigned err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
-                                  (const unsigned char *)png_data, png_size);
+                                  png_data, png_size);
 
   // err 83 = lodepng alloc failure. The decode briefly needs a ~256KB (ARGB8888)
   // plus ~192KB (scanline) contiguous block. If the RGB565 tile cache has
@@ -3001,21 +3260,27 @@ static int lua_png_to_bin(lua_State *L) {
   // tiles transparently re-load from their .bin). The Map app also proactively
   // evicts off-screen / old-zoom tiles, so this should rarely fire.
   if (err == 83 && !decoded) {
-    Serial.printf("[png2bin] err=83 frag fallback: drop cache (largest=%u)\n",
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    lv_image_cache_drop(NULL);
-    err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
-                           (const unsigned char *)png_data, png_size);
+    if (allow_lvgl_cache_drop) {
+      Serial.printf("[png2bin] err=83 frag fallback: drop cache (largest=%u)\n",
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+      lv_image_cache_drop(NULL);
+      err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
+                             png_data, png_size);
+    } else {
+      // Can't touch the LVGL cache from this thread — report frag so the
+      // caller drops it on the LVGL thread and retries the tile.
+      Serial.printf("[png2bin] err=83 on worker (largest=%u)\n",
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+      return "frag";
+    }
   }
 
-  heap_caps_free(png_data);
   if (err || !decoded) {
     Serial.printf("[png2bin] FAIL: lodepng err=%u decoded=%p psram_free=%u\n",
                   err, (void *)decoded,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     if (decoded) lv_draw_buf_destroy(decoded);
-    lua_pushboolean(L, 0);
-    return 1;
+    return "decode";
   }
   Serial.printf("[png2bin] decoded %ux%u\n", w, h);
 
@@ -3028,8 +3293,7 @@ static int lua_png_to_bin(lua_State *L) {
   if (!argb) {
     Serial.println("[png2bin] FAIL: decoded->data is NULL");
     lv_draw_buf_destroy(decoded);
-    lua_pushboolean(L, 0);
-    return 1;
+    return "decode";
   }
 
   uint32_t pixel_count = (uint32_t)w * h;
@@ -3039,8 +3303,7 @@ static int lua_png_to_bin(lua_State *L) {
   if (data_size > RGB565_BUF_SIZE) {
     Serial.printf("[png2bin] FAIL: tile %ux%u exceeds buffer\n", w, h);
     lv_draw_buf_destroy(decoded);
-    lua_pushboolean(L, 0);
-    return 1;
+    return "decode";
   }
 
   uint16_t *rgb565 = s_rgb565_buf;  // reuse persistent buffer
@@ -3069,44 +3332,328 @@ static int lua_png_to_bin(lua_State *L) {
   char tmp_path[256];
   snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dst_path);
 
-  MeshpunkFile mf = meshpunk_open(tmp_path, "w", false);
-  if (!mf.valid) {
-    Serial.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
-    lua_pushboolean(L, 0);
-    return 1;
-  }
+  const char *tmp_sd = (strncmp(tmp_path, "S:", 2) == 0) ? tmp_path + 2 : nullptr;
+  const char *dst_sd = (strncmp(dst_path, "S:", 2) == 0) ? dst_path + 2 : nullptr;
 
-  size_t hw = mf.file.write((const uint8_t *)&hdr, sizeof(hdr));
-  size_t dw = mf.file.write((const uint8_t *)rgb565, data_size);
-  meshpunk_close(mf);
-
-  // Strip S: prefix for raw SD API calls
-  const char *tmp_sd = (strncmp(tmp_path, "S:", 2) == 0) ? tmp_path + 2 : tmp_path;
-  const char *dst_sd = (strncmp(dst_path, "S:", 2) == 0) ? dst_path + 2 : dst_path;
-
-  if (hw != sizeof(hdr) || dw != data_size) {
-    Serial.printf("[png2bin] FAIL: short write hdr=%u/%u data=%u/%u\n",
-                  (unsigned)hw, (unsigned)sizeof(hdr), (unsigned)dw, (unsigned)data_size);
+  if (tmp_sd && dst_sd) {
+    // SD target: write in bounded chunks, releasing the shared SPI mutex
+    // between them, so the 131KB write never blocks the display flush or the
+    // radio for more than one chunk (~25ms at 40MHz).
     sd_spi_take();
-    SD.remove(tmp_sd);
+    File f = SD.open(tmp_sd, FILE_WRITE);
     sd_spi_release();
+    if (!f) {
+      Serial.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
+      return "sd";
+    }
+
+    sd_spi_take();
+    bool wok = f.write((const uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr);
+    sd_spi_release();
+
+    const uint8_t *src = (const uint8_t *)rgb565;
+    const uint32_t CHUNK = 32 * 1024;
+    for (uint32_t off = 0; wok && off < data_size; off += CHUNK) {
+      uint32_t n = (data_size - off < CHUNK) ? (data_size - off) : CHUNK;
+      sd_spi_take();
+      wok = f.write(src + off, n) == n;
+      sd_spi_release();
+    }
+
+    sd_spi_take();
+    f.close();
+    if (!wok) SD.remove(tmp_sd);
+    bool renamed = wok && SD.rename(tmp_sd, dst_sd);
+    sd_spi_release();
+
+    if (!wok) {
+      Serial.printf("[png2bin] FAIL: short write %s\n", tmp_path);
+      return "sd";
+    }
+    if (!renamed) {
+      Serial.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_sd, dst_sd);
+      return "sd";
+    }
+  } else {
+    // LittleFS target (L:) — internal flash, no SPI-bus contention.
+    MeshpunkFile mf = meshpunk_open(tmp_path, "w", false);
+    if (!mf.valid) {
+      Serial.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
+      return "sd";
+    }
+    size_t hw = mf.file.write((const uint8_t *)&hdr, sizeof(hdr));
+    size_t dw = mf.file.write((const uint8_t *)rgb565, data_size);
+    meshpunk_close(mf);
+
+    const char *tmp_l = (tmp_path[1] == ':') ? tmp_path + 2 : tmp_path;
+    const char *dst_l = (dst_path[1] == ':') ? dst_path + 2 : dst_path;
+    if (hw != sizeof(hdr) || dw != data_size) {
+      Serial.printf("[png2bin] FAIL: short write hdr=%u/%u data=%u/%u\n",
+                    (unsigned)hw, (unsigned)sizeof(hdr), (unsigned)dw, (unsigned)data_size);
+      LittleFS.remove(tmp_l);
+      return "sd";
+    }
+    if (!LittleFS.rename(tmp_l, dst_l)) {
+      Serial.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_l, dst_l);
+      return "sd";
+    }
+  }
+
+  return nullptr;
+}
+
+// _png_to_bin(src_path, dst_path) -> bool
+// Decodes a PNG file and writes an LVGL RGB565 .bin file.
+// Paths use S:/L: prefix convention (meshpunk_fs).
+// On success the source PNG is deleted — the .bin fully replaces it.
+static int lua_png_to_bin(lua_State *L) {
+  const char *src_path = luaL_checkstring(L, 1);
+  const char *dst_path = luaL_checkstring(L, 2);
+
+  ensure_convert_mutex();
+
+  uint32_t png_size = 0;
+  void *png_data = meshpunk_read_all(src_path, &png_size, false);
+  if (!png_data) {
+    Serial.println("[png2bin] FAIL: meshpunk_read_all returned NULL");
     lua_pushboolean(L, 0);
     return 1;
   }
 
-  // Rename .tmp -> final .bin
-  sd_spi_take();
-  bool renamed = SD.rename(tmp_sd, dst_sd);
-  sd_spi_release();
+  // Runs on the LVGL thread, so the cache-drop fallback is allowed.
+  bool ok = png_buf_to_bin((const uint8_t *)png_data, png_size, dst_path,
+                           true) == nullptr;
+  heap_caps_free(png_data);
 
-  if (!renamed) {
-    Serial.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_sd, dst_sd);
-    lua_pushboolean(L, 0);
-    return 1;
+  if (ok) {
+    // Conversion landed — the source PNG is dead weight now, so consume it.
+    if ((src_path[0] == 'S' || src_path[0] == 's') && src_path[1] == ':') {
+      sd_spi_take();
+      SD.remove(src_path + 2);
+      sd_spi_release();
+    } else if ((src_path[0] == 'L' || src_path[0] == 'l') && src_path[1] == ':') {
+      LittleFS.remove(src_path + 2);
+    }
   }
 
-  lua_pushboolean(L, 1);
+  lua_pushboolean(L, ok ? 1 : 0);
   return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Core-1 tile fetch worker
+// ---------------------------------------------------------------------------
+// The whole download→decode→convert→write pipeline runs on a Core-1 task so
+// the LVGL/Lua thread never blocks on the network. Lua submits requests with
+// _tile_fetch_start() and collects results with _tile_fetch_poll().
+
+// Persistent download buffer (PSRAM, allocated once, Core-1 only). OSM
+// raster tiles run 10-40KB typical, ~100KB worst-case urban — 256KB clears
+// any real tile and is small next to the 8MB pool.
+static uint8_t *s_tile_png_buf = nullptr;
+static const uint32_t TILE_PNG_BUF_SIZE = 256 * 1024;
+
+// Worker-owned keep-alive client (never share an HTTPClient across cores —
+// _wifi_download_file's client stays on Core 0). Closed after 10s of queue
+// idle to free the TLS buffers (~45KB internal RAM).
+static HTTPClient *s_tile_http = nullptr;
+
+static void tile_http_close() {
+  if (!s_tile_http) return;
+  s_tile_http->setReuse(false);
+  s_tile_http->end();
+  delete s_tile_http;
+  s_tile_http = nullptr;
+}
+
+static bool tile_http_open(const char *url) {
+  if (!s_tile_http) {
+    s_tile_http = new HTTPClient();
+    s_tile_http->setUserAgent("meshpunk/1.0");
+    s_tile_http->setReuse(true);
+  }
+  return s_tile_http->begin(url);
+}
+
+// Runs on the worker task. Returns nullptr on success or a stage string:
+// "wifi" | "http" | "truncated" (network — count toward connection-loss
+// detection) or "size" | "oom" | "frag" | "decode" | "sd" (local).
+static const char *do_tile_fetch(const char *url, const char *bin_path) {
+  if (WiFi.status() != WL_CONNECTED) {
+    tile_http_close();
+    return "wifi";
+  }
+
+  if (!s_tile_png_buf) {
+    s_tile_png_buf = (uint8_t *)heap_caps_malloc(TILE_PNG_BUF_SIZE,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_tile_png_buf) return "oom";
+  }
+
+  if (!tile_http_open(url)) {
+    tile_http_close();
+    return "http";
+  }
+
+  int httpCode = s_tile_http->GET();
+
+  // Negative code on a kept-alive client usually means the server closed the
+  // idle socket — rebuild the connection and retry once.
+  if (httpCode < 0) {
+    tile_http_close();
+    if (tile_http_open(url)) {
+      httpCode = s_tile_http->GET();
+    }
+  }
+
+  if (httpCode != 200) {
+    s_tile_http->end();
+    return "http";
+  }
+
+  int len = s_tile_http->getSize();
+  if (len > (int)TILE_PNG_BUF_SIZE) {
+    tile_http_close();  // body left unread — framing is unusable
+    return "size";
+  }
+
+  WiFiClient *stream = s_tile_http->getStreamPtr();
+  uint32_t total = 0;
+  uint32_t deadline = millis() + 20000;  // hard stop for stalled transfers
+  while (len > 0 || len == -1) {
+    if ((int32_t)(millis() - deadline) >= 0) break;
+    int avail = stream->available();
+    if (avail <= 0) {
+      if (!s_tile_http->connected()) break;
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+    uint32_t space = TILE_PNG_BUF_SIZE - total;
+    if (space == 0) break;  // length-less response outgrew the buffer
+    int toRead = (avail < (int)space) ? avail : (int)space;
+    int rd = stream->readBytes(s_tile_png_buf + total, toRead);
+    if (rd <= 0) break;
+    total += rd;
+    if (len > 0) len -= rd;
+  }
+
+  if (len > 0) {
+    // Short read: deadline hit or connection lost mid-body — the keep-alive
+    // framing is unusable, drop the socket.
+    tile_http_close();
+    return "truncated";
+  }
+
+  if (len == -1) {
+    // No Content-Length: body was read until close/stall, so this connection
+    // can't be trusted for another request.
+    tile_http_close();
+  } else {
+    s_tile_http->end();  // keeps the socket alive when the server allows reuse
+  }
+
+  if (total == 0) return "http";
+
+  // Never allow the LVGL cache drop from this thread; on "frag" the Lua side
+  // drops the cache on the LVGL thread and retries.
+  return png_buf_to_bin(s_tile_png_buf, total, bin_path, false);
+}
+
+struct TileFetchReq {
+  char url[128];
+  char bin_path[112];
+  char key[32];
+};
+
+struct TileFetchRes {
+  char key[32];
+  bool ok;
+  char stage[12];
+};
+
+static QueueHandle_t s_tile_req_q = nullptr;
+static QueueHandle_t s_tile_res_q = nullptr;
+static TaskHandle_t s_tile_task_handle = nullptr;
+
+static void tile_fetch_task(void *param) {
+  Serial.printf("[TASK] tile_fetch starting on core=%d\n", xPortGetCoreID());
+  for (;;) {
+    TileFetchReq req;
+    if (xQueueReceive(s_tile_req_q, &req, pdMS_TO_TICKS(10000)) != pdTRUE) {
+      // 10s with no work — drop the keep-alive socket (frees the TLS
+      // buffers), then block indefinitely until the next request.
+      tile_http_close();
+      xQueueReceive(s_tile_req_q, &req, portMAX_DELAY);
+    }
+
+    TileFetchRes res;
+    memset(&res, 0, sizeof(res));
+    strlcpy(res.key, req.key, sizeof(res.key));
+    const char *stage = do_tile_fetch(req.url, req.bin_path);
+    res.ok = (stage == nullptr);
+    if (stage) strlcpy(res.stage, stage, sizeof(res.stage));
+
+    // Result queue (8) is deeper than request queue (4) + 1 in flight, and
+    // the Map app polls every tick — this never blocks in practice.
+    xQueueSend(s_tile_res_q, &res, portMAX_DELAY);
+  }
+}
+
+// _tile_fetch_start(url, bin_path, key) -> bool
+// Queue a tile for the Core-1 fetch worker. Returns false when the worker
+// queue is full — keep the item and retry on a later tick. Results are
+// collected with _tile_fetch_poll(), matched by key.
+static int lua_tile_fetch_start(lua_State *L) {
+  const char *url = luaL_checkstring(L, 1);
+  const char *bin_path = luaL_checkstring(L, 2);
+  const char *key = luaL_checkstring(L, 3);
+
+  // Lua thread only — safe to create everything lazily here, and the convert
+  // mutex must exist before the worker can race the legacy _png_to_bin.
+  ensure_convert_mutex();
+  if (!s_tile_req_q) {
+    s_tile_req_q = xQueueCreate(4, sizeof(TileFetchReq));
+    s_tile_res_q = xQueueCreate(8, sizeof(TileFetchRes));
+  }
+  if (!s_tile_task_handle) {
+    // Priority 1: below mesh_task (2) so radio servicing always preempts
+    // TLS/decode work; same tier as gps_task. 16KB stack — the TLS
+    // handshake is the deep part.
+    xTaskCreatePinnedToCore(tile_fetch_task, "tile_fetch", 16 * 1024,
+                            nullptr, 1, &s_tile_task_handle, 1);
+  }
+
+  TileFetchReq req;
+  memset(&req, 0, sizeof(req));
+  if (strlen(url) >= sizeof(req.url) || strlen(bin_path) >= sizeof(req.bin_path)
+      || strlen(key) >= sizeof(req.key)) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  strlcpy(req.url, url, sizeof(req.url));
+  strlcpy(req.bin_path, bin_path, sizeof(req.bin_path));
+  strlcpy(req.key, key, sizeof(req.key));
+
+  lua_pushboolean(L, xQueueSend(s_tile_req_q, &req, 0) == pdTRUE ? 1 : 0);
+  return 1;
+}
+
+// _tile_fetch_poll() -> key, ok, stage | nil
+// Pop one completed fetch; call in a loop until nil. stage is "" on success.
+static int lua_tile_fetch_poll(lua_State *L) {
+  if (!s_tile_res_q) {
+    lua_pushnil(L);
+    return 1;
+  }
+  TileFetchRes res;
+  if (xQueueReceive(s_tile_res_q, &res, 0) != pdTRUE) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_pushstring(L, res.key);
+  lua_pushboolean(L, res.ok ? 1 : 0);
+  lua_pushstring(L, res.stage);
+  return 3;
 }
 
 // _lvgl_image_cache_drop([src]) -> nil
@@ -3226,6 +3773,7 @@ void setupLuaVGL() {
   lua_register(L, "_wifi_disconnect", lua_wifi_disconnect);
   lua_register(L, "_wifi_fetch", lua_wifi_fetch);
   lua_register(L, "_wifi_download_file", lua_wifi_download_file);
+  lua_register(L, "_wifi_download_end", lua_wifi_download_end);
   lua_register(L, "_wifi_scan_start", lua_wifi_scan_start);
   lua_register(L, "_wifi_scan_results", lua_wifi_scan_results);
   lua_register(L, "_wifi_get_enabled", lua_wifi_get_enabled);
@@ -3249,6 +3797,7 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_set_channel", lua_mesh_set_channel);
   lua_register(L, "_mesh_send_channel", lua_mesh_send_channel);
   lua_register(L, "_mesh_remove_contact", lua_mesh_remove_contact);
+  lua_register(L, "_mesh_readd_contact", lua_mesh_readd_contact);
   lua_register(L, "_mesh_clear_contacts", lua_mesh_clear_contacts);
   lua_register(L, "_mesh_reset_path", lua_mesh_reset_path);
   lua_register(L, "_mesh_export_contact", lua_mesh_export_contact);
@@ -3603,6 +4152,19 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // Sym key behavior: false = hold modifier (default), true = tap toggles
+  // the symbol layer (hold still works as momentary). Persisted.
+  lua_register(L, "_kb_sym_toggle_set", [](lua_State* L) -> int {
+    kb_sym_toggle_pref = lua_toboolean(L, 1);
+    if (!kb_sym_toggle_pref) kb_sym_latched = false;
+    firmware_prefs_save();
+    return 0;
+  });
+  lua_register(L, "_kb_sym_toggle_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, kb_sym_toggle_pref ? 1 : 0);
+    return 1;
+  });
+
   // Register gridnav bridge
   // Usage: _gridnav_add(obj, flags)
   //   flags: 0=none, 1=rollover, 2=scroll_first
@@ -3786,6 +4348,8 @@ void setupLuaVGL() {
   lua_register(L, "_file_exists_sd", lua_file_exists_sd);
   lua_register(L, "_mkdir_sd", lua_mkdir_sd);
   lua_register(L, "_png_to_bin", lua_png_to_bin);
+  lua_register(L, "_tile_fetch_start", lua_tile_fetch_start);
+  lua_register(L, "_tile_fetch_poll", lua_tile_fetch_poll);
   lua_register(L, "_lvgl_image_cache_drop", lua_lvgl_image_cache_drop);
   lua_register(L, "_dofile_sd", lua_dofile_sd);
   lua_register(L, "_list_all", lua_list_all);
@@ -4111,8 +4675,22 @@ void setup() {
   // Initialize SD card for persistent mesh data (survives LittleFS reflash)
   Serial.println("===== SD CARD INIT =====");
 
-  if (SD.begin(BOARD_SDCARD_CS, SPI)) {
-    sd_mounted = true;
+  // The SPI bus is shared with the TFT (80 MHz) and SX1262, but every device
+  // sets its own per-transaction SPISettings, so this clock only applies to SD
+  // transfers. 40 MHz cuts a 131KB map-tile read from ~400ms (4 MHz Arduino
+  // default) to ~50ms. Probe descending; 4 MHz floor = old behavior.
+  static const uint32_t sd_freqs[] = {40000000U, 25000000U, 4000000U};
+  for (uint32_t freq : sd_freqs) {
+    if (SD.begin(BOARD_SDCARD_CS, SPI, freq)) {
+      sd_mounted = true;
+      Serial.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
+      break;
+    }
+    SD.end();
+    Serial.printf("[SD] Mount failed at %lu Hz\n", (unsigned long)freq);
+  }
+
+  if (sd_mounted) {
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("[SD] Card mounted, size: %llu MB\n", cardSize);
 

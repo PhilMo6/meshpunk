@@ -1,4 +1,5 @@
 local lvgl = require("lvgl")
+local messages = require("lib/mesh/messages")
 
 print("[Map] starting")
 
@@ -22,6 +23,33 @@ local AREA_PRESETS = {
 local app_dir = ...
 
 -- ---------------------------------------------------------------------------
+-- Map preferences (LittleFS so they survive without an SD card)
+-- ---------------------------------------------------------------------------
+local PREFS_PATH = "L:/map_prefs"
+
+-- Prefs file: key=value lines (anim=0/1, arch=0/1)
+local function load_map_prefs()
+    local prefs = { anim = true, archived = false }
+    local f = io.open(PREFS_PATH, "r")
+    if not f then return prefs end
+    local txt = f:read("*a") or ""
+    f:close()
+    if string.find(txt, "anim=0", 1, true) then prefs.anim = false end
+    if string.find(txt, "arch=1", 1, true) then prefs.archived = true end
+    return prefs
+end
+
+local function save_map_prefs(anim_on, archived_on)
+    local f = io.open(PREFS_PATH, "w")
+    if not f then return end
+    f:write((anim_on and "anim=1" or "anim=0") .. "\n" ..
+            (archived_on and "arch=1" or "arch=0"))
+    f:close()
+end
+
+local map_prefs = load_map_prefs()
+
+-- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
 local map = {
@@ -30,7 +58,6 @@ local map = {
     cx = 0, cy = 0,
     timers = {},
     download_queue = {},
-    downloading = false,
     tooltip = nil,
     drag = nil,
     vx = 0, vy = 0,
@@ -39,7 +66,6 @@ local map = {
     base_tx = nil,
     base_ty = nil,
     canvas_zoom = nil,
-    pending_display = false,  -- visible tiles converted, awaiting batch display
     sd_ok = false,
     wifi_ok = false,
 }
@@ -68,9 +94,6 @@ end
 -- ---------------------------------------------------------------------------
 local bin_cache = {}  -- in-memory set of tiles known to have .bin on SD
 local loaded_srcs = {}  -- src paths currently decoded in the LVGL image cache
-local function tile_sd_path(z, tx, ty)
-    return CACHE_ROOT .. "/" .. z .. "/" .. tx .. "/" .. ty .. ".png"
-end
 
 local function tile_bin_path(z, tx, ty)
     return CACHE_ROOT .. "/" .. z .. "/" .. tx .. "/" .. ty .. ".bin"
@@ -83,7 +106,7 @@ end
 local function tile_cached(z, tx, ty)
     local key = z .. "/" .. tx .. "/" .. ty
     if bin_cache[key] ~= nil then return bin_cache[key] end
-    -- _png_to_bin uses atomic write (.tmp → .bin rename), so any .bin
+    -- Tile conversion uses atomic write (.tmp → .bin rename), so any .bin
     -- that exists on SD is guaranteed complete. Simple existence check.
     local ok, exists = pcall(_file_exists_sd, tile_bin_path(z, tx, ty))
     if ok and exists then
@@ -119,19 +142,41 @@ local function enqueue_download(z, tx, ty, visible)
     table.insert(map.download_queue, { z = z, tx = tx, ty = ty, key = key, visible = visible })
 end
 
--- True if any queued tile is needed in the current on-screen grid.
--- Display is deferred until none remain, so the transient 256KB RGBA decode
--- buffers never interleave with the permanent 131KB tile cache entries
--- (that interleaving fragments PSRAM and breaks lodepng decoding).
-local function any_visible_pending()
-    for _, q in ipairs(map.download_queue) do
-        if q.visible then return true end
-    end
-    return false
-end
-
 local tile_imgs = {}  -- forward-declare; populated in UI setup
 local tile_srcs = {}  -- current source path per widget (avoids redundant set_src)
+-- Cached margin tiles (in the 4x4 grid but off-screen) waiting to be loaded.
+-- Visible tiles load immediately in refresh_tiles; these trickle in via
+-- dl_timer (1-2 per tick) so each ~50ms SD read never stalls a pan frame.
+local margin_pending = {}
+-- Tile fetches running on the Core-1 worker (_tile_fetch_start/_tile_fetch_poll).
+-- pending_fetches[key] = { kind = "map"|"pc", z, tx, ty, retried }
+local pending_fetches = {}
+local map_inflight = 0        -- worker fetches owned by the map view
+local fetch_outstanding = 0   -- total worker fetches in flight (map + precache)
+local poll_fetch_results      -- forward-declare; defined after pre-cache helpers
+
+-- Packet path animation layer state. Each queue entry is a waypoint list
+-- (lat/lon, travel order: sender -> repeaters -> us) built when a channel
+-- message arrives; one animation plays at a time.
+local anim = {
+    enabled = map_prefs.anim,
+    queue = {},
+    active = nil,
+}
+
+-- Include archived contacts (evicted from / removed out of the live mesh
+-- table) in markers, tap targets and path resolution. Settings toggle.
+local show_archived = map_prefs.archived
+
+-- Own position: GPS fix first, node prefs as fallback. nil when unknown.
+local function own_position()
+    local gps_ok, _, _, gps_has_loc, gps_lat, gps_lon = pcall(_gps_info)
+    local prefs = _mesh_get_node_info()
+    local lat = (gps_ok and gps_has_loc and gps_lat) or (prefs and prefs.lat) or 0
+    local lon = (gps_ok and gps_has_loc and gps_lon) or (prefs and prefs.lon) or 0
+    if lat == 0 and lon == 0 then return nil end
+    return lat, lon
+end
 local update_dl_status  -- forward-declare; defined after UI setup
 local update_wifi_status  -- forward-declare; defined after UI setup
 local show_precache_screen  -- forward-declare; defined after UI setup
@@ -159,37 +204,40 @@ local function set_tile_widget(idx, z, tx, ty)
     return false
 end
 
-local function process_download_queue()
-    if not map.wifi_ok then return end
-    if map.downloading then return end
-    if #map.download_queue == 0 then return end
-    local item = table.remove(map.download_queue, 1)
-    if tile_cached(item.z, item.tx, item.ty) then
-        if item.visible and map.canvas_zoom == item.z and map.base_tx then
-            local c = item.tx - map.base_tx
-            local r = item.ty - map.base_ty
-            if c >= 0 and c < GRID and r >= 0 and r < GRID then
-                set_tile_widget(r * GRID + c + 1, item.z, item.tx, item.ty)
-            end
-        end
-        return
+-- Show a tile on its grid widget if it falls inside the current grid.
+local function show_tile_if_on_grid(z, tx, ty)
+    if map.canvas_zoom ~= z or not map.base_tx then return end
+    local c = tx - map.base_tx
+    local r = ty - map.base_ty
+    if c >= 0 and c < GRID and r >= 0 and r < GRID then
+        set_tile_widget(r * GRID + c + 1, z, tx, ty)
     end
-    map.downloading = true
-    ensure_tile_dirs(item.z, item.tx)
-    local url = TILE_URL .. "/" .. item.z .. "/" .. item.tx .. "/" .. item.ty .. ".png"
-    local path = "S:" .. tile_sd_path(item.z, item.tx, item.ty)
-    local result = _wifi_download_file(url, path)
-    map.downloading = false
-    if result and result.success and result.size and result.size > 0 then
-        local bin_path = "S:" .. tile_bin_path(item.z, item.tx, item.ty)
-        if not _png_to_bin(path, bin_path) then return end
-        bin_cache[item.z .. "/" .. item.tx .. "/" .. item.ty] = true
-        if item.visible and map.canvas_zoom == item.z and map.base_tx then
-            local c = item.tx - map.base_tx
-            local r = item.ty - map.base_ty
-            if c >= 0 and c < GRID and r >= 0 and r < GRID then
-                set_tile_widget(r * GRID + c + 1, item.z, item.tx, item.ty)
+end
+
+-- Feed the Core-1 fetch worker from the view's download queue, keeping up to
+-- two requests in flight so the worker's keep-alive connection stays hot.
+-- Results come back through poll_fetch_results().
+local MAX_MAP_INFLIGHT = 2
+
+local function feed_tile_fetches()
+    if not map.wifi_ok then return end
+    while #map.download_queue > 0 and map_inflight < MAX_MAP_INFLIGHT do
+        local item = map.download_queue[1]
+        if tile_cached(item.z, item.tx, item.ty) then
+            table.remove(map.download_queue, 1)
+            show_tile_if_on_grid(item.z, item.tx, item.ty)
+        elseif pending_fetches[item.key] then
+            table.remove(map.download_queue, 1)  -- already in flight
+        else
+            ensure_tile_dirs(item.z, item.tx)
+            local url = TILE_URL .. "/" .. item.z .. "/" .. item.tx .. "/" .. item.ty .. ".png"
+            if not _tile_fetch_start(url, "S:" .. tile_bin_path(item.z, item.tx, item.ty), item.key) then
+                break  -- worker queue full — retry next tick
             end
+            pending_fetches[item.key] = { kind = "map", z = item.z, tx = item.tx, ty = item.ty }
+            map_inflight = map_inflight + 1
+            fetch_outstanding = fetch_outstanding + 1
+            table.remove(map.download_queue, 1)
         end
     end
 end
@@ -324,6 +372,18 @@ marker_canvas:fill_bg("#000000", 0)
 marker_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
 marker_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
 
+-- Moving packet dot for the path animation (above the marker canvas, below
+-- the HUD). One widget repositioned per tick — far cheaper than repainting
+-- the canvas every frame.
+local anim_dot = root:Object({
+    w = 10, h = 10, x = -20, y = -20,
+    bg_color = "#00e0ff", bg_opa = 255, radius = 5,
+    border_color = "#ffffff", border_width = 1,
+})
+anim_dot:add_flag(lvgl.FLAG.HIDDEN)
+anim_dot:clear_flag(lvgl.FLAG.CLICKABLE)
+anim_dot:clear_flag(lvgl.FLAG.SCROLLABLE)
+
 -- Status bar at top
 local status_bar = root:Object({
     w = W, h = 20, x = 0, y = 0,
@@ -376,11 +436,13 @@ pcall(_emoji_preload, 0x1F3E0)
 center_btn:Label({ text = "\xF0\x9F\x8F\xA0", align = lvgl.ALIGN.CENTER })
 center_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)
 
--- Pre-cache download button (bottom left, right of home/center buttons)
-local dl_btn = root:Button({ w = 36, h = 36, x = 50, y = H - 44 })
-dl_btn:Label({ text = "DL", align = lvgl.ALIGN.CENTER })
-dl_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)
-dl_btn:add_flag(lvgl.FLAG.HIDDEN)  -- shown when WiFi + SD are both OK
+-- Settings button (bottom left, right of home/center buttons). Always
+-- visible — tile pre-cache moved into the settings page, which validates
+-- SD/WiFi itself.
+local settings_btn = root:Button({ w = 36, h = 36, x = 50, y = H - 44 })
+pcall(_emoji_preload, 0x2699)
+settings_btn:Label({ text = "\xE2\x9A\x99", align = lvgl.ALIGN.CENTER })
+settings_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)
 
 -- Tooltip for marker info
 local tooltip = root:Object({
@@ -433,40 +495,15 @@ local function evict_offscreen_tiles()
     end
 end
 
--- Batch display pass: set every cached on-screen tile widget at once.
--- Called only when no visible tiles are pending conversion, so the run of
--- permanent 131KB cache allocations happens contiguously, not interleaved
--- with the transient 256KB conversion buffers.
-local function display_visible_tiles()
-    if not map.base_tx or not map.canvas_zoom then return end
-    local max_tile = 2 ^ map.canvas_zoom - 1
-    local shown = 0
-    for r = 0, GRID - 1 do
-        for c = 0, GRID - 1 do
-            local idx = r * GRID + c + 1
-            local tx = map.base_tx + c
-            local ty = map.base_ty + r
-            if tx >= 0 and ty >= 0 and tx <= max_tile and ty <= max_tile
-               and tile_cached(map.canvas_zoom, tx, ty) then
-                if set_tile_widget(idx, map.canvas_zoom, tx, ty) then
-                    shown = shown + 1
-                end
-            else
-                tile_imgs[idx]:add_flag(lvgl.FLAG.HIDDEN)
-                tile_srcs[idx] = nil
-            end
-        end
-    end
-end
-
 local redraw_markers   -- forward declaration (defined after refresh_tiles)
 local update_status    -- forward declaration (defined after refresh_tiles)
 
 local function refresh_tiles()
     if not map.running then return end
 
-    -- Discard stale download queue — only current view matters
+    -- Discard stale queues — only the current view matters
     map.download_queue = {}
+    margin_pending = {}
 
     local half_w = math.floor(W / 2)
     local half_h = math.floor(H / 2)
@@ -493,22 +530,35 @@ local function refresh_tiles()
 
     local max_tile = 2 ^ map.zoom - 1
 
-    -- Classify on-screen tiles: cached ones are flagged for the batch display
-    -- pass; uncached ones are queued (visible=true) so we know to wait for them
-    -- before displaying. Widgets keep their current content until the batch
-    -- pass to avoid flicker.
+    -- Visible-first: the viewport only ever intersects 3×2 of the 4×4 grid.
+    -- Slots actually on screen load immediately (≤6 SD reads, mostly LVGL
+    -- cache hits when panning); cached margin slots go to margin_pending and
+    -- trickle in via dl_timer so they're warm before they scroll on-screen.
+    -- A margin slot that already shows the right tile is kept as-is; one with
+    -- stale content is hidden so wrong imagery never slides into view.
     for r = 0, GRID - 1 do
         for c = 0, GRID - 1 do
             local idx = r * GRID + c + 1
             local tx = base_tx + c
             local ty = base_ty + r
             if tx >= 0 and ty >= 0 and tx <= max_tile and ty <= max_tile then
+                local sx = c * TILE_SIZE + off_x
+                local sy = r * TILE_SIZE + off_y
+                local on_screen = sx < W and sx + TILE_SIZE > 0
+                              and sy < H and sy + TILE_SIZE > 0
                 if tile_cached(map.zoom, tx, ty) then
-                    map.pending_display = true
+                    if on_screen or tile_srcs[idx] == tile_img_src(map.zoom, tx, ty) then
+                        set_tile_widget(idx, map.zoom, tx, ty)
+                    else
+                        tile_imgs[idx]:add_flag(lvgl.FLAG.HIDDEN)
+                        tile_srcs[idx] = nil
+                        margin_pending[#margin_pending + 1] =
+                            { idx = idx, z = map.zoom, tx = tx, ty = ty }
+                    end
                 else
                     tile_imgs[idx]:add_flag(lvgl.FLAG.HIDDEN)
                     tile_srcs[idx] = nil
-                    enqueue_download(map.zoom, tx, ty, true)
+                    enqueue_download(map.zoom, tx, ty, on_screen)
                 end
             else
                 tile_imgs[idx]:add_flag(lvgl.FLAG.HIDDEN)
@@ -546,14 +596,6 @@ local function refresh_tiles()
         return da < db
     end)
 
-    -- If every on-screen tile is already cached (e.g. revisiting an area or
-    -- scrolling within pre-fetched tiles), show them immediately in one batch.
-    -- Otherwise dl_timer runs the batch once the last visible tile converts.
-    if map.pending_display and not any_visible_pending() then
-        display_visible_tiles()
-        map.pending_display = false
-    end
-
     redraw_markers()
     update_status()
     update_dl_status()
@@ -562,6 +604,40 @@ end
 -- ---------------------------------------------------------------------------
 -- Markers (drawn onto canvas — 1 widget vs 262)
 -- ---------------------------------------------------------------------------
+
+-- Draw the active packet path polyline onto the marker canvas (canvas
+-- coordinates follow map.marker_ref_vl/vt, so canvas slides keep it aligned).
+-- Segments touching a synthesized waypoint (repeater with unknown position)
+-- are dashed; real repeater hops get a small node square.
+local function draw_active_path()
+    if not anim.active or not map.marker_ref_vl then return end
+    local pts = anim.active.points
+    local prev_x, prev_y, prev_real
+    for i, p in ipairs(pts) do
+        local wx, wy = lat_lon_to_world_px(p.lat, p.lon, map.zoom)
+        local cx = wx - map.marker_ref_vl + MARKER_PAD
+        local cy = wy - map.marker_ref_vt + MARKER_PAD
+        if prev_x then
+            local certain = p.real and prev_real
+            marker_canvas:draw_line({
+                p1 = { x = prev_x, y = prev_y },
+                p2 = { x = cx, y = cy },
+                color = "#00e0ff", width = 2, opa = 150,
+                dash_width = certain and 0 or 6,
+                dash_gap = certain and 0 or 5,
+                round_start = 1, round_end = 1,
+            })
+        end
+        if p.real and i > 1 and i < #pts then
+            marker_canvas:draw_rect({
+                x1 = cx - 3, y1 = cy - 3, x2 = cx + 2, y2 = cy + 2,
+                bg_color = "#00e0ff", bg_opa = 220, radius = 3,
+            })
+        end
+        prev_x, prev_y, prev_real = cx, cy, p.real
+    end
+end
+
 redraw_markers = function()
     if not map.running then return end
 
@@ -593,8 +669,8 @@ redraw_markers = function()
         })
     end
 
-    -- Contact markers
-    local ok, contacts = pcall(_mesh_get_contacts)
+    -- Contact markers (archived ones render gray)
+    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
     if ok and contacts then
         for _, c in ipairs(contacts) do
             if c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
@@ -604,12 +680,229 @@ redraw_markers = function()
                 if cx >= -4 and cx < MCANVAS_W + 4 and cy >= -4 and cy < MCANVAS_H + 4 then
                     marker_canvas:draw_rect({
                         x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
-                        bg_color = "#ff6644", bg_opa = 255, radius = 4,
+                        bg_color = c.archived and "#888888" or "#ff6644",
+                        bg_opa = 255, radius = 4,
                         border_color = "#ffffff", border_width = 1, border_opa = 255,
                     })
                 end
             end
         end
+    end
+
+    -- Active packet path (if an animation is playing)
+    draw_active_path()
+end
+
+-- ---------------------------------------------------------------------------
+-- Packet path animation — resolve & playback
+-- ---------------------------------------------------------------------------
+
+-- Squared distance in degrees, longitude weighted by latitude so ranking is
+-- roughly metric. Only used to compare candidates — units don't matter.
+local function geo_dist2(lat1, lon1, lat2, lon2)
+    local dlat = lat1 - lat2
+    local dlon = (lon1 - lon2) * math.cos(math.rad(lat1))
+    return dlat * dlat + dlon * dlon
+end
+
+-- Resolve a received channel message into animation waypoints.
+-- msg.path is in travel order (repeaters append their hash as they forward):
+-- path[1] = first repeater after the sender, path[#path] = last before us.
+--
+-- Rules:
+--  * hash matches one positioned contact          -> that position
+--  * hash matches several (collision)             -> the candidate nearest the
+--    midpoint of the previous position and the next known one; resolving
+--    left-to-right makes each pick the anchor for the following hop, which
+--    settles consecutive collisions
+--  * hash matches nothing (repeater not in contacts / no GPS) -> synthetic
+--    waypoint at the midpoint of the previous position and the next known one
+local function resolve_path_waypoints(msg)
+    local own_lat, own_lon = own_position()
+    if not own_lat then return nil end  -- no end point — nothing to animate to
+
+    -- Archived repeaters (when enabled) count as positioned candidates too —
+    -- a repeater the mesh evicted can still anchor a hop on the animation.
+    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
+    if not ok or not contacts then return nil end
+
+    -- Sender position (start point), matched by name
+    local start_lat, start_lon
+    for _, c in ipairs(contacts) do
+        if c.name == msg.from and c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
+            start_lat, start_lon = c.lat, c.lon
+            break
+        end
+    end
+
+    -- Candidate contacts per hop hash (positioned, repeaters preferred)
+    local hops = {}
+    local n = 0
+    for _, hash in ipairs(msg.path or {}) do
+        local hl = string.lower(hash)
+        local cands, reps = {}, {}
+        for _, c in ipairs(contacts) do
+            if c.pubkey and string.lower(string.sub(c.pubkey, 1, #hash)) == hl
+               and c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
+                cands[#cands + 1] = c
+                if c.type_name and string.find(string.lower(c.type_name), "repeater", 1, true) then
+                    reps[#reps + 1] = c
+                end
+            end
+        end
+        if #reps > 0 then cands = reps end
+        n = n + 1
+        hops[n] = { cands = cands }
+    end
+
+    -- Pass 1: unambiguous hops
+    for i = 1, n do
+        if #hops[i].cands == 1 then
+            local c = hops[i].cands[1]
+            hops[i].lat, hops[i].lon, hops[i].real = c.lat, c.lon, true
+        end
+    end
+
+    -- Next known position after hop i (resolved hop, else our own position)
+    local function next_anchor(i)
+        for j = i + 1, n do
+            if hops[j].lat then return hops[j].lat, hops[j].lon end
+        end
+        return own_lat, own_lon
+    end
+
+    -- Pass 2: collisions — nearest candidate to the prev/next midpoint
+    local prev_lat, prev_lon = start_lat, start_lon
+    for i = 1, n do
+        local h = hops[i]
+        if h.lat then
+            prev_lat, prev_lon = h.lat, h.lon
+        elseif #h.cands > 1 then
+            local na_lat, na_lon = next_anchor(i)
+            local ref_lat, ref_lon
+            if prev_lat then
+                ref_lat, ref_lon = (prev_lat + na_lat) / 2, (prev_lon + na_lon) / 2
+            else
+                ref_lat, ref_lon = na_lat, na_lon  -- no anchor before this hop yet
+            end
+            local best, best_d
+            for _, c in ipairs(h.cands) do
+                local d = geo_dist2(c.lat, c.lon, ref_lat, ref_lon)
+                if not best_d or d < best_d then best, best_d = c, d end
+            end
+            h.lat, h.lon, h.real = best.lat, best.lon, true
+            prev_lat, prev_lon = h.lat, h.lon
+        end
+    end
+
+    -- Pass 3: unknown repeaters — synthetic midpoint waypoints
+    prev_lat, prev_lon = start_lat, start_lon
+    for i = 1, n do
+        local h = hops[i]
+        if h.lat then
+            prev_lat, prev_lon = h.lat, h.lon
+        elseif prev_lat then
+            local na_lat, na_lon = next_anchor(i)
+            h.lat = (prev_lat + na_lat) / 2
+            h.lon = (prev_lon + na_lon) / 2
+            h.real = false
+            prev_lat, prev_lon = h.lat, h.lon
+        end
+        -- no previous anchor and unknown sender: hop stays unresolved (skipped)
+    end
+
+    -- Assemble: sender -> hops -> us. Need at least one segment.
+    local points = {}
+    if start_lat then
+        points[#points + 1] = { lat = start_lat, lon = start_lon, real = true }
+    end
+    for i = 1, n do
+        if hops[i].lat then
+            points[#points + 1] = { lat = hops[i].lat, lon = hops[i].lon, real = hops[i].real }
+        end
+    end
+    points[#points + 1] = { lat = own_lat, lon = own_lon, real = true }
+    if #points < 2 then return nil end
+    return points
+end
+
+-- Playback: the dot eases along each segment, dwells briefly on real
+-- repeater hops, then pulses out on arrival. Positions are recomputed from
+-- lat/lon every tick, so panning and zooming mid-animation stay glued.
+local ANIM_HOP_MS = 500
+local ANIM_PAUSE_MS = 180
+local ANIM_ARRIVE_MS = 350
+
+local function anim_world_to_screen(lat, lon)
+    local px, py = lat_lon_to_world_px(lat, lon, map.zoom)
+    return px - (map.cx - math.floor(W / 2)), py - (map.cy - math.floor(H / 2))
+end
+
+local function anim_place_dot(lat, lon, size)
+    size = size or 10
+    local sx, sy = anim_world_to_screen(lat, lon)
+    anim_dot:set({
+        w = size, h = size, radius = math.floor(size / 2),
+        x = sx - math.floor(size / 2), y = sy - math.floor(size / 2),
+    })
+end
+
+local function anim_stop()
+    anim.active = nil
+    anim_dot:add_flag(lvgl.FLAG.HIDDEN)
+    anim_dot:set({ w = 10, h = 10, radius = 5, bg_opa = 255 })
+    redraw_markers()  -- wipes the path polyline
+end
+
+local function anim_start_next()
+    anim.active = table.remove(anim.queue, 1)
+    if not anim.active then return end
+    local a = anim.active
+    a.seg = 1        -- animating points[seg] -> points[seg+1]
+    a.t = 0
+    a.phase = "move"
+    anim_place_dot(a.points[1].lat, a.points[1].lon)
+    anim_dot:set({ bg_opa = 255 })
+    anim_dot:clear_flag(lvgl.FLAG.HIDDEN)
+    redraw_markers()  -- draws the path polyline
+end
+
+local function anim_tick(period)
+    if not anim.active then
+        if anim.enabled and #anim.queue > 0 then anim_start_next() end
+        return
+    end
+    local a = anim.active
+    local pts = a.points
+    a.t = a.t + period
+
+    if a.phase == "move" then
+        local f = math.min(1, a.t / ANIM_HOP_MS)
+        local e = f * f * (3 - 2 * f)  -- smoothstep ease
+        local p1, p2 = pts[a.seg], pts[a.seg + 1]
+        anim_place_dot(p1.lat + (p2.lat - p1.lat) * e,
+                       p1.lon + (p2.lon - p1.lon) * e)
+        if f >= 1 then
+            a.t = 0
+            if a.seg + 1 >= #pts then
+                a.phase = "arrive"
+            else
+                a.seg = a.seg + 1
+                a.phase = pts[a.seg].real and "pause" or "move"
+            end
+        end
+    elseif a.phase == "pause" then
+        anim_place_dot(pts[a.seg].lat, pts[a.seg].lon)
+        if a.t >= ANIM_PAUSE_MS then
+            a.t = 0
+            a.phase = "move"
+        end
+    elseif a.phase == "arrive" then
+        local f = math.min(1, a.t / ANIM_ARRIVE_MS)
+        local last = pts[#pts]
+        anim_place_dot(last.lat, last.lon, 10 + math.floor(22 * f))
+        anim_dot:set({ bg_opa = math.floor(255 * (1 - f)) })
+        if f >= 1 then anim_stop() end
     end
 end
 
@@ -626,7 +919,7 @@ end
 -- Hit-test contact markers: find the nearest contact to a world-pixel position
 local HIT_RADIUS = 20  -- px tolerance for tap/center selection
 local function find_nearest_contact(wx, wy)
-    local ok, contacts = pcall(_mesh_get_contacts)
+    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
     if not ok or not contacts then return nil end
     local best, best_dist = nil, HIT_RADIUS * HIT_RADIUS + 0.0
     for _, c in ipairs(contacts) do
@@ -705,6 +998,11 @@ local function show_contact_popup(contact)
     -- Type
     info_row("Type", contact.type_name or "?")
 
+    -- Archived contacts are no longer in the live mesh table
+    if contact.archived then
+        info_row("Status", "Archived")
+    end
+
     -- ID (first 8 hex chars of public key)
     if contact.pubkey then
         info_row("ID", contact.pubkey:sub(1, 8) .. "…")
@@ -758,6 +1056,20 @@ local function show_contact_popup(contact)
         info_row("Last seen", ago_text)
     end
 
+    -- Re-add an archived contact to the live mesh table
+    if contact.archived and contact.pubkey then
+        local readd_btn = box:Button({ w = W - 40, h = 30 })
+        readd_btn:Label({ text = "Re-add to mesh", align = lvgl.ALIGN.CENTER })
+        readd_btn:onClicked(function()
+            local ok = _mesh_readd_contact(contact.pubkey)
+            tooltip_label:set({ text = ok and "Contact re-added"
+                                           or "Re-add failed (table full?)" })
+            map.tooltip:clear_flag(lvgl.FLAG.HIDDEN)
+            close_contact_popup()
+            redraw_markers()
+        end)
+    end
+
     -- Close button
     local close_btn = box:Button({ w = W - 40, h = 30 })
     close_btn:Label({ text = "Close", align = lvgl.ALIGN.CENTER })
@@ -768,7 +1080,7 @@ end
 
 update_dl_status = function()
     if not map.sd_ok or not map.wifi_ok then return end  -- other label already shown
-    local pending = #map.download_queue + (map.downloading and 1 or 0)
+    local pending = #map.download_queue + map_inflight
     if pending > 0 then
         dl_label:set({ text = "DL " .. pending })
         dl_label:clear_flag(lvgl.FLAG.HIDDEN)
@@ -785,14 +1097,12 @@ update_wifi_status = function()
     if not map.sd_ok then return end  -- "No SD" takes priority
 
     if map.wifi_ok and not was_ok then
-        -- WiFi came back: show DL button, clear offline indicator
-        dl_btn:clear_flag(lvgl.FLAG.HIDDEN)
+        -- WiFi came back: clear offline indicator
         dl_label:add_flag(lvgl.FLAG.HIDDEN)
         -- Re-enqueue tiles for any visible gaps
         refresh_tiles()
     elseif not map.wifi_ok and was_ok then
-        -- WiFi dropped: hide DL button, show offline, flush queue
-        dl_btn:add_flag(lvgl.FLAG.HIDDEN)
+        -- WiFi dropped: show offline, flush queue
         dl_label:set({ text = "Offline" })
         dl_label:clear_flag(lvgl.FLAG.HIDDEN)
         map.download_queue = {}
@@ -814,6 +1124,8 @@ local pc = {
     total = 0,
     completed = 0,
     start_time = nil,
+    inflight = 0,     -- worker fetches owned by the pre-cache run
+    fail_streak = 0,  -- consecutive network failures (WiFi-loss detector)
 }
 
 local pc_overlay = nil
@@ -846,6 +1158,61 @@ local function update_progress_ui()
     end
 end
 
+-- Collect finished Core-1 fetches and route them by key: map tiles display
+-- on the grid, pre-cache tiles drive the progress UI. A "frag" failure means
+-- PSRAM was too fragmented to decode — drop the LVGL image cache here on the
+-- LVGL thread (decoded tiles reload from their .bin) and retry the tile once.
+poll_fetch_results = function()
+    while true do
+        local key, ok, stage = _tile_fetch_poll()
+        if key == nil then break end
+        local p = pending_fetches[key]
+        if p then
+            pending_fetches[key] = nil
+            fetch_outstanding = math.max(0, fetch_outstanding - 1)
+            if p.kind == "map" then
+                map_inflight = math.max(0, map_inflight - 1)
+            else
+                pc.inflight = math.max(0, pc.inflight - 1)
+            end
+
+            if ok then
+                bin_cache[key] = true
+            elseif stage == "frag" and not p.retried then
+                pcall(_lvgl_image_cache_drop)
+                local url = TILE_URL .. "/" .. p.z .. "/" .. p.tx .. "/" .. p.ty .. ".png"
+                if _tile_fetch_start(url, "S:" .. tile_bin_path(p.z, p.tx, p.ty), key) then
+                    p.retried = true
+                    pending_fetches[key] = p
+                    fetch_outstanding = fetch_outstanding + 1
+                    if p.kind == "map" then
+                        map_inflight = map_inflight + 1
+                    else
+                        pc.inflight = pc.inflight + 1
+                    end
+                end
+            end
+
+            if pending_fetches[key] == nil then
+                -- Fetch concluded (success or final failure)
+                if p.kind == "map" then
+                    if ok then show_tile_if_on_grid(p.z, p.tx, p.ty) end
+                else
+                    pc.completed = pc.completed + 1
+                    if ok then
+                        pc.fail_streak = 0
+                    elseif stage == "wifi" or stage == "http" or stage == "truncated" then
+                        pc.fail_streak = pc.fail_streak + 1
+                    else
+                        pc.fail_streak = 0  -- local failure — network is fine
+                    end
+                    update_progress_ui()
+                end
+            end
+        end
+    end
+end
+
 local function show_completion()
     pc_progress_title:set({ text = "Download Complete!" })
     pc_counter_lbl:set({ text = pc.completed .. " tiles cached" })
@@ -867,6 +1234,7 @@ hide_precache_screen = function()
     pc.total = 0
     pc.completed = 0
     pc.start_time = nil
+    pc.fail_streak = 0
     _nav_clear()  -- remove gridnav before delete (avoids use-after-free)
     if pc_overlay then pc_overlay:delete(); pc_overlay = nil end
     pc_confirm_group = nil
@@ -876,7 +1244,6 @@ hide_precache_screen = function()
     pc_zoom_lbl = nil
     pc_eta_lbl = nil
     pc_progress_title = nil
-    bin_cache = {}
     refresh_tiles()
     lvgl.group.focus_obj(root)
 end
@@ -1087,6 +1454,11 @@ show_precache_screen = function()
         eta_lbl:set({ text = "" })
         warn_lbl:add_flag(lvgl.FLAG.HIDDEN)
 
+        -- Block Download until the estimate finishes — clicking mid-calc would
+        -- run build_precache_list's cache checks synchronously (SD stat storm
+        -- on uncached tiles, possible watchdog reset on big areas).
+        download_btn:add_state(lvgl.STATE.DISABLED)
+
         -- Cancel previous calculation
         if pc.calc_timer then pcall(function() pc.calc_timer:delete() end); pc.calc_timer = nil end
 
@@ -1117,7 +1489,9 @@ show_precache_screen = function()
                 else
                     size_str = string.format("~%.0f MB", est_mb)
                 end
-                eta_lbl:set({ text = format_time(uncached * 2.0) .. "  " .. size_str })
+                -- ~0.5s/tile estimate: Core-1 pipeline with keep-alive
+                eta_lbl:set({ text = format_time(uncached * 0.5) .. "  " .. size_str })
+                download_btn:clear_state(lvgl.STATE.DISABLED)
             else
                 count_lbl:set({ text = "Calculating... " .. math.floor(check_idx / #coords * 100) .. "%" })
             end
@@ -1131,6 +1505,7 @@ show_precache_screen = function()
     cancel_btn:onClicked(function() hide_precache_screen() end)
 
     download_btn:onClicked(function()
+        if pc.calc_timer then return end  -- estimate still running
         if not map.sd_ok then
             warn_lbl:set({ text = "No SD card!" })
             warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
@@ -1168,19 +1543,22 @@ show_precache_screen = function()
         pc_counter_lbl:set({ text = "0 / " .. pc.total .. " tiles" })
         pc_bar_fill:set({ w = 1 })
 
-        local fail_streak = 0
+        pc.fail_streak = 0
+        pc.inflight = 0
         pc.timer = lvgl.Timer({
             period = 100,
             cb = function(t)
-                if #pc.queue == 0 then
+                poll_fetch_results()
+
+                if #pc.queue == 0 and pc.inflight == 0 then
                     t:delete()
                     pc.timer = nil
                     show_completion()
                     return
                 end
 
-                -- Abort if WiFi dropped (3 consecutive failures = lost connection)
-                if fail_streak >= 3 then
+                -- Abort if WiFi dropped (3 consecutive network failures)
+                if pc.fail_streak >= 3 then
                     t:delete()
                     pc.timer = nil
                     pc_progress_title:set({ text = "Download Failed" })
@@ -1189,30 +1567,27 @@ show_precache_screen = function()
                     return
                 end
 
-                local tile = table.remove(pc.queue, 1)
-
-                if tile_cached(tile.z, tile.tx, tile.ty) then
-                    pc.completed = pc.completed + 1
-                    update_progress_ui()
-                    return
+                -- Keep the Core-1 worker fed (two in flight)
+                while #pc.queue > 0 and pc.inflight < 2 do
+                    local tile = pc.queue[1]
+                    local key = tile.z .. "/" .. tile.tx .. "/" .. tile.ty
+                    if tile_cached(tile.z, tile.tx, tile.ty) or pending_fetches[key] then
+                        -- already on SD, or the map view is fetching it
+                        table.remove(pc.queue, 1)
+                        pc.completed = pc.completed + 1
+                        update_progress_ui()
+                    else
+                        ensure_tile_dirs(tile.z, tile.tx)
+                        local url = TILE_URL .. "/" .. tile.z .. "/" .. tile.tx .. "/" .. tile.ty .. ".png"
+                        if not _tile_fetch_start(url, "S:" .. tile_bin_path(tile.z, tile.tx, tile.ty), key) then
+                            break  -- worker queue full — retry next tick
+                        end
+                        pending_fetches[key] = { kind = "pc", z = tile.z, tx = tile.tx, ty = tile.ty }
+                        pc.inflight = pc.inflight + 1
+                        fetch_outstanding = fetch_outstanding + 1
+                        table.remove(pc.queue, 1)
+                    end
                 end
-
-                ensure_tile_dirs(tile.z, tile.tx)
-                local url = TILE_URL .. "/" .. tile.z .. "/" .. tile.tx .. "/" .. tile.ty .. ".png"
-                local png_path = "S:" .. tile_sd_path(tile.z, tile.tx, tile.ty)
-                local result = _wifi_download_file(url, png_path)
-
-                if result and result.success and result.size and result.size > 0 then
-                    local bin_path = "S:" .. tile_bin_path(tile.z, tile.tx, tile.ty)
-                    _png_to_bin(png_path, bin_path)
-                    bin_cache[tile.z .. "/" .. tile.tx .. "/" .. tile.ty] = true
-                    fail_streak = 0
-                else
-                    fail_streak = fail_streak + 1
-                end
-
-                pc.completed = pc.completed + 1
-                update_progress_ui()
             end,
         })
     end)
@@ -1222,6 +1597,83 @@ show_precache_screen = function()
 
     -- Navigation for trackball
     _nav_setup(pc_overlay, GRIDNAV_ROLLOVER)
+end
+
+-- ---------------------------------------------------------------------------
+-- Settings screen
+-- ---------------------------------------------------------------------------
+local settings_overlay = nil
+
+local function close_settings_screen()
+    if settings_overlay then
+        _nav_clear()  -- remove gridnav before delete (avoids use-after-free)
+        settings_overlay:delete()
+        settings_overlay = nil
+        lvgl.group.focus_obj(root)
+    end
+end
+
+local function show_settings_screen()
+    if settings_overlay then return end
+
+    settings_overlay = root:Object({
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#1a1a2e", bg_opa = 255,
+        pad_all = 8, border_width = 0,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    })
+    settings_overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    settings_overlay:Label({
+        text = "Map Settings",
+        text_color = "#FFFFFF",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        w = lvgl.PCT(100), h = 24,
+    })
+
+    -- Packet path animation toggle
+    local function anim_toggle_text()
+        return (anim.enabled and "[x]" or "[ ]") .. " Packet path animation"
+    end
+    local anim_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    local anim_lbl = anim_btn:Label({ text = anim_toggle_text(), align = lvgl.ALIGN.LEFT_MID })
+    anim_btn:onClicked(function()
+        anim.enabled = not anim.enabled
+        save_map_prefs(anim.enabled, show_archived)
+        anim_lbl:set({ text = anim_toggle_text() })
+        if not anim.enabled then
+            anim.queue = {}
+            if anim.active then anim_stop() end
+        end
+    end)
+
+    -- Archived contacts toggle (history of contacts the mesh dropped)
+    local function arch_toggle_text()
+        return (show_archived and "[x]" or "[ ]") .. " Show archived contacts"
+    end
+    local arch_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    local arch_lbl = arch_btn:Label({ text = arch_toggle_text(), align = lvgl.ALIGN.LEFT_MID })
+    arch_btn:onClicked(function()
+        show_archived = not show_archived
+        save_map_prefs(anim.enabled, show_archived)
+        arch_lbl:set({ text = arch_toggle_text() })
+        redraw_markers()  -- reflect immediately
+    end)
+
+    -- Tile pre-cache download (validates SD/WiFi on its own screen)
+    local dl_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    dl_btn:Label({ text = "Download map tiles...", align = lvgl.ALIGN.LEFT_MID })
+    dl_btn:onClicked(function()
+        close_settings_screen()
+        show_precache_screen()
+    end)
+
+    -- Back to map
+    local back_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    back_btn:Label({ text = "Close", align = lvgl.ALIGN.CENTER })
+    back_btn:onClicked(function() close_settings_screen() end)
+
+    _nav_setup(settings_overlay, GRIDNAV_ROLLOVER)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1286,7 +1738,6 @@ local function set_zoom(z)
     if new_z == map.zoom then return end
     map.vx = 0
     map.vy = 0
-    bin_cache = {}
 
     local lat, lon = world_px_to_lat_lon(map.cx, map.cy, map.zoom)
     map.zoom = new_z
@@ -1312,6 +1763,7 @@ end
 
 local function shutdown()
     map.running = false
+    pcall(function() messages:onAnyMessage(nil) end)  -- release the hub slot
     _nav_clear()  -- remove gridnav before delete (avoids use-after-free)
     for _, t in ipairs(map.timers) do pcall(function() t:delete() end) end
     map.timers = {}
@@ -1347,7 +1799,9 @@ root:onevent(lvgl.EVENT.KEY, function()
             end
         end
     elseif key == lvgl.KEY.ESC or key == 27 or key == 113 then -- ESC / q
-        if contact_popup then
+        if settings_overlay then
+            close_settings_screen()
+        elseif contact_popup then
             close_contact_popup()
         else
             shutdown()
@@ -1364,12 +1818,27 @@ root:onevent(lvgl.EVENT.KEY, function()
 end)
 
 -- Touch input — feeds into shared momentum system
+-- The contact popup opens on a deliberate stationary hold. LVGL's built-in
+-- LONG_PRESSED fires after only 400ms even while the finger is moving (this
+-- layer never scrolls, so LVGL doesn't recognize the pan), which kept
+-- opening the popup mid-swipe — so hold detection is done here instead:
+-- ~0.8s of press with under HOLD_MOVE_PX of finger travel.
+local HOLD_TICKS = 24      -- PRESSING events (~33ms each) ≈ 0.8s hold
+local HOLD_MOVE_PX = 12    -- finger travel that cancels the hold
+local hold = { x = 0, y = 0, ticks = 0, moved = false, fired = false }
+
 touch_layer:onevent(lvgl.EVENT.PRESSED, function()
     if not map.running then return end
     map.vx = 0
     map.vy = 0
     map.drag = true
     map.tooltip:add_flag(lvgl.FLAG.HIDDEN)
+    local indev = lvgl.indev.get_act()
+    local sx, sy = indev:get_point()
+    hold.x, hold.y = sx, sy
+    hold.ticks = 0
+    hold.moved = false
+    hold.fired = false
 end)
 
 touch_layer:onevent(lvgl.EVENT.PRESSING, function()
@@ -1378,23 +1847,28 @@ touch_layer:onevent(lvgl.EVENT.PRESSING, function()
     local vx, vy = indev:get_vect()
     map.vx = -vx
     map.vy = -vy
-end)
 
-touch_layer:onevent(lvgl.EVENT.LONG_PRESSED, function()
-    if not map.running then return end
-    map.vx = 0
-    map.vy = 0
-    map.drag = false
-    local indev = lvgl.indev.get_act()
+    -- Stationary-hold detection
     local sx, sy = indev:get_point()
-    -- Convert screen position to world pixels
-    local half_w = math.floor(W / 2)
-    local half_h = math.floor(H / 2)
-    local wx = map.cx - half_w + sx
-    local wy = map.cy - half_h + sy
-    local contact = find_nearest_contact(wx, wy)
-    if contact then
-        show_contact_popup(contact)
+    if math.abs(sx - hold.x) > HOLD_MOVE_PX
+       or math.abs(sy - hold.y) > HOLD_MOVE_PX then
+        hold.moved = true
+    end
+    if not hold.moved and not hold.fired then
+        hold.ticks = hold.ticks + 1
+        if hold.ticks >= HOLD_TICKS then
+            hold.fired = true
+            map.vx = 0
+            map.vy = 0
+            map.drag = false
+            local half_w = math.floor(W / 2)
+            local half_h = math.floor(H / 2)
+            local contact = find_nearest_contact(map.cx - half_w + sx,
+                                                 map.cy - half_h + sy)
+            if contact then
+                show_contact_popup(contact)
+            end
+        end
     end
 end)
 
@@ -1431,20 +1905,39 @@ center_btn:onevent(lvgl.EVENT.CLICKED, function()
     lvgl.group.focus_obj(root)
 end)
 
-dl_btn:onevent(lvgl.EVENT.CLICKED, function()
-    if map.running then show_precache_screen() end
+settings_btn:onevent(lvgl.EVENT.CLICKED, function()
+    if map.running then show_settings_screen() end
 end)
 
 -- ---------------------------------------------------------------------------
 -- Tile download timer
 -- ---------------------------------------------------------------------------
 
+-- The Core-1 fetch worker self-manages its keep-alive connection (it closes
+-- it after 10s of queue idle), so this timer only routes work: collect
+-- finished fetches, keep the worker fed, and trickle-load margin tiles.
 local dl_timer = lvgl.Timer({
     period = 200,
     cb = function(t)
         if not map.running then t:delete(); return end
-        process_download_queue()
+        poll_fetch_results()
+        feed_tile_fetches()
         update_dl_status()
+
+        -- Trickle-load cached margin tiles once downloads are quiet and the
+        -- map isn't moving fast. Each load is a ~50ms SD read; during a fast
+        -- fling the next boundary refresh re-targets them anyway, while slow
+        -- drags (≤8 px/tick) keep trickling so edges are warm when they
+        -- scroll into view.
+        local speed = math.max(math.abs(map.vx), math.abs(map.vy))
+        if #map.download_queue == 0 and fetch_outstanding == 0
+           and pc.timer == nil and speed <= 8 then
+            for _ = 1, 2 do
+                local m = table.remove(margin_pending, 1)
+                if not m then break end
+                set_tile_widget(m.idx, m.z, m.tx, m.ty)
+            end
+        end
     end,
 })
 table.insert(map.timers, dl_timer)
@@ -1505,6 +1998,17 @@ local tooltip_timer = lvgl.Timer({
 })
 table.insert(map.timers, tooltip_timer)
 
+-- Packet path animation ticker
+local ANIM_TICK_MS = 30
+local anim_timer = lvgl.Timer({
+    period = ANIM_TICK_MS,
+    cb = function(t)
+        if not map.running then t:delete(); return end
+        anim_tick(ANIM_TICK_MS)
+    end,
+})
+table.insert(map.timers, anim_timer)
+
 -- ---------------------------------------------------------------------------
 -- Initial view: center on own position or default
 -- ---------------------------------------------------------------------------
@@ -1547,13 +2051,26 @@ local function init_view()
         dl_label:clear_flag(lvgl.FLAG.HIDDEN)
     end
 
-    -- Only show DL button when both SD and WiFi are available
-    if map.sd_ok and map.wifi_ok then
-        dl_btn:clear_flag(lvgl.FLAG.HIDDEN)
-    end
-
     refresh_tiles()
 end
+
+-- Subscribe to live channel traffic for the path animation. DMs are ignored
+-- for now; own local-echo messages (hops 0, from = us) are skipped too.
+local own_name
+do
+    local ok, info = pcall(_mesh_get_node_info)
+    own_name = ok and info and info.name or nil
+end
+
+messages:onAnyMessage(function(msg)
+    if not map.running or not anim.enabled then return end
+    if msg.is_dm then return end
+    if own_name and msg.from == own_name then return end
+    local points = resolve_path_waypoints(msg)
+    if not points then return end
+    if #anim.queue >= 3 then table.remove(anim.queue, 1) end
+    anim.queue[#anim.queue + 1] = { points = points }
+end)
 
 _nav_clear()
 root:add_flag(lvgl.FLAG.CLICKABLE)

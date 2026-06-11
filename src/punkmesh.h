@@ -166,6 +166,29 @@ public:
   float last_rx_snr = 0;
   float last_rx_rssi = 0;
 
+  // Bumped on every contact mutation — they all funnel through
+  // saveContacts(). Lets the Lua _mesh_get_contacts binding cache its
+  // table between changes instead of rebuilding ~500 entries per call.
+  volatile uint32_t contacts_generation = 0;
+
+  // ── Contact archive ────────────────────────────────────────────
+  // Contacts that fall out of the live table (overwritten when it is full,
+  // or removed by the user) are preserved in <storage>/contacts_arch so
+  // they can still be shown on the map and re-added later — mirrors the
+  // MeshCore Android app's contact history. The PSRAM array is allocated
+  // lazily on first use; archiving itself is always on (history must be
+  // captured before the user ever enables the "show archived" setting).
+  static const int MAX_ARCHIVED_CONTACTS = 500;
+  ContactInfo* archived = nullptr;
+  int num_archived = 0;
+  bool archive_loaded = false;
+  volatile uint32_t archive_generation = 0;  // bumps on every archive change
+
+  bool ensureArchiveLoaded();
+  void saveArchive();
+  void archiveContact(const ContactInfo& c);
+  bool readdArchivedContact(const uint8_t* pub_key);
+
   // Persistent storage filesystem (SD card if available, else LittleFS)
   fs::FS* _storage = nullptr;
   String _storage_prefix = ""; // e.g. "/meshpunk" for SD subdirectory
@@ -312,6 +335,7 @@ protected:
   int calcRxDelay(float score, uint32_t air_time) const override;
   bool allowPacketForward(const mesh::Packet *packet) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t *path) override;
+  void onContactOverwrite(const uint8_t *pub_key) override;
   void onContactPathUpdated(const ContactInfo &contact) override;
   ContactInfo* processAck(const uint8_t *data) override;
   void onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text) override;

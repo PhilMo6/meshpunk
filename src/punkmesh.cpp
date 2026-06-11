@@ -1,5 +1,6 @@
 #include "punkmesh.h"
 #include <LittleFS.h>
+#include <esp_heap_caps.h>
 #include "meshpunk_sync.h"
 #include "ble_companion.h"
 
@@ -265,6 +266,68 @@ const char *PunkMesh::getTypeName(uint8_t type) const
     return "??"; // unknown
 }
 
+// Parse one tab-separated contact line into c:
+// pubkey_hex \t name \t type \t flags \t path_len \t advert_ts \t path_hex \t lat \t lon
+// Shared by loadContacts (live table) and ensureArchiveLoaded (archive file).
+static bool parse_contact_line(char* line, int len, ContactInfo& c)
+{
+    char *fields[9];
+    int nf = 0;
+    fields[0] = line;
+    for (int i = 0; i < len && nf < 8; i++) {
+        if (line[i] == '\t') {
+            line[i] = '\0';
+            fields[++nf] = &line[i + 1];
+        }
+    }
+    if (nf < 1) return false; // need at least pubkey + name
+
+    memset(&c, 0, sizeof(c));
+
+    uint8_t pub_key[32];
+    if (!mesh::Utils::fromHex(pub_key, 32, fields[0])) return false;
+    c.id = mesh::Identity(pub_key);
+
+    strncpy(c.name, fields[1], sizeof(c.name) - 1);
+    if (nf >= 2) c.type = atoi(fields[2]);
+    if (nf >= 3) c.flags = atoi(fields[3]);
+    if (nf >= 4) c.out_path_len = atoi(fields[4]);
+    if (nf >= 5) c.last_advert_timestamp = strtoul(fields[5], nullptr, 10);
+    if (nf >= 6) mesh::Utils::fromHex(c.out_path, 64, fields[6]);
+    if (nf >= 7) c.gps_lat = atol(fields[7]);
+    if (nf >= 8) c.gps_lon = atol(fields[8]);
+    c.lastmod = 0;
+    return true;
+}
+
+// Write one contact line in the same format parse_contact_line reads.
+static void write_contact_line(File& file, const ContactInfo& c)
+{
+    char pubkey_hex[65];
+    mesh::Utils::toHex(pubkey_hex, c.id.pub_key, 32);
+
+    char path_hex[129];
+    mesh::Utils::toHex(path_hex, c.out_path, 64);
+
+    file.printf("%s\t%s\t%d\t%d\t%d\t%u\t%s\t%d\t%d\n",
+        pubkey_hex, c.name, c.type, c.flags,
+        c.out_path_len, c.last_advert_timestamp, path_hex,
+        (int)c.gps_lat, (int)c.gps_lon);
+}
+
+// Read one line from file into buf; returns length (0 = blank/skip).
+static int read_contact_file_line(File& file, char* buf, int buf_size)
+{
+    int len = 0;
+    while (file.available() && len < buf_size - 1) {
+        char ch = file.read();
+        if (ch == '\n' || ch == '\r') break;
+        buf[len++] = ch;
+    }
+    buf[len] = '\0';
+    return len;
+}
+
 void PunkMesh::loadContacts()
 {
     bool is_sd = (_storage != &LittleFS);
@@ -279,43 +342,11 @@ void PunkMesh::loadContacts()
             char line[320];
             while (file.available())
             {
-                int len = 0;
-                while (file.available() && len < (int)sizeof(line) - 1) {
-                    char ch = file.read();
-                    if (ch == '\n' || ch == '\r') break;
-                    line[len++] = ch;
-                }
-                line[len] = '\0';
+                int len = read_contact_file_line(file, line, sizeof(line));
                 if (len == 0) continue;
 
-                // Parse tab-separated: pubkey_hex \t name \t type \t flags \t path_len \t advert_ts \t path_hex
-                char *fields[9];
-                int nf = 0;
-                fields[0] = line;
-                for (int i = 0; i < len && nf < 8; i++) {
-                    if (line[i] == '\t') {
-                        line[i] = '\0';
-                        fields[++nf] = &line[i + 1];
-                    }
-                }
-                if (nf < 1) continue; // need at least pubkey + name
-
                 ContactInfo c;
-                memset(&c, 0, sizeof(c));
-
-                uint8_t pub_key[32];
-                if (!mesh::Utils::fromHex(pub_key, 32, fields[0])) continue;
-                c.id = mesh::Identity(pub_key);
-
-                strncpy(c.name, fields[1], sizeof(c.name) - 1);
-                if (nf >= 2) c.type = atoi(fields[2]);
-                if (nf >= 3) c.flags = atoi(fields[3]);
-                if (nf >= 4) c.out_path_len = atoi(fields[4]);
-                if (nf >= 5) c.last_advert_timestamp = strtoul(fields[5], nullptr, 10);
-                if (nf >= 6) mesh::Utils::fromHex(c.out_path, 64, fields[6]);
-                if (nf >= 7) c.gps_lat = atol(fields[7]);
-                if (nf >= 8) c.gps_lon = atol(fields[8]);
-                c.lastmod = 0;
+                if (!parse_contact_line(line, len, c)) continue;
 
                 if (!addContact(c)) break;
             }
@@ -328,6 +359,8 @@ void PunkMesh::loadContacts()
 
 void PunkMesh::saveContacts()
 {
+    contacts_generation++;  // invalidate the Lua-side contacts cache
+
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
@@ -341,16 +374,7 @@ void PunkMesh::saveContacts()
 
         while (iter.hasNext(this, c))
         {
-            char pubkey_hex[65];
-            mesh::Utils::toHex(pubkey_hex, c.id.pub_key, 32);
-
-            char path_hex[129];
-            mesh::Utils::toHex(path_hex, c.out_path, 64);
-
-            file.printf("%s\t%s\t%d\t%d\t%d\t%u\t%s\t%d\t%d\n",
-                pubkey_hex, c.name, c.type, c.flags,
-                c.out_path_len, c.last_advert_timestamp, path_hex,
-                (int)c.gps_lat, (int)c.gps_lon);
+            write_contact_line(file, c);
 
             if (is_sd && ++count % 50 == 0) {
                 file.flush();
@@ -363,6 +387,152 @@ void PunkMesh::saveContacts()
     }
 
     if (is_sd) sd_spi_release();
+}
+
+// ── Contact archive ──────────────────────────────────────────────────
+// Contacts that fall out of the live table are preserved here so they can
+// be shown on the map and re-added. See punkmesh.h for the rationale.
+
+bool PunkMesh::ensureArchiveLoaded()
+{
+    if (archive_loaded) return archived != nullptr;
+    archive_loaded = true;
+
+    archived = (ContactInfo*)heap_caps_malloc(
+        sizeof(ContactInfo) * MAX_ARCHIVED_CONTACTS,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!archived) {
+        Serial.println("[ARCH] FAIL: PSRAM alloc for contact archive");
+        return false;
+    }
+    num_archived = 0;
+
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/contacts_arch");
+    if (_storage->exists(path.c_str()))
+    {
+        File file = _storage->open(path.c_str());
+        if (file)
+        {
+            char line[320];
+            while (file.available() && num_archived < MAX_ARCHIVED_CONTACTS)
+            {
+                int len = read_contact_file_line(file, line, sizeof(line));
+                if (len == 0) continue;
+
+                if (parse_contact_line(line, len, archived[num_archived])) {
+                    num_archived++;
+                }
+            }
+            file.close();
+        }
+    }
+
+    if (is_sd) sd_spi_release();
+    Serial.printf("[ARCH] Loaded %d archived contacts\n", num_archived);
+    return true;
+}
+
+void PunkMesh::saveArchive()
+{
+    archive_generation++;  // invalidate the Lua-side union cache
+    if (!archived) return;
+
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/contacts_arch");
+    File file = _storage->open(path.c_str(), "w", true);
+    if (file)
+    {
+        for (int i = 0; i < num_archived; i++)
+        {
+            write_contact_line(file, archived[i]);
+
+            if (is_sd && (i + 1) % 50 == 0) {
+                file.flush();
+                sd_spi_release();
+                vTaskDelay(1);
+                sd_spi_take();
+            }
+        }
+        file.close();
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+void PunkMesh::archiveContact(const ContactInfo& c)
+{
+    if (!ensureArchiveLoaded()) return;
+
+    // Already archived (e.g. evicted again after a re-add) — refresh it
+    for (int i = 0; i < num_archived; i++) {
+        if (memcmp(archived[i].id.pub_key, c.id.pub_key, PUB_KEY_SIZE) == 0) {
+            archived[i] = c;
+            saveArchive();
+            return;
+        }
+    }
+
+    if (num_archived >= MAX_ARCHIVED_CONTACTS) {
+        // Archive full — replace the entry with the oldest advert
+        int oldest = 0;
+        for (int i = 1; i < num_archived; i++) {
+            if (archived[i].last_advert_timestamp < archived[oldest].last_advert_timestamp) {
+                oldest = i;
+            }
+        }
+        archived[oldest] = c;
+    } else {
+        archived[num_archived++] = c;
+    }
+    Serial.printf("[ARCH] Archived contact: %s (total %d)\n", c.name, num_archived);
+    saveArchive();
+}
+
+bool PunkMesh::readdArchivedContact(const uint8_t* pub_key)
+{
+    if (!ensureArchiveLoaded()) return false;
+
+    for (int i = 0; i < num_archived; i++) {
+        if (memcmp(archived[i].id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+            ContactInfo c = archived[i];
+            // The stored route is stale by definition — rediscover via flood
+            c.out_path_len = OUT_PATH_UNKNOWN;
+            memset(c.out_path, 0, sizeof(c.out_path));
+            c.shared_secret_valid = false;
+            c.lastmod = getRTCClock()->getCurrentTime();
+
+            if (!addContact(c)) {
+                // live table full (and overwrite disabled, or all favorites)
+                return false;
+            }
+
+            // Remove from the archive — it's live again
+            for (int j = i; j < num_archived - 1; j++) {
+                archived[j] = archived[j + 1];
+            }
+            num_archived--;
+            saveArchive();
+            saveContacts();
+            Serial.printf("[ARCH] Re-added contact: %s\n", c.name);
+            return true;
+        }
+    }
+    return false;
+}
+
+void PunkMesh::onContactOverwrite(const uint8_t* pub_key)
+{
+    // Called just before the slot is reused — the contact data is intact.
+    ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (c) {
+        Serial.printf("[ARCH] Live table full — archiving evicted contact: %s\n", c->name);
+        archiveContact(*c);
+    }
 }
 
 void PunkMesh::loadChannels()
