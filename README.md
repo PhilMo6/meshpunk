@@ -14,10 +14,11 @@
 - Loads Lua scripts from the filesystem automatically as apps
 - Integrates MeshCore networking
 - Emoji support
-- Map app with offline tile caching
+- Map app with offline tile caching and message path animations.
 - Lua games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of development)
 - Elf file loader
 - Doom! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
+- Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts.
 
 ## Installation 
 
@@ -33,6 +34,7 @@
 8. Get meshing!
 
 Optional. Download and place doom wad files onto the sd card in either /doom or /meshpunk/apps/Games/doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
+Pico8 carts go onto the sd card in either /p8carts or /meshpunk/apps/Games/PICO-8 folder.
 
 ## Map App
 
