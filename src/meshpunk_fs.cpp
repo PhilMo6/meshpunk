@@ -62,6 +62,34 @@ void meshpunk_close(MeshpunkFile& mf) {
     mf.valid = false;
 }
 
+bool meshpunk_mkdirs(const char* path, bool default_sd) {
+    bool use_sd;
+    const char* actual = parse_prefix(path, &use_sd, default_sd);
+    if (use_sd && !sd_mounted) return false;
+
+    char buf[160];
+    size_t n = strlen(actual);
+    if (n == 0 || n >= sizeof(buf)) return false;
+    memcpy(buf, actual, n + 1);
+
+    bool ok = true;
+    if (use_sd) sd_spi_take();
+    // Create each directory prefix; the final segment is the file name and
+    // is not created.
+    for (char* p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (use_sd) {
+            if (!SD.exists(buf)) ok = SD.mkdir(buf) && ok;
+        } else {
+            if (!LittleFS.exists(buf)) ok = LittleFS.mkdir(buf) && ok;
+        }
+        *p = '/';
+    }
+    if (use_sd) sd_spi_release();
+    return ok;
+}
+
 void* meshpunk_read_all(const char* path, uint32_t* out_size, bool default_sd) {
     MeshpunkFile mf = meshpunk_open(path, "r", default_sd);
     if (!mf.valid) {

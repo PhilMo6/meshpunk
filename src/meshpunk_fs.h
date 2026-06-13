@@ -32,3 +32,8 @@ void meshpunk_close(MeshpunkFile& mf);
 // Caller must heap_caps_free() the returned pointer.
 // Returns NULL on failure.
 void* meshpunk_read_all(const char* path, uint32_t* out_size, bool default_sd = false);
+
+// Create all parent directories of `path` (the final segment is treated as
+// a file name and not created). Same prefix routing as meshpunk_open().
+// Returns true if the parents exist on return.
+bool meshpunk_mkdirs(const char* path, bool default_sd = false);

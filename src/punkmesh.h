@@ -183,9 +183,15 @@ public:
   int num_archived = 0;
   bool archive_loaded = false;
   volatile uint32_t archive_generation = 0;  // bumps on every archive change
+  // Append-only persistence: the hot path (advert eviction) appends one
+  // line; duplicates are resolved newest-wins at load. This counts appends
+  // so a compaction (full rewrite) runs only every ARCH_COMPACT_EVERY
+  // appends instead of on every change.
+  int archive_appends = 0;
 
   bool ensureArchiveLoaded();
   void saveArchive();
+  void appendArchiveEntry(const ContactInfo& c);
   void archiveContact(const ContactInfo& c);
   bool readdArchivedContact(const uint8_t* pub_key);
 

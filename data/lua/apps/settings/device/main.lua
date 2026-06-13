@@ -159,6 +159,23 @@ kbd_to_btn:onClicked(function()
     status.text = "Kbd timeout: " .. math.floor(v) .. "s"
 end)
 
+-- Sym key: hold modifier (default) vs tap-to-toggle the symbol layer.
+-- Holding sym still works as a momentary modifier in toggle mode.
+local sym_toggle_on = _kb_sym_toggle_get()
+local function sym_toggle_text()
+    return (sym_toggle_on and "[x]" or "[ ]") .. " Sym key tap toggles"
+end
+local sym_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+local sym_lbl = sym_btn:Label { text = sym_toggle_text(), align = lvgl.ALIGN.LEFT_MID }
+
+sym_btn:onClicked(function()
+    sym_toggle_on = not sym_toggle_on
+    _kb_sym_toggle_set(sym_toggle_on)
+    sym_lbl:set({ text = sym_toggle_text() })
+    status.text = sym_toggle_on and "Sym: tap toggles symbol layer"
+                                or "Sym: hold to use symbols"
+end)
+
 -- ── Trackball Sensitivity ────────────────────────────────────────────────────
 content:Label { text = "-- Trackball --", w = lvgl.PCT(100), h = 16 }
 
@@ -261,26 +278,6 @@ roll_up:onClicked(function()
     _trackball_roll_set(v)
     refresh_roll()
     status.text = "Roll: " .. _trackball_roll_get() .. "ms"
-end)
-
--- ── Keyboard ─────────────────────────────────────────────────────────────────
-content:Label { text = "-- Keyboard --", w = lvgl.PCT(100), h = 16 }
-
--- Sym key: hold modifier (default) vs tap-to-toggle the symbol layer.
--- Holding sym still works as a momentary modifier in toggle mode.
-local sym_toggle_on = _kb_sym_toggle_get()
-local function sym_toggle_text()
-    return (sym_toggle_on and "[x]" or "[ ]") .. " Sym key tap toggles"
-end
-local sym_btn = content:Button { w = lvgl.PCT(100), h = 30 }
-local sym_lbl = sym_btn:Label { text = sym_toggle_text(), align = lvgl.ALIGN.LEFT_MID }
-
-sym_btn:onClicked(function()
-    sym_toggle_on = not sym_toggle_on
-    _kb_sym_toggle_set(sym_toggle_on)
-    sym_lbl:set({ text = sym_toggle_text() })
-    status.text = sym_toggle_on and "Sym: tap toggles symbol layer"
-                                or "Sym: hold to use symbols"
 end)
 
 -- ── Back ─────────────────────────────────────────────────────────────────────

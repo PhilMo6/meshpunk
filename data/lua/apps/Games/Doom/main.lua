@@ -107,7 +107,7 @@ local KEYS = {
     -- Special keys
     Space  = 0x20,
     Enter  = 0x0D,
-    BkSpc  = 0x1B,  -- backspace maps to ESC internally
+    BkSpc  = 0x08,  -- backspace key (host produces raw BS code)
     Shift  = 0x80,
     -- Trackball
     TrkUp  = 0x81,
@@ -242,6 +242,16 @@ local function load_config()
         local bname = line:match("^basewad=(.+)$")
         if bname then selected_base_name = bname end
     end
+    -- Migrate old backspace code: host used to produce 0x1B for backspace,
+    -- now produces 0x08. Convert any saved bindings that reference 0x1B as
+    -- a physical key to 0x08 so ESC/menu still works after the update.
+    for _, a in ipairs(ACTIONS) do
+        local b = bindings[a.id]
+        if b then
+            if b.key1 == 0x1B then b.key1 = 0x08 end
+            if b.key2 == 0x1B then b.key2 = 0x08 end
+        end
+    end
     -- Restore selections by name
     if selected_wad_name then
         for i, w in ipairs(found_wads) do
@@ -298,69 +308,73 @@ create_main_screen = function()
         align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 10 },
     }
 
-    -- WAD selector
-    local function wad_label(idx)
-        if #found_wads == 0 then return "No WADs found" end
-        local w = found_wads[idx]
-        local tag = w.wtype == "pwad" and " (mod)" or ""
-        if #found_wads > 1 then
-            return "< " .. w.name .. tag .. " >"
+    -- WAD selector — dropdown over all found WADs (mods tagged)
+    local wad_opts = "No WADs found"
+    if #found_wads > 0 then
+        local names = {}
+        for i, w in ipairs(found_wads) do
+            names[i] = w.name .. (w.wtype == "pwad" and " (mod)" or "")
         end
-        return w.name .. tag
+        wad_opts = table.concat(names, "\n")
     end
 
-    local function base_label(idx)
-        if #iwad_list == 0 then return "No base game" end
-        if #iwad_list > 1 then
-            return "Base: < " .. iwad_list[idx].name .. " >"
-        end
-        return "Base: " .. iwad_list[idx].name
-    end
-
-    local wadBtn = scr:Button{
+    local wadDd = scr:Dropdown{
+        options = wad_opts,
         w = 240, h = 28,
         align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 44 },
     }
-    local wadLbl = wadBtn:Label{
-        text = wad_label(selected_wad),
-        align = lvgl.ALIGN.CENTER,
-    }
+    if #found_wads > 0 then
+        wadDd:set{ selected = selected_wad - 1 }
+    end
 
     -- Base IWAD selector (shown only when a PWAD is selected)
-    local baseBtn = scr:Button{
+    local base_row = scr:Object{
         w = 240, h = 28,
         align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 76 },
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", cross_place = "center" },
     }
-    local baseLbl = baseBtn:Label{
-        text = base_label(selected_base),
-        align = lvgl.ALIGN.CENTER,
+    base_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    base_row:Label{
+        text = "Base:",
+        text_color = "#AAAAAA",
+        w = 50,
     }
+    local base_opts = "No base game"
+    if #iwad_list > 0 then
+        local names = {}
+        for i, b in ipairs(iwad_list) do names[i] = b.name end
+        base_opts = table.concat(names, "\n")
+    end
+    local baseDd = base_row:Dropdown{
+        options = base_opts,
+        w = 190, h = 28,
+    }
+    if #iwad_list > 0 then
+        baseDd:set{ selected = selected_base - 1 }
+    end
 
     local function update_base_visibility()
         local is_pwad = #found_wads > 0 and found_wads[selected_wad].wtype == "pwad"
         if is_pwad then
-            baseBtn:clear_flag(lvgl.FLAG.HIDDEN)
+            base_row:clear_flag(lvgl.FLAG.HIDDEN)
         else
-            baseBtn:add_flag(lvgl.FLAG.HIDDEN)
+            base_row:add_flag(lvgl.FLAG.HIDDEN)
         end
     end
     update_base_visibility()
 
-    wadBtn:onClicked(function()
-        if #found_wads > 1 then
-            selected_wad = (selected_wad % #found_wads) + 1
-            wadLbl:set{ text = wad_label(selected_wad) }
-            update_base_visibility()
-            save_config()
-        end
+    wadDd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+        if #found_wads == 0 then return end
+        selected_wad = wadDd:get("selected") + 1
+        update_base_visibility()
+        save_config()
     end)
 
-    baseBtn:onClicked(function()
-        if #iwad_list > 1 then
-            selected_base = (selected_base % #iwad_list) + 1
-            baseLbl:set{ text = base_label(selected_base) }
-            save_config()
-        end
+    baseDd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+        if #iwad_list == 0 then return end
+        selected_base = baseDd:get("selected") + 1
+        save_config()
     end)
 
     -- Status
@@ -483,8 +497,8 @@ create_main_screen = function()
         launcher.create()
     end)
 
-    lvgl.group.get_default():add_obj(wadBtn)
-    lvgl.group.get_default():add_obj(baseBtn)
+    lvgl.group.get_default():add_obj(wadDd)
+    lvgl.group.get_default():add_obj(baseDd)
     _gridnav_add(optBox, GRIDNAV_ROLLOVER)
     lvgl.group.get_default():add_obj(optBox)
     _gridnav_add(btnBox, GRIDNAV_ROLLOVER)

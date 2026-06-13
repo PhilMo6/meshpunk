@@ -27,27 +27,54 @@ local app_dir = ...
 -- ---------------------------------------------------------------------------
 local PREFS_PATH = "L:/map_prefs"
 
--- Prefs file: key=value lines (anim=0/1, arch=0/1)
+-- Prefs file: key=value lines (anim, arch, color, hop, halo_w, halo_opa)
 local function load_map_prefs()
-    local prefs = { anim = true, archived = false }
+    local prefs = {
+        anim = true,           -- live packet path animation on/off
+        archived = false,      -- show archived contacts
+        anim_color = "#ff00cc",-- packet path / dot color
+        anim_hop = 500,        -- ms the dot travels per hop
+        halo_w = 5,            -- dark halo width under the path (0 = off)
+        halo_opa = 140,        -- halo opacity 0-255
+        trail = true,          -- reveal the path hop by hop behind the dot
+        hashes = true,         -- label animated waypoints with their path hash
+    }
     local f = io.open(PREFS_PATH, "r")
     if not f then return prefs end
     local txt = f:read("*a") or ""
     f:close()
     if string.find(txt, "anim=0", 1, true) then prefs.anim = false end
     if string.find(txt, "arch=1", 1, true) then prefs.archived = true end
+    if string.find(txt, "trail=0", 1, true) then prefs.trail = false end
+    if string.find(txt, "hashes=0", 1, true) then prefs.hashes = false end
+    local c = string.match(txt, "color=(#%x%x%x%x%x%x)")
+    if c then prefs.anim_color = c end
+    local hop = tonumber(string.match(txt, "hop=(%d+)") or "")
+    if hop and hop >= 100 and hop <= 5000 then prefs.anim_hop = hop end
+    local hw = tonumber(string.match(txt, "halo_w=(%d+)") or "")
+    if hw and hw >= 0 and hw <= 12 then prefs.halo_w = hw end
+    local ho = tonumber(string.match(txt, "halo_opa=(%d+)") or "")
+    if ho and ho >= 0 and ho <= 255 then prefs.halo_opa = ho end
     return prefs
 end
 
-local function save_map_prefs(anim_on, archived_on)
+local map_prefs = load_map_prefs()
+
+local function save_map_prefs()
     local f = io.open(PREFS_PATH, "w")
     if not f then return end
-    f:write((anim_on and "anim=1" or "anim=0") .. "\n" ..
-            (archived_on and "arch=1" or "arch=0"))
+    f:write(table.concat({
+        map_prefs.anim and "anim=1" or "anim=0",
+        map_prefs.archived and "arch=1" or "arch=0",
+        map_prefs.trail and "trail=1" or "trail=0",
+        map_prefs.hashes and "hashes=1" or "hashes=0",
+        "color=" .. map_prefs.anim_color,
+        "hop=" .. map_prefs.anim_hop,
+        "halo_w=" .. map_prefs.halo_w,
+        "halo_opa=" .. map_prefs.halo_opa,
+    }, "\n"))
     f:close()
 end
-
-local map_prefs = load_map_prefs()
 
 -- ---------------------------------------------------------------------------
 -- State
@@ -63,6 +90,8 @@ local map = {
     vx = 0, vy = 0,
     marker_ref_vl = nil,
     marker_ref_vt = nil,
+    anim_ref_vl = nil,
+    anim_ref_vt = nil,
     base_tx = nil,
     base_ty = nil,
     canvas_zoom = nil,
@@ -167,6 +196,24 @@ local anim = {
 -- Include archived contacts (evicted from / removed out of the live mesh
 -- table) in markers, tap targets and path resolution. Settings toggle.
 local show_archived = map_prefs.archived
+
+-- Own node name — used to skip our local-echo messages in animation/replay.
+local own_name
+do
+    local ok, info = pcall(_mesh_get_node_info)
+    own_name = ok and info and info.name or nil
+end
+
+-- Path replay: persisted channel-message paths played back one at a time,
+-- oldest first (fed into the animation queue by anim_tick). paused freezes
+-- the playback mid-flight (transport buttons; settings auto-pauses).
+local replay = { list = {}, idx = 0, total = 0, active = false, paused = false }
+local stop_replay  -- forward-declare; defined with the playback engine
+local update_replay_buttons  -- forward-declare; defined with the engine
+
+-- Packet path color, halo and speed live in map_prefs (user-tunable from
+-- the replay screen). The dark halo is what keeps any color readable on
+-- light OSM tiles — magenta default since OSM cartography never uses it.
 
 -- Own position: GPS fix first, node prefs as fallback. nil when unknown.
 local function own_position()
@@ -372,17 +419,64 @@ marker_canvas:fill_bg("#000000", 0)
 marker_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
 marker_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
 
--- Moving packet dot for the path animation (above the marker canvas, below
+-- Animation canvas: the packet path (lines, hop squares, hash chips) lives
+-- on its own layer with its own slide reference, decoupled from the marker
+-- canvas — markers redraw freely (contact updates, archive toggles) without
+-- repainting a paused/playing path, and trail reveals don't repaint 500
+-- markers. Costs ~915KB PSRAM + one more full-screen blend per frame;
+-- deliberate trade (Noah, 2026-06-12).
+local anim_canvas = root:Canvas({
+    w = MCANVAS_W, h = MCANVAS_H,
+    cf = lvgl.COLOR_FORMAT.ARGB8888,
+    x = -MARKER_PAD, y = -MARKER_PAD,
+})
+anim_canvas:fill_bg("#000000", 0)
+anim_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
+anim_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
+-- Hidden while no animation runs: a hidden layer is skipped by the
+-- renderer entirely, so the second full-screen blend only costs anything
+-- while a packet is actually flying (or paused). Unhidden in
+-- redraw_anim_canvas when an animation starts.
+anim_canvas:add_flag(lvgl.FLAG.HIDDEN)
+
+-- Moving packet dot for the path animation (above both canvases, below
 -- the HUD). One widget repositioned per tick — far cheaper than repainting
 -- the canvas every frame.
 local anim_dot = root:Object({
-    w = 10, h = 10, x = -20, y = -20,
-    bg_color = "#00e0ff", bg_opa = 255, radius = 5,
-    border_color = "#ffffff", border_width = 1,
+    w = 12, h = 12, x = -20, y = -20,
+    bg_color = map_prefs.anim_color, bg_opa = 255, radius = 6,
+    border_color = "#ffffff", border_width = 2,
 })
 anim_dot:add_flag(lvgl.FLAG.HIDDEN)
 anim_dot:clear_flag(lvgl.FLAG.CLICKABLE)
 anim_dot:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+-- Replay info popup (top-left corner under the status bar): who the
+-- currently replayed packet is from, plus progress through the replay.
+-- (Hop hashes are drawn on the map itself, next to the animated waypoints.)
+local replay_box = root:Object({
+    w = 170, h = 40, x = 4, y = 24,
+    bg_color = "#000000", bg_opa = 200,
+    border_width = 1, border_color = "#666688", radius = 4,
+    pad_all = 3,
+})
+replay_box:clear_flag(lvgl.FLAG.SCROLLABLE)
+replay_box:clear_flag(lvgl.FLAG.CLICKABLE)
+-- NOTE: no label in this app sets text_font. They all inherit the screen
+-- default — the emoji font with montserrat fallback — so names and message
+-- text with emojis render correctly. Setting MONTSERRAT_14 explicitly is
+-- what produces tofu; don't reintroduce it.
+local replay_from_lbl = replay_box:Label({
+    text = "",
+    text_color = map_prefs.anim_color,
+    align = lvgl.ALIGN.TOP_LEFT,
+})
+local replay_prog_lbl = replay_box:Label({
+    text = "",
+    text_color = "#888888",
+    align = lvgl.ALIGN.BOTTOM_LEFT,
+})
+replay_box:add_flag(lvgl.FLAG.HIDDEN)
 
 -- Status bar at top
 local status_bar = root:Object({
@@ -397,21 +491,18 @@ status_bar:clear_flag(lvgl.FLAG.CLICKABLE)
 local status_label = status_bar:Label({
     text = "Map",
     text_color = "#AAAAAA",
-    text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
     align = lvgl.ALIGN.LEFT_MID,
 })
 
 local zoom_label = status_bar:Label({
     text = "z14",
     text_color = "#AAAAAA",
-    text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
     align = lvgl.ALIGN.RIGHT_MID,
 })
 
 local dl_label = status_bar:Label({
     text = "",
     text_color = "#FFB020",
-    text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
     align = lvgl.ALIGN.CENTER,
 })
 dl_label:add_flag(lvgl.FLAG.HIDDEN)
@@ -444,6 +535,27 @@ pcall(_emoji_preload, 0x2699)
 settings_btn:Label({ text = "\xE2\x9A\x99", align = lvgl.ALIGN.CENTER })
 settings_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)
 
+-- Replay transport (right of the gear; visible only while a replay runs).
+-- Emoji glyphs (the FontAwesome symbols don't render through the emoji
+-- font's fallback), with ASCII fallbacks when the blob lacks one —
+-- same preload pattern as the topbar.
+local ok_pl, has_pl = pcall(_emoji_preload, 0x25B6)  -- ▶ play
+local ok_pa, has_pa = pcall(_emoji_preload, 0x23F8)  -- ⏸ pause
+local ok_st, has_st = pcall(_emoji_preload, 0x23F9)  -- ⏹ stop
+local GLYPH_PLAY  = (ok_pl and has_pl) and "\xE2\x96\xB6" or ">"
+local GLYPH_PAUSE = (ok_pa and has_pa) and "\xE2\x8F\xB8" or "||"
+local GLYPH_STOP  = (ok_st and has_st) and "\xE2\x8F\xB9" or "[]"
+
+local rstop_btn = root:Button({ w = 36, h = 36, x = 92, y = H - 44 })
+rstop_btn:Label({ text = GLYPH_STOP, align = lvgl.ALIGN.CENTER })
+rstop_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+rstop_btn:add_flag(lvgl.FLAG.HIDDEN)
+
+local rpp_btn = root:Button({ w = 36, h = 36, x = 134, y = H - 44 })
+local rpp_lbl = rpp_btn:Label({ text = GLYPH_PAUSE, align = lvgl.ALIGN.CENTER })
+rpp_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+rpp_btn:add_flag(lvgl.FLAG.HIDDEN)
+
 -- Tooltip for marker info
 local tooltip = root:Object({
     w = 200, h = 24, x = (W - 200) / 2, y = H - 30,
@@ -456,7 +568,6 @@ tooltip:clear_flag(lvgl.FLAG.CLICKABLE)
 local tooltip_label = tooltip:Label({
     text = "",
     text_color = "#FFFFFF",
-    text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
     align = lvgl.ALIGN.CENTER,
 })
 tooltip:add_flag(lvgl.FLAG.HIDDEN)
@@ -495,8 +606,9 @@ local function evict_offscreen_tiles()
     end
 end
 
-local redraw_markers   -- forward declaration (defined after refresh_tiles)
-local update_status    -- forward declaration (defined after refresh_tiles)
+local redraw_markers      -- forward declaration (defined after refresh_tiles)
+local redraw_anim_canvas  -- forward declaration (defined after refresh_tiles)
+local update_status       -- forward declaration (defined after refresh_tiles)
 
 local function refresh_tiles()
     if not map.running then return end
@@ -597,6 +709,7 @@ local function refresh_tiles()
     end)
 
     redraw_markers()
+    if anim.active then redraw_anim_canvas() end  -- re-anchor path at new view/zoom
     update_status()
     update_dl_status()
 end
@@ -605,37 +718,102 @@ end
 -- Markers (drawn onto canvas — 1 widget vs 262)
 -- ---------------------------------------------------------------------------
 
--- Draw the active packet path polyline onto the marker canvas (canvas
--- coordinates follow map.marker_ref_vl/vt, so canvas slides keep it aligned).
+-- Draw the active packet path polyline onto the ANIMATION canvas (canvas
+-- coordinates follow map.anim_ref_vl/vt, so canvas slides keep it aligned).
 -- Segments touching a synthesized waypoint (repeater with unknown position)
 -- are dashed; real repeater hops get a small node square.
 local function draw_active_path()
-    if not anim.active or not map.marker_ref_vl then return end
-    local pts = anim.active.points
+    if not anim.active or not map.anim_ref_vl then return end
+    local a = anim.active
+    local pts = a.points
+    -- Trail mode: only segments the dot has finished are drawn, so the path
+    -- reveals itself hop by hop instead of appearing all at once (anim_tick
+    -- triggers a canvas redraw at each hop transition).
+    local reached = #pts
+    if map_prefs.trail then
+        reached = (a.phase == "arrive") and #pts or (a.seg or 1)
+    end
     local prev_x, prev_y, prev_real
     for i, p in ipairs(pts) do
         local wx, wy = lat_lon_to_world_px(p.lat, p.lon, map.zoom)
-        local cx = wx - map.marker_ref_vl + MARKER_PAD
-        local cy = wy - map.marker_ref_vt + MARKER_PAD
-        if prev_x then
+        local cx = wx - map.anim_ref_vl + MARKER_PAD
+        local cy = wy - map.anim_ref_vt + MARKER_PAD
+        if prev_x and i <= reached then
             local certain = p.real and prev_real
-            marker_canvas:draw_line({
+            -- Dark halo first, bright line on top — keeps the path readable
+            -- on light tiles and dark tiles alike. Width 0 disables it.
+            if map_prefs.halo_w > 0 then
+                anim_canvas:draw_line({
+                    p1 = { x = prev_x, y = prev_y },
+                    p2 = { x = cx, y = cy },
+                    color = "#000000",
+                    width = map_prefs.halo_w, opa = map_prefs.halo_opa,
+                    dash_width = certain and 0 or 6,
+                    dash_gap = certain and 0 or 5,
+                    round_start = 1, round_end = 1,
+                })
+            end
+            anim_canvas:draw_line({
                 p1 = { x = prev_x, y = prev_y },
                 p2 = { x = cx, y = cy },
-                color = "#00e0ff", width = 2, opa = 150,
+                color = map_prefs.anim_color, width = 2, opa = 235,
                 dash_width = certain and 0 or 6,
                 dash_gap = certain and 0 or 5,
                 round_start = 1, round_end = 1,
             })
         end
-        if p.real and i > 1 and i < #pts then
-            marker_canvas:draw_rect({
+        if p.real and i > 1 and i < #pts and i <= reached then
+            anim_canvas:draw_rect({
                 x1 = cx - 3, y1 = cy - 3, x2 = cx + 2, y2 = cy + 2,
-                bg_color = "#00e0ff", bg_opa = 220, radius = 3,
+                bg_color = map_prefs.anim_color, bg_opa = 255, radius = 3,
+                border_color = "#ffffff", border_width = 1, border_opa = 255,
             })
         end
         prev_x, prev_y, prev_real = cx, cy, p.real
     end
+
+    -- Hash chips: label every waypoint of the active path with its repeater
+    -- hash. Drawn for the WHOLE path from animation start (not gated by the
+    -- trail reveal) so the route can be read before the dot travels it.
+    -- Second pass so the text sits on top of the lines.
+    if map_prefs.hashes then
+        for _, p in ipairs(pts) do
+            if p.hash then
+                local wx, wy = lat_lon_to_world_px(p.lat, p.lon, map.zoom)
+                local cx = wx - map.anim_ref_vl + MARKER_PAD
+                local cy = wy - map.anim_ref_vt + MARKER_PAD
+                local tw = 4 + #p.hash * 8
+                local bx, by = cx + 6, cy - 20
+                anim_canvas:draw_rect({
+                    x1 = bx, y1 = by, x2 = bx + tw, y2 = by + 16,
+                    bg_color = "#000000", bg_opa = 170, radius = 3,
+                })
+                anim_canvas:draw_label({
+                    text = p.hash,
+                    color = "#ffffff", opa = 255,
+                    x1 = bx + 3, y1 = by + 1, x2 = bx + tw, y2 = by + 16,
+                })
+            end
+        end
+    end
+end
+
+-- Repaint the animation canvas: re-anchor its slide reference to the
+-- current view, clear, and draw the active path (clears when none).
+redraw_anim_canvas = function()
+    if not map.running then return end
+    if not anim.active then
+        map.anim_ref_vl = nil
+        map.anim_ref_vt = nil
+        anim_canvas:add_flag(lvgl.FLAG.HIDDEN)  -- zero render cost while idle
+        return
+    end
+    anim_canvas:clear_flag(lvgl.FLAG.HIDDEN)
+    anim_canvas:set({ x = -MARKER_PAD, y = -MARKER_PAD })
+    anim_canvas:fill_bg("#000000", 0)
+    map.anim_ref_vl = map.cx - math.floor(W / 2)
+    map.anim_ref_vt = map.cy - math.floor(H / 2)
+    draw_active_path()
 end
 
 redraw_markers = function()
@@ -689,8 +867,6 @@ redraw_markers = function()
         end
     end
 
-    -- Active packet path (if an animation is playing)
-    draw_active_path()
 end
 
 -- ---------------------------------------------------------------------------
@@ -752,7 +928,7 @@ local function resolve_path_waypoints(msg)
         end
         if #reps > 0 then cands = reps end
         n = n + 1
-        hops[n] = { cands = cands }
+        hops[n] = { cands = cands, hash = hash }
     end
 
     -- Pass 1: unambiguous hops
@@ -818,7 +994,8 @@ local function resolve_path_waypoints(msg)
     end
     for i = 1, n do
         if hops[i].lat then
-            points[#points + 1] = { lat = hops[i].lat, lon = hops[i].lon, real = hops[i].real }
+            points[#points + 1] = { lat = hops[i].lat, lon = hops[i].lon,
+                                    real = hops[i].real, hash = hops[i].hash }
         end
     end
     points[#points + 1] = { lat = own_lat, lon = own_lon, real = true }
@@ -829,7 +1006,6 @@ end
 -- Playback: the dot eases along each segment, dwells briefly on real
 -- repeater hops, then pulses out on arrival. Positions are recomputed from
 -- lat/lon every tick, so panning and zooming mid-animation stay glued.
-local ANIM_HOP_MS = 500
 local ANIM_PAUSE_MS = 180
 local ANIM_ARRIVE_MS = 350
 
@@ -839,19 +1015,23 @@ local function anim_world_to_screen(lat, lon)
 end
 
 local function anim_place_dot(lat, lon, size)
-    size = size or 10
+    size = size or 12
     local sx, sy = anim_world_to_screen(lat, lon)
     anim_dot:set({
         w = size, h = size, radius = math.floor(size / 2),
         x = sx - math.floor(size / 2), y = sy - math.floor(size / 2),
     })
+    -- Remember where the dot sits so a paused replay stays glued to the
+    -- map while panning/zooming.
+    local a = anim.active
+    if a then a.cur_lat, a.cur_lon = lat, lon end
 end
 
 local function anim_stop()
     anim.active = nil
     anim_dot:add_flag(lvgl.FLAG.HIDDEN)
-    anim_dot:set({ w = 10, h = 10, radius = 5, bg_opa = 255 })
-    redraw_markers()  -- wipes the path polyline
+    anim_dot:set({ w = 12, h = 12, radius = 6, bg_opa = 255 })
+    redraw_anim_canvas()  -- clears the path layer (markers untouched)
 end
 
 local function anim_start_next()
@@ -864,20 +1044,57 @@ local function anim_start_next()
     anim_place_dot(a.points[1].lat, a.points[1].lon)
     anim_dot:set({ bg_opa = 255 })
     anim_dot:clear_flag(lvgl.FLAG.HIDDEN)
-    redraw_markers()  -- draws the path polyline
+    if a.replay then
+        replay_from_lbl:set({ text = "From: " .. (a.from or "?") })
+        replay_prog_lbl:set({ text = a.num .. " / " .. replay.total })
+        replay_box:clear_flag(lvgl.FLAG.HIDDEN)
+    end
+    redraw_anim_canvas()  -- draws the path polyline (markers untouched)
 end
 
 local function anim_tick(period)
     if not anim.active then
-        if anim.enabled and #anim.queue > 0 then anim_start_next() end
+        -- Replay feeder: when idle, pull the next replayable message
+        -- (skipping ones whose path can't be resolved any more).
+        if replay.active and replay.paused then return end  -- frozen: no feeding
+        if replay.active and #anim.queue == 0 then
+            local tries = 0
+            while replay.idx < replay.total and tries < 5 do
+                replay.idx = replay.idx + 1
+                tries = tries + 1
+                local m = replay.list[replay.idx]
+                local points = resolve_path_waypoints(m)
+                if points then
+                    anim.queue[#anim.queue + 1] = {
+                        points = points, replay = true,
+                        from = m.from, num = replay.idx,
+                    }
+                    break
+                end
+            end
+            if replay.idx >= replay.total and #anim.queue == 0 then
+                stop_replay()  -- exhausted (or nothing left resolvable)
+            end
+        end
+        -- Replay entries play even when live animations are toggled off —
+        -- the user asked for them explicitly.
+        if #anim.queue > 0 and (anim.enabled or anim.queue[1].replay) then
+            anim_start_next()
+        end
         return
     end
     local a = anim.active
+    if a.replay and replay.paused then
+        -- Frozen mid-flight: no time advance, but keep the dot glued to the
+        -- map so panning/zooming doesn't strand it.
+        if a.cur_lat then anim_place_dot(a.cur_lat, a.cur_lon) end
+        return
+    end
     local pts = a.points
     a.t = a.t + period
 
     if a.phase == "move" then
-        local f = math.min(1, a.t / ANIM_HOP_MS)
+        local f = math.min(1, a.t / map_prefs.anim_hop)
         local e = f * f * (3 - 2 * f)  -- smoothstep ease
         local p1, p2 = pts[a.seg], pts[a.seg + 1]
         anim_place_dot(p1.lat + (p2.lat - p1.lat) * e,
@@ -890,6 +1107,9 @@ local function anim_tick(period)
                 a.seg = a.seg + 1
                 a.phase = pts[a.seg].real and "pause" or "move"
             end
+            -- Trail mode: reveal the just-completed segment on the path
+            -- layer — no marker repaint involved anymore
+            if map_prefs.trail then redraw_anim_canvas() end
         end
     elseif a.phase == "pause" then
         anim_place_dot(pts[a.seg].lat, pts[a.seg].lon)
@@ -900,10 +1120,92 @@ local function anim_tick(period)
     elseif a.phase == "arrive" then
         local f = math.min(1, a.t / ANIM_ARRIVE_MS)
         local last = pts[#pts]
-        anim_place_dot(last.lat, last.lon, 10 + math.floor(22 * f))
+        anim_place_dot(last.lat, last.lon, 12 + math.floor(22 * f))
         anim_dot:set({ bg_opa = math.floor(255 * (1 - f)) })
         if f >= 1 then anim_stop() end
     end
+end
+
+-- Transport buttons mirror the replay state: hidden when idle, pause
+-- button swaps its glyph with the paused flag.
+update_replay_buttons = function()
+    if replay.active then
+        rstop_btn:clear_flag(lvgl.FLAG.HIDDEN)
+        rpp_btn:clear_flag(lvgl.FLAG.HIDDEN)
+        rpp_lbl:set({ text = replay.paused and GLYPH_PLAY or GLYPH_PAUSE })
+    else
+        rstop_btn:add_flag(lvgl.FLAG.HIDDEN)
+        rpp_btn:add_flag(lvgl.FLAG.HIDDEN)
+    end
+end
+
+stop_replay = function()
+    replay.active = false
+    replay.paused = false
+    replay.list = {}
+    replay.idx = 0
+    replay.total = 0
+    -- Drop queued replay animations (live ones stay), stop a playing one
+    local i = 1
+    while i <= #anim.queue do
+        if anim.queue[i].replay then table.remove(anim.queue, i) else i = i + 1 end
+    end
+    if anim.active and anim.active.replay then anim_stop() end
+    replay_box:add_flag(lvgl.FLAG.HIDDEN)
+    update_replay_buttons()
+end
+
+-- Gather persisted channel messages from `window_secs` ago until now
+-- (0 = everything), optionally only those from a sender whose name starts
+-- with `name_filter`, oldest first. Returns how many will be replayed.
+local REPLAY_MAX = 50  -- newest N when the window matches more
+
+local function start_replay(window_secs, name_filter, skip_1byte)
+    stop_replay()
+
+    local cutoff = (window_secs and window_secs > 0) and (os.time() - window_secs) or 0
+    local filter = name_filter and string.lower(name_filter) or ""
+    filter = filter:gsub("^%s+", ""):gsub("%s+$", "")
+    if filter == "" then filter = nil end
+
+    local list = {}
+    for ch = 0, 7 do
+        local ok, msgs = pcall(_mesh_get_channel_messages, ch)
+        if ok and type(msgs) == "table" then
+            for _, m in ipairs(msgs) do
+                -- All hashes in one packet's path share a size; 1-byte
+                -- hashes are 2 hex chars. Zero-hop (empty path) messages
+                -- contain no 1-byte hashes, so the skip leaves them in.
+                local one_byte = m.path and #m.path > 0 and #m.path[1] <= 2
+                if m.from and (m.timestamp or 0) >= cutoff
+                   and not m.is_dm
+                   and (not own_name or m.from ~= own_name)
+                   and (not filter or string.lower(m.from):sub(1, #filter) == filter)
+                   and not (skip_1byte and one_byte)
+                then
+                    list[#list + 1] = m
+                end
+            end
+        end
+    end
+
+    table.sort(list, function(a, b) return (a.timestamp or 0) < (b.timestamp or 0) end)
+
+    if #list > REPLAY_MAX then
+        local trimmed = {}
+        for i = #list - REPLAY_MAX + 1, #list do trimmed[#trimmed + 1] = list[i] end
+        list = trimmed
+    end
+
+    if #list == 0 then return 0 end
+
+    replay.list = list
+    replay.total = #list
+    replay.idx = 0
+    replay.active = true
+    replay.paused = false
+    update_replay_buttons()
+    return #list
 end
 
 -- ---------------------------------------------------------------------------
@@ -957,15 +1259,18 @@ local function show_contact_popup(contact)
     })
     contact_popup:clear_flag(lvgl.FLAG.SCROLLABLE)
 
+    -- Sizes to content but never beyond the screen; archived contacts add
+    -- rows (Status + Re-add) that overflow 240px, so the box stays
+    -- scrollable and gridnav scrolls the focused button into view.
     local box = contact_popup:Object({
         w = W - 20, h = lvgl.SIZE_CONTENT,
+        max_height = H - 16,
         align = lvgl.ALIGN.CENTER,
         bg_color = "#1a1a2e", radius = 8,
         border_width = 1, border_color = "#444466",
         pad_all = 10,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     })
-    box:clear_flag(lvgl.FLAG.SCROLLABLE)
 
     local function info_row(label, value)
         local row = box:Object({
@@ -976,13 +1281,11 @@ local function show_contact_popup(contact)
         row:Label({
             text = label,
             text_color = "#888888",
-            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
             align = lvgl.ALIGN.LEFT_MID,
         })
         row:Label({
             text = value,
             text_color = "#FFFFFF",
-            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
             align = lvgl.ALIGN.RIGHT_MID,
         })
     end
@@ -991,7 +1294,6 @@ local function show_contact_popup(contact)
     box:Label({
         text = contact.name or "Unknown",
         text_color = "#FFFFFF",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = W - 40, h = 22,
     })
 
@@ -1075,7 +1377,7 @@ local function show_contact_popup(contact)
     close_btn:Label({ text = "Close", align = lvgl.ALIGN.CENTER })
     close_btn:onClicked(function() close_contact_popup() end)
 
-    _nav_setup(box, GRIDNAV_ROLLOVER)
+    _nav_setup(box, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
 end
 
 update_dl_status = function()
@@ -1273,7 +1575,6 @@ show_precache_screen = function()
     pc_confirm_group:Label({
         text = "Download Map Tiles",
         text_color = "#FFFFFF",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 24,
     })
 
@@ -1288,7 +1589,6 @@ show_precache_screen = function()
     area_row:Label({
         text = "Area: ",
         text_color = "#AAAAAA",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = 55, h = 30,
     })
     local area_dd = area_row:Dropdown({
@@ -1298,7 +1598,6 @@ show_precache_screen = function()
     local area_desc = area_row:Label({
         text = "",
         text_color = "#888888",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = 120, h = 30,
     })
 
@@ -1320,7 +1619,6 @@ show_precache_screen = function()
     zoom_row:Label({
         text = "Min z:",
         text_color = "#AAAAAA",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = 55, h = 30,
     })
     local minz_dd = zoom_row:Dropdown({
@@ -1331,7 +1629,6 @@ show_precache_screen = function()
     zoom_row:Label({
         text = " Max z:",
         text_color = "#AAAAAA",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = 65, h = 30,
     })
     local maxz_dd = zoom_row:Dropdown({
@@ -1344,19 +1641,16 @@ show_precache_screen = function()
     local count_lbl = pc_confirm_group:Label({
         text = "",
         text_color = "#FFFFFF",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 20,
     })
     local eta_lbl = pc_confirm_group:Label({
         text = "",
         text_color = "#FFFFFF",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 20,
     })
     local warn_lbl = pc_confirm_group:Label({
         text = "",
         text_color = "#FF4444",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 20,
     })
     warn_lbl:add_flag(lvgl.FLAG.HIDDEN)
@@ -1392,7 +1686,6 @@ show_precache_screen = function()
     pc_progress_title = pc_progress_group:Label({
         text = "Downloading Tiles",
         text_color = "#FFFFFF",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 24,
     })
 
@@ -1414,19 +1707,16 @@ show_precache_screen = function()
     pc_counter_lbl = pc_progress_group:Label({
         text = "0 / 0 tiles",
         text_color = "#FFFFFF",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 20,
     })
     pc_zoom_lbl = pc_progress_group:Label({
         text = "",
         text_color = "#AAAAAA",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 20,
     })
     pc_eta_lbl = pc_progress_group:Label({
         text = "",
         text_color = "#AAAAAA",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 20,
     })
 
@@ -1600,6 +1890,258 @@ show_precache_screen = function()
 end
 
 -- ---------------------------------------------------------------------------
+-- Path replay screen
+-- ---------------------------------------------------------------------------
+local replay_overlay = nil
+
+local function close_replay_screen()
+    if not replay_overlay then return end
+    local ov = replay_overlay
+    replay_overlay = nil
+
+    -- This overlay holds textareas, and it closes from inside its own
+    -- buttons' click events. Tearing down a focused textarea synchronously
+    -- mid-event-chain crashed once on hardware — so: drop gridnav, move
+    -- focus off the overlay, hide it now, and delete it on the next timer
+    -- tick once the event chain has fully unwound.
+    _nav_clear()
+    lvgl.group.focus_obj(root)
+    ov:add_flag(lvgl.FLAG.HIDDEN)
+    lvgl.Timer({
+        period = 20,
+        cb = function(t)
+            t:delete()
+            -- pcall: the map may have shut down (root:delete) in the gap
+            pcall(function() ov:delete() end)
+        end,
+    })
+end
+
+local function show_replay_screen()
+    if replay_overlay then return end
+
+    replay_overlay = root:Object({
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#1a1a2e", bg_opa = 255,
+        pad_all = 8, border_width = 0,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    })
+    -- Content is taller than the screen — keep the overlay scrollable so the
+    -- lower buttons are reachable (gridnav scrolls the focused one into view).
+
+    replay_overlay:Label({
+        text = "Replay Packet Paths",
+        text_color = "#FFFFFF",
+        w = lvgl.PCT(100), h = 24,
+    })
+
+    -- Time window: minutes back from now, 0 = entire history
+    local win_row = replay_overlay:Object({
+        w = W - 16, h = 34,
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    })
+    win_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    win_row:Label({
+        text = "Minutes back (0=all): ",
+        text_color = "#AAAAAA",
+        w = 165, h = 30,
+    })
+    local win_ta = win_row:Textarea({
+        password_mode = false, one_line = true,
+        text = "60",
+        w = W - 16 - 169, h = 30,
+    })
+    win_ta:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    -- Sender filter
+    local name_row = replay_overlay:Object({
+        w = W - 16, h = 34,
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    })
+    name_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    name_row:Label({
+        text = "From: ",
+        text_color = "#AAAAAA",
+        w = 75, h = 30,
+    })
+    local name_ta = name_row:Textarea({
+        password_mode = false, one_line = true,
+        text = "",
+        w = W - 16 - 79, h = 30,
+    })
+    name_ta:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    replay_overlay:Label({
+        text = "Leave name empty to replay everyone",
+        text_color = "#888888",
+        w = lvgl.PCT(100), h = 18,
+    })
+
+    -- 1-byte path hashes collide easily (midpoint guesses); this skips
+    -- messages whose path uses them, keeping only precise multi-byte paths.
+    local skip_1b = false
+    local function skip_1b_text()
+        return (skip_1b and "[x]" or "[ ]") .. " Skip 1-byte hash paths"
+    end
+    local skip_btn = replay_overlay:Button({ w = W - 16, h = 32 })
+    local skip_lbl = skip_btn:Label({ text = skip_1b_text(), align = lvgl.ALIGN.LEFT_MID })
+    skip_btn:onClicked(function()
+        skip_1b = not skip_1b
+        skip_lbl:set({ text = skip_1b_text() })
+    end)
+
+    local warn_lbl = replay_overlay:Label({
+        text = "",
+        text_color = "#FF4444",
+        w = lvgl.PCT(100), h = 18,
+    })
+    warn_lbl:add_flag(lvgl.FLAG.HIDDEN)
+
+    -- Start / Stop / Close
+    local start_btn = replay_overlay:Button({ w = W - 16, h = 32 })
+    start_btn:Label({ text = "Start replay", align = lvgl.ALIGN.CENTER })
+    start_btn:onClicked(function()
+        local mins = tonumber(win_ta.text)
+        if not mins or mins < 0 then
+            warn_lbl:set({ text = "Enter minutes >= 0", text_color = "#FF4444" })
+            warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
+            return
+        end
+        local n = start_replay(math.floor(mins) * 60, name_ta.text, skip_1b)
+        if n == 0 then
+            warn_lbl:set({ text = "No matching messages", text_color = "#FF4444" })
+            warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
+            return
+        end
+        close_replay_screen()  -- back to the map to watch
+    end)
+
+    local stop_btn = replay_overlay:Button({ w = W - 16, h = 32 })
+    stop_btn:Label({ text = "Stop replay", align = lvgl.ALIGN.CENTER })
+    stop_btn:onClicked(function()
+        stop_replay()
+        close_replay_screen()
+    end)
+
+    -- ── Animation settings (shared by live + replay animations) ──
+    replay_overlay:Label({
+        text = "Animation",
+        text_color = "#FFFFFF",
+        w = lvgl.PCT(100), h = 22,
+    })
+
+    -- Color (applies + saves immediately)
+    local COLOR_VALUES = { "#ff00cc", "#00e0ff", "#ffe000", "#ff8800", "#00ff66", "#ffffff" }
+    local color_row = replay_overlay:Object({
+        w = W - 16, h = 34,
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    })
+    color_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    color_row:Label({
+        text = "Color: ",
+        text_color = "#AAAAAA",
+        w = 75, h = 30,
+    })
+    local color_dd = color_row:Dropdown({
+        options = "Magenta\nCyan\nYellow\nOrange\nGreen\nWhite",
+        w = 130, h = 30,
+    })
+    local color_sel = 1
+    for i, v in ipairs(COLOR_VALUES) do
+        if v == map_prefs.anim_color then color_sel = i break end
+    end
+    color_dd:set({ selected = color_sel - 1 })
+    color_dd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+        local i = color_dd:get("selected") + 1
+        map_prefs.anim_color = COLOR_VALUES[i] or COLOR_VALUES[1]
+        save_map_prefs()
+        anim_dot:set({ bg_color = map_prefs.anim_color })
+        replay_from_lbl:set({ text_color = map_prefs.anim_color })
+    end)
+
+    -- Trail mode: reveal the path hop by hop vs draw it all up front
+    local function trail_toggle_text()
+        return (map_prefs.trail and "[x]" or "[ ]") .. " Reveal path hop by hop"
+    end
+    local trail_btn = replay_overlay:Button({ w = W - 16, h = 32 })
+    local trail_lbl = trail_btn:Label({ text = trail_toggle_text(), align = lvgl.ALIGN.LEFT_MID })
+    trail_btn:onClicked(function()
+        map_prefs.trail = not map_prefs.trail
+        save_map_prefs()
+        trail_lbl:set({ text = trail_toggle_text() })
+    end)
+
+    -- Hash chips on the animated waypoints
+    local function hashes_toggle_text()
+        return (map_prefs.hashes and "[x]" or "[ ]") .. " Show hop hashes"
+    end
+    local hashes_btn = replay_overlay:Button({ w = W - 16, h = 32 })
+    local hashes_lbl = hashes_btn:Label({ text = hashes_toggle_text(), align = lvgl.ALIGN.LEFT_MID })
+    hashes_btn:onClicked(function()
+        map_prefs.hashes = not map_prefs.hashes
+        save_map_prefs()
+        hashes_lbl:set({ text = hashes_toggle_text() })
+    end)
+
+    -- Numeric settings (validated + saved by the Apply button)
+    local function num_row(label_text, value)
+        local row = replay_overlay:Object({
+            w = W - 16, h = 34,
+            bg_opa = 0, border_width = 0, pad_all = 0,
+            flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        })
+        row:clear_flag(lvgl.FLAG.SCROLLABLE)
+        row:Label({
+            text = label_text,
+            text_color = "#AAAAAA",
+            w = 165, h = 30,
+        })
+        local ta = row:Textarea({
+            password_mode = false, one_line = true,
+            text = tostring(value),
+            w = W - 16 - 169, h = 30,
+        })
+        ta:clear_flag(lvgl.FLAG.SCROLLABLE)
+        return ta
+    end
+    local hop_ta = num_row("Hop time (ms): ", map_prefs.anim_hop)
+    local hw_ta  = num_row("Halo width (0=off): ", map_prefs.halo_w)
+    local ho_ta  = num_row("Halo opacity: ", map_prefs.halo_opa)
+
+    local apply_btn = replay_overlay:Button({ w = W - 16, h = 32 })
+    apply_btn:Label({ text = "Apply animation settings", align = lvgl.ALIGN.CENTER })
+    apply_btn:onClicked(function()
+        local hop = tonumber(hop_ta.text)
+        local hw  = tonumber(hw_ta.text)
+        local ho  = tonumber(ho_ta.text)
+        if not hop or not hw or not ho then
+            warn_lbl:set({ text = "Enter numbers in all fields", text_color = "#FF4444" })
+            warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
+            return
+        end
+        map_prefs.anim_hop = math.max(100, math.min(5000, math.floor(hop)))
+        map_prefs.halo_w   = math.max(0, math.min(12, math.floor(hw)))
+        map_prefs.halo_opa = math.max(0, math.min(255, math.floor(ho)))
+        save_map_prefs()
+        -- reflect clamped values back into the fields
+        hop_ta.text = tostring(map_prefs.anim_hop)
+        hw_ta.text  = tostring(map_prefs.halo_w)
+        ho_ta.text  = tostring(map_prefs.halo_opa)
+        warn_lbl:set({ text = "Animation settings saved", text_color = "#24ba24" })
+        warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
+    end)
+
+    local back_btn = replay_overlay:Button({ w = W - 16, h = 32 })
+    back_btn:Label({ text = "Close", align = lvgl.ALIGN.CENTER })
+    back_btn:onClicked(function() close_replay_screen() end)
+
+    _nav_setup(replay_overlay, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+end
+
+-- ---------------------------------------------------------------------------
 -- Settings screen
 -- ---------------------------------------------------------------------------
 local settings_overlay = nil
@@ -1616,6 +2158,13 @@ end
 local function show_settings_screen()
     if settings_overlay then return end
 
+    -- A running replay auto-pauses while the settings cover the map
+    -- (stays paused on return — resume with the play button).
+    if replay.active and not replay.paused then
+        replay.paused = true
+        update_replay_buttons()
+    end
+
     settings_overlay = root:Object({
         w = W, h = H, x = 0, y = 0,
         bg_color = "#1a1a2e", bg_opa = 255,
@@ -1627,7 +2176,6 @@ local function show_settings_screen()
     settings_overlay:Label({
         text = "Map Settings",
         text_color = "#FFFFFF",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         w = lvgl.PCT(100), h = 24,
     })
 
@@ -1639,7 +2187,8 @@ local function show_settings_screen()
     local anim_lbl = anim_btn:Label({ text = anim_toggle_text(), align = lvgl.ALIGN.LEFT_MID })
     anim_btn:onClicked(function()
         anim.enabled = not anim.enabled
-        save_map_prefs(anim.enabled, show_archived)
+        map_prefs.anim = anim.enabled
+        save_map_prefs()
         anim_lbl:set({ text = anim_toggle_text() })
         if not anim.enabled then
             anim.queue = {}
@@ -1655,9 +2204,18 @@ local function show_settings_screen()
     local arch_lbl = arch_btn:Label({ text = arch_toggle_text(), align = lvgl.ALIGN.LEFT_MID })
     arch_btn:onClicked(function()
         show_archived = not show_archived
-        save_map_prefs(anim.enabled, show_archived)
+        map_prefs.archived = show_archived
+        save_map_prefs()
         arch_lbl:set({ text = arch_toggle_text() })
         redraw_markers()  -- reflect immediately
+    end)
+
+    -- Replay packet paths from message history
+    local replay_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    replay_btn:Label({ text = "Replay packet paths...", align = lvgl.ALIGN.LEFT_MID })
+    replay_btn:onClicked(function()
+        close_settings_screen()
+        show_replay_screen()
     end)
 
     -- Tile pre-cache download (validates SD/WiFi on its own screen)
@@ -1710,6 +2268,16 @@ local function reposition_tiles()
         -- Recenter canvas when edge nears viewport
         if math.abs(dx) > MARKER_PAD - 20 or math.abs(dy) > MARKER_PAD - 20 then
             redraw_markers()
+        end
+    end
+    -- Slide the animation canvas on its own reference (decoupled from the
+    -- markers; recentering it repaints only the path)
+    if anim.active and map.anim_ref_vl then
+        local adx = map.anim_ref_vl - view_left
+        local ady = map.anim_ref_vt - view_top
+        anim_canvas:set({ x = adx - MARKER_PAD, y = ady - MARKER_PAD })
+        if math.abs(adx) > MARKER_PAD - 20 or math.abs(ady) > MARKER_PAD - 20 then
+            redraw_anim_canvas()
         end
     end
 end
@@ -1799,7 +2367,9 @@ root:onevent(lvgl.EVENT.KEY, function()
             end
         end
     elseif key == lvgl.KEY.ESC or key == 27 or key == 113 then -- ESC / q
-        if settings_overlay then
+        if replay_overlay then
+            close_replay_screen()
+        elseif settings_overlay then
             close_settings_screen()
         elseif contact_popup then
             close_contact_popup()
@@ -1907,6 +2477,17 @@ end)
 
 settings_btn:onevent(lvgl.EVENT.CLICKED, function()
     if map.running then show_settings_screen() end
+end)
+
+-- Replay transport
+rstop_btn:onevent(lvgl.EVENT.CLICKED, function()
+    if map.running then stop_replay() end
+end)
+rpp_btn:onevent(lvgl.EVENT.CLICKED, function()
+    if map.running and replay.active then
+        replay.paused = not replay.paused
+        update_replay_buttons()
+    end
 end)
 
 -- ---------------------------------------------------------------------------
@@ -2056,12 +2637,6 @@ end
 
 -- Subscribe to live channel traffic for the path animation. DMs are ignored
 -- for now; own local-echo messages (hops 0, from = us) are skipped too.
-local own_name
-do
-    local ok, info = pcall(_mesh_get_node_info)
-    own_name = ok and info and info.name or nil
-end
-
 messages:onAnyMessage(function(msg)
     if not map.running or not anim.enabled then return end
     if msg.is_dm then return end

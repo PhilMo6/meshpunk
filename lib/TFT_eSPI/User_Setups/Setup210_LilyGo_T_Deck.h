@@ -44,7 +44,10 @@
 
 
 // #define SPI_FREQUENCY  27000000
-#define SPI_FREQUENCY  40000000
+// 80 MHz: above the ST7789 datasheet max (62.5) but routinely stable on
+// T-Decks; halves full-frame push time (PICO-8/Doom blits, LVGL flushes).
+// If the panel shows artifacts/tearing, drop back to 40000000.
+#define SPI_FREQUENCY  80000000
 
 #define SPI_READ_FREQUENCY  20000000
 

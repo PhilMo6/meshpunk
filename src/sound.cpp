@@ -34,17 +34,29 @@ static bool    active_file_is_sd = false;
 
 static const uint32_t TONE_SR = 44100;
 static bool tone_sr_set = false;
+// NOTE (2026-06-12): a "pull-native I2S" experiment lived here — it
+// uninstalled/reinstalled the I2S driver at the module's rate with a
+// shallow DMA queue (lower latency, no resampling). REMOVED at the base-
+// architecture level: the boot-installed driver is shared with the
+// ESP32-audioI2S lib (notifications/MP3) and the push path (Doom), and
+// driver juggling left the whole boot's audio broken when the restore
+// raced playback or its 32KB DMA realloc failed. Do not reintroduce
+// driver reinstalls here; if pull latency matters again, solve it at the
+// lib-config level and test notifications + MP3 + Doom + PICO-8 together.
 
 static TaskHandle_t      s_sound_task  = nullptr;
 static SemaphoreHandle_t s_sound_mutex = nullptr;
 static volatile bool     s_sound_suspended = false;  // I2S halted for native module
 
-// ── External audio ring buffer (mono 11025 Hz → upsampled to 44100 Hz stereo) ─
+// ── External audio ring buffer (mono → upsampled to 44100 Hz stereo) ──────────
 #define EXTERN_RING_SIZE 4096
 static int16_t s_extern_ring[EXTERN_RING_SIZE];
 static volatile int s_extern_head = 0;
 static volatile int s_extern_tail = 0;
-#define EXTERN_UPSAMPLE 4  // 11025 * 4 = 44100
+static volatile int s_extern_upsample = 4;  // 44100 / input_rate (default 11025 Hz)
+// Pull-model source — when set, the mixer fetches samples from the module
+// instead of the ring. Written only under s_sound_mutex.
+static void (*s_extern_pull)(int16_t* out, int count) = nullptr;
 
 static void sound_task_body(void* param);
 
@@ -54,9 +66,11 @@ void sound_init(Audio* audio_ptr, void (*prefs_save_fn)()) {
     s_audio      = audio_ptr;
     s_prefs_save = prefs_save_fn;
     s_sound_mutex = xSemaphoreCreateMutex();
+    // 12KB stack: a pull-model ELF module's synth (sound_extern_set_pull)
+    // runs its code on this task, on top of the mixer's ~4KB of locals.
     xTaskCreatePinnedToCore(
         sound_task_body, "sound_task",
-        8 * 1024, nullptr, 3, &s_sound_task, 1
+        12 * 1024, nullptr, 3, &s_sound_task, 1
     );
 }
 
@@ -83,6 +97,14 @@ void sound_resume() {
 
 // ── External audio ring buffer ────────────────────────────────────────────────
 
+void sound_extern_set_rate(int sample_rate) {
+    if (sample_rate <= 0) sample_rate = 11025;
+    int factor = 44100 / sample_rate;
+    if (factor < 1) factor = 1;
+    if (factor > 4) factor = 4;
+    s_extern_upsample = factor;
+}
+
 void sound_extern_push(const int16_t* samples, int count) {
     bool was_empty = (s_extern_head == s_extern_tail);
     for (int i = 0; i < count; i++) {
@@ -103,6 +125,22 @@ bool sound_extern_active(void) {
 
 void sound_extern_flush(void) {
     s_extern_tail = s_extern_head;
+    s_extern_upsample = 4;  // reset to default (11025 Hz)
+}
+
+void sound_extern_set_pull(void (*cb)(int16_t* out, int count), int sample_rate) {
+    // Taking the mutex guarantees the mixer is not inside the old callback
+    // when we return — required before the module's code is unloaded.
+    xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
+    s_extern_pull = cb;
+    if (cb) {
+        sound_extern_set_rate(sample_rate);
+        s_extern_tail = s_extern_head;  // drop any queued push-model audio
+    } else {
+        s_extern_upsample = 4;
+    }
+    xSemaphoreGive(s_sound_mutex);
+    if (cb && s_sound_task) xTaskNotifyGive(s_sound_task);
 }
 
 // ── Accessors ─────────────────────────────────────────────────────────────────
@@ -704,11 +742,11 @@ static void sound_task_body(void* param) {
                 any_tones = true;
         }
 
-        bool has_extern = sound_extern_active();
+        bool has_extern = (s_extern_pull != nullptr) || sound_extern_active();
 
         if (!any_tones && !has_extern) {
             // Don't reset tone_sr_set here — the ring buffer goes briefly empty
-            // between Doom tic pushes, and reconfiguring I2S every wake cycle
+            // between module audio pushes, and reconfiguring I2S every wake cycle
             // causes audible DMA glitches.  Only the Audio-library path resets it.
             xSemaphoreGive(s_sound_mutex);
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
@@ -734,33 +772,66 @@ static void sound_task_body(void* param) {
             }
         }
 
-        xSemaphoreGive(s_sound_mutex);
+        // The in-mixer heap-hunt checkpoints (sound:tones/postpull/extern,
+        // every 64th chunk) are GONE: their phase-discrimination question is
+        // answered (module api_sfx OOB, fixed), and the 3x ~12ms walk burst
+        // stalled this prio-3 task long enough to starve the prio-2 blit
+        // task (a metronome-like frame hitch — every 743ms at 22050 native)
+        // and to chew most of the shallow pull-native DMA queue's headroom
+        // (audible click). The 250ms ambient walk at the top of the loop
+        // and the meshloop walk remain the corruption soak detectors.
 
-        // ── Mix external audio (Doom SFX etc.) ──────────────────────
-        // Read from the 11025 Hz mono ring buffer; upsample 4x to
-        // 44100 Hz stereo using linear interpolation.
+        // ── Mix external audio (ELF module) ─────────────────────────
+        // Pull model: fetch exactly the samples needed straight from the
+        // module's synth (running here, on Core 1). Push model: drain the
+        // ring filled via host_audio_push. Either way, upsample to
+        // 44100 Hz stereo with linear interpolation (1=44100, 2=22050,
+        // 4=11025). Still under s_sound_mutex so sound_extern_set_pull()
+        // can't unload the callback mid-call.
         {
             static int16_t s_prev_extern = 0;
-            int avail = (s_extern_head - s_extern_tail + EXTERN_RING_SIZE)
-                        % EXTERN_RING_SIZE;
-            int needed = CHUNK / EXTERN_UPSAMPLE; // 256/4 = 64 input samples
-            int n = (avail < needed) ? avail : needed;
-            int tail = s_extern_tail;
+            int upsample = s_extern_upsample;
+            int needed = CHUNK / upsample;
+            int n = 0;
+            int16_t samp[256]; // CHUNK max (when upsample=1)
+            // Stack canary after samp[] — a pull module writing more
+            // samples than asked for corrupts this task's stack (volatile
+            // so it stays placed after the buffer).
+            volatile uint32_t samp_guard = 0xCAFEBABE;
 
-            int16_t samp[64]; // CHUNK / EXTERN_UPSAMPLE
-            for (int i = 0; i < n; i++) {
-                samp[i] = s_extern_ring[tail];
-                tail = (tail + 1) % EXTERN_RING_SIZE;
+            if (s_extern_pull) {
+                s_extern_pull(samp, needed);
+                n = needed;
+                if (samp_guard != 0xCAFEBABE) {
+                    static uint32_t s_guard_last_print = 0;
+                    uint32_t now_g = millis();
+                    if (now_g - s_guard_last_print >= 1000) {  // don't spam
+                        s_guard_last_print = now_g;
+                        Serial.printf("[sound] module pull OVERRAN samp[] "
+                                      "(guard=%08x, needed=%d)\n",
+                                      (unsigned)samp_guard, needed);
+                    }
+                    samp_guard = 0xCAFEBABE;
+                }
+            } else {
+                int avail = (s_extern_head - s_extern_tail + EXTERN_RING_SIZE)
+                            % EXTERN_RING_SIZE;
+                n = (avail < needed) ? avail : needed;
+                int tail = s_extern_tail;
+                for (int i = 0; i < n; i++) {
+                    samp[i] = s_extern_ring[tail];
+                    tail = (tail + 1) % EXTERN_RING_SIZE;
+                }
+                s_extern_tail = tail;
             }
-            s_extern_tail = tail;
 
             for (int i = 0; i < n; i++) {
                 int16_t prev = (i == 0) ? s_prev_extern : samp[i - 1];
                 int16_t cur  = samp[i];
-                for (int j = 0; j < EXTERN_UPSAMPLE; j++) {
+                for (int j = 0; j < upsample; j++) {
                     int32_t out = (int32_t)prev
-                                + ((int32_t)(cur - prev) * j) / EXTERN_UPSAMPLE;
-                    int idx = (i * EXTERN_UPSAMPLE + j) * 2;
+                                + ((int32_t)(cur - prev) * j) / upsample;
+                    int idx = (i * upsample + j) * 2;
                     if (idx + 1 < CHUNK * 2) {
                         mix[idx]     += (int16_t)out;
                         mix[idx + 1] += (int16_t)out;
@@ -769,6 +840,8 @@ static void sound_task_body(void* param) {
             }
             if (n > 0) s_prev_extern = samp[n - 1];
         }
+
+        xSemaphoreGive(s_sound_mutex);
 
         float vol_scale = sound_muted ? 0.0f : (float)sound_volume / 21.0f;
         int16_t out[CHUNK * 2];

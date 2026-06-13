@@ -410,6 +410,10 @@ bool PunkMesh::ensureArchiveLoaded()
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
+    // The file is an append-only log: re-archiving a contact appends a
+    // fresh line rather than rewriting the file, so the same pubkey can
+    // appear multiple times — the LAST occurrence is the current one.
+    int file_lines = 0;
     String path = storagePath(_storage_prefix, "/contacts_arch");
     if (_storage->exists(path.c_str()))
     {
@@ -417,13 +421,36 @@ bool PunkMesh::ensureArchiveLoaded()
         if (file)
         {
             char line[320];
-            while (file.available() && num_archived < MAX_ARCHIVED_CONTACTS)
+            ContactInfo entry;
+            while (file.available())
             {
                 int len = read_contact_file_line(file, line, sizeof(line));
                 if (len == 0) continue;
+                if (!parse_contact_line(line, len, entry)) continue;
+                file_lines++;
 
-                if (parse_contact_line(line, len, archived[num_archived])) {
-                    num_archived++;
+                int slot = -1;
+                for (int i = 0; i < num_archived; i++) {
+                    if (memcmp(archived[i].id.pub_key, entry.id.pub_key, PUB_KEY_SIZE) == 0) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot >= 0) {
+                    archived[slot] = entry;        // newer line wins
+                } else if (num_archived < MAX_ARCHIVED_CONTACTS) {
+                    archived[num_archived++] = entry;
+                } else {
+                    // More uniques on disk than capacity (replace-oldest at
+                    // runtime leaves the replaced entries' lines behind) —
+                    // apply the same replace-oldest policy here.
+                    int oldest = 0;
+                    for (int i = 1; i < num_archived; i++) {
+                        if (archived[i].last_advert_timestamp < archived[oldest].last_advert_timestamp)
+                            oldest = i;
+                    }
+                    if (entry.last_advert_timestamp > archived[oldest].last_advert_timestamp)
+                        archived[oldest] = entry;
                 }
             }
             file.close();
@@ -431,14 +458,54 @@ bool PunkMesh::ensureArchiveLoaded()
     }
 
     if (is_sd) sd_spi_release();
-    Serial.printf("[ARCH] Loaded %d archived contacts\n", num_archived);
+    archive_appends = 0;
+    Serial.printf("[ARCH] Loaded %d archived contacts (%d lines)\n", num_archived, file_lines);
+
+    // Compact when the log carries meaningful duplicate slack — one bounded
+    // rewrite at load time instead of one on every change.
+    if (file_lines > num_archived + 64) {
+        Serial.printf("[ARCH] Compacting archive (%d lines -> %d entries)\n",
+                      file_lines, num_archived);
+        saveArchive();
+    }
     return true;
+}
+
+// Hot-path persistence: append ONE contact line. A full saveArchive() at
+// 200+ contacts is a ~45KB rewrite on the mesh task holding the shared
+// SD/TFT SPI bus — per advert eviction at live-table saturation, that was
+// measurable as fps drops during advert storms. An append is ~200 bytes.
+void PunkMesh::appendArchiveEntry(const ContactInfo& c)
+{
+    archive_generation++;  // invalidate the Lua-side union cache
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/contacts_arch");
+    File file = _storage->open(path.c_str(), "a", true);
+    if (file) {
+        write_contact_line(file, c);
+        file.close();
+    }
+
+    if (is_sd) sd_spi_release();
+
+    // Bound the log's growth during long uptimes: amortized one rewrite
+    // per ARCH_COMPACT_EVERY appends (load-time compaction handles the
+    // accumulated slack between boots).
+    static const int ARCH_COMPACT_EVERY = 512;
+    if (++archive_appends >= ARCH_COMPACT_EVERY) {
+        Serial.printf("[ARCH] Periodic compaction after %d appends\n", archive_appends);
+        archive_appends = 0;
+        saveArchive();
+    }
 }
 
 void PunkMesh::saveArchive()
 {
     archive_generation++;  // invalidate the Lua-side union cache
     if (!archived) return;
+    archive_appends = 0;   // a full rewrite IS a compaction
 
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
@@ -468,17 +535,20 @@ void PunkMesh::archiveContact(const ContactInfo& c)
 {
     if (!ensureArchiveLoaded()) return;
 
-    // Already archived (e.g. evicted again after a re-add) — refresh it
+    // Already archived (e.g. evicted again after a re-add) — refresh it.
+    // Append-only: the new line supersedes the old one at load time.
     for (int i = 0; i < num_archived; i++) {
         if (memcmp(archived[i].id.pub_key, c.id.pub_key, PUB_KEY_SIZE) == 0) {
             archived[i] = c;
-            saveArchive();
+            appendArchiveEntry(c);
             return;
         }
     }
 
     if (num_archived >= MAX_ARCHIVED_CONTACTS) {
-        // Archive full — replace the entry with the oldest advert
+        // Archive full — replace the entry with the oldest advert. The
+        // replaced entry's old lines stay in the log; load applies the
+        // same replace-oldest policy, so disk converges to RAM.
         int oldest = 0;
         for (int i = 1; i < num_archived; i++) {
             if (archived[i].last_advert_timestamp < archived[oldest].last_advert_timestamp) {
@@ -490,7 +560,7 @@ void PunkMesh::archiveContact(const ContactInfo& c)
         archived[num_archived++] = c;
     }
     Serial.printf("[ARCH] Archived contact: %s (total %d)\n", c.name, num_archived);
-    saveArchive();
+    appendArchiveEntry(c);
 }
 
 bool PunkMesh::readdArchivedContact(const uint8_t* pub_key)
@@ -756,8 +826,8 @@ static void push_path_table(lua_State* L, uint16_t path_len, const uint8_t* path
     lua_newtable(L);
     uint8_t hash_size = (path_len >> 6) + 1;
     uint8_t hash_count = path_len & 63;
-    char hex[7];
-    for (int j = 0; j < hash_count; j++) {
+    char hex[9];  // up to 4-byte hashes (8 hex chars + NUL)
+    for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
         mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
         lua_pushstring(L, hex);
         lua_rawseti(L, -2, j + 1);
@@ -782,8 +852,8 @@ static void write_path_field(File& f, uint16_t path_len, const uint8_t* path) {
     uint8_t hash_count = path_len & 63;
     if (hash_count == 0) return;
     f.print("path=");
-    char hex[7];
-    for (int j = 0; j < hash_count; j++) {
+    char hex[9];  // up to 4-byte hashes
+    for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
         if (j > 0) f.print(",");
         mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
         f.print(hex);
@@ -796,8 +866,8 @@ static void write_rpath_line(File& f, uint16_t path_len, const uint8_t* path,
     uint8_t hash_size = (path_len >> 6) + 1;
     uint8_t hash_count = path_len & 63;
     f.print("rpath=");
-    char hex[7];
-    for (int j = 0; j < hash_count; j++) {
+    char hex[9];  // up to 4-byte hashes
+    for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
         if (j > 0) f.print(",");
         mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
         f.print(hex);
@@ -993,7 +1063,9 @@ static uint16_t parse_path_field(const char* val, uint8_t* path_out) {
         const char* comma = strchr(p, ',');
         size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
         uint8_t hash_size = tok_len / 2;
-        if (hash_size == 0 || hash_size > 3) break;
+        if (hash_size == 0 || hash_size > 4) break;
+        // never write past the fixed path buffer (corrupt/oversized lines)
+        if ((size_t)(count + 1) * hash_size > MAX_PATH_SIZE) break;
         for (size_t i = 0; i < hash_size; i++) {
             char byte_hex[3] = { p[i*2], p[i*2+1], '\0' };
             path_out[count * hash_size + i] = (uint8_t)strtoul(byte_hex, nullptr, 16);
@@ -1777,7 +1849,10 @@ void PunkMesh::onSendTimeout()
 static bool paths_equal(uint16_t a_len, const uint8_t* a_path,
                         uint16_t b_len, const uint8_t* b_path) {
     if (a_len != b_len) return false;
-    uint8_t byte_len = (a_len & 63) * ((a_len >> 6) + 1);
+    // Clamp: a sentinel/corrupt encoding (e.g. OUT_PATH_UNKNOWN 0xFF decodes
+    // as 63×4 = 252) must not read past the 64-byte path buffers.
+    uint16_t byte_len = (uint16_t)(a_len & 63) * ((a_len >> 6) + 1);
+    if (byte_len > MAX_PATH_SIZE) byte_len = MAX_PATH_SIZE;
     return memcmp(a_path, b_path, byte_len) == 0;
 }
 
@@ -1861,6 +1936,9 @@ void PunkMesh::recordPath(const uint8_t* pub_key, uint16_t path_len,
 void PunkMesh::recordPathSuccess(const uint8_t* pub_key, uint32_t trip_time_ms) {
     ContactPathHistory* h = findOrCreatePathHistory(pub_key);
     if (!h || !curr_recipient) return;
+    // No learned route — nothing to credit (and 0xFF must not be treated
+    // as a path encoding; it used to create garbage 63×4-hash records).
+    if (curr_recipient->out_path_len == OUT_PATH_UNKNOWN) return;
 
     for (int i = 0; i < h->count; i++) {
         if (paths_equal(h->records[i].path_len, h->records[i].path,
@@ -1888,6 +1966,7 @@ void PunkMesh::recordPathSuccess(const uint8_t* pub_key, uint32_t trip_time_ms) 
 void PunkMesh::recordPathFailure(const uint8_t* pub_key) {
     ContactPathHistory* h = findOrCreatePathHistory(pub_key);
     if (!h || !curr_recipient) return;
+    if (curr_recipient->out_path_len == OUT_PATH_UNKNOWN) return;
 
     for (int i = 0; i < h->count; i++) {
         if (paths_equal(h->records[i].path_len, h->records[i].path,
@@ -2013,8 +2092,11 @@ void PunkMesh::persistExtraPath(const uint8_t* hash, const ObservedPath& op) {
     rlen += snprintf(rpath_buf + rlen, sizeof(rpath_buf) - rlen, "rpath=");
     uint8_t hs = (op.path_len >> 6) + 1;
     uint8_t hc = op.path_len & 63;
-    char hex[7];
-    for (int j = 0; j < hc; j++) {
+    if (hs > 4) hc = 0;  // invalid encoding — write no hops
+    char hex[9];  // up to 4-byte hashes (8 hex chars + NUL)
+    for (int j = 0; j < hc && (j + 1) * hs <= MAX_PATH_SIZE; j++) {
+        // leave room for this token plus the ;snr;rssi;d\n tail
+        if (rlen + (int)hs * 2 + 32 >= (int)sizeof(rpath_buf)) break;
         if (j > 0) rpath_buf[rlen++] = ',';
         mesh::Utils::toHex(hex, &op.path[j * hs], hs);
         memcpy(rpath_buf + rlen, hex, hs * 2);

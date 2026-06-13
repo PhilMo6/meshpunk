@@ -1973,16 +1973,21 @@ static void push_contact_table(lua_State *L, const ContactInfo &c, bool archived
   lua_pushboolean(L, (c.flags & 0x01) != 0);
   lua_setfield(L, -2, "favorite");
 
-  // out_path as array of hex hashes
+  // out_path as array of hex hashes. out_path_len 0xFF is the
+  // OUT_PATH_UNKNOWN sentinel (no route learned) — it must NOT be decoded
+  // as size/count (it reads as 63 hashes of 4 bytes and used to overflow
+  // the hex buffer); unknown routes get an empty path table.
   {
-    uint8_t hash_size = (c.out_path_len >> 6) + 1;
-    uint8_t hash_count = c.out_path_len & 63;
     lua_newtable(L);
-    char h[7];
-    for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
-      mesh::Utils::toHex(h, &c.out_path[j * hash_size], hash_size);
-      lua_pushstring(L, h);
-      lua_rawseti(L, -2, j + 1);
+    if (c.out_path_len != OUT_PATH_UNKNOWN) {
+      uint8_t hash_size = (c.out_path_len >> 6) + 1;
+      uint8_t hash_count = c.out_path_len & 63;
+      char h[9];  // up to 4-byte hashes (8 hex chars + NUL)
+      for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
+        mesh::Utils::toHex(h, &c.out_path[j * hash_size], hash_size);
+        lua_pushstring(L, h);
+        lua_rawseti(L, -2, j + 1);
+      }
     }
     lua_setfield(L, -2, "path");
   }

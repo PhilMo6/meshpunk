@@ -62,7 +62,7 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S);
 
 void sound_register_lua(lua_State* L);
 
-// Suspend/resume I2S audio while a full-screen native module (e.g. the Doom
+// Suspend/resume I2S audio while a full-screen native module (e.g. an ELF
 // ELF) takes over the device. Audio is serviced from Core 0 (audio->loop()) and
 // Core 1 (sound_task); when the module monopolizes Core 0 the I2S TX DMA would
 // otherwise keep cycling unattended, its completion ISR firing into stale state.
@@ -71,18 +71,35 @@ void sound_register_lua(lua_State* L);
 void sound_suspend();
 void sound_resume();
 
-// ── External audio (native modules like Doom) ────────────────────────────────
+// ── External audio (native ELF modules) ──────────────────────────────────────
 
-// Push mono 11025Hz PCM samples into the mixing ring buffer. Called from
-// Core 0 by the loaded module; the sound task on Core 1 upsamples to
-// 44100Hz stereo and mixes them alongside notification tones. Volume and
-// mute controls apply automatically.
+// Set the input sample rate for external audio. The mixer upsamples to
+// 44100 Hz stereo; supported rates are 11025, 22050, and 44100 Hz
+// (integer upsample factors of 4, 2, and 1). Call before the first push
+// or whenever the module's rate changes. Defaults to 11025 Hz on flush.
+void sound_extern_set_rate(int sample_rate);
+
+// Push mono PCM samples into the mixing ring buffer. Called from Core 0
+// by the loaded module; the sound task on Core 1 upsamples to 44100 Hz
+// stereo and mixes them alongside notification tones. Volume and mute
+// controls apply automatically. Call sound_extern_set_rate() first if
+// the module's sample rate is not 11025 Hz.
 void sound_extern_push(const int16_t* samples, int count);
+
+// Pull-model external audio: while registered, the sound task (Core 1)
+// calls `cb` to synthesize exactly the mono samples it needs at
+// `sample_rate`, replacing the push ring. Eliminates ring starvation for
+// modules whose synth renders on demand (e.g. PICO-8) and moves the synth
+// cost off the module's game loop. The callback runs under the sound
+// mutex, so sound_extern_set_pull(NULL, 0) blocks until the mixer is
+// outside the callback — call it before unloading the module's code.
+void sound_extern_set_pull(void (*cb)(int16_t* out, int count), int sample_rate);
 
 // True if there are samples waiting in the external ring buffer.
 bool sound_extern_active(void);
 
-// Flush the external ring buffer (call on module exit).
+// Flush the external ring buffer and reset sample rate to default.
+// Call on module exit.
 void sound_extern_flush(void);
 
 // ── State accessors ───────────────────────────────────────────────────────────

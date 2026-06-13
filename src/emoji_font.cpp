@@ -11,7 +11,13 @@
 
 namespace {
 
-constexpr uint32_t EMOJI_MIN_CODEPOINT = 0x2600u;
+// 0x2300 covers Miscellaneous Technical (⏸⏹⏺ ⌚⌛, 0x23xx) and Geometric
+// Shapes (▶◀▪▫, 0x25xx) — emoji the blob ships but the old 0x2600 gate
+// routed to montserrat (which lacks them → tofu). Codepoints in range but
+// missing from the blob render as zero-width blanks, same as before.
+// NOTE: emoji_preload() has no gate, so keep this aligned with the blob —
+// a preload "true" must mean the render path will actually use it.
+constexpr uint32_t EMOJI_MIN_CODEPOINT = 0x2300u;
 constexpr const char * EMOJI_BLOB_PATH = "L:/emojis.bin";
 
 // Blob file format (see tools/build_emoji.sh):
@@ -269,9 +275,8 @@ const void * emoji_path_cb(const lv_font_t * font,
     LV_UNUSED(unicode_next);
     LV_UNUSED(user_data);
 
-    // Below the emoji threshold — let LVGL fall through to the montserrat
-    // fallback (ASCII/Latin/FontAwesome).
-    if (unicode < EMOJI_MIN_CODEPOINT) return nullptr;
+    // ASCII fast path — the overwhelming majority of glyphs; never emoji.
+    if (unicode < 0x80) return nullptr;
 
     blank_dsc_init_once();
 
@@ -291,9 +296,16 @@ const void * emoji_path_cb(const lv_font_t * font,
 
     if (auto * cached = cache_lookup(unicode)) return cached;
 
+    // No range gate: blob MEMBERSHIP decides the route. In the blob →
+    // emoji glyph (every emoji the blob ships is available); not in the
+    // blob → montserrat fallback (Latin-1, FontAwesome, and anything we
+    // can't render shows montserrat's placeholder rather than vanishing).
+    // The in-RAM binary search is ~11 compares — cheap enough per glyph.
+    if (!blob_init_once() || blob_find(unicode) < 0) return nullptr;
+
     auto * fresh = load_emoji_from_blob(unicode);
-    // Missing entry (or OOM) — cache the miss so we never retry this
-    // codepoint. Subsequent lookups return the blank immediately.
+    // In the index but failed to load (OOM/decode) — cache the blank so we
+    // never retry this codepoint every frame.
     if (!fresh) {
         cache_insert(unicode, &s_blank_dsc);
         return &s_blank_dsc;
