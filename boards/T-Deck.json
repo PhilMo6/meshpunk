@@ -2,7 +2,7 @@
   "build": {
     "arduino": {
       "ldscript": "esp32s3_out.ld",
-      "partitions": "default_16MB.csv",
+      "partitions": "meshpunk_custom_16Mb.csv",
       "memory_type": "qio_opi"
     },
     "core": "esp32",
