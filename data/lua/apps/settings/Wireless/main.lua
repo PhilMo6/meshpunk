@@ -1,10 +1,11 @@
 local lvgl  = require("lvgl")
 local utils = require("lib/utils")
+local apps  = require("lib/apps")
 
 local wifi_avail = type(_wifi_get_enabled) == "function"
 local ble_avail  = type(_ble_get_enabled) == "function"
 
-local root = lvgl.Object()
+local root = apps.new_root()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0 }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
@@ -21,7 +22,6 @@ local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 
 local status = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
-local timers = {}
 local scan_timer = nil
 
 -- ═══════════════════════════════════════════════════════════════════
@@ -214,10 +214,9 @@ scan_btn:onClicked(function()
 end)
 
 -- Periodic WiFi status refresh
-local wifi_refresh_timer = lvgl.Timer { period = 2000, cb = function()
+apps.add_timer { period = 2000, cb = function()
     refresh_wifi_status()
 end }
-table.insert(timers, wifi_refresh_timer)
 
 end -- wifi_avail
 
@@ -272,8 +271,7 @@ local function refresh_conn()
 end
 refresh_conn()
 
-local ble_timer = lvgl.Timer { period = 2000, cb = function() refresh_conn() end }
-table.insert(timers, ble_timer)
+apps.add_timer { period = 2000, cb = function() refresh_conn() end }
 
 end -- ble_avail
 
@@ -282,16 +280,11 @@ end -- ble_avail
 -- ═══════════════════════════════════════════════════════════════════
 
 back_btn:onClicked(function()
-    for _, t in ipairs(timers) do
-        if t then pcall(function() t:delete() end) end
-    end
+    -- scan_timer is dynamic (recreated per scan, self-deleting) and not
+    -- manager-tracked; kill it before teardown. The wifi/ble refresh timers
+    -- were registered via apps.add_timer, so the manager deletes those.
     if scan_timer then pcall(function() scan_timer:delete() end) end
-    utils.loadingPopUpAdd(nil, "Home", function()
-        root:delete()
-        local launcher = require("launcher")
-        launcher.create()
-        return true
-    end)
+    apps.go_home()
 end)
 
 return root

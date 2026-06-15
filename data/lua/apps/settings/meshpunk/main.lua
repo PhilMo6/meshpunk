@@ -4,6 +4,7 @@
 local lvgl = require("lvgl")
 local clock_fmt_mod = require("lib/clock_fmt")
 local utils = require("lib/utils")
+local apps = require("lib/apps")
 
 local ok2, storage = pcall(_storage_get_info)
 if not ok2 or not storage then
@@ -11,7 +12,7 @@ if not ok2 or not storage then
 end
 
 -- Root
-local root = lvgl.Object()
+local root = apps.new_root()
 root:set {
     w = lvgl.HOR_RES(),
     h = lvgl.VER_RES(),
@@ -36,12 +37,7 @@ content:Label { text = "Firmware Settings", w = lvgl.PCT(70), h = 26 }
 local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 back_btn:onClicked(function()
-    utils.loadingPopUpAdd(nil, "Home", function()
-        root:delete()
-        local launcher = require("launcher")
-        launcher.create()
-        return true
-    end)
+    apps.go_home()
 end)
 
 -- Status line

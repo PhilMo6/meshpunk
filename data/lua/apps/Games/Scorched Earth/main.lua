@@ -1,4 +1,5 @@
 local lvgl = require("lvgl")
+local apps = require("lib/apps")
 
 local app_dir = ...
 
@@ -60,31 +61,21 @@ local game = {
 function game:alive() return self.running end
 
 function game:trackTimer(t)
-    if t then table.insert(self.timers, t) end
-    return t
+    return apps.track_timer(t)   -- manager owns timer teardown
 end
 
 function game:shutdown()
     if not self.running then return end
     self.running = false
     self.playing = false
-
-    for _, t in ipairs(self.timers) do
-        pcall(function() if t.delete then t:delete() end end)
-    end
-    self.timers = {}
-
-    if self.scr then
-        pcall(function() self.scr:delete() end)
-        self.scr = nil
-    end
+    apps.go_home()   -- manager deletes tracked timers, then the root
 end
 
 -- ============================================================
 -- Helpers
 -- ============================================================
 local function screenCreate(parent)
-    local scr = lvgl.Object(parent, {
+    local scr = apps.new_root({
         w = W, h = H,
         bg_opa = lvgl.OPA(0),
         border_width = 0, pad_all = 0
@@ -596,9 +587,7 @@ showGameOver = function(winner)
     end)
 
     exitBtn:onevent(lvgl.EVENT.CLICKED, function()
-        game:shutdown()
-        local launcher = require("launcher")
-        launcher.create()
+        game:shutdown()   -- ends with apps.go_home()
     end)
 end
 
@@ -683,9 +672,7 @@ local function showMenu(scr)
     end)
 
     exitBtn:onevent(lvgl.EVENT.CLICKED, function()
-        game:shutdown()
-        local launcher = require("launcher")
-        launcher.create()
+        game:shutdown()   -- ends with apps.go_home()
     end)
 end
 
@@ -777,7 +764,7 @@ end
 -- Entry point
 -- ============================================================
 local function entry()
-    local scr = screenCreate()
+    local scr = screenCreate()   -- apps.new_root inside: already registered
     game.scr = scr
     setupInput(scr)
     showMenu(scr)

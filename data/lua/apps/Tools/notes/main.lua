@@ -4,10 +4,11 @@
 ]]
 
 local lvgl = require("lvgl")
+local apps = require("lib/apps")
 
 local NOTES_PATH = "/lua/apps/notes/notes.txt"
 
-local root = lvgl.Object {
+local root = apps.new_root {
     w = lvgl.HOR_RES(),
     h = lvgl.VER_RES(),
     flex = {
@@ -62,9 +63,7 @@ save:onClicked(save_file)
 -- save file then quit
 local function quit_app()
     save_file()
-    root:delete()
-    local launcher = require("launcher")
-    launcher.create()
+    apps.go_home()
 end
 
 local quit = root:Button { w = lvgl.PCT(45), h = 40 }

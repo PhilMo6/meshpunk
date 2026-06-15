@@ -21,6 +21,7 @@
 ]]
 
 local lvgl = require("lvgl")
+local apps = require("lib/apps")
 
 -- ── Screen constants ──
 local W = lvgl.HOR_RES()
@@ -284,6 +285,7 @@ show_browser = function()
     }
     home_btn:onClicked(function()
         root:delete()
+        apps.refresh()   -- pick up any files created/edited this session
         local launcher = require("launcher")
         launcher.create()
     end)

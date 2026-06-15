@@ -1,4 +1,5 @@
 local lvgl = require("lvgl")
+local apps = require("lib/apps")
 
 local app_dir = ...
 
@@ -39,6 +40,16 @@ local seen_lower = {}
 local selected_cart = 1
 local selected_cart_name = nil
 local scr = nil
+
+-- Stable, manager-registered root. The menu/controls/bind/input views swap by
+-- replacing `scr` (a CHILD of this root); the root itself is never deleted, so
+-- apps.go_home() (and a future home/back key) can tear the app down cleanly.
+local root = apps.new_root({
+    w = W, h = H,
+    bg_color = "#000000", bg_opa = lvgl.OPA(255),
+    border_width = 0, pad_all = 0,
+})
+root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
 local function scan_dir_for_carts(dir_path, prefix)
     local entries = {}
@@ -230,7 +241,7 @@ local function create_input_screen() end
 create_main_screen = function()
     if scr then scr:delete() end
 
-    scr = lvgl.Object(nil, {
+    scr = root:Object({
         w = W, h = H,
         bg_color = "#000000", bg_opa = lvgl.OPA(255),
         border_width = 0, pad_all = 0,
@@ -352,10 +363,7 @@ create_main_screen = function()
     local quitBtn = btnBox:Button{ w = lvgl.PCT(100), h = 34 }
     quitBtn:Label{ text = "Quit", align = lvgl.ALIGN.CENTER }
     quitBtn:onClicked(function()
-        scr:delete()
-        scr = nil
-        local launcher = require("launcher")
-        launcher.create()
+        apps.go_home()   -- manager tears down the stable root (and its current view)
     end)
 
     lvgl.group.get_default():add_obj(cartDd)
@@ -369,7 +377,7 @@ end
 create_controls_screen = function()
     if scr then scr:delete() end
 
-    scr = lvgl.Object(nil, {
+    scr = root:Object({
         w = W, h = H,
         bg_color = "#000000", bg_opa = lvgl.OPA(255),
         border_width = 0, pad_all = 0,
@@ -473,7 +481,7 @@ create_bind_screen = function(action_idx, slot)
     local b = bindings[a.id]
     if scr then scr:delete() end
 
-    scr = lvgl.Object(nil, {
+    scr = root:Object({
         w = W, h = H,
         bg_color = "#000000", bg_opa = lvgl.OPA(255),
         border_width = 0, pad_all = 0,
@@ -542,7 +550,7 @@ end
 create_input_screen = function()
     if scr then scr:delete() end
 
-    scr = lvgl.Object(nil, {
+    scr = root:Object({
         w = W, h = H,
         bg_color = "#000000", bg_opa = lvgl.OPA(255),
         border_width = 0, pad_all = 0,

@@ -5,6 +5,14 @@ local H = lvgl.VER_RES()
 
 local utils = {}
 
+-- Returns true if an internal (LittleFS) file exists.
+-- For SD-card paths use the _file_exists_sd C++ binding instead.
+function utils.file_exists(path)
+    local f = io.open(path, "r")
+    if f then f:close() return true end
+    return false
+end
+
 -- Format time string
 function utils.formatTime(timestamp)
     local time = os.date("*t", timestamp or os.time())

@@ -1,5 +1,6 @@
 local lvgl = require("lvgl")
 local messages = require("lib/mesh/messages")
+local apps = require("lib/apps")
 
 print("[Map] starting")
 
@@ -367,7 +368,7 @@ end
 -- UI setup
 -- ---------------------------------------------------------------------------
 
-local root = lvgl.Object({
+local root = apps.new_root({
     w = W, h = H, x = 0, y = 0,
     pad_all = 0, border_width = 0,
     bg_color = "#1a1a2e",
@@ -2330,14 +2331,9 @@ local function center_on_self()
 end
 
 local function shutdown()
-    map.running = false
+    map.running = false                               -- stops timer-tick work
     pcall(function() messages:onAnyMessage(nil) end)  -- release the hub slot
-    _nav_clear()  -- remove gridnav before delete (avoids use-after-free)
-    for _, t in ipairs(map.timers) do pcall(function() t:delete() end) end
-    map.timers = {}
-    root:delete()
-    local launcher = require("launcher")
-    launcher.create()
+    apps.go_home()   -- manager: _nav_clear, delete tracked timers, then the root
 end
 
 -- ---------------------------------------------------------------------------
@@ -2521,7 +2517,7 @@ local dl_timer = lvgl.Timer({
         end
     end,
 })
-table.insert(map.timers, dl_timer)
+apps.track_timer(dl_timer)
 
 -- Periodic WiFi status check (every 3s)
 local wifi_timer = lvgl.Timer({
@@ -2531,7 +2527,7 @@ local wifi_timer = lvgl.Timer({
         update_wifi_status()
     end,
 })
-table.insert(map.timers, wifi_timer)
+apps.track_timer(wifi_timer)
 
 -- Momentum timer — single movement engine for both touch and trackball
 local momentum_timer = lvgl.Timer({
@@ -2567,7 +2563,7 @@ local momentum_timer = lvgl.Timer({
         reposition_tiles()
     end,
 })
-table.insert(map.timers, momentum_timer)
+apps.track_timer(momentum_timer)
 
 -- Auto-hide tooltip after 3 seconds
 local tooltip_timer = lvgl.Timer({
@@ -2577,7 +2573,7 @@ local tooltip_timer = lvgl.Timer({
         map.tooltip:add_flag(lvgl.FLAG.HIDDEN)
     end,
 })
-table.insert(map.timers, tooltip_timer)
+apps.track_timer(tooltip_timer)
 
 -- Packet path animation ticker
 local ANIM_TICK_MS = 30
@@ -2588,7 +2584,7 @@ local anim_timer = lvgl.Timer({
         anim_tick(ANIM_TICK_MS)
     end,
 })
-table.insert(map.timers, anim_timer)
+apps.track_timer(anim_timer)
 
 -- ---------------------------------------------------------------------------
 -- Initial view: center on own position or default

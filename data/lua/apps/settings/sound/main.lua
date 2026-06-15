@@ -1,9 +1,10 @@
 local lvgl  = require("lvgl")
 local sound = require("lib/sound")
 local utils = require("lib/utils")
+local apps  = require("lib/apps")
 
 -- Root
-local root = lvgl.Object()
+local root = apps.new_root()
 root:set {
     w = lvgl.HOR_RES(),
     h = lvgl.VER_RES(),
@@ -247,16 +248,12 @@ end)
 
 -- Cleanup on back
 back_btn:onClicked(function()
-    utils.loadingPopUpAdd(nil, "Home", function()
-        if test_tone then test_tone:delete(); test_tone = nil end
-        if test_file then test_file:delete(); test_file = nil end
-        for _, t in ipairs(demo_tones) do t:delete() end
-        demo_tones = {}
-        root:delete()
-        local launcher = require("launcher")
-        launcher.create()
-        return true
-    end)
+    -- app-specific audio cleanup first, then let the manager tear down the root
+    if test_tone then test_tone:delete(); test_tone = nil end
+    if test_file then test_file:delete(); test_file = nil end
+    for _, t in ipairs(demo_tones) do t:delete() end
+    demo_tones = {}
+    apps.go_home()
 end)
 
 return root

@@ -1,7 +1,8 @@
 local lvgl  = require("lvgl")
 local utils = require("lib/utils")
+local apps  = require("lib/apps")
 
-local root = lvgl.Object()
+local root = apps.new_root()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0 }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
@@ -282,12 +283,7 @@ end)
 
 -- ── Back ─────────────────────────────────────────────────────────────────────
 back_btn:onClicked(function()
-    utils.loadingPopUpAdd(nil, "Home", function()
-        root:delete()
-        local launcher = require("launcher")
-        launcher.create()
-        return true
-    end)
+    apps.go_home()
 end)
 
 return root

@@ -7,6 +7,7 @@ local lvgl = require("lvgl")
 local messages = require("lib/mesh/messages")
 local utils = require("lib/utils")
 local gridnav_body = require("lib/gridnav_body")
+local apps = require("lib/apps")
 
 -- Persistence lives on the C++ PunkMesh side (respects _storage: LittleFS
 -- root or /meshpunk on SD), so any app can access the same message history.
@@ -26,7 +27,7 @@ local group = lvgl.group.get_default()
 
 
 -- Root container
-local root = lvgl.Object()
+local root = apps.new_root()
 root:set { w = W, h = H, pad_all = 0, border_width = 0 }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
@@ -212,7 +213,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
 end
 
 -- ── Periodic peer count update ──────────────────────────────────
-local contactTimer = lvgl.Timer {
+apps.add_timer {
     period = 5000,
     cb = function(t)
         if current_mode == "inbox" or current_mode =="contacts" then
@@ -240,16 +241,11 @@ show_inbox = function()
     local back_btn = body:Button { w = 50, h = 24 }
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
     back_btn:onevent(lvgl.EVENT.RELEASED,function()
-        utils.loadingPopUpAdd(nil, "Home", function()
-            contactTimer:delete()
-            messages:onMessage(nil)
-            messages:onDirectMessage(nil)
-            messages:onContactUpdate(nil)
-            root:delete()
-            local launcher = require("launcher")
-            launcher.create()
-            return true
-        end)
+        -- app-specific: release message callbacks, then let the manager tear down
+        messages:onMessage(nil)
+        messages:onDirectMessage(nil)
+        messages:onContactUpdate(nil)
+        apps.go_home()   -- manager deletes the tracked contact timer, then the root
     end)
 
     local ch_btn = body:Button { w = 70, h = 24 }

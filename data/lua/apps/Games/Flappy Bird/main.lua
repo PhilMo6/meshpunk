@@ -1,5 +1,6 @@
 local lvgl = require("lvgl")
 local sound = require("lib/sound")
+local apps = require("lib/apps")
 
 -- Receive app directory from launcher (e.g. "L:/lua/apps/flappyBird")
 local app_dir = ...
@@ -48,8 +49,7 @@ function game:trackAnim(a)
 end
 
 function game:trackTimer(t)
-    if t then table.insert(self.timers, t) end
-    return t
+    return apps.track_timer(t)   -- manager owns timer teardown
 end
 
 function game:shutdown()
@@ -62,18 +62,10 @@ function game:shutdown()
     end
     self.anims = {}
 
-    for _, t in ipairs(self.timers) do
-        pcall(function() if t.delete then t:delete() end end)
-    end
-    self.timers = {}
-
     if self.gameover_snd then pcall(function() self.gameover_snd:delete() end); self.gameover_snd = nil end
     if self.flap_snd then pcall(function() self.flap_snd:delete() end); self.flap_snd = nil end
 
-    if self.scr then
-        pcall(function() self.scr:delete() end)
-        self.scr = nil
-    end
+    apps.go_home()   -- manager deletes tracked timers, then the root
 end
 
 -- Try to load best score from file
@@ -105,7 +97,7 @@ local function randomY()
 end
 
 local function screenCreate(parent)
-    local scr = lvgl.Object(parent, {
+    local scr = apps.new_root({
         w = W, h = H,
         bg_opa = lvgl.OPA(0),
         border_width = 0, pad_all = 0
@@ -481,15 +473,13 @@ local function createQuitBtn(sysLayer)
     quitBtn:onevent(lvgl.EVENT.PRESSED, function()
         -- Single exit point: shutdown flips game.running=false FIRST so any
         -- in-flight anim/timer tick short-circuits, then stops and deletes.
-        game:shutdown()
-        local launcher = require("launcher")
-        launcher.create()
+        game:shutdown()   -- ends with apps.go_home()
     end)
     return quitBtn
 end
 
 local function entry()
-    local scr = screenCreate()
+    local scr = screenCreate()   -- apps.new_root inside: already registered
     game.scr = scr
     local bird, pipes, sysLayer
     local gameStart, gameOver

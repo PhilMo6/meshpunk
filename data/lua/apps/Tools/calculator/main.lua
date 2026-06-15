@@ -1,5 +1,5 @@
 local utils = require("lib/utils")
-local nav = require("lib/nav")
+local apps = require("lib/apps")
 
 local W = lvgl.HOR_RES()
 local H = lvgl.VER_RES()
@@ -21,7 +21,7 @@ local DISPLAY_H = 44
 local BTN_H     = 33
 local PAD       = 6
 
-local root = lvgl.Object()
+local root = apps.new_root()
 root:set {
     w = W, h = H,
     bg_color = CLR_BG, bg_opa = 255,
@@ -50,10 +50,7 @@ header:clear_flag(lvgl.FLAG.SCROLLABLE)
 local back_btn = header:Button { w = 45, h = HEADER_H, radius = 4, bg_color = CLR_DIGIT, bg_opa = 255 }
 back_btn:Label { text = "<", align = lvgl.ALIGN.CENTER, text_color = CLR_TEXT }
 back_btn:onClicked(function()
-    utils.loadingPopUpAdd(nil, "Home", function()
-        nav.goHome(root)
-        return true
-    end)
+    apps.go_home()
 end)
 
 header:Label {
@@ -250,10 +247,7 @@ back_grid_btn:Label {
     align = lvgl.ALIGN.CENTER,
 }
 back_grid_btn:onClicked(function()
-    utils.loadingPopUpAdd(nil, "Home", function()
-        nav.goHome(root)
-        return true
-    end)
+    apps.go_home()
 end)
 
 for _, label in ipairs(buttons) do
