@@ -723,6 +723,28 @@ String readFile(const char *filename) {
   return content;
 }
 
+// Streaming Lua chunk reader: feeds an open file to lua_load() in fixed blocks
+// so we never hold an entire source file in one contiguous RAM buffer. Building
+// the whole file into an Arduino String (as readFile does) fails for large
+// modules once internal heap is fragmented -- the String build truncates and
+// the parser then chokes with a bogus "unexpected symbol". Used by require().
+struct LuaFileChunkReader {
+  fs::File file;
+  char buf[512];
+};
+
+static const char *lua_file_chunk_reader(lua_State *L, void *ud, size_t *size) {
+  (void)L;
+  LuaFileChunkReader *st = (LuaFileChunkReader *)ud;
+  size_t n = st->file.read((uint8_t *)st->buf, sizeof(st->buf));
+  if (n == 0) {
+    *size = 0;
+    return NULL;
+  }
+  *size = n;
+  return st->buf;
+}
+
 // -- Replaced by safe_open version that parses L:/S: prefix
 // static int lua_io_open(lua_State *L) {
 //   const char *filename = luaL_checkstring(L, 1);
@@ -4367,20 +4389,25 @@ void setupLuaVGL() {
   // Get the length of the searchers table
   int len = lua_rawlen(L, -1);
 
-  // Custom loader function for the filesystem
+  // Custom loader for the filesystem. Streams the file to lua_load() in blocks
+  // (see lua_file_chunk_reader) instead of slurping it into one big RAM String,
+  // so large modules load reliably regardless of heap fragmentation.
   lua_pushcfunction(L, [](lua_State *L) -> int {
     const char *modname = luaL_checkstring(L, 1);
     String filename = String(LUA_PATH) + modname + ".lua";
 
-    String content = readFile(filename.c_str());
-    if (content.length() == 0) {
+    LuaFileChunkReader rdr;
+    rdr.file = LittleFS.open(filename, "r");
+    if (!rdr.file) {
       lua_pushfstring(L, "\n\tno file '%s' in LittleFS", filename.c_str());
-      return 1; // Return the error message
+      return 1; // not found -> let require try the next searcher / report it
     }
 
-    if (luaL_loadbuffer(L, content.c_str(), content.length(),
-                        filename.c_str()) != 0) {
-      lua_error(L);
+    int status = lua_load(L, lua_file_chunk_reader, &rdr, filename.c_str(), NULL);
+    rdr.file.close();
+
+    if (status != LUA_OK) {
+      lua_error(L); // propagate the real syntax error (with file:line)
     }
 
     return 1; // Return the loaded chunk
