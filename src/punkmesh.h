@@ -44,6 +44,15 @@ struct NodePrefs
   uint8_t msg_repeat_enabled;
   uint8_t msg_repeat_max;
   uint8_t msg_repeat_interval_secs;
+  // "Do not add" auto-add exclusions by advert type (bit0=chat/user,
+  // bit1=repeater, bit2=room, bit3=sensor). 0 = add all. Appended last so older
+  // (shorter) prefs files just keep the zero default.
+  uint8_t no_add_mask;
+  // Archive contacts to file as they leave the active table (evict/remove) so
+  // they can be re-added later. 1 = on (default behaviour). When on AND
+  // overwrite-when-full is off, a new contact that can't fit is archived
+  // instead of discarded. Defaulted to 1 in begin() (memset would make it 0).
+  uint8_t archive_contacts;
 };
 
 struct MeshMessage {
@@ -98,6 +107,8 @@ struct StoredMsg {
   bool     has_hash;
   uint8_t  sender_pub_key[6];
   bool     has_pub_key;
+  double   lat, lon;     // our GPS location when the msg was sent/received
+  bool     has_loc;      // false when no GPS fix was available (lat/lon omitted)
   uint8_t  rpath_count;
   ObservedPath rpaths[MAX_PATHS_PER_MSG];
 };
@@ -331,6 +342,9 @@ public:
   uint8_t getQueueLength() const { return (uint8_t)_mgr->getOutboundTotal(); }
 
   bool shouldOverwriteWhenFull() const override { return _prefs.contact_overwrite != 0; }
+  // "Do not add" exclusions: gate which advert types get auto-added (defined in
+  // punkmesh.cpp where the ADV_TYPE_* constants are in scope).
+  bool shouldAutoAddContactType(uint8_t type) const override;
   void clearContacts() { resetContacts(); }
 
 protected:

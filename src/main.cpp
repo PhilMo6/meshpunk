@@ -546,6 +546,17 @@ void gps_sync_poll() {
   }
 }
 
+// Last known GPS location (captured at the most recent time-fix; held until the
+// next sync restart). Read by the mesh task to stamp messages — see
+// meshpunk_sync.h. Unlocked read of values that change only once per sync cycle;
+// a rare torn read just yields a slightly-off coordinate, acceptable here.
+bool meshpunk_gps_last_fix(double* lat, double* lon) {
+  if (!gps_location_valid_at_fix) return false;
+  if (lat) *lat = gps_lat_at_fix;
+  if (lon) *lon = gps_lng_at_fix;
+  return true;
+}
+
 void gps_sync_restart() {
   new (&gps_tinygps) TinyGPSPlus();
   if (gps_serial_active) {
@@ -1848,16 +1859,21 @@ static int lua_mesh_send_direct(lua_State *L) {
     return 2;
   }
 
+  // Returns: ok, route("flood"/"direct"), expected_ack (uint32, 0 if none),
+  // hash (hex string for flood, else nil). The UI uses expected_ack to match
+  // the delivery result delivered later via messages.__dispatch_ack().
   bool is_flood = (r.code == MSG_SEND_SENT_FLOOD);
   lua_pushboolean(L, 1);
   lua_pushstring(L, is_flood ? "flood" : "direct");
+  lua_pushinteger(L, (lua_Integer)r.expected_ack);
   if (r.has_hash) {
     char hex[MAX_HASH_SIZE * 2 + 1];
     mesh::Utils::toHex(hex, r.tx_hash, MAX_HASH_SIZE);
     lua_pushstring(L, hex);
-    return 3;
+  } else {
+    lua_pushnil(L);
   }
-  return 2;
+  return 4;
 }
 
 // Get this node's info (name, pubkey hex, freq, tx power)
@@ -1898,6 +1914,9 @@ static int lua_mesh_get_node_info(lua_State *L) {
 
   lua_pushboolean(L, the_mesh->_prefs.contact_overwrite != 0);
   lua_setfield(L, -2, "contact_overwrite");
+
+  lua_pushboolean(L, the_mesh->_prefs.archive_contacts != 0);
+  lua_setfield(L, -2, "archive_contacts");
   MESH_UNLOCK();
 
   return 1;
@@ -2381,6 +2400,11 @@ static int lua_mesh_set_config(lua_State *L) {
     the_mesh->savePrefs();
     Serial.printf("Contact overwrite set to: %s\n", the_mesh->_prefs.contact_overwrite ? "ON" : "OFF");
     lua_pushboolean(L, 1);
+  } else if (strcmp(key, "archive_contacts") == 0) {
+    the_mesh->_prefs.archive_contacts = (atoi(value) != 0) ? 1 : 0;
+    the_mesh->savePrefs();
+    Serial.printf("Archive contacts set to: %s\n", the_mesh->_prefs.archive_contacts ? "ON" : "OFF");
+    lua_pushboolean(L, 1);
   } else {
     MESH_UNLOCK();
     lua_pushboolean(L, 0);
@@ -2780,6 +2804,35 @@ static int lua_mesh_set_rx_boost(lua_State *L) {
   the_mesh->savePrefs();
   Serial.printf("[RADIO] RX Boost preference saved: %d\n", en ? 1 : 0);
 
+  return 0;
+}
+
+// ── "Do not add" contact-type exclusions ─────────────────────────
+// Returns four booleans (users, repeaters, rooms, sensors) — true = do NOT
+// auto-add that advert type. Mirrors _prefs.no_add_mask bits 0/1/2/3.
+static int lua_mesh_get_no_add(lua_State *L) {
+  MESH_LOCK();
+  uint8_t m = the_mesh->_prefs.no_add_mask;
+  MESH_UNLOCK();
+  lua_pushboolean(L, (m & 0x01) != 0);
+  lua_pushboolean(L, (m & 0x02) != 0);
+  lua_pushboolean(L, (m & 0x04) != 0);
+  lua_pushboolean(L, (m & 0x08) != 0);
+  return 4;
+}
+
+// _mesh_set_no_add(no_users, no_repeaters, no_rooms, no_sensors)
+static int lua_mesh_set_no_add(lua_State *L) {
+  uint8_t m = 0;
+  if (lua_toboolean(L, 1)) m |= 0x01;
+  if (lua_toboolean(L, 2)) m |= 0x02;
+  if (lua_toboolean(L, 3)) m |= 0x04;
+  if (lua_toboolean(L, 4)) m |= 0x08;
+  MESH_LOCK();
+  the_mesh->_prefs.no_add_mask = m;
+  the_mesh->savePrefs();
+  MESH_UNLOCK();
+  Serial.printf("[MESH] no_add_mask set to 0x%02X\n", m);
   return 0;
 }
 
@@ -3836,6 +3889,8 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
   lua_register(L, "_mesh_get_rx_boost", lua_mesh_get_rx_boost);
   lua_register(L, "_mesh_set_rx_boost", lua_mesh_set_rx_boost);
+  lua_register(L, "_mesh_get_no_add", lua_mesh_get_no_add);
+  lua_register(L, "_mesh_set_no_add", lua_mesh_set_no_add);
   lua_register(L, "_mesh_get_contact_paths", lua_mesh_get_contact_paths);
   lua_register(L, "_mesh_get_message_paths", lua_mesh_get_message_paths);
   lua_register(L, "_mesh_get_msg_repeat", lua_mesh_get_msg_repeat);
@@ -4189,6 +4244,30 @@ void setupLuaVGL() {
   });
   lua_register(L, "_kb_sym_toggle_get", [](lua_State* L) -> int {
     lua_pushboolean(L, kb_sym_toggle_pref ? 1 : 0);
+    return 1;
+  });
+
+  // QR code: create an lv_qrcode child inside a Lua object, encoding `text`.
+  // Usage: local ok = _qr_create(parent_obj, "meshcore://...", size_px)
+  // The QR is centered in the parent; deleting the parent removes it.
+  lua_register(L, "_qr_create", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) { lua_pushboolean(L, 0); return 1; }
+    const char *text = luaL_checkstring(L, 2);
+    int size = luaL_optinteger(L, 3, 180);
+    lv_obj_t *qr = lv_qrcode_create(lobj->obj);
+    if (!qr) { lua_pushboolean(L, 0); return 1; }
+    lv_qrcode_set_size(qr, size);
+    lv_qrcode_set_dark_color(qr, lv_color_black());
+    lv_qrcode_set_light_color(qr, lv_color_white());
+    lv_result_t r = lv_qrcode_update(qr, text, strlen(text));
+    if (r != LV_RESULT_OK) {
+      lv_obj_delete(qr);
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    lv_obj_center(qr);
+    lua_pushboolean(L, 1);
     return 1;
   });
 
@@ -4695,6 +4774,10 @@ void setup() {
     fs_mounted = true;
     Serial.println("LittleFS mounted successfully");
 
+    // Save any module crash stashed in RTC by the previous boot before
+    // anything else touches LittleFS.
+    elf_crashlog_check_and_save();
+
     Serial.println("LittleFS contents:");
     listDir(LittleFS, "/lua");
 
@@ -4969,6 +5052,7 @@ void setup() {
 extern void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, int channel_idx, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash);
 extern void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash);
 extern void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contact_type);
+extern void lua_mesh_push_ack(lua_State* L, uint32_t ack, int32_t rtt);
 
 // Drain RX events posted by the mesh core. Runs every UI tick.
 // Bounded per call so a flood on the queue can't starve LVGL.
@@ -4988,6 +5072,8 @@ static void drain_rx_events() {
                                     ev.pkt_hash);
     } else if (ev.kind == RxEvent::CONTACT_UPDATE) {
       lua_mesh_push_contact_update(L, ev.sender, ev.hops);
+    } else if (ev.kind == RxEvent::ACK) {
+      lua_mesh_push_ack(L, ev.ack, ev.rtt);
     }
   }
 }

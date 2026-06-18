@@ -223,6 +223,30 @@ void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contac
     lua_pop(L, 1); // pop module
 }
 
+// Dispatch a delivery result (ACK / send-timeout) to Lua. The UI correlates it
+// to the sent DM by the expected-ack CRC returned from _mesh_send_direct.
+// rtt >= 0 => delivered (round-trip ms); rtt < 0 => failed/no-ack.
+void lua_mesh_push_ack(lua_State* L, uint32_t ack, int32_t rtt) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "__dispatch_ack");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+    lua_pushinteger(L, (lua_Integer)ack);
+    lua_pushinteger(L, (lua_Integer)rtt);
+    if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+        Serial.printf("__dispatch_ack failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1); // pop module
+}
+
 void PunkMesh::store_message(const char* from, const char* text, uint32_t timestamp, uint8_t hops, bool direct) {
     int idx = (msg_head + msg_count) % MAX_MESSAGES;
 
@@ -265,6 +289,20 @@ const char *PunkMesh::getTypeName(uint8_t type) const
         return "Room";
     return "??"; // unknown
 }
+
+// "Do not add" exclusions: return false to stop the base mesh from auto-adding
+// a discovered contact of this type. Driven by _prefs.no_add_mask
+// (bit0=chat/user, bit1=repeater, bit2=room, bit3=sensor). Only affects NEW
+// adverts; already added contacts of an excluded type keep updating.
+bool PunkMesh::shouldAutoAddContactType(uint8_t type) const
+{
+    if (type == ADV_TYPE_CHAT     && (_prefs.no_add_mask & 0x01)) return false;
+    if (type == ADV_TYPE_REPEATER && (_prefs.no_add_mask & 0x02)) return false;
+    if (type == ADV_TYPE_ROOM     && (_prefs.no_add_mask & 0x04)) return false;
+    if (type == ADV_TYPE_SENSOR   && (_prefs.no_add_mask & 0x08)) return false;
+    return true;
+}
+
 
 // Parse one tab-separated contact line into c:
 // pubkey_hex \t name \t type \t flags \t path_len \t advert_ts \t path_hex \t lat \t lon
@@ -533,6 +571,7 @@ void PunkMesh::saveArchive()
 
 void PunkMesh::archiveContact(const ContactInfo& c)
 {
+    if (!_prefs.archive_contacts) return;  // archiving disabled by setting
     if (!ensureArchiveLoaded()) return;
 
     // Already archived (e.g. evicted again after a re-add) — refresh it.
@@ -819,6 +858,14 @@ static void fill_stored_msg(StoredMsg& m, int channel_idx, const char* from,
         memcpy(m.sender_pub_key, pub_key, 6);
         m.has_pub_key = true;
     }
+    // Stamp our last known GPS location (if any). Omitted entirely when there's
+    // no fix, so those records save exactly like before.
+    double glat, glon;
+    if (meshpunk_gps_last_fix(&glat, &glon)) {
+        m.lat = glat;
+        m.lon = glon;
+        m.has_loc = true;
+    }
 }
 
 // Push path hashes as a Lua table of hex strings.
@@ -973,6 +1020,10 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
             mesh::Utils::toHex(pk_hex, m.sender_pub_key, 6);
             f.printf("pubkey=%s\n", pk_hex);
         }
+        if (m.has_loc) {
+            f.printf("lat=%.6f\n", m.lat);
+            f.printf("lon=%.6f\n", m.lon);
+        }
         f.print("---\n");
         f.close();
     }
@@ -1024,6 +1075,10 @@ static void push_stored_msg_table(lua_State* L, const StoredMsg& m) {
     lua_pushboolean(L, (m.flags & 0x01) != 0); lua_setfield(L, -2, "direct");
     lua_pushboolean(L, (m.flags & 0x02) != 0); lua_setfield(L, -2, "is_dm");
     lua_pushinteger(L, m.channel_idx); lua_setfield(L, -2, "channel_idx");
+    if (m.has_loc) {
+        lua_pushnumber(L, m.lat); lua_setfield(L, -2, "lat");
+        lua_pushnumber(L, m.lon); lua_setfield(L, -2, "lon");
+    }
     push_path_table(L, m.path_len, m.path);
     lua_setfield(L, -2, "path");
     if (m.has_hash) {
@@ -1152,6 +1207,8 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
             mesh::Utils::fromHex(m.sender_pub_key, 6, val);
             m.has_pub_key = true;
         }
+        else if (strcmp(key, "lat") == 0) { m.lat = atof(val); m.has_loc = true; }
+        else if (strcmp(key, "lon") == 0) { m.lon = atof(val); m.has_loc = true; }
         else if (strcmp(key, "rpath") == 0 && m.rpath_count < MAX_PATHS_PER_MSG) {
             // Format: hop_hashes;snr;rssi;direct
             char rval[256];
@@ -1522,27 +1579,101 @@ void PunkMesh::setClock(uint32_t timestamp)
     }
 }
 
+// URL-decode src into dst ('+' -> space, %XX -> byte). dst is null-terminated.
+static void url_decode(const char *src, char *dst, size_t dst_sz)
+{
+    size_t di = 0;
+    for (size_t si = 0; src[si] && di + 1 < dst_sz; si++) {
+        char c = src[si];
+        if (c == '+') {
+            dst[di++] = ' ';
+        } else if (c == '%' && src[si + 1] && src[si + 2]) {
+            char hx[3] = { src[si + 1], src[si + 2], 0 };
+            dst[di++] = (char)strtoul(hx, nullptr, 16);
+            si += 2;
+        } else {
+            dst[di++] = c;
+        }
+    }
+    dst[di] = 0;
+}
+
 void PunkMesh::importCard(const char *command)
 {
     while (*command == ' ')
         command++; // skip leading spaces
-    if (memcmp(command, "meshcore://", 11) == 0)
+    if (memcmp(command, "meshcore://", 11) != 0) {
+        Serial.println("   error: invalid format");
+        return;
+    }
+    char *body = (char *)command + 11;  // after the scheme
+
+    // ── MeshCore app contact URI ──────────────────────────────────────
+    // meshcore://contact/add?name=<urlenc>&public_key=<64hex>&type=<1-4>
+    // (this is what the phone app's QR / clipboard share produces)
+    if (memcmp(body, "contact/add?", 12) == 0) {
+        char name[40] = {0};
+        char pubhex[80] = {0};
+        int ctype = 1;
+        char *p = body + 12;
+        while (p && *p) {                 // body is writable; tokenise in place
+            char *amp = strchr(p, '&');
+            if (amp) *amp = 0;
+            char *eq = strchr(p, '=');
+            if (eq) {
+                *eq = 0;
+                const char *key = p;
+                const char *val = eq + 1;
+                if (strcmp(key, "name") == 0)            url_decode(val, name, sizeof(name));
+                else if (strcmp(key, "public_key") == 0) strncpy(pubhex, val, sizeof(pubhex) - 1);
+                else if (strcmp(key, "type") == 0)       ctype = atoi(val);
+            }
+            p = amp ? amp + 1 : nullptr;
+        }
+        if (strlen(pubhex) != PUB_KEY_SIZE * 2) {
+            Serial.println("   error: bad public_key in contact URI");
+            return;
+        }
+        mesh::Identity id(pubhex);  // construct from 64-hex pubkey
+        ContactInfo *existing = lookupContactByPubKey(id.pub_key, PUB_KEY_SIZE);
+        if (existing) {
+            strncpy(existing->name, name, sizeof(existing->name) - 1);
+            existing->name[sizeof(existing->name) - 1] = 0;
+            existing->type = (uint8_t)ctype;
+            existing->lastmod = getRTCClock()->getCurrentTime();
+            saveContacts();
+            Serial.printf("   updated contact from URI: %s\n", name);
+        } else {
+            ContactInfo ci;
+            memset(&ci, 0, sizeof(ci));
+            ci.id = id;
+            ci.out_path_len = OUT_PATH_UNKNOWN;  // no route yet -> flood
+            strncpy(ci.name, name, sizeof(ci.name) - 1);
+            ci.type = (uint8_t)ctype;
+            ci.lastmod = getRTCClock()->getCurrentTime();
+            if (addContact(ci)) {
+                saveContacts();
+                Serial.printf("   imported contact from URI: %s\n", name);
+            } else {
+                Serial.println("   error: contact list full");
+            }
+        }
+        return;
+    }
+
+    // ── Legacy biz-card: meshcore://<hex of raw advert packet> ────────
     {
-        command += 11;                 // skip the prefix
-        char *ep = strchr(command, 0); // find end of string
-        while (ep > command)
-        {
+        char *ep = strchr(body, 0); // find end of string
+        while (ep > body) {
             ep--;
             if (mesh::Utils::isHexChar(*ep))
                 break; // found tail end of card
             *ep = 0;   // remove trailing spaces and other junk
         }
-        int len = strlen(command);
-        if (len % 2 == 0)
-        {
+        int len = strlen(body);
+        if (len % 2 == 0) {
             len >>= 1; // halve, for num bytes
-            if (mesh::Utils::fromHex(tmp_buf, len, command))
-            {
+            if (mesh::Utils::fromHex(tmp_buf, len, body)) {
                 importContact(tmp_buf, len);
                 return;
             }
@@ -1568,6 +1699,27 @@ bool PunkMesh::allowPacketForward(const mesh::Packet *packet)
 
 void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t *path)
 {
+    // The base notifies us about excluded ("do not add") types too, with a temp
+    // contact it didn't add. Ignore those completely so they don't pollute path
+    // history or the UI contact list.
+    if (is_new && !shouldAutoAddContactType(contact.type)) {
+        Serial.printf("[MESH RX] Advert from excluded type (%s) — not adding\n",
+                      getTypeName(contact.type));
+        return;
+    }
+
+    // New advert the base mesh did NOT add to the live table — i.e. the list is
+    // full and overwrite-when-full is off (excluded types returned above; the
+    // hop-limit path is disabled). Archive it (a no-op when archiving is off) so
+    // it can be re-added later, then stop: it's not a live contact, so don't
+    // record path / persist / notify the UI.
+    if (is_new && !lookupContactByPubKey(contact.id.pub_key, PUB_KEY_SIZE)) {
+        Serial.printf("[MESH RX] List full — %s discarded new contact: %s\n",
+                      _prefs.archive_contacts ? "archiving" : "dropping", contact.name);
+        archiveContact(contact);
+        return;
+    }
+
     Serial.println("[MESH RX] ========== ADVERT RECEIVED ==========");
     Serial.printf("[MESH RX] Name: %s (%s)\n", contact.name, is_new ? "NEW" : "known");
     Serial.printf("[MESH RX] Type: %s, path_len: %d\n", getTypeName(contact.type), path_len);
@@ -1610,6 +1762,7 @@ ContactInfo* PunkMesh::processAck(const uint8_t *data)
     if (memcmp(data, &expected_ack_crc, 4) == 0)
     {
         uint32_t rtt = _ms->getMillis() - last_msg_sent;
+        uint32_t acked_crc = expected_ack_crc;
         Serial.printf("   Got ACK! (round trip: %d millis)\n", rtt);
         expected_ack_crc = 0;
         if (curr_recipient) {
@@ -1620,6 +1773,15 @@ ContactInfo* PunkMesh::processAck(const uint8_t *data)
         memcpy(&ack_crc, data, 4);
         if (ble_companion) ble_companion->pushSendConfirmed(ack_crc, rtt);
 #endif
+        // Notify the Lua UI so it can mark the sent DM delivered.
+        if (rx_event_queue) {
+            RxEvent ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.kind = RxEvent::ACK;
+            ev.ack  = acked_crc;
+            ev.rtt  = (int32_t)rtt;
+            xQueueSend(rx_event_queue, &ev, 0);
+        }
         return curr_recipient;
     }
     return nullptr;
@@ -1841,6 +2003,17 @@ void PunkMesh::onSendTimeout()
     Serial.println("   ERROR: timed out, no ACK.");
     if (curr_recipient) {
         recordPathFailure(curr_recipient->id.pub_key);
+    }
+    // Tell the Lua UI the send failed (only if there is still a pending ack —
+    // a successful processAck clears expected_ack_crc, so this won't fire a
+    // false failure after a delivery).
+    if (rx_event_queue && expected_ack_crc != 0) {
+        RxEvent ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = RxEvent::ACK;
+        ev.ack  = expected_ack_crc;
+        ev.rtt  = -1;
+        xQueueSend(rx_event_queue, &ev, 0);
     }
 }
 
@@ -2286,6 +2459,8 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
     _prefs.msg_repeat_enabled = 0;
     _prefs.msg_repeat_max = 3;
     _prefs.msg_repeat_interval_secs = 30;
+    _prefs.archive_contacts = 1;  // default on (preserves prior always-archive)
+    _prefs.contact_overwrite = 1; // default on: overwrite oldest non-fav when full
 
     memset(_pending_repeats, 0, sizeof(_pending_repeats));
     memset(_repeat_history, 0, sizeof(_repeat_history));
@@ -2431,6 +2606,11 @@ void PunkMesh::begin()
                 else if (strcmp(key, "path_hash_mode") == 0) _prefs.path_hash_mode = atoi(val);
                 else if (strcmp(key, "autoadd_config") == 0) _prefs.autoadd_config = atoi(val);
                 else if (strcmp(key, "autoadd_max_hops") == 0) _prefs.autoadd_max_hops = atoi(val);
+                else if (strcmp(key, "no_add_users") == 0)     { if (atoi(val)) _prefs.no_add_mask |= 0x01; else _prefs.no_add_mask &= ~0x01; }
+                else if (strcmp(key, "no_add_repeaters") == 0) { if (atoi(val)) _prefs.no_add_mask |= 0x02; else _prefs.no_add_mask &= ~0x02; }
+                else if (strcmp(key, "no_add_rooms") == 0)     { if (atoi(val)) _prefs.no_add_mask |= 0x04; else _prefs.no_add_mask &= ~0x04; }
+                else if (strcmp(key, "no_add_sensors") == 0)   { if (atoi(val)) _prefs.no_add_mask |= 0x08; else _prefs.no_add_mask &= ~0x08; }
+                else if (strcmp(key, "archive_contacts") == 0) _prefs.archive_contacts = atoi(val);
                 else if (strcmp(key, "default_scope_name") == 0) strncpy(_prefs.default_scope_name, val, 30);
                 else if (strcmp(key, "default_scope_key") == 0) {
                     for (int dk = 0; dk < 16 && val[dk*2] && val[dk*2+1]; dk++) {
@@ -2518,6 +2698,12 @@ static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
         file.printf("msg_repeat_enabled=%d\n", p.msg_repeat_enabled);
         file.printf("msg_repeat_max=%d\n", p.msg_repeat_max);
         file.printf("msg_repeat_interval=%d\n", p.msg_repeat_interval_secs);
+        // Stored as four readable booleans (internally a bitmask).
+        file.printf("no_add_users=%d\n",     (p.no_add_mask & 0x01) ? 1 : 0);
+        file.printf("no_add_repeaters=%d\n", (p.no_add_mask & 0x02) ? 1 : 0);
+        file.printf("no_add_rooms=%d\n",     (p.no_add_mask & 0x04) ? 1 : 0);
+        file.printf("no_add_sensors=%d\n",   (p.no_add_mask & 0x08) ? 1 : 0);
+        file.printf("archive_contacts=%d\n", p.archive_contacts);
         if (p.default_scope_name[0]) {
             file.printf("default_scope_name=%s\n", p.default_scope_name);
             file.print("default_scope_key=");

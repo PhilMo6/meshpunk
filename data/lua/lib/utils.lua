@@ -19,6 +19,75 @@ function utils.formatTime(timestamp)
     return string.format("%02d:%02d", time.hour, time.min)
 end
 
+-- ── RTC-aware time helpers ──────────────────────────────────────────────────
+-- Messages/contacts carry RTC epoch seconds (UTC). These mirror topbar's
+-- civil-date maths so chat/inbox timestamps honour the device clock + tz
+-- offset without depending on the Lua os clock being set.
+
+-- Current epoch in RTC seconds (UTC). Falls back to os.time().
+function utils.now()
+    local ok, ts = pcall(_rtc_time)
+    if ok and ts and ts > 0 then return ts end
+    return os.time()
+end
+
+local SECS_PER_DAY = 86400
+-- Decompose a UTC epoch into local wall-clock components (y, mo, d, hour, min).
+local function local_components(ts)
+    local ok, off = pcall(_rtc_tz_offset_minutes)
+    local local_ts = ts + ((ok and off or 0) * 60)
+    if local_ts < 0 then local_ts = 0 end
+    local days = math.floor(local_ts / SECS_PER_DAY)
+    local rem = local_ts - days * SECS_PER_DAY
+    local hour = math.floor(rem / 3600)
+    local min = math.floor((rem % 3600) / 60)
+    local z = days + 719468
+    local era = math.floor(z / 146097)
+    local doe = z - era * 146097
+    local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+    local y = yoe + era * 400
+    local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+    local mp = math.floor((5 * doy + 2) / 153)
+    local d = doy - math.floor((153 * mp + 2) / 5) + 1
+    local mo = mp + (mp < 10 and 3 or -9)
+    if mo <= 2 then y = y + 1 end
+    return y, mo, d, hour, min
+end
+
+-- "HH:MM" honouring the 12/24h clock preference.
+function utils.clockHM(ts)
+    if not ts or ts < 1 then return "--:--" end
+    local _, _, _, hour, min = local_components(ts)
+    local ok, fmt = pcall(_clock_fmt_get)
+    if ok and fmt == "12" then
+        local ampm = (hour < 12) and "AM" or "PM"
+        local h12 = hour % 12
+        if h12 == 0 then h12 = 12 end
+        return string.format("%d:%02d %s", h12, min, ampm)
+    end
+    return string.format("%02d:%02d", hour, min)
+end
+
+-- Absolute "M/D HH:MM" for tooltips / detail views.
+function utils.clockDateTime(ts)
+    if not ts or ts < 1 then return "unknown" end
+    local _, mo, d = local_components(ts)
+    return string.format("%d/%d %s", mo, d, utils.clockHM(ts))
+end
+
+-- Compact relative age: now / 5m / 3h / 2d / M/D.
+function utils.relTime(ts)
+    if not ts or ts < 1 then return "" end
+    local diff = utils.now() - ts
+    if diff < 0 then diff = 0 end
+    if diff < 45 then return "now" end
+    if diff < 3600 then return math.floor(diff / 60) .. "m" end
+    if diff < 86400 then return math.floor(diff / 3600) .. "h" end
+    if diff < 7 * SECS_PER_DAY then return math.floor(diff / SECS_PER_DAY) .. "d" end
+    local _, mo, d = local_components(ts)
+    return string.format("%d/%d", mo, d)
+end
+
 -- Create a simple notification
 function utils.createNotification(parent, message, duration)
     duration = duration or 3000  -- default 3 seconds

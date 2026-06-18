@@ -1028,17 +1028,36 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
   // ── Autoadd config ──────────────────────────────────────────────
   } else if (cmd_frame[0] == CMD_SET_AUTOADD_CONFIG) {
-    _mesh._prefs.autoadd_config = cmd_frame[1];
+    // MeshCore spec auto-add bitmask (set = DO auto-add that type):
+    //   0x01 overwrite-oldest, 0x02 chat, 0x04 repeater, 0x08 room, 0x10 sensor.
+    // Translate into meshpunk's own settings (no_add_mask: set = do NOT add;
+    // contact_overwrite). The raw byte is still kept for round-tripping.
+    uint8_t cfg = cmd_frame[1];
+    _mesh._prefs.autoadd_config = cfg;
     if (len >= 3) {
       _mesh._prefs.autoadd_max_hops = min(cmd_frame[2], (uint8_t)64);
     }
+    uint8_t mask = 0;
+    if (!(cfg & 0x02)) mask |= 0x01;  // no chat/users
+    if (!(cfg & 0x04)) mask |= 0x02;  // no repeaters
+    if (!(cfg & 0x08)) mask |= 0x04;  // no rooms
+    if (!(cfg & 0x10)) mask |= 0x08;  // no sensors
+    _mesh._prefs.no_add_mask = mask;
+    _mesh._prefs.contact_overwrite = (cfg & 0x01) ? 1 : 0;
     _mesh.savePrefs();
     writeOKFrame();
 
   } else if (cmd_frame[0] == CMD_GET_AUTOADD_CONFIG) {
     int i = 0;
     out_frame[i++] = RESP_CODE_AUTOADD_CONFIG;
-    out_frame[i++] = _mesh._prefs.autoadd_config;
+    // Build the spec byte from meshpunk's settings (inverse of the SET above).
+    uint8_t cfg = 0;
+    if (!(_mesh._prefs.no_add_mask & 0x01)) cfg |= 0x02;  // chat
+    if (!(_mesh._prefs.no_add_mask & 0x02)) cfg |= 0x04;  // repeater
+    if (!(_mesh._prefs.no_add_mask & 0x04)) cfg |= 0x08;  // room
+    if (!(_mesh._prefs.no_add_mask & 0x08)) cfg |= 0x10;  // sensor
+    if (_mesh._prefs.contact_overwrite)     cfg |= 0x01;  // overwrite-oldest
+    out_frame[i++] = cfg;
     out_frame[i++] = _mesh._prefs.autoadd_max_hops;
     _serial.writeFrame(out_frame, i);
 

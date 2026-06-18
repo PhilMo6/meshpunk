@@ -42,7 +42,7 @@ inline void sd_spi_take()    { SPI_LOCK();   }
 
 // Event structs shuttled across the cores.
 struct RxEvent {
-  enum Kind : uint8_t { DIRECT_MSG, CHANNEL_MSG, CONTACT_UPDATE } kind;
+  enum Kind : uint8_t { DIRECT_MSG, CHANNEL_MSG, CONTACT_UPDATE, ACK } kind;
   uint8_t  hops;
   int8_t   channel_idx;   // -1 for DM
   bool     direct;
@@ -54,6 +54,8 @@ struct RxEvent {
   uint16_t path_len;
   uint8_t  path[MAX_PATH_SIZE];
   uint8_t  pkt_hash[MAX_HASH_SIZE];
+  uint32_t ack;           // ACK: the expected-ack CRC this delivery matches
+  int32_t  rtt;           // ACK: round-trip ms (>=0 delivered, <0 failed/timeout)
 };
 
 struct TxCommand {
@@ -83,6 +85,11 @@ void meshpunk_spawn_gps_task();
 
 // Wake the GPS task early from its inter-cycle sleep (manual trigger).
 void gps_notify_wake();
+
+// Most recent GPS location fix (the last sync cycle's position; persists until
+// the next cycle restarts). Returns false if no fix is available, leaving
+// lat/lon untouched. Safe to call from the mesh task. Defined in main.cpp.
+bool meshpunk_gps_last_fix(double* lat, double* lon);
 
 // When true, mesh_task pauses its loop body (radio/BLE processing).
 // Set by elf_host during module execution to isolate Core 1 activity.

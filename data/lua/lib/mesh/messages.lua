@@ -17,10 +17,19 @@ local M = {
     __onDirectMessageFirst = nil,
     __onMessageMention = nil,
     __onMessageMentionFirst = nil,
+    __onAck = nil,         -- fires when a sent DM is delivered or fails
+    __ack_index = {},      -- [expected_ack_crc] = sent msg (latest send only)
     __history = {},
     __dm_history = {},
     __dm_threads = {},     -- grouped by contact name: {[name] = {msg, msg, ...}}
-    __channel_history = {} -- grouped by channel idx: {[idx] = {msg, msg, ...}}
+    __channel_history = {}, -- grouped by channel idx: {[idx] = {msg, msg, ...}}
+    -- Incremental unread counters so per-thread badges never rescan history.
+    -- Bumped only by live dispatch (own echoes don't count); reset when the
+    -- thread's chat view opens. Keeps the inbox O(threads), not O(messages),
+    -- which matters because loadPersisted pulls the full on-disk history (up
+    -- to the firmware cap, default 400 per file) into RAM at startup.
+    __channel_unread = {}, -- [idx]  = count
+    __dm_unread = {},      -- [name] = count
 }
 
 -- Avoid double-loading if an app calls loadPersisted() more than once
@@ -99,6 +108,12 @@ function M:onContactUpdate(cb)
     M.__onContactUpdate = cb
 end
 
+-- Register a callback for DM delivery results (delivered / failed). The
+-- callback receives the sent msg table (with .status and .rtt updated).
+function M:onAck(cb)
+    M.__onAck = cb
+end
+
 function M:onDirectMessageFirst(cb)
     M.__onDirectMessageFirst = cb
 end
@@ -148,14 +163,15 @@ end
 
 -- Send a direct message to a contact by name prefix
 function M:sendDirect(name_prefix, text)
-    local ok, route, hash_hex = _mesh_send_direct(name_prefix, text)
+    local ok, route, ack, hash_hex = _mesh_send_direct(name_prefix, text)
     if not ok then
         print("Failed to send DM: " .. tostring(route))
         return false
     end
 
-    -- Local echo — C++ side already persisted it.
-    -- hash_hex is only present for flood-routed DMs (3rd return value).
+    -- Local echo — C++ side already persisted it. `ack` is the expected-ack
+    -- CRC the firmware waits for; the delivery result arrives later via
+    -- __dispatch_ack. hash_hex is only set for flood-routed DMs.
     local info = _mesh_get_node_info()
     local msg = {
         from = info and info.name or "me",
@@ -167,13 +183,19 @@ function M:sendDirect(name_prefix, text)
         to = name_prefix,
         snr = 0,
         rssi = 0,
-        hash = hash_hex
+        hash = hash_hex,
+        ack = ack,
+        status = "sent",
     }
     table.insert(M.__dm_history, msg)
     if not M.__dm_threads[name_prefix] then
         M.__dm_threads[name_prefix] = {}
     end
     table.insert(M.__dm_threads[name_prefix], msg)
+    -- Firmware tracks one outstanding ack, so only the latest send can be
+    -- confirmed; index just this one (bounded, no stale build-up).
+    M.__ack_index = {}
+    if ack and ack ~= 0 then M.__ack_index[ack] = msg end
     if M.__onDirectMessage then M.__onDirectMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
 
@@ -312,6 +334,10 @@ function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_id
         table.insert(M.__channel_history[channel_idx], msg)
     end
 
+    -- Unknown-channel (-1) messages surface under Public (idx 0), so badge them there.
+    local unread_idx = channel_idx >= 0 and channel_idx or 0
+    M.__channel_unread[unread_idx] = (M.__channel_unread[unread_idx] or 0) + 1
+
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if is_mention then
@@ -348,6 +374,7 @@ function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi, path, h
         M.__dm_threads[key] = {}
     end
     table.insert(M.__dm_threads[key], msg)
+    M.__dm_unread[key] = (M.__dm_unread[key] or 0) + 1
 
     if M.__onDirectMessageFirst then M.__onDirectMessageFirst(msg) end
     if M.__onDirectMessage then M.__onDirectMessage(msg) end
@@ -358,12 +385,63 @@ function M.__dispatch_contact(name, ctype)
     if M.__onContactUpdate then M.__onContactUpdate(name, ctype) end
 end
 
+-- Called from C++ when a sent DM is confirmed (rtt >= 0, round-trip ms) or
+-- times out with no ack (rtt < 0). Correlated to the sent message by the
+-- expected-ack CRC returned from _mesh_send_direct.
+function M.__dispatch_ack(ack, rtt)
+    local msg = M.__ack_index[ack]
+    if not msg then return end
+    M.__ack_index[ack] = nil
+    if rtt and rtt >= 0 then
+        msg.status = "delivered"
+        msg.rtt = rtt
+    else
+        msg.status = "failed"
+    end
+    if M.__onAck then M.__onAck(msg) end
+end
+
 function M:countUnread()
     local count = 0
     for _, msg in ipairs(M.__history) do
         if not msg.seen then count = count + 1 end
     end
     return count
+end
+
+-- Per-thread unread counts. "Unread" means "arrived live while you weren't
+-- looking at that conversation" — counters are bumped by dispatch and reset
+-- when the chat opens, so these reads are O(1) regardless of history size.
+function M:unreadInChannel(ch_idx)
+    return self.__channel_unread[ch_idx] or 0
+end
+
+function M:unreadInDM(name)
+    return self.__dm_unread[name] or 0
+end
+
+-- O(1) badge reset — used by the open chat's live listener so a thread you're
+-- actively viewing never accrues unread.
+function M:clearUnreadChannel(ch_idx)
+    self.__channel_unread[ch_idx] = 0
+end
+
+function M:clearUnreadDM(name)
+    self.__dm_unread[name] = 0
+end
+
+-- Called once when a chat view opens. Clears the badge and, for Public, also
+-- flips the seen flag on the flat history the topbar's countUnread() scans, so
+-- opening Public tidies the global unread number even for older messages.
+function M:markChannelSeen(ch_idx)
+    self.__channel_unread[ch_idx] = 0
+    if ch_idx == 0 then
+        for _, m in ipairs(self.__history) do m.seen = true end
+    end
+end
+
+function M:markDMSeen(name)
+    self.__dm_unread[name] = 0
 end
 
 -- Get all channel message history
@@ -389,6 +467,7 @@ function M:getDMThreadNames()
             table.insert(names, {
                 name = name,
                 count = #thread,
+                unread = self.__dm_unread[name] or 0,
                 last_msg = thread[#thread]
             })
         end
