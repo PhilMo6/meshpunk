@@ -19,21 +19,37 @@ local M = {
     __onMessageMentionFirst = nil,
     __onAck = nil,         -- fires when a sent DM is delivered or fails
     __ack_index = {},      -- [expected_ack_crc] = sent msg (latest send only)
-    __history = {},
-    __dm_history = {},
     __dm_threads = {},     -- grouped by contact name: {[name] = {msg, msg, ...}}
     __channel_history = {}, -- grouped by channel idx: {[idx] = {msg, msg, ...}}
-    -- Incremental unread counters so per-thread badges never rescan history.
-    -- Bumped only by live dispatch (own echoes don't count); reset when the
-    -- thread's chat view opens. Keeps the inbox O(threads), not O(messages),
-    -- which matters because loadPersisted pulls the full on-disk history (up
-    -- to the firmware cap, default 400 per file) into RAM at startup.
+    -- The two grouped tables above are the SINGLE in-RAM source. The old flat
+    -- __history / __dm_history duplicates were removed: __history only existed
+    -- for the topbar's O(N) countUnread scan (now O(1) via the counters below)
+    -- and the Public fallback (now reads __channel_history[0]); __dm_history was
+    -- never read at all. Each list is capped (trim_list) so a busy mesh can't
+    -- grow them unbounded — they share the PSRAM heap with LVGL's draw allocator
+    -- and were starving it. loadPersisted seeds them from disk once at startup.
+    -- Incremental unread counters so badges never rescan history. Bumped only by
+    -- live dispatch (own echoes don't count); reset when the thread's chat opens.
     __channel_unread = {}, -- [idx]  = count
     __dm_unread = {},      -- [name] = count
 }
 
 -- Avoid double-loading if an app calls loadPersisted() more than once
 M._loaded = false
+
+-- Cap each in-RAM list so a busy mesh can't grow it without bound (it shares the
+-- PSRAM heap with LVGL's draw allocator, which hard-crashes on alloc failure).
+-- Mirrors the on-disk _max_messages cap; trims in a SLACK batch so the O(n) shift
+-- amortizes to O(1) per message. Bump these if you raise the firmware cap.
+local HIST_CAP = 400
+local HIST_SLACK = 100
+local function trim_list(list)
+    local n = #list
+    if n <= HIST_CAP + HIST_SLACK then return end
+    local drop = n - HIST_CAP
+    for i = 1, HIST_CAP do list[i] = list[i + drop] end
+    for i = HIST_CAP + 1, n do list[i] = nil end
+end
 
 -- Configure the on-disk cap. Delegates to C++ (PunkMesh owns the files).
 function M:setMaxMessages(n)
@@ -56,13 +72,8 @@ function M:loadPersisted()
             local ok, list = pcall(_mesh_get_channel_messages, i)
             if ok and type(list) == "table" and #list > 0 then
                 M.__channel_history[i] = list
-                if i == 0 then
-                    for _, m in ipairs(list) do
-                        m.seen = true
-                        table.insert(M.__history, m)
-                    end
-                end
-            end
+                trim_list(M.__channel_history[i])  -- days-retained files can exceed
+            end                                    -- HIST_CAP; keep RAM bounded
         end
     end
 
@@ -74,10 +85,7 @@ function M:loadPersisted()
                 local ok2, list = pcall(_mesh_get_dm_messages, name)
                 if ok2 and type(list) == "table" and #list > 0 then
                     M.__dm_threads[name] = list
-                    for _, m in ipairs(list) do
-                        m.seen = true
-                        table.insert(M.__dm_history, m)
-                    end
+                    trim_list(M.__dm_threads[name])  -- bound RAM (see above)
                 end
             end
         end
@@ -151,9 +159,9 @@ function M:broadcast(text)
         rssi = 0,
         hash = hash_hex
     }
-    table.insert(M.__history, msg)
     if not M.__channel_history[0] then M.__channel_history[0] = {} end
     table.insert(M.__channel_history[0], msg)
+    trim_list(M.__channel_history[0])
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
@@ -187,11 +195,11 @@ function M:sendDirect(name_prefix, text)
         ack = ack,
         status = "sent",
     }
-    table.insert(M.__dm_history, msg)
     if not M.__dm_threads[name_prefix] then
         M.__dm_threads[name_prefix] = {}
     end
     table.insert(M.__dm_threads[name_prefix], msg)
+    trim_list(M.__dm_threads[name_prefix])
     -- Firmware tracks one outstanding ack, so only the latest send can be
     -- confirmed; index just this one (bounded, no stale build-up).
     M.__ack_index = {}
@@ -211,9 +219,7 @@ function M:sendToChannel(ch_idx, text)
         return false
     end
 
-    -- Local echo. Only the public channel (idx 0) uses M.__history — other
-    -- channels live exclusively in M.__channel_history[ch_idx] so they
-    -- don't bleed into the Public view's fallback history.
+    -- Local echo — C++ side already persisted it.
     local info = _mesh_get_node_info()
     local msg = {
         from = info and info.name or "me",
@@ -227,13 +233,11 @@ function M:sendToChannel(ch_idx, text)
         rssi = 0,
         hash = hash_hex
     }
-    if ch_idx == 0 then
-        table.insert(M.__history, msg)
-    end
     if not M.__channel_history[ch_idx] then
         M.__channel_history[ch_idx] = {}
     end
     table.insert(M.__channel_history[ch_idx], msg)
+    trim_list(M.__channel_history[ch_idx])
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
@@ -322,21 +326,15 @@ function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_id
         hash = hash
     }
 
-    -- File into the right per-channel bucket. Public (idx 0) also feeds the
-    -- legacy flat M.__history, which is what Public's chat view falls back to.
-    if channel_idx == 0 or channel_idx == -1 then
-        table.insert(M.__history, msg)
+    -- File into the per-channel bucket. Unknown-channel (-1) messages surface
+    -- under Public (idx 0), both for display and the unread badge.
+    local bucket = channel_idx >= 0 and channel_idx or 0
+    if not M.__channel_history[bucket] then
+        M.__channel_history[bucket] = {}
     end
-    if channel_idx >= 0 then
-        if not M.__channel_history[channel_idx] then
-            M.__channel_history[channel_idx] = {}
-        end
-        table.insert(M.__channel_history[channel_idx], msg)
-    end
-
-    -- Unknown-channel (-1) messages surface under Public (idx 0), so badge them there.
-    local unread_idx = channel_idx >= 0 and channel_idx or 0
-    M.__channel_unread[unread_idx] = (M.__channel_unread[unread_idx] or 0) + 1
+    table.insert(M.__channel_history[bucket], msg)
+    trim_list(M.__channel_history[bucket])
+    M.__channel_unread[bucket] = (M.__channel_unread[bucket] or 0) + 1
 
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
@@ -366,14 +364,13 @@ function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi, path, h
         hash = hash
     }
 
-    table.insert(M.__dm_history, msg)
-
     -- Group into thread by sender name
     local key = msg.from
     if not M.__dm_threads[key] then
         M.__dm_threads[key] = {}
     end
     table.insert(M.__dm_threads[key], msg)
+    trim_list(M.__dm_threads[key])
     M.__dm_unread[key] = (M.__dm_unread[key] or 0) + 1
 
     if M.__onDirectMessageFirst then M.__onDirectMessageFirst(msg) end
@@ -401,11 +398,12 @@ function M.__dispatch_ack(ack, rtt)
     if M.__onAck then M.__onAck(msg) end
 end
 
+-- Total unread across all channels + DMs (O(threads), not O(messages)). Used by
+-- the topbar's global mail badge. Own echoes never bump these counters.
 function M:countUnread()
     local count = 0
-    for _, msg in ipairs(M.__history) do
-        if not msg.seen then count = count + 1 end
-    end
+    for _, c in pairs(M.__channel_unread) do count = count + c end
+    for _, c in pairs(M.__dm_unread) do count = count + c end
     return count
 end
 
@@ -430,28 +428,20 @@ function M:clearUnreadDM(name)
     self.__dm_unread[name] = 0
 end
 
--- Called once when a chat view opens. Clears the badge and, for Public, also
--- flips the seen flag on the flat history the topbar's countUnread() scans, so
--- opening Public tidies the global unread number even for older messages.
+-- Called once when a chat view opens. Clears the thread's unread counter, which
+-- (summed) is the topbar's global badge — so opening a thread tidies it.
 function M:markChannelSeen(ch_idx)
     self.__channel_unread[ch_idx] = 0
-    if ch_idx == 0 then
-        for _, m in ipairs(self.__history) do m.seen = true end
-    end
 end
 
 function M:markDMSeen(name)
     self.__dm_unread[name] = 0
 end
 
--- Get all channel message history
+-- Public-channel history (idx 0, which also holds unknown-channel messages).
+-- Kept as an alias so existing Public-view fallbacks keep working.
 function M:all()
-    return self.__history
-end
-
--- Get all DM history
-function M:allDMs()
-    return self.__dm_history
+    return self.__channel_history[0] or {}
 end
 
 -- Get DM thread for a specific contact

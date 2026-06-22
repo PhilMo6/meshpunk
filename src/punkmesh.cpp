@@ -28,10 +28,10 @@ static void recover_tmp_files(fs::FS* storage, const String& dir) {
                 String log_path = name.substring(0, name.length() - 4);
                 if (storage->exists(log_path.c_str())) {
                     storage->remove(name.c_str());
-                    Serial.printf("[STORAGE] Removed stale tmp: %s\n", name.c_str());
+                    SLog.printf("[STORAGE] Removed stale tmp: %s\n", name.c_str());
                 } else {
                     storage->rename(name.c_str(), log_path.c_str());
-                    Serial.printf("[STORAGE] Recovered tmp: %s -> %s\n",
+                    SLog.printf("[STORAGE] Recovered tmp: %s -> %s\n",
                                   name.c_str(), log_path.c_str());
                 }
             }
@@ -45,7 +45,7 @@ static void recover_tmp_files(fs::FS* storage, const String& dir) {
 void PunkMesh::setStorage(fs::FS* fs, const char* prefix) {
     _storage = fs;
     _storage_prefix = String(prefix);
-    Serial.printf("[STORAGE] Set to %s, prefix=\"%s\"\n",
+    SLog.printf("[STORAGE] Set to %s, prefix=\"%s\"\n",
         (fs == &LittleFS) ? "LittleFS" : "SD", prefix);
     recover_tmp_files(_storage, messages_dir(_storage_prefix));
 }
@@ -118,14 +118,14 @@ void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_
     lua_pushstring(L, "lib/mesh/messages");
 
     if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-        Serial.printf("require failed: %s\n", lua_tostring(L, -1));
+        SLog.printf("require failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
         return;
     }
 
     lua_getfield(L, -1, "__dispatch");
     if (!lua_isfunction(L, -1)) {
-        Serial.println("__dispatch not a function!");
+        SLog.println("__dispatch not a function!");
         lua_pop(L, 2);
         return;
     }
@@ -149,7 +149,7 @@ void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_
     }
 
     if (lua_pcall(L, 11, 0, 0) != LUA_OK) {
-        Serial.printf("__dispatch failed: %s\n", lua_tostring(L, -1));
+        SLog.printf("__dispatch failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }
 
@@ -162,7 +162,7 @@ void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t
     lua_pushstring(L, "lib/mesh/messages");
 
     if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-        Serial.printf("require failed: %s\n", lua_tostring(L, -1));
+        SLog.printf("require failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
         return;
     }
@@ -190,7 +190,7 @@ void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t
     }
 
     if (lua_pcall(L, 9, 0, 0) != LUA_OK) {
-        Serial.printf("__dispatch_dm failed: %s\n", lua_tostring(L, -1));
+        SLog.printf("__dispatch_dm failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }
 
@@ -216,7 +216,7 @@ void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contac
     lua_pushinteger(L, contact_type);
 
     if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
-        Serial.printf("__dispatch_contact failed: %s\n", lua_tostring(L, -1));
+        SLog.printf("__dispatch_contact failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }
 
@@ -241,7 +241,7 @@ void lua_mesh_push_ack(lua_State* L, uint32_t ack, int32_t rtt) {
     lua_pushinteger(L, (lua_Integer)ack);
     lua_pushinteger(L, (lua_Integer)rtt);
     if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
-        Serial.printf("__dispatch_ack failed: %s\n", lua_tostring(L, -1));
+        SLog.printf("__dispatch_ack failed: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }
     lua_pop(L, 1); // pop module
@@ -304,66 +304,42 @@ bool PunkMesh::shouldAutoAddContactType(uint8_t type) const
 }
 
 
-// Parse one tab-separated contact line into c:
-// pubkey_hex \t name \t type \t flags \t path_len \t advert_ts \t path_hex \t lat \t lon
-// Shared by loadContacts (live table) and ensureArchiveLoaded (archive file).
-static bool parse_contact_line(char* line, int len, ContactInfo& c)
-{
-    char *fields[9];
-    int nf = 0;
-    fields[0] = line;
-    for (int i = 0; i < len && nf < 8; i++) {
-        if (line[i] == '\t') {
-            line[i] = '\0';
-            fields[++nf] = &line[i + 1];
-        }
-    }
-    if (nf < 1) return false; // need at least pubkey + name
+// Fixed-size binary contact record (little-endian, on-device). Mirrors the
+// persisted fields the old TSV held. Used by BOTH the live store (slot = array
+// index, in-place O(1) updates) and the archive (append-only). lastmod/sync_since
+// are runtime-only (not persisted), matching the old format.
+//   pubkey(32) name(32) type(1) flags(1) out_path_len(1) out_path(64)
+//   last_advert_ts(4) gps_lat(4) gps_lon(4)  = 143 bytes
+static const int CONTACT_REC = 143;
 
+static void serialize_contact(const ContactInfo& c, uint8_t* b) {
+    int p = 0;
+    memcpy(b + p, c.id.pub_key, 32); p += 32;
+    memset(b + p, 0, 32); strncpy((char*)(b + p), c.name, 31); p += 32;  // null-padded
+    b[p++] = c.type;
+    b[p++] = c.flags;
+    b[p++] = c.out_path_len;
+    memcpy(b + p, c.out_path, 64); p += 64;
+    memcpy(b + p, &c.last_advert_timestamp, 4); p += 4;
+    memcpy(b + p, &c.gps_lat, 4); p += 4;
+    memcpy(b + p, &c.gps_lon, 4); p += 4;
+}
+
+static void deserialize_contact(const uint8_t* b, ContactInfo& c) {
     memset(&c, 0, sizeof(c));
-
-    uint8_t pub_key[32];
-    if (!mesh::Utils::fromHex(pub_key, 32, fields[0])) return false;
-    c.id = mesh::Identity(pub_key);
-
-    strncpy(c.name, fields[1], sizeof(c.name) - 1);
-    if (nf >= 2) c.type = atoi(fields[2]);
-    if (nf >= 3) c.flags = atoi(fields[3]);
-    if (nf >= 4) c.out_path_len = atoi(fields[4]);
-    if (nf >= 5) c.last_advert_timestamp = strtoul(fields[5], nullptr, 10);
-    if (nf >= 6) mesh::Utils::fromHex(c.out_path, 64, fields[6]);
-    if (nf >= 7) c.gps_lat = atol(fields[7]);
-    if (nf >= 8) c.gps_lon = atol(fields[8]);
+    int p = 0;
+    uint8_t pk[32]; memcpy(pk, b + p, 32); p += 32;
+    c.id = mesh::Identity(pk);
+    memcpy(c.name, b + p, 32); c.name[31] = '\0'; p += 32;
+    c.type = b[p++];
+    c.flags = b[p++];
+    c.out_path_len = b[p++];
+    memcpy(c.out_path, b + p, 64); p += 64;
+    memcpy(&c.last_advert_timestamp, b + p, 4); p += 4;
+    memcpy(&c.gps_lat, b + p, 4); p += 4;
+    memcpy(&c.gps_lon, b + p, 4); p += 4;
     c.lastmod = 0;
-    return true;
-}
-
-// Write one contact line in the same format parse_contact_line reads.
-static void write_contact_line(File& file, const ContactInfo& c)
-{
-    char pubkey_hex[65];
-    mesh::Utils::toHex(pubkey_hex, c.id.pub_key, 32);
-
-    char path_hex[129];
-    mesh::Utils::toHex(path_hex, c.out_path, 64);
-
-    file.printf("%s\t%s\t%d\t%d\t%d\t%u\t%s\t%d\t%d\n",
-        pubkey_hex, c.name, c.type, c.flags,
-        c.out_path_len, c.last_advert_timestamp, path_hex,
-        (int)c.gps_lat, (int)c.gps_lon);
-}
-
-// Read one line from file into buf; returns length (0 = blank/skip).
-static int read_contact_file_line(File& file, char* buf, int buf_size)
-{
-    int len = 0;
-    while (file.available() && len < buf_size - 1) {
-        char ch = file.read();
-        if (ch == '\n' || ch == '\r') break;
-        buf[len++] = ch;
-    }
-    buf[len] = '\0';
-    return len;
+    c.shared_secret_valid = false;
 }
 
 void PunkMesh::loadContacts()
@@ -371,22 +347,19 @@ void PunkMesh::loadContacts()
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
-    String path = storagePath(_storage_prefix, "/contacts");
+    String path = storagePath(_storage_prefix, "/contacts.bin");
     if (_storage->exists(path.c_str()))
     {
         File file = _storage->open(path.c_str());
         if (file)
         {
-            char line[320];
-            while (file.available())
+            uint8_t rec[CONTACT_REC];
+            while (file.available() >= CONTACT_REC)
             {
-                int len = read_contact_file_line(file, line, sizeof(line));
-                if (len == 0) continue;
-
+                if (file.read(rec, CONTACT_REC) != CONTACT_REC) break;
                 ContactInfo c;
-                if (!parse_contact_line(line, len, c)) continue;
-
-                if (!addContact(c)) break;
+                deserialize_contact(rec, c);
+                if (!addContact(c)) break;  // live table full
             }
             file.close();
         }
@@ -395,6 +368,9 @@ void PunkMesh::loadContacts()
     if (is_sd) sd_spi_release();
 }
 
+// Full rewrite of the live store, in ARRAY-INDEX order (getContactByIdx, so file
+// slot i == contacts[i]). Used on removal/clear (the array compacts) and as the
+// bulk fallback. Frequent single-contact mutations use saveOneContact instead.
 void PunkMesh::saveContacts()
 {
     contacts_generation++;  // invalidate the Lua-side contacts cache
@@ -402,159 +378,18 @@ void PunkMesh::saveContacts()
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
-    String path = storagePath(_storage_prefix, "/contacts");
+    String path = storagePath(_storage_prefix, "/contacts.bin");
     File file = _storage->open(path.c_str(), "w", true);
     if (file)
     {
-        ContactsIterator iter;
-        ContactInfo c;
-        int count = 0;
-
-        while (iter.hasNext(this, c))
+        uint8_t rec[CONTACT_REC];
+        int n = getNumContacts();
+        for (int i = 0; i < n; i++)
         {
-            write_contact_line(file, c);
-
-            if (is_sd && ++count % 50 == 0) {
-                file.flush();
-                sd_spi_release();
-                vTaskDelay(1);
-                sd_spi_take();
-            }
-        }
-        file.close();
-    }
-
-    if (is_sd) sd_spi_release();
-}
-
-// ── Contact archive ──────────────────────────────────────────────────
-// Contacts that fall out of the live table are preserved here so they can
-// be shown on the map and re-added. See punkmesh.h for the rationale.
-
-bool PunkMesh::ensureArchiveLoaded()
-{
-    if (archive_loaded) return archived != nullptr;
-    archive_loaded = true;
-
-    archived = (ContactInfo*)heap_caps_malloc(
-        sizeof(ContactInfo) * MAX_ARCHIVED_CONTACTS,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!archived) {
-        Serial.println("[ARCH] FAIL: PSRAM alloc for contact archive");
-        return false;
-    }
-    num_archived = 0;
-
-    bool is_sd = (_storage != &LittleFS);
-    if (is_sd) sd_spi_take();
-
-    // The file is an append-only log: re-archiving a contact appends a
-    // fresh line rather than rewriting the file, so the same pubkey can
-    // appear multiple times — the LAST occurrence is the current one.
-    int file_lines = 0;
-    String path = storagePath(_storage_prefix, "/contacts_arch");
-    if (_storage->exists(path.c_str()))
-    {
-        File file = _storage->open(path.c_str());
-        if (file)
-        {
-            char line[320];
-            ContactInfo entry;
-            while (file.available())
-            {
-                int len = read_contact_file_line(file, line, sizeof(line));
-                if (len == 0) continue;
-                if (!parse_contact_line(line, len, entry)) continue;
-                file_lines++;
-
-                int slot = -1;
-                for (int i = 0; i < num_archived; i++) {
-                    if (memcmp(archived[i].id.pub_key, entry.id.pub_key, PUB_KEY_SIZE) == 0) {
-                        slot = i;
-                        break;
-                    }
-                }
-                if (slot >= 0) {
-                    archived[slot] = entry;        // newer line wins
-                } else if (num_archived < MAX_ARCHIVED_CONTACTS) {
-                    archived[num_archived++] = entry;
-                } else {
-                    // More uniques on disk than capacity (replace-oldest at
-                    // runtime leaves the replaced entries' lines behind) —
-                    // apply the same replace-oldest policy here.
-                    int oldest = 0;
-                    for (int i = 1; i < num_archived; i++) {
-                        if (archived[i].last_advert_timestamp < archived[oldest].last_advert_timestamp)
-                            oldest = i;
-                    }
-                    if (entry.last_advert_timestamp > archived[oldest].last_advert_timestamp)
-                        archived[oldest] = entry;
-                }
-            }
-            file.close();
-        }
-    }
-
-    if (is_sd) sd_spi_release();
-    archive_appends = 0;
-    Serial.printf("[ARCH] Loaded %d archived contacts (%d lines)\n", num_archived, file_lines);
-
-    // Compact when the log carries meaningful duplicate slack — one bounded
-    // rewrite at load time instead of one on every change.
-    if (file_lines > num_archived + 64) {
-        Serial.printf("[ARCH] Compacting archive (%d lines -> %d entries)\n",
-                      file_lines, num_archived);
-        saveArchive();
-    }
-    return true;
-}
-
-// Hot-path persistence: append ONE contact line. A full saveArchive() at
-// 200+ contacts is a ~45KB rewrite on the mesh task holding the shared
-// SD/TFT SPI bus — per advert eviction at live-table saturation, that was
-// measurable as fps drops during advert storms. An append is ~200 bytes.
-void PunkMesh::appendArchiveEntry(const ContactInfo& c)
-{
-    archive_generation++;  // invalidate the Lua-side union cache
-    bool is_sd = (_storage != &LittleFS);
-    if (is_sd) sd_spi_take();
-
-    String path = storagePath(_storage_prefix, "/contacts_arch");
-    File file = _storage->open(path.c_str(), "a", true);
-    if (file) {
-        write_contact_line(file, c);
-        file.close();
-    }
-
-    if (is_sd) sd_spi_release();
-
-    // Bound the log's growth during long uptimes: amortized one rewrite
-    // per ARCH_COMPACT_EVERY appends (load-time compaction handles the
-    // accumulated slack between boots).
-    static const int ARCH_COMPACT_EVERY = 512;
-    if (++archive_appends >= ARCH_COMPACT_EVERY) {
-        Serial.printf("[ARCH] Periodic compaction after %d appends\n", archive_appends);
-        archive_appends = 0;
-        saveArchive();
-    }
-}
-
-void PunkMesh::saveArchive()
-{
-    archive_generation++;  // invalidate the Lua-side union cache
-    if (!archived) return;
-    archive_appends = 0;   // a full rewrite IS a compaction
-
-    bool is_sd = (_storage != &LittleFS);
-    if (is_sd) sd_spi_take();
-
-    String path = storagePath(_storage_prefix, "/contacts_arch");
-    File file = _storage->open(path.c_str(), "w", true);
-    if (file)
-    {
-        for (int i = 0; i < num_archived; i++)
-        {
-            write_contact_line(file, archived[i]);
+            ContactInfo c;
+            if (!getContactByIdx(i, c)) break;
+            serialize_contact(c, rec);
+            file.write(rec, CONTACT_REC);
 
             if (is_sd && (i + 1) % 50 == 0) {
                 file.flush();
@@ -569,69 +404,200 @@ void PunkMesh::saveArchive()
     if (is_sd) sd_spi_release();
 }
 
+// O(1) single-contact persist: find c's array index, seek to that slot, write
+// just its record (~1 sector vs the whole file). Used by the frequent mutation
+// paths (advert, path update, favorite, re-add). Falls back to a full write if
+// the contact isn't found or the file doesn't exist yet.
+void PunkMesh::saveOneContact(const ContactInfo& c)
+{
+    contacts_generation++;
+    int idx = -1, n = getNumContacts();
+    for (int i = 0; i < n; i++) {
+        ContactInfo tmp;
+        if (getContactByIdx(i, tmp) &&
+            memcmp(tmp.id.pub_key, c.id.pub_key, PUB_KEY_SIZE) == 0) { idx = i; break; }
+    }
+    if (idx < 0) { saveContacts(); return; }
+
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+    String path = storagePath(_storage_prefix, "/contacts.bin");
+    File f = _storage->open(path.c_str(), "r+");
+    if (!f) { if (is_sd) sd_spi_release(); saveContacts(); return; }  // no file yet
+    uint8_t rec[CONTACT_REC];
+    serialize_contact(c, rec);
+    f.seek((uint32_t)idx * CONTACT_REC);
+    f.write(rec, CONTACT_REC);
+    f.close();
+    if (is_sd) sd_spi_release();
+}
+
+// ── Contact archive ──────────────────────────────────────────────────
+// DISK-ONLY: the archive lives only in the <storage>/contacts_arch append-only
+// log — no RAM array, no cap. See punkmesh.h. Read on demand (transient) for
+// the "show archived" map union and re-add.
+
+// Read the log into `out` (deduped — the newest line per pubkey wins, since the
+// file is append-order), up to max_out entries; returns the count. The whole
+// archive stays on disk regardless of max_out — only the on-map display is
+// bounded so the transient buffer can't blow up PSRAM on a huge mesh.
+int PunkMesh::readArchivedDeduped(ContactInfo* out, int max_out)
+{
+    int n = 0;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    if (_storage->exists(path.c_str()))
+    {
+        File file = _storage->open(path.c_str());
+        if (file)
+        {
+            uint8_t rec[CONTACT_REC];
+            ContactInfo entry;
+            int cnt = 0;
+            while (file.available() >= CONTACT_REC)
+            {
+                if (file.read(rec, CONTACT_REC) != CONTACT_REC) break;
+                deserialize_contact(rec, entry);
+
+                int slot = -1;
+                for (int i = 0; i < n; i++) {
+                    if (memcmp(out[i].id.pub_key, entry.id.pub_key, PUB_KEY_SIZE) == 0) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot >= 0) out[slot] = entry;        // newer record supersedes
+                else if (n < max_out) out[n++] = entry;  // display cap; disk keeps all
+
+                if (is_sd && ++cnt % 200 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+            }
+            file.close();
+        }
+    }
+
+    if (is_sd) sd_spi_release();
+    return n;
+}
+
+int PunkMesh::readArchiveBatch(uint32_t offset, int max_count, ContactInfo* out,
+                               uint32_t* next_offset, bool* done)
+{
+    int n = 0;
+    *done = true;
+    *next_offset = offset;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    if (_storage->exists(path.c_str()))
+    {
+        File file = _storage->open(path.c_str());
+        if (file)
+        {
+            if (offset > 0) file.seek(offset);
+            uint8_t rec[CONTACT_REC];
+            ContactInfo entry;
+            while (n < max_count && file.available() >= CONTACT_REC)
+            {
+                if (file.read(rec, CONTACT_REC) != CONTACT_REC) break;
+                deserialize_contact(rec, entry);
+                out[n++] = entry;
+            }
+            *next_offset = (uint32_t)file.position();
+            *done = (file.available() < CONTACT_REC);
+            file.close();
+        }
+    }
+
+    if (is_sd) sd_spi_release();
+    return n;
+}
+
+// Hot-path persistence: append ONE binary contact record (CONTACT_REC bytes).
+// Keeping the archive append-only (vs rewriting) is what keeps eviction during
+// advert storms cheap on the shared SD/TFT SPI bus. Duplicates (re-archived
+// pubkeys) are resolved newest-wins when the log is read.
+void PunkMesh::appendArchiveEntry(const ContactInfo& c)
+{
+    archive_generation++;  // invalidate the Lua-side union cache
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    File file = _storage->open(path.c_str(), "a", true);
+    if (file) {
+        uint8_t rec[CONTACT_REC];
+        serialize_contact(c, rec);
+        file.write(rec, CONTACT_REC);
+        file.close();
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
 void PunkMesh::archiveContact(const ContactInfo& c)
 {
     if (!_prefs.archive_contacts) return;  // archiving disabled by setting
-    if (!ensureArchiveLoaded()) return;
-
-    // Already archived (e.g. evicted again after a re-add) — refresh it.
-    // Append-only: the new line supersedes the old one at load time.
-    for (int i = 0; i < num_archived; i++) {
-        if (memcmp(archived[i].id.pub_key, c.id.pub_key, PUB_KEY_SIZE) == 0) {
-            archived[i] = c;
-            appendArchiveEntry(c);
-            return;
-        }
-    }
-
-    if (num_archived >= MAX_ARCHIVED_CONTACTS) {
-        // Archive full — replace the entry with the oldest advert. The
-        // replaced entry's old lines stay in the log; load applies the
-        // same replace-oldest policy, so disk converges to RAM.
-        int oldest = 0;
-        for (int i = 1; i < num_archived; i++) {
-            if (archived[i].last_advert_timestamp < archived[oldest].last_advert_timestamp) {
-                oldest = i;
-            }
-        }
-        archived[oldest] = c;
-    } else {
-        archived[num_archived++] = c;
-    }
-    Serial.printf("[ARCH] Archived contact: %s (total %d)\n", c.name, num_archived);
+    // Disk-only: just append. A re-archived pubkey gets a fresh line that
+    // supersedes the old one on read (newest-wins) — no RAM lookup, no cap.
     appendArchiveEntry(c);
+    SLog.printf("[ARCH] Archived contact: %s\n", c.name);
 }
 
 bool PunkMesh::readdArchivedContact(const uint8_t* pub_key)
 {
-    if (!ensureArchiveLoaded()) return false;
+    // Scan the binary log for this pubkey's newest record (fixed stride, no parse).
+    ContactInfo found;
+    bool have = false;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
 
-    for (int i = 0; i < num_archived; i++) {
-        if (memcmp(archived[i].id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
-            ContactInfo c = archived[i];
-            // The stored route is stale by definition — rediscover via flood
-            c.out_path_len = OUT_PATH_UNKNOWN;
-            memset(c.out_path, 0, sizeof(c.out_path));
-            c.shared_secret_valid = false;
-            c.lastmod = getRTCClock()->getCurrentTime();
-
-            if (!addContact(c)) {
-                // live table full (and overwrite disabled, or all favorites)
-                return false;
+    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    if (_storage->exists(path.c_str()))
+    {
+        File file = _storage->open(path.c_str());
+        if (file)
+        {
+            uint8_t rec[CONTACT_REC];
+            ContactInfo entry;
+            int cnt = 0;
+            while (file.available() >= CONTACT_REC)
+            {
+                if (file.read(rec, CONTACT_REC) != CONTACT_REC) break;
+                deserialize_contact(rec, entry);
+                if (memcmp(entry.id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+                    found = entry;  // keep scanning — the last match is newest
+                    have = true;
+                }
+                if (is_sd && ++cnt % 200 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
             }
-
-            // Remove from the archive — it's live again
-            for (int j = i; j < num_archived - 1; j++) {
-                archived[j] = archived[j + 1];
-            }
-            num_archived--;
-            saveArchive();
-            saveContacts();
-            Serial.printf("[ARCH] Re-added contact: %s\n", c.name);
-            return true;
+            file.close();
         }
     }
-    return false;
+
+    if (is_sd) sd_spi_release();
+    if (!have) return false;
+
+    // The stored route is stale by definition — rediscover via flood.
+    found.out_path_len = OUT_PATH_UNKNOWN;
+    memset(found.out_path, 0, sizeof(found.out_path));
+    found.shared_secret_valid = false;
+    found.lastmod = getRTCClock()->getCurrentTime();
+
+    if (!addContact(found)) {
+        // live table full (and overwrite disabled, or all favorites)
+        return false;
+    }
+
+    // No need to rewrite the log: the contact is live now, and the map union
+    // skips contacts that are live, so the stale archive line is harmless (and
+    // is superseded by a fresh line if it's ever evicted again).
+    archive_generation++;  // drop the now-live entry from the union cache
+    saveOneContact(found);
+    SLog.printf("[ARCH] Re-added contact: %s\n", found.name);
+    return true;
 }
 
 void PunkMesh::onContactOverwrite(const uint8_t* pub_key)
@@ -639,7 +605,7 @@ void PunkMesh::onContactOverwrite(const uint8_t* pub_key)
     // Called just before the slot is reused — the contact data is intact.
     ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (c) {
-        Serial.printf("[ARCH] Live table full — archiving evicted contact: %s\n", c->name);
+        SLog.printf("[ARCH] Live table full — archiving evicted contact: %s\n", c->name);
         archiveContact(*c);
     }
 }
@@ -687,7 +653,7 @@ void PunkMesh::loadChannels()
                 strncpy(cd.name, fields[1], sizeof(cd.name) - 1);
                 mesh::Utils::fromHex(cd.channel.secret, 32, fields[2]);
                 setChannel(slot, cd);
-                Serial.printf("[MESH INIT] Restored channel[%d]: %s\n", slot, cd.name);
+                SLog.printf("[MESH INIT] Restored channel[%d]: %s\n", slot, cd.name);
             }
             file.close();
         }
@@ -939,12 +905,20 @@ static int count_text_records(File& f) {
     return count;
 }
 
+// Per-append safety valve only — days-based retention is handled by the periodic
+// age prune (prune_msg_file_by_age via pruneStep). Gated on file SIZE so the common
+// path is an O(1) size check (no per-append record-count scan); only a pathologically large
+// file (one runaway day) gets rewritten, keeping the newest records.
+static const size_t MSG_FILE_SAFETY_BYTES = 768 * 1024;  // ~3000 msgs before it acts
+static const int    MSG_FILE_SAFETY_KEEP  = 2000;
 static void trim_msg_text_file(fs::FS* storage, const String& path, int cap) {
+    (void)cap;  // retention is by days now; this is just a size-gated backstop
     if (!storage) return;
     File f = storage->open(path.c_str(), "r");
     if (!f) return;
+    if ((size_t)f.size() < MSG_FILE_SAFETY_BYTES) { f.close(); return; }
     int count = count_text_records(f);
-    int keep = cap > 0 ? cap : 400;
+    int keep = MSG_FILE_SAFETY_KEEP;
     int max_count = keep + 100;
     if (count <= max_count) { f.close(); return; }
     int skip = count - keep;
@@ -976,7 +950,7 @@ static void trim_msg_text_file(fs::FS* storage, const String& path, int cap) {
         wf.close();
         storage->remove(path.c_str());
         if (!storage->rename(tmp.c_str(), path.c_str())) {
-            Serial.printf("[STORAGE] rename failed: %s -> %s\n",
+            SLog.printf("[STORAGE] rename failed: %s -> %s\n",
                           tmp.c_str(), path.c_str());
         }
     }
@@ -992,7 +966,7 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
 
     if (storage->exists(fpath.c_str()) && is_old_binary_file(storage, fpath)) {
         storage->remove(fpath.c_str());
-        Serial.printf("[STORAGE] Cleared old binary log: %s\n", fpath.c_str());
+        SLog.printf("[STORAGE] Cleared old binary log: %s\n", fpath.c_str());
     }
 
     File f = storage->open(fpath.c_str(), "a", true);
@@ -1031,6 +1005,202 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
     if (is_sd) sd_spi_release();
 }
 
+// ── Routing store (daily, sender-indexed) ───────────────────────────────────
+// A compact, denormalized projection of channel traffic for meshprint/replay:
+// one tiny binary record per channel message — { from, ts, lat, lon, path } — in
+// a per-day log, with a per-day {sender,offset} index for fast sender lookup. No
+// message text or channel; DMs excluded. Daily files make retention a file
+// delete (no rewrite) and give a free time index. On-device little-endian.
+//   <prefix>/route/YYYY-MM-DD.log : u16 reclen | u8 from_len | from |
+//                                   u32 ts | i32 lat_e6 | i32 lon_e6 |
+//                                   u16 path_len | u8 path_nbytes | path
+//   <prefix>/route/YYYY-MM-DD.idx : u8 from_len | from | u32 offset
+static String route_dir(const String& prefix) { return prefix + "/route"; }
+
+static void route_date_str(uint32_t ts, char* out /* >= 11 bytes */) {
+    DateTime dt = DateTime(ts);
+    snprintf(out, 11, "%04d-%02d-%02d", dt.year(), dt.month(), dt.day());
+}
+
+// Delete route .log/.idx whose date is older than retain_days. Lexicographic
+// compare works since YYYY-MM-DD sorts chronologically. 0 = keep all. Caller
+// holds the SD lock; runs once per day (first record of a new day file).
+static void prune_routing_logs(fs::FS* storage, const String& prefix, uint32_t cutoff_ts) {
+    if (!storage || cutoff_ts == 0) return;
+    char cutoff[11];
+    route_date_str(cutoff_ts, cutoff);
+
+    String dir = route_dir(prefix);
+    File root = storage->open(dir.c_str());
+    if (!root || !root.isDirectory()) { if (root) root.close(); return; }
+
+    // Collect victims first; deleting during openNextFile iteration is unsafe.
+    String victims[64];
+    int nv = 0;
+    File entry = root.openNextFile();
+    while (entry && nv < 64) {
+        if (!entry.isDirectory()) {
+            String name = entry.name();
+            int slash = name.lastIndexOf('/');
+            String base = (slash >= 0) ? name.substring(slash + 1) : name;
+            if ((base.endsWith(".log") || base.endsWith(".idx")) && base.length() >= 10
+                && base.substring(0, 10) < String(cutoff)) {
+                victims[nv++] = dir + "/" + base;
+            }
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
+    for (int i = 0; i < nv; i++) {
+        storage->remove(victims[i].c_str());
+        SLog.printf("[ROUTE] pruned %s\n", victims[i].c_str());
+    }
+}
+
+// Age-prune one text-message log: rewrite it keeping only records with ts >=
+// cutoff. Records ("ts=..\n..\n---\n") are append/oldest-first, so we find the
+// first keeper's byte offset and copy the tail (chunked — no big buffer). Caller
+// holds the SD lock. .tmp + rename keeps it crash-safe like the count trim.
+static void prune_msg_file_by_age(fs::FS* storage, const String& path, uint32_t cutoff_ts) {
+    if (!storage || cutoff_ts == 0) return;
+    File f = storage->open(path.c_str(), "r");
+    if (!f) return;
+
+    long keep_start = -1;
+    long rec_start = 0;
+    uint32_t cur_ts = 0;
+    char line[256];
+    while (f.available()) {
+        int len = 0;
+        while (f.available() && len < (int)sizeof(line) - 1) {
+            char ch = f.read();
+            if (ch == '\n' || ch == '\r') break;
+            line[len++] = ch;
+        }
+        line[len] = '\0';
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+            if (cur_ts >= cutoff_ts) { keep_start = rec_start; break; }
+            rec_start = f.position();   // next record begins after this terminator
+            cur_ts = 0;
+        } else if (strncmp(line, "ts=", 3) == 0) {
+            cur_ts = strtoul(line + 3, nullptr, 10);
+        }
+    }
+    if (keep_start < 0) keep_start = f.size();   // every record older than cutoff
+    if (keep_start == 0) { f.close(); return; }  // nothing to drop
+
+    f.seek(keep_start);
+    String tmp = path + ".tmp";
+    File wf = storage->open(tmp.c_str(), "w", true);
+    if (!wf) { f.close(); return; }
+    uint8_t chunk[512];
+    while (f.available()) {
+        int n = f.read(chunk, sizeof(chunk));
+        if (n <= 0) break;
+        wf.write(chunk, n);
+    }
+    wf.close();
+    f.close();
+    storage->remove(path.c_str());
+    if (!storage->rename(tmp.c_str(), path.c_str()))
+        SLog.printf("[STORAGE] age-prune rename failed: %s\n", path.c_str());
+}
+
+// Collect channel/DM text-log paths into `out` (up to `max`); returns the count.
+// Caller holds the SD lock. Used by the incremental retention sweep (pruneStep),
+// which then rewrites each file under its OWN lock so the bus is freed between
+// files (never held for the whole multi-file sweep).
+static int collect_message_logs(fs::FS* storage, const String& prefix,
+                                String* out, int max) {
+    int nf = 0;
+    String dir = messages_dir(prefix);
+    File root = storage->open(dir.c_str());
+    if (!root || !root.isDirectory()) { if (root) root.close(); return 0; }
+    File e = root.openNextFile();
+    while (e && nf < max) {
+        if (!e.isDirectory()) {
+            String name = e.name();
+            int slash = name.lastIndexOf('/');
+            String base = (slash >= 0) ? name.substring(slash + 1) : name;
+            if (base.endsWith(".log") && (base.startsWith("ch_") || base.startsWith("dm_")))
+                out[nf++] = dir + "/" + base;
+        }
+        e = root.openNextFile();
+    }
+    root.close();
+    return nf;
+}
+
+// Lock-free core: write one routing record (+idx) for `m`. CALLER HOLDS the SD
+// lock. Returns true if this was the first record of a new day file. Shared by
+// the live append path and the one-shot history backfill.
+static bool route_write_record(fs::FS* storage, const String& prefix, const StoredMsg& m) {
+    if (!storage) return false;
+    if (m.timestamp < 86400) return false;   // no valid clock / bad ts — would misbucket
+    if (m.from[0] == '\0') return false;
+
+    char datestr[11];
+    route_date_str(m.timestamp, datestr);
+    String dir = route_dir(prefix);
+    String logpath = dir + "/" + datestr + ".log";
+    String idxpath = dir + "/" + datestr + ".idx";
+
+    if (!storage->exists(dir.c_str())) storage->mkdir(dir.c_str());
+    bool new_day = !storage->exists(logpath.c_str());
+
+    // ── Record body (single write; on-device little-endian) ──
+    uint8_t from_len = strlen(m.from);
+    if (from_len > 31) from_len = 31;
+    uint8_t path_nbytes = (uint8_t)((m.path_len & 63) * ((m.path_len >> 6) + 1));
+    if (path_nbytes > MAX_PATH_SIZE) path_nbytes = MAX_PATH_SIZE;
+    int32_t lat_e6 = m.has_loc ? (int32_t)(m.lat * 1000000.0 + (m.lat >= 0 ? 0.5 : -0.5)) : 0;
+    int32_t lon_e6 = m.has_loc ? (int32_t)(m.lon * 1000000.0 + (m.lon >= 0 ? 0.5 : -0.5)) : 0;
+    uint16_t body = (uint16_t)(1 + from_len + 4 + 4 + 4 + 2 + 1 + path_nbytes);
+
+    uint8_t buf[2 + 1 + 31 + 4 + 4 + 4 + 2 + 1 + MAX_PATH_SIZE];
+    int q = 0;
+    memcpy(buf + q, &body, 2);            q += 2;
+    buf[q++] = from_len;
+    memcpy(buf + q, m.from, from_len);    q += from_len;
+    memcpy(buf + q, &m.timestamp, 4);     q += 4;
+    memcpy(buf + q, &lat_e6, 4);          q += 4;
+    memcpy(buf + q, &lon_e6, 4);          q += 4;
+    memcpy(buf + q, &m.path_len, 2);      q += 2;
+    buf[q++] = path_nbytes;
+    if (path_nbytes) { memcpy(buf + q, m.path, path_nbytes); q += path_nbytes; }
+
+    uint32_t offset = 0;
+    File lf = storage->open(logpath.c_str(), "a", true);
+    if (lf) {
+        offset = lf.size();   // append position = start of this record
+        lf.write(buf, q);
+        lf.close();
+    }
+
+    // Index record: {from_len, from, offset}
+    uint8_t ibuf[1 + 31 + 4];
+    int ip = 0;
+    ibuf[ip++] = from_len;
+    memcpy(ibuf + ip, m.from, from_len);  ip += from_len;
+    memcpy(ibuf + ip, &offset, 4);        ip += 4;
+    File xf = storage->open(idxpath.c_str(), "a", true);
+    if (xf) { xf.write(ibuf, ip); xf.close(); }
+
+    return new_day;
+}
+
+// Locking wrapper for the live append path. new_day → caller flags a deferred
+// retention sweep (run off this locked path on the device clock). See pruneStep.
+static bool append_routing_record(fs::FS* storage, const String& prefix,
+                                  const StoredMsg& m) {
+    if (!storage) return false;
+    bool is_sd = (storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+    bool new_day = route_write_record(storage, prefix, m);
+    if (is_sd) sd_spi_release();
+    return new_day;
+}
+
 void PunkMesh::appendChannelMessage(int channel_idx, const char* from, const char* text,
                                     uint32_t timestamp, float snr, float rssi,
                                     uint8_t hops, bool direct,
@@ -1045,6 +1215,183 @@ void PunkMesh::appendChannelMessage(int channel_idx, const char* from, const cha
     append_msg_text(_storage, _storage_prefix,
                     channel_msg_path(_storage_prefix, ch_name.c_str()),
                     m, _max_messages);
+    // Compact routing projection for meshprint/replay (sender-indexed, daily).
+    if (append_routing_record(_storage, _storage_prefix, m)) _prune_due = true;
+}
+
+static void str_tolower_buf(char* s) { for (; *s; ++s) if (*s >= 'A' && *s <= 'Z') *s += 32; }
+
+// Decode one routing record at the file's current position; advances past it.
+// Pushes {from,timestamp,lat,lon,path} at out_idx when the record matches the
+// optional lowercased sender `want_lc` and ts is in [since,until] (0 = open).
+// Returns: 1 pushed, 0 skipped (filtered, or internally malformed but framing
+// intact — caller continues), -1 unrecoverable (EOF / lost framing — caller stops).
+static int route_decode_and_push(lua_State* L, File& f, const char* want_lc,
+                                 uint32_t since_ts, uint32_t until_ts, int out_idx) {
+    uint16_t reclen = 0;
+    if (f.read((uint8_t*)&reclen, 2) != 2) return -1;                // EOF
+    if (reclen < (1 + 4 + 4 + 4 + 2 + 1) || reclen > 200) return -1; // framing lost
+    uint8_t body[200];
+    if (f.read(body, reclen) != (int)reclen) return -1;             // partial last record
+    // Past this point exactly `reclen` bytes were consumed, so a record with a
+    // bad interior can be SKIPPED (return 0) without losing later records' framing.
+    int p = 0;
+    uint8_t from_len = body[p++];
+    if (from_len > 31 || p + from_len + 4 + 4 + 4 + 2 + 1 > reclen) return 0;
+    char from[32];
+    memcpy(from, body + p, from_len); from[from_len] = '\0'; p += from_len;
+    uint32_t ts;       memcpy(&ts, body + p, 4);       p += 4;
+    int32_t  lat_e6;   memcpy(&lat_e6, body + p, 4);   p += 4;
+    int32_t  lon_e6;   memcpy(&lon_e6, body + p, 4);   p += 4;
+    uint16_t path_len; memcpy(&path_len, body + p, 2); p += 2;
+    uint8_t  path_nbytes = body[p++];
+    if (p + path_nbytes > reclen) return 0;
+
+    if (want_lc && want_lc[0]) {
+        char fl[32]; strncpy(fl, from, sizeof(fl) - 1); fl[sizeof(fl) - 1] = '\0';
+        str_tolower_buf(fl);
+        if (strcmp(fl, want_lc) != 0) return 0;
+    }
+    if (since_ts && ts < since_ts) return 0;
+    if (until_ts && ts > until_ts) return 0;
+
+    lua_newtable(L);
+    lua_pushstring(L, from);                lua_setfield(L, -2, "from");
+    lua_pushinteger(L, ts);                 lua_setfield(L, -2, "timestamp");
+    lua_pushnumber(L, lat_e6 / 1000000.0);  lua_setfield(L, -2, "lat");
+    lua_pushnumber(L, lon_e6 / 1000000.0);  lua_setfield(L, -2, "lon");
+    push_path_table(L, path_len, body + p); lua_setfield(L, -2, "path");
+    lua_rawseti(L, -2, out_idx);
+    return 1;
+}
+
+// Query the routing store. Day files in [since_date, until_date] are walked in
+// directory order (caller/Lua sorts if it needs chronology). With a sender, the
+// per-day .idx supplies offsets so non-matching records are never decoded and a
+// day without the sender is skipped entirely. The .log handle IS the iterated
+// dir entry, so only the .idx is opened separately. Output is capped to bound
+// PSRAM (meshprint tallies; replay trims to its own max).
+int PunkMesh::pushRoutingQuery(lua_State* L, const char* sender,
+                               uint32_t since_ts, uint32_t until_ts) {
+    lua_newtable(L);
+    if (!_storage) return 1;
+    bool is_sd = (_storage != &LittleFS);
+
+    char want[32] = {0};
+    bool filter_sender = sender && sender[0];
+    if (filter_sender) { strncpy(want, sender, sizeof(want) - 1); str_tolower_buf(want); }
+
+    char since_date[11], until_date[11];
+    route_date_str(since_ts, since_date);                        // since==0 → 1970 → all
+    route_date_str(until_ts ? until_ts : 0xFFFFFFFFu, until_date);
+
+    if (is_sd) sd_spi_take();
+    String dir = route_dir(_storage_prefix);
+    File root = _storage->open(dir.c_str());
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        if (is_sd) sd_spi_release();
+        return 1;
+    }
+
+    const int MAX_OUT = 2000;
+    int out_idx = 1, produced = 0, yctr = 0;
+
+    File entry = root.openNextFile();
+    while (entry && produced < MAX_OUT) {
+        if (!entry.isDirectory()) {
+            String name = entry.name();
+            int slash = name.lastIndexOf('/');
+            String base = (slash >= 0) ? name.substring(slash + 1) : name;
+            if (base.endsWith(".log") && base.length() >= 14) {   // YYYY-MM-DD.log
+                String d = base.substring(0, 10);
+                if (d >= String(since_date) && d <= String(until_date)) {
+                    if (filter_sender) {
+                        String idxpath = dir + "/" + d + ".idx";
+                        File xf = _storage->open(idxpath.c_str(), "r");
+                        if (xf) {
+                            while (xf.available() && produced < MAX_OUT) {
+                                uint8_t fl = 0;
+                                if (xf.read(&fl, 1) != 1) break;
+                                if (fl > 31) fl = 31;
+                                char fn[32] = {0};
+                                if (xf.read((uint8_t*)fn, fl) != fl) break;
+                                fn[fl] = '\0';
+                                uint32_t off = 0;
+                                if (xf.read((uint8_t*)&off, 4) != 4) break;
+                                str_tolower_buf(fn);
+                                if (strcmp(fn, want) != 0) continue;
+                                entry.seek(off);
+                                if (route_decode_and_push(L, entry, want, since_ts, until_ts, out_idx) == 1) {
+                                    out_idx++; produced++;
+                                }
+                                if (is_sd && (++yctr % 50 == 0)) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+                            }
+                            xf.close();
+                        } else {
+                            // No .idx (e.g. a crash between the .log and .idx writes):
+                            // sequential scan filtering by sender so the day's records
+                            // aren't silently dropped.
+                            entry.seek(0);
+                            while (entry.available() && produced < MAX_OUT) {
+                                int r = route_decode_and_push(L, entry, want, since_ts, until_ts, out_idx);
+                                if (r < 0) break;
+                                if (r == 1) { out_idx++; produced++; }
+                                if (is_sd && (++yctr % 50 == 0)) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+                            }
+                        }
+                    } else {
+                        entry.seek(0);
+                        while (entry.available() && produced < MAX_OUT) {
+                            int r = route_decode_and_push(L, entry, nullptr, since_ts, until_ts, out_idx);
+                            if (r < 0) break;
+                            if (r == 1) { out_idx++; produced++; }
+                            if (is_sd && (++yctr % 50 == 0)) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+                        }
+                    }
+                }
+            }
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
+    if (is_sd) sd_spi_release();
+    return 1;
+}
+
+// Incremental retention sweep, driven by _prune_due (set on a new-day routing
+// record or at boot). Called from the Core-0 main loop. Phase 1 (first call
+// after the flag) deletes old routing day-files and snapshots the text-log list;
+// each later call rewrites ONE text log. Every disk step takes its own
+// MESH_LOCK+SPI and releases it before returning, so the radio and UI are never
+// blocked for more than a single file's rewrite (bounded by the size-safety cap).
+void PunkMesh::pruneStep() {
+    if (!_sweep_active) {
+        if (!_prune_due) return;
+        _prune_due = false;
+        if (!_storage || _msg_retain_days == 0) return;  // unlimited: nothing to do
+        uint32_t now_ts = getRTCClock()->getCurrentTime();
+        if (now_ts < 86400) { _prune_due = true; return; }  // no clock yet — retry later
+        _sweep_cutoff = (now_ts > (uint32_t)_msg_retain_days * 86400u)
+                        ? now_ts - (uint32_t)_msg_retain_days * 86400u : 0;
+        if (_sweep_cutoff == 0) return;
+        bool is_sd = (_storage != &LittleFS);
+        MESH_LOCK(); if (is_sd) sd_spi_take();
+        prune_routing_logs(_storage, _storage_prefix, _sweep_cutoff);  // quick deletes
+        _sweep_count = collect_message_logs(_storage, _storage_prefix, _sweep_files, 64);
+        if (is_sd) sd_spi_release(); MESH_UNLOCK();
+        _sweep_idx = 0;
+        _sweep_active = (_sweep_count > 0);
+        return;
+    }
+    if (_sweep_idx >= _sweep_count) { _sweep_active = false; return; }
+    bool is_sd = (_storage != &LittleFS);
+    MESH_LOCK(); if (is_sd) sd_spi_take();
+    prune_msg_file_by_age(_storage, _sweep_files[_sweep_idx], _sweep_cutoff);
+    if (is_sd) sd_spi_release(); MESH_UNLOCK();
+    _sweep_files[_sweep_idx] = String();   // free the path now
+    _sweep_idx++;
+    if (_sweep_idx >= _sweep_count) _sweep_active = false;
 }
 
 void PunkMesh::appendDMMessage(const char* peer, const char* from, const char* text,
@@ -1571,11 +1918,11 @@ void PunkMesh::setClock(uint32_t timestamp)
     if (timestamp > curr)
     {
         getRTCClock()->setCurrentTime(timestamp);
-        Serial.println("   (OK - clock set!)");
+        SLog.println("   (OK - clock set!)");
     }
     else
     {
-        Serial.println("   (ERR: clock cannot go backwards)");
+        SLog.println("   (ERR: clock cannot go backwards)");
     }
 }
 
@@ -1603,7 +1950,7 @@ void PunkMesh::importCard(const char *command)
     while (*command == ' ')
         command++; // skip leading spaces
     if (memcmp(command, "meshcore://", 11) != 0) {
-        Serial.println("   error: invalid format");
+        SLog.println("   error: invalid format");
         return;
     }
     char *body = (char *)command + 11;  // after the scheme
@@ -1631,7 +1978,7 @@ void PunkMesh::importCard(const char *command)
             p = amp ? amp + 1 : nullptr;
         }
         if (strlen(pubhex) != PUB_KEY_SIZE * 2) {
-            Serial.println("   error: bad public_key in contact URI");
+            SLog.println("   error: bad public_key in contact URI");
             return;
         }
         mesh::Identity id(pubhex);  // construct from 64-hex pubkey
@@ -1641,8 +1988,8 @@ void PunkMesh::importCard(const char *command)
             existing->name[sizeof(existing->name) - 1] = 0;
             existing->type = (uint8_t)ctype;
             existing->lastmod = getRTCClock()->getCurrentTime();
-            saveContacts();
-            Serial.printf("   updated contact from URI: %s\n", name);
+            saveOneContact(*existing);
+            SLog.printf("   updated contact from URI: %s\n", name);
         } else {
             ContactInfo ci;
             memset(&ci, 0, sizeof(ci));
@@ -1652,10 +1999,10 @@ void PunkMesh::importCard(const char *command)
             ci.type = (uint8_t)ctype;
             ci.lastmod = getRTCClock()->getCurrentTime();
             if (addContact(ci)) {
-                saveContacts();
-                Serial.printf("   imported contact from URI: %s\n", name);
+                saveOneContact(ci);
+                SLog.printf("   imported contact from URI: %s\n", name);
             } else {
-                Serial.println("   error: contact list full");
+                SLog.println("   error: contact list full");
             }
         }
         return;
@@ -1679,7 +2026,7 @@ void PunkMesh::importCard(const char *command)
             }
         }
     }
-    Serial.println("   error: invalid format");
+    SLog.println("   error: invalid format");
 }
 
 float PunkMesh::getAirtimeBudgetFactor() const
@@ -1703,7 +2050,7 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
     // contact it didn't add. Ignore those completely so they don't pollute path
     // history or the UI contact list.
     if (is_new && !shouldAutoAddContactType(contact.type)) {
-        Serial.printf("[MESH RX] Advert from excluded type (%s) — not adding\n",
+        SLog.printf("[MESH RX] Advert from excluded type (%s) — not adding\n",
                       getTypeName(contact.type));
         return;
     }
@@ -1714,24 +2061,23 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
     // it can be re-added later, then stop: it's not a live contact, so don't
     // record path / persist / notify the UI.
     if (is_new && !lookupContactByPubKey(contact.id.pub_key, PUB_KEY_SIZE)) {
-        Serial.printf("[MESH RX] List full — %s discarded new contact: %s\n",
+        SLog.printf("[MESH RX] List full — %s discarded new contact: %s\n",
                       _prefs.archive_contacts ? "archiving" : "dropping", contact.name);
         archiveContact(contact);
         return;
     }
 
-    Serial.println("[MESH RX] ========== ADVERT RECEIVED ==========");
-    Serial.printf("[MESH RX] Name: %s (%s)\n", contact.name, is_new ? "NEW" : "known");
-    Serial.printf("[MESH RX] Type: %s, path_len: %d\n", getTypeName(contact.type), path_len);
-    Serial.print("[MESH RX] Public key: ");
-    mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE);
-    Serial.println();
-    Serial.printf("[MESH RX] Total contacts now: %d\n", getNumContacts() + (is_new ? 1 : 0));
+    // One atomic line — separate prints could interleave / be partially dropped.
+    char pk_hex[PUB_KEY_SIZE * 2 + 1];
+    mesh::Utils::toHex(pk_hex, contact.id.pub_key, PUB_KEY_SIZE);
+    SLog.printf("[MESH RX] ADVERT %s (%s) type=%s path_len=%d pubkey=%s contacts=%d\n",
+        contact.name, is_new ? "NEW" : "known", getTypeName(contact.type), path_len,
+        pk_hex, getNumContacts() + (is_new ? 1 : 0));
 
     recordPath(contact.id.pub_key, path_len, path,
                last_rx_snr, last_rx_rssi, PATH_SRC_ADVERT, false);
 
-    saveContacts();
+    saveOneContact(contact);  // O(1): just this contact's slot, not the whole file
 
     if (rx_event_queue) {
         RxEvent ev = {};
@@ -1748,10 +2094,10 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
 
 void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
 {
-    Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t)contact.out_path_len);
+    SLog.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t)contact.out_path_len);
     recordPath(contact.id.pub_key, contact.out_path_len, contact.out_path,
                0, 0, PATH_SRC_PATH_UPDATE, true);
-    saveContacts();
+    saveOneContact(contact);  // O(1): just this contact's slot
 #if BLE_COMPANION_ENABLED
     if (ble_companion) ble_companion->pushPathUpdated(contact);
 #endif
@@ -1763,7 +2109,7 @@ ContactInfo* PunkMesh::processAck(const uint8_t *data)
     {
         uint32_t rtt = _ms->getMillis() - last_msg_sent;
         uint32_t acked_crc = expected_ack_crc;
-        Serial.printf("   Got ACK! (round trip: %d millis)\n", rtt);
+        SLog.printf("   Got ACK! (round trip: %d millis)\n", rtt);
         expected_ack_crc = 0;
         if (curr_recipient) {
             recordPathSuccess(curr_recipient->id.pub_key, rtt);
@@ -1789,11 +2135,11 @@ ContactInfo* PunkMesh::processAck(const uint8_t *data)
 
 void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text)
 {
-    Serial.println("[MESH RX] ========== DIRECT MSG RECEIVED ==========");
-    Serial.printf("[MESH RX] From: %s, route: %s, hops: %d\n",
+    SLog.println("[MESH RX] ========== DIRECT MSG RECEIVED ==========");
+    SLog.printf("[MESH RX] From: %s, route: %s, hops: %d\n",
         from.name, pkt->isRouteDirect() ? "DIRECT" : "FLOOD", pkt->getPathHashCount());
-    Serial.printf("[MESH RX] Text: \"%s\"\n", text);
-    Serial.printf("[MESH RX] Sender timestamp: %u\n", sender_timestamp);
+    SLog.printf("[MESH RX] Text: \"%s\"\n", text);
+    SLog.printf("[MESH RX] Sender timestamp: %u\n", sender_timestamp);
 
     if (strcmp(text, "clock sync") == 0)
     { // special text command
@@ -1844,7 +2190,7 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
         memcpy(ev.path, pkt->path, pkt->getPathByteLen());
         memcpy(ev.pkt_hash, _last_pkt_hash, MAX_HASH_SIZE);
         if (xQueueSend(rx_event_queue, &ev, 0) != pdTRUE) {
-            Serial.println("[MESH RX] WARNING: rx_event_queue full, dropping DM");
+            SLog.println("[MESH RX] WARNING: rx_event_queue full, dropping DM");
         }
     }
 
@@ -1865,9 +2211,9 @@ void PunkMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, u
 
 void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp, const char *text)
 {
-    Serial.println("[MESH RX] ========== CHANNEL MSG RECEIVED ==========");
-    Serial.printf("[MESH RX] Raw text: \"%s\"\n", text);
-    Serial.printf("[MESH RX] Route: %s, hops: %d, timestamp: %u\n",
+    SLog.println("[MESH RX] ========== CHANNEL MSG RECEIVED ==========");
+    SLog.printf("[MESH RX] Raw text: \"%s\"\n", text);
+    SLog.printf("[MESH RX] Route: %s, hops: %d, timestamp: %u\n",
         pkt->isRouteDirect() ? "DIRECT" : "FLOOD", pkt->getPathHashCount(), timestamp);
 
     // Parse "sender: message" format used by group messages
@@ -1884,7 +2230,7 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
 
     // Identify which channel slot decrypted this packet (-1 if not in our table)
     int channel_idx = findChannelIdx(channel);
-    Serial.printf("[MESH RX] Parsed sender: \"%s\", msg: \"%s\", channel_idx: %d\n", sender_name, msg_text, channel_idx);
+    SLog.printf("[MESH RX] Parsed sender: \"%s\", msg: \"%s\", channel_idx: %d\n", sender_name, msg_text, channel_idx);
 
     // Normalize UTF-8 smart quotes to ASCII in the message body so they
     // render from montserrat rather than as tofu.
@@ -1923,7 +2269,7 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
         memcpy(ev.path, pkt->path, pkt->getPathByteLen());
         memcpy(ev.pkt_hash, _last_pkt_hash, MAX_HASH_SIZE);
         if (xQueueSend(rx_event_queue, &ev, 0) != pdTRUE) {
-            Serial.println("[MESH RX] WARNING: rx_event_queue full, dropping channel msg");
+            SLog.println("[MESH RX] WARNING: rx_event_queue full, dropping channel msg");
         }
     }
 
@@ -2000,7 +2346,7 @@ uint32_t PunkMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8
 
 void PunkMesh::onSendTimeout()
 {
-    Serial.println("   ERROR: timed out, no ACK.");
+    SLog.println("   ERROR: timed out, no ACK.");
     if (curr_recipient) {
         recordPathFailure(curr_recipient->id.pub_key);
     }
@@ -2372,7 +2718,7 @@ void PunkMesh::registerPendingRepeat(const uint8_t* hash, uint8_t header,
     pr.next_retry_time = millis() + (unsigned long)_prefs.msg_repeat_interval_secs * 1000UL;
     pr.active = true;
 
-    Serial.printf("[MSG REPEAT] registered, %d retries, interval %ds\n",
+    SLog.printf("[MSG REPEAT] registered, %d retries, interval %ds\n",
                   pr.attempts_remaining, _prefs.msg_repeat_interval_secs);
 }
 
@@ -2389,7 +2735,7 @@ void PunkMesh::checkPendingRepeats() {
             memcpy(ro.pkt_hash, pr.pkt_hash, MAX_HASH_SIZE);
             ro.status = 2;
             _repeat_history_next = (_repeat_history_next + 1) % MAX_REPEAT_HISTORY;
-            Serial.println("[MSG REPEAT] echo heard, confirmed");
+            SLog.println("[MSG REPEAT] echo heard, confirmed");
             continue;
         }
 
@@ -2401,7 +2747,7 @@ void PunkMesh::checkPendingRepeats() {
             memcpy(ro.pkt_hash, pr.pkt_hash, MAX_HASH_SIZE);
             ro.status = 3;
             _repeat_history_next = (_repeat_history_next + 1) % MAX_REPEAT_HISTORY;
-            Serial.println("[MSG REPEAT] exhausted, no echo heard");
+            SLog.println("[MSG REPEAT] exhausted, no echo heard");
             continue;
         }
 
@@ -2416,7 +2762,7 @@ void PunkMesh::checkPendingRepeats() {
         pr.attempts_remaining--;
         pr.next_retry_time = now + (unsigned long)_prefs.msg_repeat_interval_secs * 1000UL;
 
-        Serial.printf("[MSG REPEAT] retransmit, %d remaining\n", pr.attempts_remaining);
+        SLog.printf("[MSG REPEAT] retransmit, %d remaining\n", pr.attempts_remaining);
     }
 }
 
@@ -2484,9 +2830,8 @@ void PunkMesh::begin()
     // Try to load saved identity from storage (SD or LittleFS)
     String idPath = storagePath(_storage_prefix, "/identity");
     String prefsPath = storagePath(_storage_prefix, "/node_prefs");
-    String contactsPath = storagePath(_storage_prefix, "/contacts");
-    Serial.printf("[STORAGE] Identity path: %s\n", idPath.c_str());
-    Serial.printf("[STORAGE] Prefs path: %s\n", prefsPath.c_str());
+    SLog.printf("[STORAGE] Identity path: %s\n", idPath.c_str());
+    SLog.printf("[STORAGE] Prefs path: %s\n", prefsPath.c_str());
 
     bool identity_loaded = false;
     bool id_is_sd = (_storage != &LittleFS);
@@ -2497,13 +2842,13 @@ void PunkMesh::begin()
             identity_loaded = self_id.readFrom(file);
             file.close();
             if (identity_loaded) {
-                Serial.printf("[STORAGE] Loaded identity from %s\n", idPath.c_str());
+                SLog.printf("[STORAGE] Loaded identity from %s\n", idPath.c_str());
             } else {
-                Serial.printf("[STORAGE] WARNING: Failed to read %s\n", idPath.c_str());
+                SLog.printf("[STORAGE] WARNING: Failed to read %s\n", idPath.c_str());
             }
         }
     } else {
-        Serial.printf("[STORAGE] No identity file at %s\n", idPath.c_str());
+        SLog.printf("[STORAGE] No identity file at %s\n", idPath.c_str());
     }
     if (id_is_sd) sd_spi_release();
 
@@ -2513,7 +2858,7 @@ void PunkMesh::begin()
             if (lfs_file) {
                 self_id.writeTo(lfs_file);
                 lfs_file.close();
-                Serial.println("[STORAGE] Copied identity from SD to LittleFS");
+                SLog.println("[STORAGE] Copied identity from SD to LittleFS");
             }
         } else if (!identity_loaded && LittleFS.exists("/identity")) {
             File lfs_file = LittleFS.open("/identity");
@@ -2521,13 +2866,13 @@ void PunkMesh::begin()
                 identity_loaded = self_id.readFrom(lfs_file);
                 lfs_file.close();
                 if (identity_loaded) {
-                    Serial.println("[STORAGE] Loaded identity from LittleFS fallback");
+                    SLog.println("[STORAGE] Loaded identity from LittleFS fallback");
                     sd_spi_take();
                     File sd_file = _storage->open(idPath.c_str(), "w", true);
                     if (sd_file) {
                         self_id.writeTo(sd_file);
                         sd_file.close();
-                        Serial.println("[STORAGE] Copied identity from LittleFS to SD");
+                        SLog.println("[STORAGE] Copied identity from LittleFS to SD");
                     }
                     sd_spi_release();
                 }
@@ -2537,7 +2882,7 @@ void PunkMesh::begin()
 
     // If no saved identity, generate a new one
     if (!identity_loaded) {
-        Serial.println("[STORAGE] Generating new identity...");
+        SLog.println("[STORAGE] Generating new identity...");
         ((StdRNG *)getRNG())->begin(esp_random());
 
         self_id = mesh::LocalIdentity(getRNG());
@@ -2553,9 +2898,9 @@ void PunkMesh::begin()
         if (file) {
             bool ok = self_id.writeTo(file);
             file.close();
-            Serial.printf("[STORAGE] Identity saved to %s: %s\n", idPath.c_str(), ok ? "OK" : "FAILED");
+            SLog.printf("[STORAGE] Identity saved to %s: %s\n", idPath.c_str(), ok ? "OK" : "FAILED");
         } else {
-            Serial.printf("[STORAGE] ERROR: Cannot open %s for writing!\n", idPath.c_str());
+            SLog.printf("[STORAGE] ERROR: Cannot open %s for writing!\n", idPath.c_str());
         }
         if (is_sd) {
             sd_spi_release();
@@ -2563,7 +2908,7 @@ void PunkMesh::begin()
             if (lfs_file) {
                 self_id.writeTo(lfs_file);
                 lfs_file.close();
-                Serial.println("[STORAGE] Identity also saved to LittleFS");
+                SLog.println("[STORAGE] Identity also saved to LittleFS");
             }
         }
     }
@@ -2623,24 +2968,24 @@ void PunkMesh::begin()
                 else if (strcmp(key, "msg_repeat_interval") == 0) _prefs.msg_repeat_interval_secs = atoi(val);
             }
             file.close();
-            Serial.printf("[STORAGE] Loaded prefs from %s (name=%s, freq=%.3f)\n",
+            SLog.printf("[STORAGE] Loaded prefs from %s (name=%s, freq=%.3f)\n",
                 prefsPath.c_str(), _prefs.node_name, _prefs.freq);
         }
     } else {
-        Serial.printf("[STORAGE] No prefs file at %s, using defaults\n", prefsPath.c_str());
+        SLog.printf("[STORAGE] No prefs file at %s, using defaults\n", prefsPath.c_str());
     }
 
     loadContacts();
-    Serial.printf("[MESH INIT] Loaded %d contacts from flash\n", getNumContacts());
+    SLog.printf("[MESH INIT] Loaded %d contacts from flash\n", getNumContacts());
 
     _public = addChannel("Public", PUBLIC_GROUP_PSK);
     if (_public) {
-        Serial.println("[MESH INIT] Public channel created OK");
-        Serial.print("[MESH INIT] Channel hash: ");
-        mesh::Utils::printHex(Serial, _public->channel.hash, 6);
-        Serial.println();
+        SLog.println("[MESH INIT] Public channel created OK");
+        char ch_hex[13];
+        mesh::Utils::toHex(ch_hex, _public->channel.hash, 6);
+        SLog.printf("[MESH INIT] Channel hash: %s\n", ch_hex);
     } else {
-        Serial.println("[MESH INIT] ERROR: addChannel returned NULL!");
+        SLog.println("[MESH INIT] ERROR: addChannel returned NULL!");
     }
 
     loadChannels();
@@ -2663,13 +3008,12 @@ void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {
                          entry->paths[entry->path_count - 1]);
     }
 
-    Serial.println("[RADIO RX] ---- packet received ----");
-    Serial.printf("[RADIO RX] len=%d, type=%d, route=%s, payload_len=%d\n",
+    // One atomic line — separate prints could interleave / be partially dropped.
+    SLog.printf("[RADIO RX] rx len=%d type=%d route=%s payload_len=%d | SNR=%d RSSI=%d score=%d\n",
         len, pkt->getPayloadType(),
         pkt->isRouteDirect() ? "DIRECT" : "FLOOD",
-        pkt->payload_len);
-    Serial.printf("[RADIO RX] SNR=%d, RSSI=%d, score=%d\n",
-        (int)last_rx_snr, (int)last_rx_rssi, (int)(score*1000));
+        pkt->payload_len,
+        (int)last_rx_snr, (int)last_rx_rssi, (int)(score * 1000));
 
 #if BLE_COMPANION_ENABLED
     if (ble_companion) ble_companion->pushLogRxData(pkt, last_rx_snr, last_rx_rssi);
@@ -2711,9 +3055,9 @@ static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
             file.print("\n");
         }
         file.close();
-        Serial.printf("[STORAGE] Prefs saved to %s\n", path);
+        SLog.printf("[STORAGE] Prefs saved to %s\n", path);
     } else {
-        Serial.printf("[STORAGE] ERROR: Cannot save prefs to %s\n", path);
+        SLog.printf("[STORAGE] ERROR: Cannot save prefs to %s\n", path);
     }
 }
 
@@ -2802,47 +3146,47 @@ bool PunkMesh::sendAndPersistChannelMsg(int channel_idx, uint32_t timestamp,
 
 void PunkMesh::showWelcome()
 {
-    Serial.println("===== MeshCore Chat Terminal =====");
-    Serial.println();
-    Serial.printf("WELCOME  %s\n", _prefs.node_name);
+    SLog.println("===== MeshCore Chat Terminal =====");
+    SLog.println();
+    SLog.printf("WELCOME  %s\n", _prefs.node_name);
 
-    // Serial.print("Public key: ");
+    // SLog.print("Public key: ");
     // mesh::Utils::printHex(Serial, self_id.pub_key, PUB_KEY_SIZE);
 
-    // Serial.print("Private key: ");
+    // SLog.print("Private key: ");
     // mesh::Utils::printHex(Serial, self_id.prv_key, PRIV_KEY_SIZE);
 
     self_id.printTo(Serial);
 
-    Serial.println();
-    Serial.println("   (enter 'help' for basic commands)");
-    Serial.println();
+    SLog.println();
+    SLog.println("   (enter 'help' for basic commands)");
+    SLog.println();
 }
 
 void PunkMesh::sendSelfAdvert(int delay_millis)
 {
-    Serial.printf("[MESH TX] sendSelfAdvert: name=%s, delay=%d ms\n", _prefs.node_name, delay_millis);
+    SLog.printf("[MESH TX] sendSelfAdvert: name=%s, delay=%d ms\n", _prefs.node_name, delay_millis);
     auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
     if (pkt)
     {
-        Serial.printf("[MESH TX] Advert packet created, payload_len=%d, sending flood...\n", pkt->payload_len);
+        SLog.printf("[MESH TX] Advert packet created, payload_len=%d, sending flood...\n", pkt->payload_len);
         sendFlood(pkt, delay_millis);
-        Serial.println("[MESH TX] Advert flood sent.");
+        SLog.println("[MESH TX] Advert flood sent.");
     }
     else
     {
-        Serial.println("[MESH TX] ERROR: createSelfAdvert returned NULL!");
+        SLog.println("[MESH TX] ERROR: createSelfAdvert returned NULL!");
     }
 }
 
 // ContactVisitor
 void PunkMesh::onContactVisit(const ContactInfo &contact)
 {
-    Serial.printf("   %s - ", contact.name);
+    SLog.printf("   %s - ", contact.name);
     char tmp[40];
     int32_t secs = contact.last_advert_timestamp - getRTCClock()->getCurrentTime();
     AdvertTimeHelper::formatRelativeTimeDiff(tmp, secs, false);
-    Serial.println(tmp);
+    SLog.println(tmp);
 }
 
 void PunkMesh::handleCommand(const char *command)
@@ -2860,31 +3204,31 @@ void PunkMesh::handleCommand(const char *command)
             int result = sendMessage(*curr_recipient, getRTCClock()->getCurrentTime(), 0, text, expected_ack_crc, est_timeout);
             if (result == MSG_SEND_FAILED)
             {
-                Serial.println("   ERROR: unable to send.");
+                SLog.println("   ERROR: unable to send.");
             }
             else
             {
                 last_msg_sent = _ms->getMillis();
-                Serial.printf("   (message sent - %s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
+                SLog.printf("   (message sent - %s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
             }
         }
         else
         {
-            Serial.println("   ERROR: no recipient selected (use 'to' cmd).");
+            SLog.println("   ERROR: no recipient selected (use 'to' cmd).");
         }
     }
     else if (memcmp(command, "public ", 7) == 0)
     { // send GroupChannel msg
-        Serial.printf("[MESH TX] Serial 'public' command, text=\"%s\"\n", &command[7]);
+        SLog.printf("[MESH TX] Serial 'public' command, text=\"%s\"\n", &command[7]);
 
         if (!_public) {
-            Serial.println("[MESH TX] ERROR: _public channel is NULL!");
+            SLog.println("[MESH TX] ERROR: _public channel is NULL!");
         } else {
             uint32_t timestamp = getRTCClock()->getCurrentTime();
-            Serial.printf("[MESH TX] timestamp=%u, sender=%s\n", timestamp, _prefs.node_name);
+            SLog.printf("[MESH TX] timestamp=%u, sender=%s\n", timestamp, _prefs.node_name);
 
             bool ok = sendGroupMessage(timestamp, _public->channel, _prefs.node_name, &command[7], strlen(&command[7]));
-            Serial.printf("[MESH TX] sendGroupMessage returned %s\n", ok ? "true" : "false");
+            SLog.printf("[MESH TX] sendGroupMessage returned %s\n", ok ? "true" : "false");
         }
     }
     else if (memcmp(command, "list", 4) == 0)
@@ -2900,7 +3244,7 @@ void PunkMesh::handleCommand(const char *command)
     { // show current time
         uint32_t now = getRTCClock()->getCurrentTime();
         DateTime dt = DateTime(now);
-        Serial.printf("%02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+        SLog.printf("%02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
     }
     else if (memcmp(command, "time ", 5) == 0)
     { // set time (to epoch seconds)
@@ -2912,22 +3256,22 @@ void PunkMesh::handleCommand(const char *command)
         curr_recipient = searchContactsByPrefix(&command[3]);
         if (curr_recipient)
         {
-            Serial.printf("   Recipient %s now selected.\n", curr_recipient->name);
+            SLog.printf("   Recipient %s now selected.\n", curr_recipient->name);
         }
         else
         {
-            Serial.println("   Error: Name prefix not found.");
+            SLog.println("   Error: Name prefix not found.");
         }
     }
     else if (strcmp(command, "to") == 0)
     { // show current recipient
         if (curr_recipient)
         {
-            Serial.printf("   Current: %s\n", curr_recipient->name);
+            SLog.printf("   Current: %s\n", curr_recipient->name);
         }
         else
         {
-            Serial.println("   Err: no recipient selected");
+            SLog.println("   Err: no recipient selected");
         }
     }
     else if (strcmp(command, "advert") == 0)
@@ -2936,11 +3280,11 @@ void PunkMesh::handleCommand(const char *command)
         if (pkt)
         {
             sendZeroHop(pkt);
-            Serial.println("   (advert sent, zero hop).");
+            SLog.println("   (advert sent, zero hop).");
         }
         else
         {
-            Serial.println("   ERR: unable to send");
+            SLog.println("   ERR: unable to send");
         }
     }
     else if (strcmp(command, "reset path") == 0)
@@ -2948,13 +3292,13 @@ void PunkMesh::handleCommand(const char *command)
         if (curr_recipient)
         {
             resetPathTo(*curr_recipient);
-            saveContacts();
-            Serial.println("   Done.");
+            saveOneContact(*curr_recipient);
+            SLog.println("   Done.");
         }
     }
     else if (memcmp(command, "card", 4) == 0)
     {
-        Serial.printf("Hello %s\n", _prefs.node_name);
+        SLog.printf("Hello %s\n", _prefs.node_name);
         auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
         if (pkt)
         {
@@ -2962,14 +3306,14 @@ void PunkMesh::handleCommand(const char *command)
             releasePacket(pkt); // undo the obtainNewPacket()
 
             mesh::Utils::toHex(hex_buf, tmp_buf, len);
-            Serial.println("Your MeshCore biz card:");
-            Serial.print("meshcore://");
-            Serial.println(hex_buf);
-            Serial.println();
+            SLog.println("Your MeshCore biz card:");
+            SLog.print("meshcore://");
+            SLog.println(hex_buf);
+            SLog.println();
         }
         else
         {
-            Serial.println("  Error");
+            SLog.println("  Error");
         }
     }
     else if (memcmp(command, "import ", 7) == 0)
@@ -2983,120 +3327,120 @@ void PunkMesh::handleCommand(const char *command)
         {
             _prefs.airtime_factor = atof(&config[3]);
             savePrefs();
-            Serial.println("  OK");
+            SLog.println("  OK");
         }
         else if (memcmp(config, "name ", 5) == 0)
         {
             StrHelper::strncpy(_prefs.node_name, &config[5], sizeof(_prefs.node_name));
             savePrefs();
-            Serial.println("  OK");
+            SLog.println("  OK");
         }
         else if (memcmp(config, "lat ", 4) == 0)
         {
             _prefs.node_lat = atof(&config[4]);
             savePrefs();
-            Serial.println("  OK");
+            SLog.println("  OK");
         }
         else if (memcmp(config, "lon ", 4) == 0)
         {
             _prefs.node_lon = atof(&config[4]);
             savePrefs();
-            Serial.println("  OK");
+            SLog.println("  OK");
         }
         else if (memcmp(config, "tx ", 3) == 0)
         {
             _prefs.tx_power_dbm = atoi(&config[3]);
             savePrefs();
-            Serial.println("  OK - reboot to apply");
+            SLog.println("  OK - reboot to apply");
         }
         else if (memcmp(config, "freq ", 5) == 0)
         {
             _prefs.freq = atof(&config[5]);
             savePrefs();
-            Serial.println("  OK - reboot to apply");
+            SLog.println("  OK - reboot to apply");
         }
         else if (memcmp(config, "bw ", 3) == 0)
         {
             _prefs.bandwidth = atof(&config[3]);
             savePrefs();
-            Serial.println("  OK - reboot to apply");
+            SLog.println("  OK - reboot to apply");
         }
         else if (memcmp(config, "sf ", 3) == 0)
         {
             _prefs.spreading_factor = atoi(&config[3]);
             savePrefs();
-            Serial.println("  OK - reboot to apply");
+            SLog.println("  OK - reboot to apply");
         }
         else if (memcmp(config, "cr ", 3) == 0)
         {
             _prefs.coding_rate = atoi(&config[3]);
             savePrefs();
-            Serial.println("  OK - reboot to apply");
+            SLog.println("  OK - reboot to apply");
         }
         else
         {
-            Serial.printf("  ERROR: unknown config: %s\n", config);
+            SLog.printf("  ERROR: unknown config: %s\n", config);
         }
     }
     else if (memcmp(command, "ver", 3) == 0)
     {
-        Serial.println(FIRMWARE_VER_TEXT);
+        SLog.println(FIRMWARE_VER_TEXT);
     }
     else if (strcmp(command, "diag") == 0)
     {
-        Serial.println("===== MESH DIAGNOSTICS =====");
-        Serial.printf("  Storage: %s, prefix: \"%s\"\n",
+        SLog.println("===== MESH DIAGNOSTICS =====");
+        SLog.printf("  Storage: %s, prefix: \"%s\"\n",
             (_storage == &LittleFS) ? "LittleFS" : "SD", _storage_prefix.c_str());
-        Serial.printf("  Node name: %s\n", _prefs.node_name);
-        Serial.printf("  Freq pref (runtime): %.3f MHz\n", _prefs.freq);
-        Serial.printf("  Freq (build-time):   %.3f MHz\n", (float)LORA_FREQ);
-        Serial.printf("  BW pref: %.1f kHz (build: %d)\n", _prefs.bandwidth, LORA_BW);
-        Serial.printf("  SF pref: %d (build: %d)\n", _prefs.spreading_factor, LORA_SF);
-        Serial.printf("  CR pref: %d (build: %d)\n", _prefs.coding_rate, LORA_CR);
-        Serial.printf("  TX power pref: %d dBm (build: %d)\n", _prefs.tx_power_dbm, LORA_TX_POWER);
-        Serial.printf("  Airtime factor: %.2f\n", _prefs.airtime_factor);
-        Serial.printf("  GPS: %.4f, %.4f\n", _prefs.node_lat, _prefs.node_lon);
+        SLog.printf("  Node name: %s\n", _prefs.node_name);
+        SLog.printf("  Freq pref (runtime): %.3f MHz\n", _prefs.freq);
+        SLog.printf("  Freq (build-time):   %.3f MHz\n", (float)LORA_FREQ);
+        SLog.printf("  BW pref: %.1f kHz (build: %d)\n", _prefs.bandwidth, LORA_BW);
+        SLog.printf("  SF pref: %d (build: %d)\n", _prefs.spreading_factor, LORA_SF);
+        SLog.printf("  CR pref: %d (build: %d)\n", _prefs.coding_rate, LORA_CR);
+        SLog.printf("  TX power pref: %d dBm (build: %d)\n", _prefs.tx_power_dbm, LORA_TX_POWER);
+        SLog.printf("  Airtime factor: %.2f\n", _prefs.airtime_factor);
+        SLog.printf("  GPS: %.4f, %.4f\n", _prefs.node_lat, _prefs.node_lon);
         if (_prefs.freq != (float)LORA_FREQ) {
-            Serial.println("  *** WARNING: runtime freq != build freq! Old /node_prefs? ***");
+            SLog.println("  *** WARNING: runtime freq != build freq! Old /node_prefs? ***");
         }
-        Serial.print("  Pub key: ");
-        mesh::Utils::printHex(Serial, self_id.pub_key, PUB_KEY_SIZE);
-        Serial.println();
-        Serial.printf("  Num contacts: %d\n", getNumContacts());
-        Serial.printf("  Public channel: %s\n", _public ? "configured" : "NULL (PROBLEM!)");
-        Serial.printf("  Lua runtime: %s\n", lua_runtime ? "attached" : "NULL (PROBLEM!)");
-        Serial.printf("  RTC clock: %u\n", getRTCClock()->getCurrentTime());
-        Serial.printf("  Uptime: %lu ms\n", millis());
-        Serial.println();
-        Serial.println("  Contacts:");
+        char pk_hex[PUB_KEY_SIZE * 2 + 1];
+        mesh::Utils::toHex(pk_hex, self_id.pub_key, PUB_KEY_SIZE);
+        SLog.printf("  Pub key: %s\n", pk_hex);
+        SLog.printf("  Num contacts: %d\n", getNumContacts());
+        SLog.printf("  Public channel: %s\n", _public ? "configured" : "NULL (PROBLEM!)");
+        SLog.printf("  Lua runtime: %s\n", lua_runtime ? "attached" : "NULL (PROBLEM!)");
+        SLog.printf("  RTC clock: %u\n", getRTCClock()->getCurrentTime());
+        SLog.printf("  Uptime: %lu ms\n", millis());
+        SLog.println();
+        SLog.println("  Contacts:");
         if (getNumContacts() == 0) {
-            Serial.println("    (none)");
+            SLog.println("    (none)");
         } else {
             scanRecentContacts(0, this);
         }
-        Serial.println("============================");
+        SLog.println("============================");
     }
     else if (memcmp(command, "help", 4) == 0)
     {
-        Serial.println("Commands:");
-        Serial.println("   set {name|lat|lon|freq|tx|bw|sf|cr|af} {value}");
-        Serial.println("   card");
-        Serial.println("   import {biz card}");
-        Serial.println("   clock");
-        Serial.println("   time <epoch-seconds>");
-        Serial.println("   list {n}");
-        Serial.println("   to <recipient name or prefix>");
-        Serial.println("   to");
-        Serial.println("   send <text>");
-        Serial.println("   advert");
-        Serial.println("   reset path");
-        Serial.println("   public <text>");
-        Serial.println("   diag");
+        SLog.println("Commands:");
+        SLog.println("   set {name|lat|lon|freq|tx|bw|sf|cr|af} {value}");
+        SLog.println("   card");
+        SLog.println("   import {biz card}");
+        SLog.println("   clock");
+        SLog.println("   time <epoch-seconds>");
+        SLog.println("   list {n}");
+        SLog.println("   to <recipient name or prefix>");
+        SLog.println("   to");
+        SLog.println("   send <text>");
+        SLog.println("   advert");
+        SLog.println("   reset path");
+        SLog.println("   public <text>");
+        SLog.println("   diag");
     }
     else
     {
-        Serial.print("   ERROR: unknown command: ");
-        Serial.println(command);
+        SLog.print("   ERROR: unknown command: ");
+        SLog.println(command);
     }
 }
 
@@ -3114,7 +3458,7 @@ void PunkMesh::loop()
             command[len++] = c;
             command[len] = 0;
         }
-        Serial.print(c);
+        SLog.print(c);
     }
     if (len == sizeof(command) - 1)
     { // command buffer full

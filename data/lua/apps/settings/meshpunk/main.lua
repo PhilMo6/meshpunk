@@ -111,6 +111,40 @@ apply_btn:onClicked(function()
     end
 end)
 
+-- ── Section: Message History ──
+content:Label { text = "-- Message History --", w = lvgl.PCT(100), h = 16 }
+content:Label { text = "Days kept (0 = forever):", w = lvgl.PCT(100), h = 16 }
+
+local retain_days = (function()
+    local ok_r, d = pcall(_msg_retain_get)
+    return (ok_r and d) or 30
+end)()
+
+local retain_input = content:Textarea {
+    one_line = true, text = tostring(retain_days),
+    accepted_chars = "0123456789", w = lvgl.PCT(40), h = 30,
+}
+retain_input:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+local retain_save_btn = content:Button { w = lvgl.PCT(30), h = 30 }
+retain_save_btn:Label { text = "Save", align = lvgl.ALIGN.CENTER }
+retain_save_btn:onClicked(function()
+    local n = tonumber(retain_input.text)
+    if not n or n < 0 then
+        status_label.text = "Days: enter 0 or more"
+        return
+    end
+    n = math.floor(n)
+    local ok_s = pcall(_msg_retain_set, n)
+    if ok_s then
+        retain_input.text = tostring(n)
+        status_label.text = (n == 0) and "History: kept forever"
+                                      or ("History: " .. n .. " days")
+    else
+        status_label.text = "Failed to save retention"
+    end
+end)
+
 -- ── Section: Time Zone ──
 content:Label { text = "-- Time Zone --", w = lvgl.PCT(100), h = 16 }
 

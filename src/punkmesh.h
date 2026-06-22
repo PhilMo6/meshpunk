@@ -184,27 +184,32 @@ public:
 
   // ── Contact archive ────────────────────────────────────────────
   // Contacts that fall out of the live table (overwritten when it is full,
-  // or removed by the user) are preserved in <storage>/contacts_arch so
-  // they can still be shown on the map and re-added later — mirrors the
-  // MeshCore Android app's contact history. The PSRAM array is allocated
-  // lazily on first use; archiving itself is always on (history must be
-  // captured before the user ever enables the "show archived" setting).
-  static const int MAX_ARCHIVED_CONTACTS = 500;
-  ContactInfo* archived = nullptr;
-  int num_archived = 0;
-  bool archive_loaded = false;
+  // or removed by the user) are preserved in <storage>/contacts_arch so they
+  // can still be shown on the map and re-added later — mirrors the MeshCore
+  // Android app's contact history. DISK-ONLY (2026-06-19): the archive lives
+  // ONLY in the append-only log on disk — there is NO in-RAM array and NO cap,
+  // so it is permanent and costs ZERO PSRAM unless the user opens "show
+  // archived", which reads it on demand. The hot path just appends one line;
+  // duplicates are resolved newest-wins when read (re-adds rely on the union
+  // skipping live contacts, so a re-added contact's stale line is harmless).
   volatile uint32_t archive_generation = 0;  // bumps on every archive change
-  // Append-only persistence: the hot path (advert eviction) appends one
-  // line; duplicates are resolved newest-wins at load. This counts appends
-  // so a compaction (full rewrite) runs only every ARCH_COMPACT_EVERY
-  // appends instead of on every change.
-  int archive_appends = 0;
 
-  bool ensureArchiveLoaded();
-  void saveArchive();
   void appendArchiveEntry(const ContactInfo& c);
   void archiveContact(const ContactInfo& c);
   bool readdArchivedContact(const uint8_t* pub_key);
+  // Read the archive log into `out` (deduped, newest line per pubkey wins),
+  // up to max_out entries; returns the count. Used by the "show archived" map
+  // union. Caller owns the (transient) buffer; disk keeps everything regardless
+  // of max_out (only the on-map display is bounded).
+  int readArchivedDeduped(ContactInfo* out, int max_out);
+
+  // Read up to max_count archived contacts starting at byte `offset` in the log
+  // into `out`; sets *next_offset to resume from and *done at EOF; returns the
+  // count. Stateless (re-open + seek per call) so the mesh task can keep
+  // appending between batches. Drives the Map's progressive "show archived"
+  // loader — no dedup here (raw lines, caller decides).
+  int readArchiveBatch(uint32_t offset, int max_count, ContactInfo* out,
+                       uint32_t* next_offset, bool* done);
 
   // Persistent storage filesystem (SD card if available, else LittleFS)
   fs::FS* _storage = nullptr;
@@ -227,7 +232,8 @@ public:
   void savePrefs();
   const char *getTypeName(uint8_t type) const;
   void loadContacts();
-  void saveContacts();
+  void saveContacts();                          // full rewrite (removal/clear/bulk)
+  void saveOneContact(const ContactInfo& c);    // O(1) in-place single-slot write
   void loadChannels();
   void saveChannels();
 
@@ -250,6 +256,13 @@ public:
   // Max records kept per file (channel or DM). Compaction fires at
   // cap + 100 records and trims back to cap.
   int _max_messages = 400;
+  uint16_t _msg_retain_days = 30;  // days of message/routing history kept (0 = unlimited)
+  // Incremental retention sweep (driven by pruneStep on the Core-0 loop).
+  volatile bool _prune_due = false;        // set on new-day record / boot
+  bool     _sweep_active = false;          // cursor below is pruneStep-only (Core 0)
+  int      _sweep_idx = 0, _sweep_count = 0;
+  uint32_t _sweep_cutoff = 0;
+  String   _sweep_files[64];
   void setMaxMessages(int n);
 
   // Write paths (called from RX handlers and Lua send bindings).
@@ -306,6 +319,13 @@ public:
   int pushChannelMessagesToLua(lua_State* L, int channel_idx);
   int pushDMMessagesToLua(lua_State* L, const char* peer);
   int pushDMThreadNamesToLua(lua_State* L);
+  // Routing store (Phase 3): pushes {from,timestamp,lat,lon,path} records for a
+  // sender (empty/null = all) within [since_ts, until_ts] (0 = open bound).
+  int pushRoutingQuery(lua_State* L, const char* sender, uint32_t since_ts, uint32_t until_ts);
+  // Incremental days-based retention sweep (routing + text logs), driven by
+  // _prune_due and run one file per call from the Core-0 main loop, so it never
+  // blocks the radio/UI for more than a single file's rewrite.
+  void pruneStep();
   int lookupPersistedPaths(lua_State* L, const char* hash_hex, int channel_idx, const char* peer);
 
   bool hasConnectionToContact(const uint8_t* pub_key) { return hasConnectionTo(pub_key); }
