@@ -26,13 +26,13 @@ static char ble_dev_name[13] = "@@MAC";
 void ble_companion_init_early() {
   if (ble_serial) return;
 
-  Serial.printf("[BLE] Early init (free heap: %u)...\n", ESP.getFreeHeap());
+  SLog.printf("[BLE] Early init (free heap: %u)...\n", ESP.getFreeHeap());
 
   ble_serial = new PunkBLEInterface();
   ble_serial->begin(BLE_NAME_PREFIX, ble_dev_name, BLE_PIN_CODE);
   ble_serial->enable();
 
-  Serial.printf("[BLE] BLE stack up, advertising. PIN=%d, name=%s%s (free heap: %u)\n",
+  SLog.printf("[BLE] BLE stack up, advertising. PIN=%d, name=%s%s (free heap: %u)\n",
                 BLE_PIN_CODE, BLE_NAME_PREFIX, ble_dev_name, ESP.getFreeHeap());
 }
 
@@ -43,17 +43,17 @@ void ble_companion_start(PunkMesh& mesh) {
   if (mem) {
     ble_companion = new (mem) BleCompanionHandler(mesh, *ble_serial);
   } else {
-    Serial.println("[BLE] FATAL: cannot allocate companion handler");
+    SLog.println("[BLE] FATAL: cannot allocate companion handler");
     return;
   }
 
-  Serial.printf("[BLE] Companion handler ready (free heap: %u)\n", ESP.getFreeHeap());
+  SLog.printf("[BLE] Companion handler ready (free heap: %u)\n", ESP.getFreeHeap());
 }
 
 void ble_companion_stop() {
   if (!ble_serial) return;
 
-  Serial.println("[BLE] Stopping companion interface...");
+  SLog.println("[BLE] Stopping companion interface...");
 
   ble_serial->disable();
   if (ble_companion) {
@@ -65,7 +65,7 @@ void ble_companion_stop() {
   ble_serial = nullptr;
 
   BLEDevice::deinit(false);
-  Serial.println("[BLE] Companion stopped, BLE resources freed.");
+  SLog.println("[BLE] Companion stopped, BLE resources freed.");
 }
 
 // ── BleCompanionHandler ──────────────────────────────────────────
@@ -204,13 +204,13 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_APP_START && len >= 8) {
     char* app_name = (char*)&cmd_frame[8];
     cmd_frame[len] = 0;
-    Serial.printf("[BLE] App '%s' connected\n", app_name);
+    SLog.printf("[BLE] App '%s' connected\n", app_name);
 
     _iter_started = false;
 
     _msg_sync.has_pending_file = false;
     startFullSync();
-    Serial.printf("[BLE] Message sync: %d files, %d frames ready\n",
+    SLog.printf("[BLE] Message sync: %d files, %d frames ready\n",
                   _msg_sync.file_count, _msg_sync.frame_count);
 
     int i = 0;
@@ -306,7 +306,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         // Targeted sync — only the file that just received a message
         _msg_sync.since = load_sync_timestamp(_mesh);
         _msg_sync.has_pending_file = false;
-        Serial.printf("[BLE SYNC] targeted file=%s, since=%u\n",
+        SLog.printf("[BLE SYNC] targeted file=%s, since=%u\n",
                       _msg_sync.pending_file, _msg_sync.since);
         loadFileFrames(_msg_sync.pending_file);
       } else {
@@ -1230,7 +1230,7 @@ void BleCompanionHandler::startFullSync() {
   _msg_sync.since = load_sync_timestamp(_mesh);
   _msg_sync.most_recent_ts = 0;
   _msg_sync.active = false;
-  Serial.printf("[BLE SYNC] full sync: files=%d, since=%u\n",
+  SLog.printf("[BLE SYNC] full sync: files=%d, since=%u\n",
                 _msg_sync.file_count, _msg_sync.since);
   if (_msg_sync.file_count > 0)
     loadNextFileFrames();
@@ -1246,7 +1246,7 @@ bool BleCompanionHandler::loadFileFrames(const char* path) {
   if (!records) return false;
 
   int n = _mesh.readStoredMsgsSince(path, _msg_sync.since, records, SYNC_BATCH);
-  Serial.printf("[BLE SYNC] file=%s, records=%d, since=%u\n",
+  SLog.printf("[BLE SYNC] file=%s, records=%d, since=%u\n",
                 path, n, _msg_sync.since);
   if (n <= 0) { heap_caps_free(records); return false; }
 

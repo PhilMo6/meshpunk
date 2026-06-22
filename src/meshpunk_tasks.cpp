@@ -26,7 +26,7 @@ static TaskHandle_t s_mesh_task_handle = nullptr;
 volatile bool mesh_task_paused = false;
 
 static void mesh_task_body(void *param) {
-  Serial.printf("[TASK] mesh_task starting on core=%d\n", xPortGetCoreID());
+  SLog.printf("[TASK] mesh_task starting on core=%d\n", xPortGetCoreID());
 
   for (;;) {
     // When paused (e.g. during ELF module execution), skip all work
@@ -51,7 +51,7 @@ static void mesh_task_body(void *param) {
     uint32_t now = millis();
     if (now - last_heap_log > 60000) {
       last_heap_log = now;
-      Serial.printf("[HEAP] internal: %u free, %u largest block | PSRAM: %u free | min ever: %u\n",
+      SLog.printf("[HEAP] internal: %u free, %u largest block | PSRAM: %u free | min ever: %u\n",
           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
           heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
           heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -93,17 +93,17 @@ extern void gps_sync_restart();
 static TaskHandle_t s_gps_task_handle = nullptr;
 
 static void gps_task_body(void *param) {
-  Serial.printf("[TASK] gps_task starting on core=%d\n", xPortGetCoreID());
+  SLog.printf("[TASK] gps_task starting on core=%d\n", xPortGetCoreID());
   for (;;) {
     gps_sync_restart();
     while (!gps_sync_is_done()) {
       gps_sync_poll();
       vTaskDelay(pdMS_TO_TICKS(20));
     }
-    Serial.println("[TASK] gps_task sync cycle done; sleeping 5 min.");
+    SLog.println("[TASK] gps_task sync cycle done; sleeping 5 min.");
     // Sleep 5 minutes, or wake early if notified (manual trigger).
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5 * 60 * 1000));
-    Serial.println("[TASK] gps_task waking for next sync cycle.");
+    SLog.println("[TASK] gps_task waking for next sync cycle.");
   }
 }
 

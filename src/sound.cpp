@@ -807,7 +807,7 @@ static void sound_task_body(void* param) {
                     uint32_t now_g = millis();
                     if (now_g - s_guard_last_print >= 1000) {  // don't spam
                         s_guard_last_print = now_g;
-                        Serial.printf("[sound] module pull OVERRAN samp[] "
+                        SLog.printf("[sound] module pull OVERRAN samp[] "
                                       "(guard=%08x, needed=%d)\n",
                                       (unsigned)samp_guard, needed);
                     }

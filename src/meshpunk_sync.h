@@ -19,6 +19,11 @@ extern SemaphoreHandle_t spi_bus_mutex;
 // Lua send bindings call into methods that themselves take the lock.
 extern SemaphoreHandle_t the_mesh_mutex;
 
+// Serializes Serial (UART log) output so prints from Core 0 and Core 1 never
+// interleave mid-line. Independent of the SPI bus. Recursive so a multi-call
+// log line can be bracketed with SLOG_LOCK()/SLOG_UNLOCK().
+extern SemaphoreHandle_t serial_mutex;
+
 // Cross-core event plumbing.
 // rx_event_queue : Core 1 (mesh_task) -> Core 0 (UI loop)
 // tx_cmd_queue   : Core 0 (UI/Lua)    -> Core 1 (mesh_task)  [reserved for step 7]
@@ -31,6 +36,64 @@ extern QueueHandle_t gps_event_queue;
 #define SPI_UNLOCK()  do { if (spi_bus_mutex)  xSemaphoreGiveRecursive(spi_bus_mutex);                 } while (0)
 #define MESH_LOCK()   do { if (the_mesh_mutex) xSemaphoreTakeRecursive(the_mesh_mutex, portMAX_DELAY); } while (0)
 #define MESH_UNLOCK() do { if (the_mesh_mutex) xSemaphoreGiveRecursive(the_mesh_mutex);                } while (0)
+
+// Serial (log) lock. Guarded so it's a harmless no-op before meshpunk_sync_init.
+#define SLOG_LOCK()   do { if (serial_mutex) xSemaphoreTakeRecursive(serial_mutex, portMAX_DELAY); } while (0)
+#define SLOG_UNLOCK() do { if (serial_mutex) xSemaphoreGiveRecursive(serial_mutex);                } while (0)
+
+// Thread-safe, NON-BLOCKING Serial log wrapper. Use SLog.printf/print/println in
+// place of Serial.* so cross-core output never garbles. Mechanics:
+//   * Each call is atomic (recursive serial_mutex) — held only for the buffer
+//     copy (µs), never across a UART wait, so cross-core contention is µs.
+//   * emit() copies into the UART TX buffer ONLY if the whole line fits
+//     (availableForWrite); otherwise the line is DROPPED. write() is never
+//     called when it would block, so the caller NEVER waits on the UART. The
+//     UART ISR drains the (enlarged, see setTxBufferSize) buffer in the
+//     background. Tradeoff: sustained logging past the drain rate drops lines
+//     rather than stalling the radio/UI.
+//   * printf + literal print/println are heap-free (stack format / direct copy);
+//     only print(<number>) builds a small temporary.
+// Multi-call log lines: render into one printf instead (see the printHex sites).
+class SerialMux {
+  // Atomic + non-blocking: emit the whole buffer iff it fits, else drop it.
+  size_t emit(const uint8_t* p, size_t n) {
+    if (!p || n == 0) return 0;
+    size_t w = 0;
+    SLOG_LOCK();
+    if ((size_t)Serial.availableForWrite() >= n) w = Serial.write(p, n);
+    SLOG_UNLOCK();
+    return w;
+  }
+public:
+  size_t printf(const char* fmt, ...) {
+    char buf[224];
+    va_list ap; va_start(ap, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (len < 0) return 0;
+    if (len > (int)sizeof(buf)) len = sizeof(buf);   // over-long line: bounded, no heap
+    return emit((const uint8_t*)buf, (size_t)len);
+  }
+  size_t print(const char* s)        { return emit((const uint8_t*)s, s ? strlen(s) : 0); }
+  size_t print(const String& s)      { return emit((const uint8_t*)s.c_str(), s.length()); }
+  template <typename... A> size_t print(A... a) { String s(a...); return emit((const uint8_t*)s.c_str(), s.length()); }
+  size_t println()                   { return emit((const uint8_t*)"\r\n", 2); }
+  size_t println(const char* s) {
+    size_t sl = s ? strlen(s) : 0;
+    size_t w = 0;
+    SLOG_LOCK();
+    if ((size_t)Serial.availableForWrite() >= sl + 2) {   // line + CRLF as one atomic unit
+      if (sl) Serial.write((const uint8_t*)s, sl);
+      Serial.write((const uint8_t*)"\r\n", 2);
+      w = sl + 2;
+    }
+    SLOG_UNLOCK();
+    return w;
+  }
+  size_t println(const String& s)    { return println(s.c_str()); }
+  template <typename... A> size_t println(A... a) { String s(a...); s += "\r\n"; return emit((const uint8_t*)s.c_str(), s.length()); }
+};
+extern SerialMux SLog;
 
 // SD-op convenience wrappers. Today they are just SPI_LOCK/UNLOCK — the
 // historical TFT-reinit poke in sd_spi_release() is now redundant because

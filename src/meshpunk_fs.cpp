@@ -93,7 +93,7 @@ bool meshpunk_mkdirs(const char* path, bool default_sd) {
 void* meshpunk_read_all(const char* path, uint32_t* out_size, bool default_sd) {
     MeshpunkFile mf = meshpunk_open(path, "r", default_sd);
     if (!mf.valid) {
-        Serial.printf("[meshpunk_fs] failed to open %s\n", path);
+        SLog.printf("[meshpunk_fs] failed to open %s\n", path);
         return NULL;
     }
 
@@ -101,7 +101,7 @@ void* meshpunk_read_all(const char* path, uint32_t* out_size, bool default_sd) {
     void* buf = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) {
         meshpunk_close(mf);
-        Serial.printf("[meshpunk_fs] failed to alloc %u bytes for %s\n", sz, path);
+        SLog.printf("[meshpunk_fs] failed to alloc %u bytes for %s\n", sz, path);
         return NULL;
     }
 
@@ -109,7 +109,7 @@ void* meshpunk_read_all(const char* path, uint32_t* out_size, bool default_sd) {
     meshpunk_close(mf);
 
     if (rd != sz) {
-        Serial.printf("[meshpunk_fs] short read: %u/%u for %s\n", (uint32_t)rd, sz, path);
+        SLog.printf("[meshpunk_fs] short read: %u/%u for %s\n", (uint32_t)rd, sz, path);
         heap_caps_free(buf);
         return NULL;
     }
