@@ -142,6 +142,7 @@ static uint8_t display_brightness = 16;  // 0–16, persisted
 // ── Inactivity Timeouts ───────────────────────────────────────────────────
 static uint16_t screen_timeout_secs  = 60;  // 0 = never, persisted
 static uint16_t kbd_timeout_secs     = 55;  // 0 = never, persisted
+static uint16_t msg_retain_days      = 30;  // days of message/routing history (0 = unlimited)
 
 // ── Trackball Sensitivity ────────────────────────────────────────────────
 static uint16_t trackball_sensitivity_ms = 75;  // ms between accepted direction pulses, persisted
@@ -177,7 +178,7 @@ void sd_spi_release();
 
 static void write_firmware_prefs(fs::FS& fs, const char* path) {
   File f = fs.open(path, "w", true);
-  if (!f) { Serial.printf("[FW_PREFS] cannot write %s\n", path); return; }
+  if (!f) { SLog.printf("[FW_PREFS] cannot write %s\n", path); return; }
   f.printf("use_sd=%d\n", use_sd_pref ? 1 : 0);
   f.printf("tz=%s\n", tz_setting_str.c_str());
   f.printf("clock_fmt=%s\n", clock_fmt_str.c_str());
@@ -188,6 +189,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("disp_bright=%d\n", display_brightness);
   f.printf("screen_timeout=%d\n", screen_timeout_secs);
   f.printf("kbd_timeout=%d\n", kbd_timeout_secs);
+  f.printf("msg_retain_days=%d\n", msg_retain_days);
   f.printf("notify_kbd=%d\n", notify_kbd_enabled ? 1 : 0);
   f.printf("notify_sound=%d\n", notify_sound_enabled ? 1 : 0);
   f.printf("ble_enabled=%d\n", ble_enabled_pref ? 1 : 0);
@@ -197,7 +199,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("trackball_roll=%d\n", trackball_roll_ms);
   f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
   f.close();
-  Serial.printf("[FW_PREFS] saved to %s\n", path);
+  SLog.printf("[FW_PREFS] saved to %s\n", path);
 }
 
 static void firmware_prefs_save() {
@@ -211,7 +213,7 @@ static void firmware_prefs_save() {
 
 static void write_wifi_creds(fs::FS& fs, const char* path) {
   File f = fs.open(path, "w", true);
-  if (!f) { Serial.printf("[WIFI_CREDS] cannot write %s\n", path); return; }
+  if (!f) { SLog.printf("[WIFI_CREDS] cannot write %s\n", path); return; }
   f.println(wifi_saved_ssid.c_str());
   f.println(wifi_saved_pass.c_str());
   f.close();
@@ -223,7 +225,7 @@ static void wifi_creds_save() {
     sd_spi_take();
     write_wifi_creds(SD, "/meshpunk/wifi_creds");
     sd_spi_release();
-    Serial.println("[WIFI_CREDS] Saved to SD");
+    SLog.println("[WIFI_CREDS] Saved to SD");
   }
 }
 
@@ -236,7 +238,7 @@ static void wifi_creds_load() {
   wifi_saved_pass.trim();
   f.close();
   if (wifi_saved_ssid.length() > 0) {
-    Serial.printf("[WIFI_CREDS] loaded SSID: %s\n", wifi_saved_ssid.c_str());
+    SLog.printf("[WIFI_CREDS] loaded SSID: %s\n", wifi_saved_ssid.c_str());
   }
 }
 
@@ -254,7 +256,7 @@ static void wifi_creds_clear() {
 static void firmware_prefs_load() {
   File f = LittleFS.open("/firmware_prefs", "r");
   if (!f) {
-    Serial.println("[FW_PREFS] no /firmware_prefs, using defaults");
+    SLog.println("[FW_PREFS] no /firmware_prefs, using defaults");
     return;
   }
   char line[128];
@@ -304,6 +306,9 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "screen_timeout") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 65535) screen_timeout_secs = (uint16_t)v;
+    } else if (strcmp(key, "msg_retain_days") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 3650) msg_retain_days = (uint16_t)v;
     } else if (strcmp(key, "kbd_timeout") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 65535) kbd_timeout_secs = (uint16_t)v;
@@ -328,7 +333,7 @@ static void firmware_prefs_load() {
     }
   }
   f.close();
-  Serial.printf("[FW_PREFS] loaded: use_sd=%d tz=%s clock=%s\n",
+  SLog.printf("[FW_PREFS] loaded: use_sd=%d tz=%s clock=%s\n",
                 use_sd_pref ? 1 : 0, tz_setting_str.c_str(), clock_fmt_str.c_str());
 }
 
@@ -349,7 +354,7 @@ static void gps_print_stats(const char* tag) {
   uint32_t delta = chars - gps_last_chars;
   gps_last_chars = chars;
 
-  Serial.printf("[GPS %s] t=%lus chars=%lu(+%lu) sent_with_fix=%lu csum_ok=%lu csum_fail=%lu\n",
+  SLog.printf("[GPS %s] t=%lus chars=%lu(+%lu) sent_with_fix=%lu csum_ok=%lu csum_fail=%lu\n",
                 tag,
                 (unsigned long)(elapsed / 1000UL),
                 (unsigned long)chars,
@@ -360,55 +365,55 @@ static void gps_print_stats(const char* tag) {
 
   // Satellites in view (from GSV/GGA)
   if (gps_tinygps.satellites.isValid()) {
-    Serial.printf("[GPS %s]   sats=%lu (age=%lums)\n",
+    SLog.printf("[GPS %s]   sats=%lu (age=%lums)\n",
                   tag,
                   (unsigned long)gps_tinygps.satellites.value(),
                   (unsigned long)gps_tinygps.satellites.age());
   } else {
-    Serial.printf("[GPS %s]   sats=--\n", tag);
+    SLog.printf("[GPS %s]   sats=--\n", tag);
   }
 
   // HDOP — lower is better; <5 is usable, <2 is good
   if (gps_tinygps.hdop.isValid()) {
-    Serial.printf("[GPS %s]   hdop=%.2f\n", tag, gps_tinygps.hdop.hdop());
+    SLog.printf("[GPS %s]   hdop=%.2f\n", tag, gps_tinygps.hdop.hdop());
   }
 
   // Date (often appears before full position fix)
   if (gps_tinygps.date.isValid()) {
-    Serial.printf("[GPS %s]   date=%04u-%02u-%02u (age=%lums)\n",
+    SLog.printf("[GPS %s]   date=%04u-%02u-%02u (age=%lums)\n",
                   tag,
                   gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                   (unsigned long)gps_tinygps.date.age());
   } else {
-    Serial.printf("[GPS %s]   date=INVALID\n", tag);
+    SLog.printf("[GPS %s]   date=INVALID\n", tag);
   }
 
   // Time
   if (gps_tinygps.time.isValid()) {
-    Serial.printf("[GPS %s]   time=%02u:%02u:%02u (age=%lums)\n",
+    SLog.printf("[GPS %s]   time=%02u:%02u:%02u (age=%lums)\n",
                   tag,
                   gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second(),
                   (unsigned long)gps_tinygps.time.age());
   } else {
-    Serial.printf("[GPS %s]   time=INVALID\n", tag);
+    SLog.printf("[GPS %s]   time=INVALID\n", tag);
   }
 
   // Location (not required for time sync, but useful signal)
   if (gps_tinygps.location.isValid()) {
-    Serial.printf("[GPS %s]   loc=%.5f,%.5f (age=%lums)\n",
+    SLog.printf("[GPS %s]   loc=%.5f,%.5f (age=%lums)\n",
                   tag,
                   gps_tinygps.location.lat(), gps_tinygps.location.lng(),
                   (unsigned long)gps_tinygps.location.age());
   } else {
-    Serial.printf("[GPS %s]   loc=NO FIX YET\n", tag);
+    SLog.printf("[GPS %s]   loc=NO FIX YET\n", tag);
   }
 
   // Diagnostic hint
   if (delta == 0) {
-    Serial.printf("[GPS %s]   !! no new bytes — check power/TX pin (expected RX=%d)\n",
+    SLog.printf("[GPS %s]   !! no new bytes — check power/TX pin (expected RX=%d)\n",
                   tag, TDECK_GPS_RX);
   } else if (gps_tinygps.passedChecksum() == 0 && chars > 200 && gps_baud_locked) {
-    Serial.printf("[GPS %s]   !! bytes flowing but 0 valid sentences at locked baud %u\n",
+    SLog.printf("[GPS %s]   !! bytes flowing but 0 valid sentences at locked baud %u\n",
                   tag, (unsigned)GPS_BAUD_CANDIDATES[gps_baud_idx]);
   }
 }
@@ -424,12 +429,12 @@ static void gps_start_probe_at_current_baud() {
   GPSSerial.flush(false);
   gps_baud_probe_start_ms = millis();
   gps_baud_probe_chars_start = gps_tinygps.charsProcessed();
-  Serial.printf("[GPS] probing baud=%u (candidate %u/%u)\n",
+  SLog.printf("[GPS] probing baud=%u (candidate %u/%u)\n",
                 (unsigned)baud, (unsigned)(gps_baud_idx + 1), (unsigned)GPS_BAUD_COUNT);
 }
 
 static void gps_sync_begin() {
-  Serial.printf("[GPS] Listening on UART1 RX=%d TX=%d\n", TDECK_GPS_RX, TDECK_GPS_TX);
+  SLog.printf("[GPS] Listening on UART1 RX=%d TX=%d\n", TDECK_GPS_RX, TDECK_GPS_TX);
   gps_sync_restart();
 }
 
@@ -443,7 +448,7 @@ static bool gps_baud_probe_tick() {
 
   // Lock as soon as we see ≥2 clean sentences at this rate.
   if (ok >= 2) {
-    Serial.printf("[GPS] baud LOCKED at %u (csum_ok=%lu csum_fail=%lu)\n",
+    SLog.printf("[GPS] baud LOCKED at %u (csum_ok=%lu csum_fail=%lu)\n",
                   (unsigned)GPS_BAUD_CANDIDATES[gps_baud_idx],
                   (unsigned long)ok, (unsigned long)fail);
     gps_baud_locked = true;
@@ -453,7 +458,7 @@ static bool gps_baud_probe_tick() {
   // Advance to next candidate after the probe window expires.
   if (now - gps_baud_probe_start_ms >= GPS_BAUD_PROBE_MS) {
     uint32_t delta = gps_tinygps.charsProcessed() - gps_baud_probe_chars_start;
-    Serial.printf("[GPS] baud %u rejected: chars=+%lu csum_ok=%lu csum_fail=%lu\n",
+    SLog.printf("[GPS] baud %u rejected: chars=+%lu csum_ok=%lu csum_fail=%lu\n",
                   (unsigned)GPS_BAUD_CANDIDATES[gps_baud_idx],
                   (unsigned long)delta, (unsigned long)ok, (unsigned long)fail);
     gps_baud_idx = (gps_baud_idx + 1) % GPS_BAUD_COUNT;
@@ -463,6 +468,86 @@ static bool gps_baud_probe_tick() {
 }
 
 bool gps_sync_is_done() { return gps_sync_done; }
+
+// ── Last-known GPS / clock fallback ─────────────────────────────────────────
+// Persisted to the user's default filesystem (the same _storage the message
+// logs use). On a cold boot before the GPS gets a fix, this lets us seed the
+// RTC with a plausible (if stale) time and prime a last-known location instead
+// of starting at the 1970 epoch with no position. Live GPS and a manual time
+// set both override it (see gps_sync_poll / _rtc_set_time). Written once per
+// sync cycle when a fix lands; tiny key=value file.
+static String gps_last_path() {
+  return String(the_mesh ? the_mesh->_storage_prefix.c_str() : "") + "/last_gps";
+}
+
+static void gps_last_save(double lat, double lon, bool has_loc, uint32_t t) {
+  if (!the_mesh || !the_mesh->_storage) return;
+  bool is_sd = (the_mesh->_storage != &LittleFS);
+  String path = gps_last_path();
+  if (is_sd) sd_spi_take();
+  File f = the_mesh->_storage->open(path.c_str(), "w", true);
+  if (f) {
+    f.printf("time=%u\n", (unsigned)t);
+    f.printf("hasloc=%d\n", has_loc ? 1 : 0);
+    if (has_loc) {
+      f.printf("lat=%.6f\n", lat);
+      f.printf("lon=%.6f\n", lon);
+    }
+    f.close();
+  }
+  if (is_sd) sd_spi_release();
+}
+
+// Boot seed: if a saved fix exists, set the RTC (unless a manual override is
+// already in effect) and prime the last-known location so own-position lookups
+// have something before the first live fix. Does NOT mark a *live* time/location
+// fix — the GPS sync keeps running and overwrites these when it succeeds.
+static void gps_last_load() {
+  if (!the_mesh || !the_mesh->_storage) return;
+  bool is_sd = (the_mesh->_storage != &LittleFS);
+  String path = gps_last_path();
+  if (is_sd) sd_spi_take();
+  File f = the_mesh->_storage->open(path.c_str(), "r");
+  if (!f) { if (is_sd) sd_spi_release(); return; }
+
+  uint32_t t = 0;
+  bool has_loc = false;
+  double lat = 0, lon = 0;
+  char line[64];
+  while (f.available()) {
+    int len = 0;
+    while (f.available() && len < (int)sizeof(line) - 1) {
+      char ch = f.read();
+      if (ch == '\n' || ch == '\r') break;
+      line[len++] = ch;
+    }
+    line[len] = '\0';
+    if (len == 0) continue;
+    char* eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    const char* key = line; const char* val = eq + 1;
+    if      (strcmp(key, "time") == 0)   t = strtoul(val, nullptr, 10);
+    else if (strcmp(key, "hasloc") == 0) has_loc = (atoi(val) == 1);
+    else if (strcmp(key, "lat") == 0)    lat = atof(val);
+    else if (strcmp(key, "lon") == 0)    lon = atof(val);
+  }
+  f.close();
+  if (is_sd) sd_spi_release();
+
+  if (t > 86400 && !gps_manual_time_override) {  // >1 day past epoch = a real saved time
+    MESH_LOCK();
+    the_mesh->getRTCClock()->setCurrentTime(t);
+    MESH_UNLOCK();
+    SLog.printf("[GPS] Seeded RTC from last_gps: %u UTC\n", (unsigned)t);
+  }
+  if (has_loc && (lat != 0.0 || lon != 0.0)) {
+    gps_lat_at_fix = lat;
+    gps_lng_at_fix = lon;
+    gps_location_valid_at_fix = true;
+    SLog.printf("[GPS] Last-known location primed: %.5f, %.5f\n", lat, lon);
+  }
+}
 
 void gps_sync_poll() {
   if (gps_sync_done) return;
@@ -482,7 +567,7 @@ void gps_sync_poll() {
     bool window_expired = (now - gps_fix_acquired_ms >= GPS_POST_FIX_MS);
     if (sats_ready || window_expired) {
       if (window_expired && !sats_ready) {
-        Serial.println("[GPS] post-fix window expired; no satellite count received.");
+        SLog.println("[GPS] post-fix window expired; no satellite count received.");
       }
       gps_print_stats("fix-final");
       GPSSerial.println("$PMTK161,0*28");
@@ -508,7 +593,7 @@ void gps_sync_poll() {
       the_mesh->getRTCClock()->setCurrentTime(utc.unixtime());
       MESH_UNLOCK();
     } else {
-      Serial.println("[GPS] Manual time override active; skipping RTC update.");
+      SLog.println("[GPS] Manual time override active; skipping RTC update.");
     }
 
     gps_fix_acquired_ms = now;
@@ -520,15 +605,19 @@ void gps_sync_poll() {
       gps_lat_at_fix = gps_tinygps.location.lat();
       gps_lng_at_fix = gps_tinygps.location.lng();
       gps_location_valid_at_fix = true;
-      Serial.printf("[TZ] captured lat=%.5f lng=%.5f -> auto offset=%d min\n",
+      SLog.printf("[TZ] captured lat=%.5f lng=%.5f -> auto offset=%d min\n",
                     gps_lat_at_fix, gps_lng_at_fix, (int)tz_auto_offset_minutes());
     } else {
-      Serial.println("[TZ] no location at time-fix; auto-tz falls back to UTC");
+      SLog.println("[TZ] no location at time-fix; auto-tz falls back to UTC");
     }
 
-    Serial.println("[GPS] ======== FIX ACQUIRED — entering post-fix window ========");
+    // Persist this fix as the last-known GPS for the next cold boot (clock seed
+    // + location fallback). Outside MESH_LOCK; runs once per sync cycle.
+    gps_last_save(gps_lat_at_fix, gps_lng_at_fix, gps_location_valid_at_fix, utc.unixtime());
+
+    SLog.println("[GPS] ======== FIX ACQUIRED — entering post-fix window ========");
     gps_print_stats("fix");
-    Serial.printf("[GPS] RTC set to %u UTC (%04u-%02u-%02u %02u:%02u:%02u) after %lus\n",
+    SLog.printf("[GPS] RTC set to %u UTC (%04u-%02u-%02u %02u:%02u:%02u) after %lus\n",
                   (unsigned)utc.unixtime(),
                   gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                   gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second(),
@@ -537,9 +626,9 @@ void gps_sync_poll() {
   }
 
   if (now - gps_sync_start_ms > GPS_SYNC_TIMEOUT_MS) {
-    Serial.println("[GPS] ======== TIMEOUT ========");
+    SLog.println("[GPS] ======== TIMEOUT ========");
     gps_print_stats("timeout");
-    Serial.printf("[GPS] No fix after %us. Move to open sky for cold start (can take 30s-5min+).\n",
+    SLog.printf("[GPS] No fix after %us. Move to open sky for cold start (can take 30s-5min+).\n",
                   (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
     GPSSerial.println("$PMTK161,0*28");
     gps_sync_done = true;
@@ -574,7 +663,7 @@ void gps_sync_restart() {
   gps_time_fix_valid = false;
   gps_sats_at_fix = 0;
   gps_hdop_at_fix = 0;
-  Serial.printf("[GPS] Restarting sync (auto-baud, timeout=%us)\n",
+  SLog.printf("[GPS] Restarting sync (auto-baud, timeout=%us)\n",
                 (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
   gps_start_probe_at_current_baud();
 }
@@ -685,20 +774,20 @@ void sd_spi_release() {
 void listDir(fs::FS &fs, const char *dirname, int level = 0) {
   File root = fs.open(dirname);
   if (!root || !root.isDirectory()) {
-    Serial.print("Failed to open directory: ");
-    Serial.println(dirname);
+    SLog.print("Failed to open directory: ");
+    SLog.println(dirname);
     return;
   }
 
   File file = root.openNextFile();
   while (file) {
-    for (int i = 0; i < level; i++) Serial.print("  ");
-    Serial.print(dirname);
-    Serial.print("/");
-    Serial.print(file.name());
-    Serial.print(":");
-    Serial.print(file.size());
-    Serial.println("b");
+    for (int i = 0; i < level; i++) SLog.print("  ");
+    SLog.print(dirname);
+    SLog.print("/");
+    SLog.print(file.name());
+    SLog.print(":");
+    SLog.print(file.size());
+    SLog.println("b");
 
     if (file.isDirectory()) {
       String path = String(dirname);
@@ -714,14 +803,14 @@ void listDir(fs::FS &fs, const char *dirname, int level = 0) {
 // Helper functions for Lua file loading
 String readFile(const char *filename) {
   if (!fs_mounted) {
-    Serial.println("Filesystem not mounted!");
+    SLog.println("Filesystem not mounted!");
     return "";
   }
 
   fs::File file = LittleFS.open(filename, "r");
   if (!file) {
-    Serial.print("Failed to open file: ");
-    Serial.println(filename);
+    SLog.print("Failed to open file: ");
+    SLog.println(filename);
     return "";
   }
 
@@ -761,10 +850,10 @@ static const char *lua_file_chunk_reader(lua_State *L, void *ud, size_t *size) {
 //   const char *filename = luaL_checkstring(L, 1);
 //   const char *mode = luaL_optstring(L, 2, "r");
 //
-//   Serial.print("io.open: ");
-//   Serial.print(filename);
-//   Serial.print(" mode: ");
-//   Serial.println(mode);
+//   SLog.print("io.open: ");
+//   SLog.print(filename);
+//   SLog.print(" mode: ");
+//   SLog.println(mode);
 //
 //   const char *fs_mode;
 //   if (strcmp(mode, "r") == 0) {
@@ -976,11 +1065,28 @@ static bool kb_rshift_active = false;
 static bool kb_sym_active = false;
 static bool kb_alt_active = false;
 
-// Navigation controller state
-static lv_obj_t *nav_container = NULL;
-static lv_gridnav_ctrl_t nav_flags = LV_GRIDNAV_CTRL_NONE;
-static bool nav_gridnav_active = false;
+// Navigation controller state — a STACK of navigable scopes, not a single
+// container. The TOP scope is the interactive one (in the focus group, gridnav
+// armed for trackball); scopes beneath are suspended (a popup over a view, or a
+// row-select list over its controls). Pushing suspends the scope below; popping
+// resumes it. A single global container could not represent nesting, so apps
+// hand-rolled a save/restore dance and a single deferred-removal slot that could
+// clobber itself — this replaces both. `armed` tracks whether gridnav is
+// currently added to the top container (touch removes it so the finger can
+// scroll; trackball re-adds it), exactly as the old `nav_gridnav_active` did.
+struct NavScope {
+    lv_obj_t *cont;
+    lv_gridnav_ctrl_t flags;
+    bool armed;
+};
+#define NAV_STACK_MAX 6
+static NavScope nav_stack[NAV_STACK_MAX];
+static int nav_depth = 0;
 static lv_obj_t *pending_gridnav_remove = NULL;
+
+static inline NavScope *nav_top() {
+    return nav_depth > 0 ? &nav_stack[nav_depth - 1] : NULL;
+}
 
 static void flush_pending_gridnav() {
     if (pending_gridnav_remove) {
@@ -991,14 +1097,17 @@ static void flush_pending_gridnav() {
     }
 }
 
-// Detect stale nav_container (freed by app deletion).
-// Gridnav's own LV_EVENT_DELETE handler cleans up its resources automatically;
-// we only need to null our C++ globals.
+// Drop any scopes whose container was freed (an app deleted its view without
+// resetting nav). Gridnav's own LV_EVENT_DELETE handler frees its resources; we
+// just compact the stack so nav_top() never points at freed memory.
 static void nav_check_valid() {
-    if (nav_container && !lv_obj_is_valid(nav_container)) {
-        nav_container = NULL;
-        nav_gridnav_active = false;
+    int w = 0;
+    for (int i = 0; i < nav_depth; i++) {
+        if (nav_stack[i].cont && lv_obj_is_valid(nav_stack[i].cont)) {
+            nav_stack[w++] = nav_stack[i];
+        }
     }
+    nav_depth = w;
 }
 
 static lv_obj_t *nav_find_visible_child(lv_obj_t *cont) {
@@ -1014,6 +1123,45 @@ static lv_obj_t *nav_find_visible_child(lv_obj_t *cont) {
         if (cy + ch > scroll_top && cy < scroll_top + cont_h) return child;
     }
     return NULL;
+}
+
+// Arm a scope: add it to the focus group, focus it, and attach gridnav. This is
+// the exact, proven sequence the old _nav_setup used. preserve_scroll matters
+// when re-entering a scrolled list (resume / row-select): add to the group and
+// focus BEFORE lv_gridnav_add so the FOCUSED event doesn't snap to child 0, then
+// pin focus to the first on-screen child instead of scrolling back to the top.
+static void nav_install(NavScope *s, bool preserve_scroll) {
+    if (!s || !s->cont || !lv_obj_is_valid(s->cont)) return;
+    if (preserve_scroll) {
+        lv_group_add_obj(lv_group_get_default(), s->cont);
+        lv_group_focus_obj(s->cont);
+        lv_gridnav_add(s->cont, s->flags);
+        lv_obj_t *vis = nav_find_visible_child(s->cont);
+        if (vis) lv_gridnav_set_focused(s->cont, vis, LV_ANIM_OFF);
+    } else {
+        lv_gridnav_add(s->cont, s->flags);
+        lv_group_add_obj(lv_group_get_default(), s->cont);
+        lv_group_focus_obj(s->cont);
+    }
+    s->armed = true;
+}
+
+// Reset the whole nav stack (app exit / full teardown). Mirrors the old
+// _nav_clear's immediate gridnav removal, applied to every live scope.
+// Registered under both _nav_clear (back-compat) and _nav_reset.
+static int lua_nav_reset(lua_State *L) {
+    (void)L;
+    flush_pending_gridnav();
+    nav_check_valid();
+    for (int i = 0; i < nav_depth; i++) {
+        if (nav_stack[i].cont && lv_obj_is_valid(nav_stack[i].cont)) {
+            lv_gridnav_remove(nav_stack[i].cont);
+        }
+        nav_stack[i].cont = NULL;
+        nav_stack[i].armed = false;
+    }
+    nav_depth = 0;
+    return 0;
 }
 
 // LVGL keyboard read callback
@@ -1176,19 +1324,21 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     if (key_from_trackball) last_activity_ms = millis();
   }
 
-  // ── Re-enable gridnav on trackball input ──
-  if (key_from_trackball && nav_container && lv_obj_is_valid(nav_container) && !nav_gridnav_active) {
-    uint32_t cnt = lv_obj_get_child_count(nav_container);
+  // ── Re-enable gridnav on trackball input (top scope only) ──
+  NavScope *kb_top = nav_top();
+  if (key_from_trackball && kb_top && kb_top->cont &&
+      lv_obj_is_valid(kb_top->cont) && !kb_top->armed) {
+    uint32_t cnt = lv_obj_get_child_count(kb_top->cont);
     for (uint32_t i = 0; i < cnt; i++) {
-      lv_obj_remove_state(lv_obj_get_child(nav_container, i),
+      lv_obj_remove_state(lv_obj_get_child(kb_top->cont, i),
                           LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY | LV_STATE_EDITED);
     }
-    lv_group_focus_obj(nav_container);
-    lv_gridnav_add(nav_container, nav_flags);
-    nav_gridnav_active = true;
-    lv_obj_t *vis = nav_find_visible_child(nav_container);
+    lv_group_focus_obj(kb_top->cont);
+    lv_gridnav_add(kb_top->cont, kb_top->flags);
+    kb_top->armed = true;
+    lv_obj_t *vis = nav_find_visible_child(kb_top->cont);
     if (vis) {
-      lv_gridnav_set_focused(nav_container, vis, LV_ANIM_OFF);
+      lv_gridnav_set_focused(kb_top->cont, vis, LV_ANIM_OFF);
     }
   }
 
@@ -1231,14 +1381,18 @@ static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
     if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
 
-    if (nav_container && nav_gridnav_active) {
-      uint32_t cnt = lv_obj_get_child_count(nav_container);
+    // Touch disarms gridnav on the top scope so the finger scrolls instead of
+    // moving focus; trackball re-arms it (above). Safe point: indev callback,
+    // not inside a gridnav event dispatch.
+    NavScope *tp_top = nav_top();
+    if (tp_top && tp_top->cont && tp_top->armed) {
+      uint32_t cnt = lv_obj_get_child_count(tp_top->cont);
       for (uint32_t i = 0; i < cnt; i++) {
-        lv_obj_remove_state(lv_obj_get_child(nav_container, i),
+        lv_obj_remove_state(lv_obj_get_child(tp_top->cont, i),
                             LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
       }
-      lv_gridnav_remove(nav_container);
-      nav_gridnav_active = false;
+      lv_gridnav_remove(tp_top->cont);
+      tp_top->armed = false;
     }
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
@@ -1256,7 +1410,7 @@ void handleWebSerialCommands() {
       String path = cmd.substring(5);
       File f = LittleFS.open(path, "r");
       if (!f) {
-        Serial.println("ERR: Cannot open file");
+        SLog.println("ERR: Cannot open file");
         return;
       }
 
@@ -1264,15 +1418,15 @@ void handleWebSerialCommands() {
         Serial.write(f.read());
       }
       f.close();
-      Serial.println(); // newline after file content
-      Serial.println("OK");
+      SLog.println(); // newline after file content
+      SLog.println("OK");
     }
 
     else if (cmd.startsWith("WRITE ")) {
       String path = cmd.substring(6);
       File f = LittleFS.open(path, "w");
       if (!f) {
-        Serial.println("ERR: Cannot open file for writing");
+        SLog.println("ERR: Cannot open file for writing");
         return;
       }
 
@@ -1280,26 +1434,26 @@ void handleWebSerialCommands() {
       String content = Serial.readStringUntil(0x1A); // end with CTRL+Z (ASCII 26)
       f.print(content);
       f.close();
-      Serial.println("OK");
+      SLog.println("OK");
     }
 
     else if (cmd.startsWith("LS")) {
       File root = LittleFS.open("/lua");
       File file = root.openNextFile();
       while (file) {
-        Serial.println(file.name());
+        SLog.println(file.name());
         file = root.openNextFile();
       }
-      Serial.println("OK");
+      SLog.println("OK");
     }
 
     else if (cmd == "REBOOT") {
-      Serial.println("REBOOTING...");
+      SLog.println("REBOOTING...");
       ESP.restart();
     }
 
     else {
-      Serial.println("ERR: Unknown command");
+      SLog.println("ERR: Unknown command");
     }
   }
 }
@@ -1314,7 +1468,7 @@ void setupLvgl() {
   //
   //static uint8_t *buf = (uint8_t *)ps_malloc(LVGL_BUFFER_SIZE);
   //if (!buf) {
-  //  Serial.println("Memory allocation failed!");
+  //  SLog.println("Memory allocation failed!");
   //  delay(5000);
   //  assert(buf);
   //}
@@ -1325,7 +1479,7 @@ void setupLvgl() {
   static uint8_t *buf1 = (uint8_t *)ps_malloc(BUF_SIZE);
   static uint8_t *buf2 = (uint8_t *)ps_malloc(BUF_SIZE);
   if (!buf1 || !buf2) {
-    Serial.println("LVGL buffer allocation failed!");
+    SLog.println("LVGL buffer allocation failed!");
     delay(5000);
     assert(buf1 && buf2);
   }
@@ -1383,7 +1537,7 @@ void setupLvgl() {
     // Connect keyboard to the default group
     lv_indev_set_group(kb_indev, lv_group_get_default());
 
-    Serial.println("Keyboard input device registered with LVGL");
+    SLog.println("Keyboard input device registered with LVGL");
   }
 }
 
@@ -1407,8 +1561,8 @@ static int lua_wifi_connect(lua_State *L) {
   const char *network = luaL_checkstring(L, 1);
   const char *pass = luaL_checkstring(L, 2);
 
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(network);
+  SLog.print("Connecting to WiFi: ");
+  SLog.println(network);
 
   WiFi.begin(network, pass);
 
@@ -1802,12 +1956,12 @@ static int lua_mesh_send_public(lua_State *L) {
   char text[160];
   normalize_smart_quotes(raw, text, sizeof(text));
 
-  Serial.printf("[MESH TX] lua_mesh_send_public called, text=\"%s\"\n", text);
+  SLog.printf("[MESH TX] lua_mesh_send_public called, text=\"%s\"\n", text);
 
   MESH_LOCK();
   if (!the_mesh->_public) {
     MESH_UNLOCK();
-    Serial.println("[MESH TX] ERROR: No public channel configured!");
+    SLog.println("[MESH TX] ERROR: No public channel configured!");
     lua_pushboolean(L, 0);
     lua_pushstring(L, "No public channel configured");
     return 2;
@@ -2111,7 +2265,6 @@ static int lua_mesh_get_contacts(lua_State *L) {
                  (agen == s_union_arch_gen) &&
                  (millis() - s_union_built_ms < 10000);
     if (!fresh) {
-      the_mesh->ensureArchiveLoaded();
       lua_newtable(L);
 
       ContactInfo c;
@@ -2122,14 +2275,25 @@ static int lua_mesh_get_contacts(lua_State *L) {
           lua_rawseti(L, -2, idx++);
         }
       }
-      // Archived entries not currently live (live wins by pubkey — also
-      // self-heals entries left behind when a contact re-adverted back in).
-      for (int i = 0; i < the_mesh->num_archived; i++) {
-        if (!the_mesh->lookupContactByPubKey(the_mesh->archived[i].id.pub_key,
-                                             PUB_KEY_SIZE)) {
-          push_contact_table(L, the_mesh->archived[i], true);
-          lua_rawseti(L, -2, idx++);
+      // Archived contacts live on disk only. Read a transient, deduped view
+      // here (freed immediately after) so the archive costs ZERO steady-state
+      // PSRAM — this whole branch only runs when the user has "show archived"
+      // on, and is cached for 10s. The on-map display is bounded; the disk
+      // archive keeps everything (re-add can still pull back any contact).
+      const int ARCH_DISPLAY_MAX = 1000;
+      ContactInfo* abuf = (ContactInfo*)heap_caps_malloc(
+          sizeof(ContactInfo) * ARCH_DISPLAY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (abuf) {
+        int na = the_mesh->readArchivedDeduped(abuf, ARCH_DISPLAY_MAX);
+        for (int i = 0; i < na; i++) {
+          // Live wins by pubkey — also self-heals entries left behind when a
+          // contact re-adverted back in.
+          if (!the_mesh->lookupContactByPubKey(abuf[i].id.pub_key, PUB_KEY_SIZE)) {
+            push_contact_table(L, abuf[i], true);
+            lua_rawseti(L, -2, idx++);
+          }
         }
+        heap_caps_free(abuf);
       }
 
       if (s_union_ref != LUA_NOREF) {
@@ -2155,6 +2319,57 @@ static int lua_mesh_get_contacts(lua_State *L) {
   }
   lua_remove(L, -2);  // drop the master, leave the copy
   return 1;
+}
+
+// _mesh_archive_read(offset, max) -> contacts_table, next_offset, done
+// One batch of archived contacts from the disk log, for the Map's progressive
+// "show archived" loader. Stateless (byte-offset based) so the mesh task keeps
+// appending between batches. Raw lines (no dedup/live-skip) — caller decides.
+static int lua_mesh_archive_read(lua_State *L) {
+  uint32_t offset = (uint32_t)luaL_optinteger(L, 1, 0);
+  int max_count = (int)luaL_optinteger(L, 2, 150);
+  if (max_count < 1) max_count = 1;
+  if (max_count > 300) max_count = 300;  // bound the transient buffer
+
+  ContactInfo *buf = (ContactInfo *)heap_caps_malloc(
+      sizeof(ContactInfo) * max_count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) {
+    lua_newtable(L);
+    lua_pushinteger(L, offset);
+    lua_pushboolean(L, true);
+    return 3;
+  }
+
+  uint32_t next_offset = offset;
+  bool done = true;
+  // No MESH_LOCK: only touches the archive file (sd_spi serialized inside),
+  // not the live contact table.
+  int n = the_mesh->readArchiveBatch(offset, max_count, buf, &next_offset, &done);
+
+  lua_newtable(L);
+  for (int i = 0; i < n; i++) {
+    const ContactInfo &c = buf[i];
+    // LEAN entry — only what the Map needs to draw a gray dot and open the
+    // re-add popup (name/pubkey/type/last_seen/lat/lon). NO path array / lastmod
+    // / favorite, so thousands can be held for a fraction of the PSRAM the full
+    // push_contact_table would cost.
+    lua_newtable(L);
+    lua_pushstring(L, c.name);                          lua_setfield(L, -2, "name");
+    char hex[PUB_KEY_SIZE * 2 + 1];
+    mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
+    lua_pushstring(L, hex);                             lua_setfield(L, -2, "pubkey");
+    lua_pushstring(L, the_mesh->getTypeName(c.type));   lua_setfield(L, -2, "type_name");
+    lua_pushinteger(L, (lua_Integer)c.last_advert_timestamp); lua_setfield(L, -2, "last_seen");
+    lua_pushnumber(L, c.gps_lat / 1000000.0);           lua_setfield(L, -2, "lat");
+    lua_pushnumber(L, c.gps_lon / 1000000.0);           lua_setfield(L, -2, "lon");
+    lua_pushboolean(L, 1);                              lua_setfield(L, -2, "archived");
+    lua_rawseti(L, -2, i + 1);
+  }
+  heap_caps_free(buf);
+
+  lua_pushinteger(L, (lua_Integer)next_offset);
+  lua_pushboolean(L, done);
+  return 3;
 }
 
 // _mesh_readd_contact(pubkey_hex) -> bool
@@ -2360,17 +2575,17 @@ static int lua_mesh_set_config(lua_State *L) {
     strncpy(the_mesh->_prefs.node_name, value, sizeof(the_mesh->_prefs.node_name) - 1);
     the_mesh->_prefs.node_name[sizeof(the_mesh->_prefs.node_name) - 1] = '\0';
     the_mesh->savePrefs();
-    Serial.printf("Node name set to: %s\n", the_mesh->_prefs.node_name);
+    SLog.printf("Node name set to: %s\n", the_mesh->_prefs.node_name);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "freq") == 0) {
     the_mesh->_prefs.freq = atof(value);
     the_mesh->savePrefs();
-    Serial.printf("Frequency set to: %.3f (reboot to apply)\n", the_mesh->_prefs.freq);
+    SLog.printf("Frequency set to: %.3f (reboot to apply)\n", the_mesh->_prefs.freq);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "tx") == 0) {
     the_mesh->_prefs.tx_power_dbm = atoi(value);
     the_mesh->savePrefs();
-    Serial.printf("TX power set to: %d dBm (reboot to apply)\n", the_mesh->_prefs.tx_power_dbm);
+    SLog.printf("TX power set to: %d dBm (reboot to apply)\n", the_mesh->_prefs.tx_power_dbm);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "lat") == 0) {
     the_mesh->_prefs.node_lat = atof(value);
@@ -2383,27 +2598,27 @@ static int lua_mesh_set_config(lua_State *L) {
   } else if (strcmp(key, "bw") == 0) {
     the_mesh->_prefs.bandwidth = atof(value);
     the_mesh->savePrefs();
-    Serial.printf("Bandwidth set to: %.1f kHz (reboot to apply)\n", the_mesh->_prefs.bandwidth);
+    SLog.printf("Bandwidth set to: %.1f kHz (reboot to apply)\n", the_mesh->_prefs.bandwidth);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "sf") == 0) {
     the_mesh->_prefs.spreading_factor = atoi(value);
     the_mesh->savePrefs();
-    Serial.printf("Spreading factor set to: %d (reboot to apply)\n", the_mesh->_prefs.spreading_factor);
+    SLog.printf("Spreading factor set to: %d (reboot to apply)\n", the_mesh->_prefs.spreading_factor);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "cr") == 0) {
     the_mesh->_prefs.coding_rate = atoi(value);
     the_mesh->savePrefs();
-    Serial.printf("Coding rate set to: %d (reboot to apply)\n", the_mesh->_prefs.coding_rate);
+    SLog.printf("Coding rate set to: %d (reboot to apply)\n", the_mesh->_prefs.coding_rate);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "contact_overwrite") == 0) {
     the_mesh->_prefs.contact_overwrite = (atoi(value) != 0) ? 1 : 0;
     the_mesh->savePrefs();
-    Serial.printf("Contact overwrite set to: %s\n", the_mesh->_prefs.contact_overwrite ? "ON" : "OFF");
+    SLog.printf("Contact overwrite set to: %s\n", the_mesh->_prefs.contact_overwrite ? "ON" : "OFF");
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "archive_contacts") == 0) {
     the_mesh->_prefs.archive_contacts = (atoi(value) != 0) ? 1 : 0;
     the_mesh->savePrefs();
-    Serial.printf("Archive contacts set to: %s\n", the_mesh->_prefs.archive_contacts ? "ON" : "OFF");
+    SLog.printf("Archive contacts set to: %s\n", the_mesh->_prefs.archive_contacts ? "ON" : "OFF");
     lua_pushboolean(L, 1);
   } else {
     MESH_UNLOCK();
@@ -2587,7 +2802,7 @@ static int lua_mesh_clear_contacts(lua_State *L) {
   the_mesh->clearContacts();
   the_mesh->saveContacts();
   MESH_UNLOCK();
-  Serial.println("[MESH] All contacts cleared");
+  SLog.println("[MESH] All contacts cleared");
   lua_pushboolean(L, 1);
   return 1;
 }
@@ -2607,7 +2822,7 @@ static int lua_mesh_reset_path(lua_State *L) {
   }
 
   the_mesh->resetPathTo(*c);
-  the_mesh->saveContacts();
+  the_mesh->saveOneContact(*c);
   MESH_UNLOCK();
 
   lua_pushboolean(L, 1);
@@ -2631,7 +2846,7 @@ static int lua_mesh_set_contact_favorite(lua_State *L) {
 
   if (fav) c->flags |= 0x01;
   else     c->flags &= ~0x01;
-  the_mesh->saveContacts();
+  the_mesh->saveOneContact(*c);
   MESH_UNLOCK();
 
   lua_pushboolean(L, 1);
@@ -2802,7 +3017,7 @@ static int lua_mesh_set_rx_boost(lua_State *L) {
 
   the_mesh->_prefs.rx_boost = en ? 1 : 0;
   the_mesh->savePrefs();
-  Serial.printf("[RADIO] RX Boost preference saved: %d\n", en ? 1 : 0);
+  SLog.printf("[RADIO] RX Boost preference saved: %d\n", en ? 1 : 0);
 
   return 0;
 }
@@ -2832,7 +3047,7 @@ static int lua_mesh_set_no_add(lua_State *L) {
   the_mesh->_prefs.no_add_mask = m;
   the_mesh->savePrefs();
   MESH_UNLOCK();
-  Serial.printf("[MESH] no_add_mask set to 0x%02X\n", m);
+  SLog.printf("[MESH] no_add_mask set to 0x%02X\n", m);
   return 0;
 }
 
@@ -2892,6 +3107,16 @@ static int lua_mesh_get_channel_messages(lua_State *L) {
   int n = the_mesh->pushChannelMessagesToLua(L, ch_idx);
   MESH_UNLOCK();
   return n;
+}
+
+// _mesh_routing_query(sender_or_nil, since_ts, until_ts) -> array of
+// { from, timestamp, lat, lon, path } from the routing store. sender nil/"" = all.
+// No MESH_LOCK: only touches the routing files (sd_spi serialized inside).
+static int lua_mesh_routing_query(lua_State *L) {
+  const char *sender = lua_isnoneornil(L, 1) ? nullptr : luaL_checkstring(L, 1);
+  uint32_t since = (uint32_t)luaL_optinteger(L, 2, 0);
+  uint32_t until = (uint32_t)luaL_optinteger(L, 3, 0);
+  return the_mesh->pushRoutingQuery(L, sender, since, until);
 }
 
 // Read all stored messages for a DM thread.
@@ -2982,10 +3207,10 @@ static bool copyFile(fs::FS &srcFS, const char* srcPath, fs::FS &dstFS, const ch
 static int lua_storage_set_use_sd(lua_State *L) {
   bool want_sd = lua_toboolean(L, 1);
 
-  Serial.printf("[STORAGE] User requested: use_sd=%s\n", want_sd ? "true" : "false");
+  SLog.printf("[STORAGE] User requested: use_sd=%s\n", want_sd ? "true" : "false");
 
   if (want_sd && !sd_mounted) {
-    Serial.println("[STORAGE] Cannot use SD — card not mounted");
+    SLog.println("[STORAGE] Cannot use SD — card not mounted");
     lua_pushboolean(L, 0);
     lua_pushstring(L, "SD card not available");
     return 2;
@@ -3012,7 +3237,7 @@ static int lua_storage_set_use_sd(lua_State *L) {
 
   // Migrate data files if switching to a different FS
   if (newFS != oldFS) {
-    Serial.println("[STORAGE] Migrating mesh data...");
+    SLog.println("[STORAGE] Migrating mesh data...");
     // Migration may touch SD (either source or destination) plus LittleFS;
     // holding the SPI mutex across the whole loop is simpler and safe.
     sd_spi_take();
@@ -3022,7 +3247,7 @@ static int lua_storage_set_use_sd(lua_State *L) {
       String dstPath = newPrefix + files[i];
       if (oldFS->exists(srcPath.c_str())) {
         bool ok = copyFile(*oldFS, srcPath.c_str(), *newFS, dstPath.c_str());
-        Serial.printf("[STORAGE]   %s -> %s: %s\n", srcPath.c_str(), dstPath.c_str(), ok ? "OK" : "FAILED");
+        SLog.printf("[STORAGE]   %s -> %s: %s\n", srcPath.c_str(), dstPath.c_str(), ok ? "OK" : "FAILED");
       }
     }
     sd_spi_release();
@@ -3060,7 +3285,7 @@ static int lua_list_dir(lua_State *L) {
 
   File root = LittleFS.open(path);
   if (!root || !root.isDirectory()) {
-    Serial.printf("[FS] _list_dir: cannot open %s\n", path);
+    SLog.printf("[FS] _list_dir: cannot open %s\n", path);
     return 1; // return empty table
   }
 
@@ -3076,7 +3301,7 @@ static int lua_list_dir(lua_State *L) {
     entry = root.openNextFile();
   }
 
-  Serial.printf("[FS] _list_dir(%s): found %d dirs\n", path, idx - 1);
+  SLog.printf("[FS] _list_dir(%s): found %d dirs\n", path, idx - 1);
   return 1;
 }
 
@@ -3089,7 +3314,7 @@ static int lua_list_dir_sd(lua_State *L) {
   int idx = 1;
 
   if (!sd_mounted) {
-    Serial.println("[FS] _list_dir_sd: SD not mounted");
+    SLog.println("[FS] _list_dir_sd: SD not mounted");
     return 1; // return empty table
   }
 
@@ -3098,7 +3323,7 @@ static int lua_list_dir_sd(lua_State *L) {
   File root = SD.open(path);
 
   if (!root || !root.isDirectory()) {
-    Serial.printf("[FS] _list_dir_sd: cannot open %s\n", path);
+    SLog.printf("[FS] _list_dir_sd: cannot open %s\n", path);
     sd_spi_release();
     MESH_UNLOCK();
     return 1;
@@ -3125,7 +3350,7 @@ static int lua_list_dir_sd(lua_State *L) {
   sd_spi_release();
   MESH_UNLOCK();
 
-  Serial.printf("[FS] _list_dir_sd(%s): found %d dirs, scanned %d entries\n", path, idx - 1, iter);
+  SLog.printf("[FS] _list_dir_sd(%s): found %d dirs, scanned %d entries\n", path, idx - 1, iter);
   return 1;
 }
 
@@ -3140,7 +3365,7 @@ static int lua_list_all(lua_State *L) {
 
   File root = LittleFS.open(path);
   if (!root || !root.isDirectory()) {
-    Serial.printf("[FS] _list_all: cannot open %s\n", path);
+    SLog.printf("[FS] _list_all: cannot open %s\n", path);
     return 1; // return empty table
   }
 
@@ -3167,7 +3392,7 @@ static int lua_list_all(lua_State *L) {
     entry = root.openNextFile();
   }
 
-  Serial.printf("[FS] _list_all(%s): found %d entries\n", path, idx - 1);
+  SLog.printf("[FS] _list_all(%s): found %d entries\n", path, idx - 1);
   return 1;
 }
 
@@ -3180,7 +3405,7 @@ static int lua_list_all_sd(lua_State *L) {
   int idx = 1;
 
   if (!sd_mounted) {
-    Serial.println("[FS] _list_all_sd: SD not mounted");
+    SLog.println("[FS] _list_all_sd: SD not mounted");
     return 1;
   }
 
@@ -3188,7 +3413,7 @@ static int lua_list_all_sd(lua_State *L) {
   sd_spi_take();
   File root = SD.open(path);
   if (!root || !root.isDirectory()) {
-    Serial.printf("[FS] _list_all_sd: cannot open %s\n", path);
+    SLog.printf("[FS] _list_all_sd: cannot open %s\n", path);
     sd_spi_release();
     MESH_UNLOCK();
     return 1;
@@ -3227,7 +3452,7 @@ static int lua_list_all_sd(lua_State *L) {
   sd_spi_release();
   MESH_UNLOCK();
 
-  Serial.printf("[FS] _list_all_sd(%s): found %d entries\n", path, idx - 1);
+  SLog.printf("[FS] _list_all_sd(%s): found %d entries\n", path, idx - 1);
   return 1;
 }
 
@@ -3300,7 +3525,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
                                   bool allow_lvgl_cache_drop) {
   ConvertLock lock(s_convert_mutex);
 
-  Serial.printf("[png2bin] dst=%s psram_free=%u largest=%u\n",
+  SLog.printf("[png2bin] dst=%s psram_free=%u largest=%u\n",
                 dst_path,
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
@@ -3310,7 +3535,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
     s_rgb565_buf = (uint16_t *)heap_caps_malloc(RGB565_BUF_SIZE,
                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_rgb565_buf) {
-      Serial.println("[png2bin] FAIL: initial rgb565 buffer alloc");
+      SLog.println("[png2bin] FAIL: initial rgb565 buffer alloc");
       return "oom";
     }
   }
@@ -3319,7 +3544,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
   // Decode needs ~256KB contiguous for ARGB8888 + ~192KB for scanlines.
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
   if (largest < 512 * 1024) {
-    Serial.printf("[png2bin] SKIP: PSRAM fragmented (largest=%u)\n", (unsigned)largest);
+    SLog.printf("[png2bin] SKIP: PSRAM fragmented (largest=%u)\n", (unsigned)largest);
     return "frag";
   }
 
@@ -3341,7 +3566,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
   // evicts off-screen / old-zoom tiles, so this should rarely fire.
   if (err == 83 && !decoded) {
     if (allow_lvgl_cache_drop) {
-      Serial.printf("[png2bin] err=83 frag fallback: drop cache (largest=%u)\n",
+      SLog.printf("[png2bin] err=83 frag fallback: drop cache (largest=%u)\n",
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
       lv_image_cache_drop(NULL);
       err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
@@ -3349,20 +3574,20 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
     } else {
       // Can't touch the LVGL cache from this thread — report frag so the
       // caller drops it on the LVGL thread and retries the tile.
-      Serial.printf("[png2bin] err=83 on worker (largest=%u)\n",
+      SLog.printf("[png2bin] err=83 on worker (largest=%u)\n",
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
       return "frag";
     }
   }
 
   if (err || !decoded) {
-    Serial.printf("[png2bin] FAIL: lodepng err=%u decoded=%p psram_free=%u\n",
+    SLog.printf("[png2bin] FAIL: lodepng err=%u decoded=%p psram_free=%u\n",
                   err, (void *)decoded,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     if (decoded) lv_draw_buf_destroy(decoded);
     return "decode";
   }
-  Serial.printf("[png2bin] decoded %ux%u\n", w, h);
+  SLog.printf("[png2bin] decoded %ux%u\n", w, h);
 
   // decoded->data is ARGB8888 in byte order R,G,B,A (lodepng_convert /
   // rgba8ToPixel), stride = 4*w (contiguous). Pack to native little-endian
@@ -3371,7 +3596,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
   // the reference scripts/LVGLImage.py output).
   const uint8_t *argb = (const uint8_t *)decoded->data;
   if (!argb) {
-    Serial.println("[png2bin] FAIL: decoded->data is NULL");
+    SLog.println("[png2bin] FAIL: decoded->data is NULL");
     lv_draw_buf_destroy(decoded);
     return "decode";
   }
@@ -3381,7 +3606,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
   uint32_t data_size = (uint32_t)stride * h;
 
   if (data_size > RGB565_BUF_SIZE) {
-    Serial.printf("[png2bin] FAIL: tile %ux%u exceeds buffer\n", w, h);
+    SLog.printf("[png2bin] FAIL: tile %ux%u exceeds buffer\n", w, h);
     lv_draw_buf_destroy(decoded);
     return "decode";
   }
@@ -3423,7 +3648,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
     File f = SD.open(tmp_sd, FILE_WRITE);
     sd_spi_release();
     if (!f) {
-      Serial.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
+      SLog.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
       return "sd";
     }
 
@@ -3447,18 +3672,18 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
     sd_spi_release();
 
     if (!wok) {
-      Serial.printf("[png2bin] FAIL: short write %s\n", tmp_path);
+      SLog.printf("[png2bin] FAIL: short write %s\n", tmp_path);
       return "sd";
     }
     if (!renamed) {
-      Serial.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_sd, dst_sd);
+      SLog.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_sd, dst_sd);
       return "sd";
     }
   } else {
     // LittleFS target (L:) — internal flash, no SPI-bus contention.
     MeshpunkFile mf = meshpunk_open(tmp_path, "w", false);
     if (!mf.valid) {
-      Serial.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
+      SLog.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
       return "sd";
     }
     size_t hw = mf.file.write((const uint8_t *)&hdr, sizeof(hdr));
@@ -3468,13 +3693,13 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
     const char *tmp_l = (tmp_path[1] == ':') ? tmp_path + 2 : tmp_path;
     const char *dst_l = (dst_path[1] == ':') ? dst_path + 2 : dst_path;
     if (hw != sizeof(hdr) || dw != data_size) {
-      Serial.printf("[png2bin] FAIL: short write hdr=%u/%u data=%u/%u\n",
+      SLog.printf("[png2bin] FAIL: short write hdr=%u/%u data=%u/%u\n",
                     (unsigned)hw, (unsigned)sizeof(hdr), (unsigned)dw, (unsigned)data_size);
       LittleFS.remove(tmp_l);
       return "sd";
     }
     if (!LittleFS.rename(tmp_l, dst_l)) {
-      Serial.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_l, dst_l);
+      SLog.printf("[png2bin] FAIL: rename %s -> %s\n", tmp_l, dst_l);
       return "sd";
     }
   }
@@ -3495,7 +3720,7 @@ static int lua_png_to_bin(lua_State *L) {
   uint32_t png_size = 0;
   void *png_data = meshpunk_read_all(src_path, &png_size, false);
   if (!png_data) {
-    Serial.println("[png2bin] FAIL: meshpunk_read_all returned NULL");
+    SLog.println("[png2bin] FAIL: meshpunk_read_all returned NULL");
     lua_pushboolean(L, 0);
     return 1;
   }
@@ -3656,7 +3881,7 @@ static QueueHandle_t s_tile_res_q = nullptr;
 static TaskHandle_t s_tile_task_handle = nullptr;
 
 static void tile_fetch_task(void *param) {
-  Serial.printf("[TASK] tile_fetch starting on core=%d\n", xPortGetCoreID());
+  SLog.printf("[TASK] tile_fetch starting on core=%d\n", xPortGetCoreID());
   for (;;) {
     TileFetchReq req;
     if (xQueueReceive(s_tile_req_q, &req, pdMS_TO_TICKS(10000)) != pdTRUE) {
@@ -3790,7 +4015,7 @@ static int lua_dofile_sd(lua_State *L) {
   // Release SD bus back to display BEFORE executing the Lua chunk
   sd_spi_release();
 
-  Serial.printf("[FS] _dofile_sd: loading %s (%d bytes)\n", path, (int)size);
+  SLog.printf("[FS] _dofile_sd: loading %s (%d bytes)\n", path, (int)size);
 
   // Count extra args (everything after the path on the stack)
   int nargs = lua_gettop(L) - 1;
@@ -3799,7 +4024,7 @@ static int lua_dofile_sd(lua_State *L) {
   free(buffer);
 
   if (status != LUA_OK) {
-    Serial.printf("[FS] _dofile_sd: load error: %s\n", lua_tostring(L, -1));
+    SLog.printf("[FS] _dofile_sd: load error: %s\n", lua_tostring(L, -1));
     return lua_error(L);
   }
 
@@ -3810,7 +4035,7 @@ static int lua_dofile_sd(lua_State *L) {
   // Stack: [chunk, arg1, arg2, ...]
 
   if (lua_pcall(L, nargs, LUA_MULTRET, 0) != LUA_OK) {
-    Serial.printf("[FS] _dofile_sd: exec error: %s\n", lua_tostring(L, -1));
+    SLog.printf("[FS] _dofile_sd: exec error: %s\n", lua_tostring(L, -1));
     return lua_error(L);
   }
 
@@ -3833,7 +4058,7 @@ void setupLuaVGL() {
   // Create Lua state with PSRAM allocator
   L = lua_newstate(lua_psram_alloc, NULL);
   if (!L) {
-    Serial.println("Failed to create Lua state");
+    SLog.println("Failed to create Lua state");
     return;
   }
 
@@ -3878,6 +4103,7 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_send_channel", lua_mesh_send_channel);
   lua_register(L, "_mesh_remove_contact", lua_mesh_remove_contact);
   lua_register(L, "_mesh_readd_contact", lua_mesh_readd_contact);
+  lua_register(L, "_mesh_archive_read", lua_mesh_archive_read);
   lua_register(L, "_mesh_clear_contacts", lua_mesh_clear_contacts);
   lua_register(L, "_mesh_reset_path", lua_mesh_reset_path);
   lua_register(L, "_mesh_export_contact", lua_mesh_export_contact);
@@ -3899,6 +4125,7 @@ void setupLuaVGL() {
 
   // Persistent message history APIs — available to any app, not just messenger
   lua_register(L, "_mesh_get_channel_messages", lua_mesh_get_channel_messages);
+  lua_register(L, "_mesh_routing_query", lua_mesh_routing_query);
   lua_register(L, "_mesh_get_dm_messages", lua_mesh_get_dm_messages);
   lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
   lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
@@ -3916,6 +4143,23 @@ void setupLuaVGL() {
   // Register Storage bridge functions
   lua_register(L, "_storage_get_info", lua_storage_get_info);
   lua_register(L, "_storage_set_use_sd", lua_storage_set_use_sd);
+
+  // Message / routing history retention, in days (0 = unlimited). Drives the
+  // routing-log prune and (Phase 4) the text-log age prune.
+  lua_register(L, "_msg_retain_get", [](lua_State *L) -> int {
+    lua_pushinteger(L, msg_retain_days);
+    return 1;
+  });
+  lua_register(L, "_msg_retain_set", [](lua_State *L) -> int {
+    int v = (int)luaL_checkinteger(L, 1);
+    if (v < 0) v = 0;
+    if (v > 3650) v = 3650;
+    msg_retain_days = (uint16_t)v;
+    if (the_mesh) the_mesh->_msg_retain_days = msg_retain_days;
+    firmware_prefs_save();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
   lua_register(L, "_emoji_preload", lua_emoji_preload);
 
   // Register Filesystem bridge functions
@@ -3923,10 +4167,22 @@ void setupLuaVGL() {
 
   // System
   lua_register(L, "_system_reboot", [](lua_State *L) -> int {
-    Serial.println("[SYSTEM] Reboot requested from Lua");
+    SLog.println("[SYSTEM] Reboot requested from Lua");
     delay(100);
     ESP.restart();
     return 0;
+  });
+
+  // Heap stats: free + largest contiguous block for PSRAM and internal RAM.
+  // Returns: psram_free, psram_largest, internal_free, internal_largest (bytes).
+  // The largest-block value is what matters for big single allocations (e.g. an
+  // LVGL canvas buffer), since total free can be fragmented.
+  lua_register(L, "_heap_info", [](lua_State *L) -> int {
+    lua_pushinteger(L, (lua_Integer)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    lua_pushinteger(L, (lua_Integer)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    lua_pushinteger(L, (lua_Integer)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    lua_pushinteger(L, (lua_Integer)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return 4;
   });
 
   // RTC epoch seconds (seeded from GPS once at boot, then free-running)
@@ -4055,7 +4311,7 @@ void setupLuaVGL() {
     the_mesh->getRTCClock()->setCurrentTime((uint32_t)ts);
     MESH_UNLOCK();
     gps_manual_time_override = true;
-    Serial.printf("[RTC] Manual time set to %u UTC, GPS override enabled\n", (unsigned)ts);
+    SLog.printf("[RTC] Manual time set to %u UTC, GPS override enabled\n", (unsigned)ts);
     lua_pushboolean(L, 1);
     return 1;
   });
@@ -4067,7 +4323,7 @@ void setupLuaVGL() {
 
   lua_register(L, "_rtc_manual_override_clear", [](lua_State *L) -> int {
     gps_manual_time_override = false;
-    Serial.println("[RTC] Manual override cleared; GPS time updates re-enabled.");
+    SLog.println("[RTC] Manual override cleared; GPS time updates re-enabled.");
     lua_pushboolean(L, 1);
     return 1;
   });
@@ -4300,72 +4556,128 @@ void setupLuaVGL() {
   lua_pushinteger(L, LV_GRIDNAV_CTRL_SCROLL_FIRST);
   lua_setglobal(L, "GRIDNAV_SCROLL_FIRST");
 
-  // Navigation controller: manages gridnav + touch/trackball switching
+  // Navigation controller: a stack of navigable scopes (gridnav + touch/trackball
+  // switching). _nav_setup replaces the TOP scope (back-compat with the old
+  // single-container model: existing apps stay at stack depth 1); _nav_push /
+  // _nav_pop add real nesting for popups and row-select lists.
   lua_register(L, "_nav_setup", [](lua_State *L) -> int {
     luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
     if (!lobj || !lobj->obj) return 0;
     int flags = luaL_optinteger(L, 2, LV_GRIDNAV_CTRL_ROLLOVER);
     bool preserve_scroll = lua_toboolean(L, 3);
 
-    // Clean up stale nav_container (already freed by app deletion)
-    if (nav_container && !lv_obj_is_valid(nav_container)) {
-      nav_container = NULL;
-      nav_gridnav_active = false;
+    nav_check_valid();
+    NavScope *top = nav_top();
+
+    // Proven-safe timing, preserved exactly: DEFER removing a DIFFERENT outgoing
+    // container's gridnav (it may be mid-event-dispatch), but remove immediately
+    // when re-setting up the SAME container. flush_pending first so a second
+    // deferred removal can't clobber the first (two pending removals = orphaned
+    // gridnav = the watchdog hang).
+    if (top && top->cont != lobj->obj) {
+      flush_pending_gridnav();
+      if (top->armed) pending_gridnav_remove = top->cont;
+    } else if (top && top->cont == lobj->obj && top->armed) {
+      lv_gridnav_remove(top->cont);
     }
 
-    if (nav_container && nav_container != lobj->obj) {
-      pending_gridnav_remove = nav_container;
-    } else if (nav_container == lobj->obj && nav_gridnav_active) {
-      lv_gridnav_remove(nav_container);
-    }
-
-    nav_container = lobj->obj;
-    nav_flags = (lv_gridnav_ctrl_t)flags;
-    nav_gridnav_active = true;
-
-    if (preserve_scroll) {
-      lv_group_add_obj(lv_group_get_default(), nav_container);
-      lv_group_focus_obj(nav_container);
-      lv_gridnav_add(nav_container, nav_flags);
-      lv_obj_t *vis = nav_find_visible_child(nav_container);
-      if (vis) {
-        lv_gridnav_set_focused(nav_container, vis, LV_ANIM_OFF);
-      }
-    } else {
-      lv_gridnav_add(nav_container, nav_flags);
-      lv_group_add_obj(lv_group_get_default(), nav_container);
-      lv_group_focus_obj(nav_container);
-    }
+    if (!top) { nav_depth = 1; top = &nav_stack[0]; }
+    top->cont = lobj->obj;
+    top->flags = (lv_gridnav_ctrl_t)flags;
+    top->armed = false;
+    nav_install(top, preserve_scroll);
 
     // No nav_delete_cb registration — gridnav's own LV_EVENT_DELETE handler
     // cleans up its resources. Adding a second DELETE handler caused a crash:
     // when nav_delete_cb fired first (preprocess) and called lv_gridnav_remove(),
     // it modified the event array while lv_event_send was iterating it with
     // cached pointers, causing a stale-pointer read (0xbaad5678).
-    // nav_check_valid() in keyboard/touch callbacks detects the freed container.
+    // nav_check_valid() in keyboard/touch callbacks detects freed containers.
+    return 0;
+  });
+
+  // Open a nested scope over the current one (a popup, or a row-select list over
+  // its controls). Suspends the parent (drops it from the focus group, defers
+  // removing its gridnav) and makes `cont` the active scope. Args: cont, [flags],
+  // [focus child], [preserve_scroll]. Pop with _nav_pop to resume the parent.
+  lua_register(L, "_nav_push", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) return 0;
+    int flags = luaL_optinteger(L, 2, LV_GRIDNAV_CTRL_ROLLOVER);
+    luavgl_obj_t *fobj = (luavgl_obj_t *)lua_touserdata(L, 3);  // optional focus
+    bool preserve_scroll = lua_toboolean(L, 4);
+
+    nav_check_valid();
+    NavScope *top = nav_top();
+    if (top && top->cont && lv_obj_is_valid(top->cont)) {
+      flush_pending_gridnav();
+      if (top->armed) pending_gridnav_remove = top->cont;
+      lv_group_remove_obj(top->cont);
+      top->armed = false;
+    }
+    if (nav_depth >= NAV_STACK_MAX) nav_depth = NAV_STACK_MAX - 1;  // overflow guard
+    NavScope *s = &nav_stack[nav_depth++];
+    s->cont = lobj->obj;
+    s->flags = (lv_gridnav_ctrl_t)flags;
+    s->armed = false;
+    nav_install(s, preserve_scroll);
+    if (fobj && fobj->obj && lv_obj_is_valid(fobj->obj))
+      lv_gridnav_set_focused(s->cont, fobj->obj, LV_ANIM_OFF);
+    return 0;
+  });
+
+  // Close the top scope and resume the one beneath it. The closing container is
+  // usually deleted by the caller right after (its gridnav is deferred-removed
+  // here and finalized by its own DELETE handler); the parent is re-armed.
+  lua_register(L, "_nav_pop", [](lua_State *L) -> int {
+    (void)L;
+    nav_check_valid();
+    NavScope *top = nav_top();
+    if (top) {
+      if (top->armed && top->cont && lv_obj_is_valid(top->cont)) {
+        flush_pending_gridnav();
+        pending_gridnav_remove = top->cont;
+      }
+      if (top->cont && lv_obj_is_valid(top->cont)) lv_group_remove_obj(top->cont);
+      top->cont = NULL;
+      top->armed = false;
+      nav_depth--;
+    }
+    NavScope *below = nav_top();
+    if (below && below->cont && lv_obj_is_valid(below->cont)) {
+      nav_install(below, true);  // resume: preserve scroll, pick the visible child
+    }
     return 0;
   });
 
   lua_register(L, "_nav_set_focused", [](lua_State *L) -> int {
     luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
-    if (!lobj || !lobj->obj || !nav_container || !nav_gridnav_active) return 0;
-    lv_gridnav_set_focused(nav_container, lobj->obj, LV_ANIM_OFF);
+    NavScope *top = nav_top();
+    if (!lobj || !lobj->obj || !top || !top->cont || !top->armed) return 0;
+    lv_gridnav_set_focused(top->cont, lobj->obj, LV_ANIM_OFF);
     return 0;
   });
 
   lua_register(L, "_nav_is_active", [](lua_State *L) -> int {
-    lua_pushboolean(L, nav_gridnav_active);
+    NavScope *top = nav_top();
+    lua_pushboolean(L, top && top->armed);
     return 1;
   });
 
-  lua_register(L, "_nav_clear", [](lua_State *L) -> int {
-    flush_pending_gridnav();
-    nav_check_valid();
-    if (nav_container) {
-      lv_gridnav_remove(nav_container);
-      nav_container = NULL;
-      nav_gridnav_active = false;
-    }
+  // _nav_clear (back-compat) and _nav_reset both tear down the whole stack.
+  lua_register(L, "_nav_clear", lua_nav_reset);
+  lua_register(L, "_nav_reset", lua_nav_reset);
+
+  // Reset all input devices: clear their act/scroll/last object references and
+  // bail the in-flight gesture (reset_query). A synchronous lv_obj_delete does
+  // this per deleted object (obj_indev_reset); when a view is torn down
+  // ASYNCHRONOUSLY (apps.delete_view hides then drains it over ticks) nothing
+  // resets the indev, so a lingering touch/scroll on the doomed subtree later
+  // dereferences a freed ->parent (LoadProhibited @ 0x4). Call before tearing
+  // down the view the user just interacted with.
+  lua_register(L, "_indev_reset", [](lua_State *L) -> int {
+    (void)L;
+    lv_indev_reset(NULL, NULL);
     return 0;
   });
 
@@ -4599,7 +4911,7 @@ void setupLuaVGL() {
 
   lua_pop(L, 1); // pop metatable
 
-  Serial.println("Added esp32_file");
+  SLog.println("Added esp32_file");
 
 
   // Inject our C++-backed io.open into the Lua global 'io' table
@@ -4616,14 +4928,14 @@ void setupLuaVGL() {
 
   lua_pop(L, 1); // pop io table
 
-  Serial.println("Patched IO");
+  SLog.println("Patched IO");
 
-  Serial.println("[LUA] LuaVGL environment initialized");
-  Serial.printf("[LUA] Free heap: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("[LUA] Free PSRAM: %d bytes\n", ESP.getFreePsram());
+  SLog.println("[LUA] LuaVGL environment initialized");
+  SLog.printf("[LUA] Free heap: %d bytes\n", ESP.getFreeHeap());
+  SLog.printf("[LUA] Free PSRAM: %d bytes\n", ESP.getFreePsram());
 
   if (!fs_mounted) {
-    Serial.println("Filesystem not mounted, can't load Lua scripts");
+    SLog.println("Filesystem not mounted, can't load Lua scripts");
 
     const char *fallbackScript = R"(
     local root = lvgl.Object()
@@ -4638,8 +4950,8 @@ void setupLuaVGL() {
   )";
 
     if (luaL_dostring(L, fallbackScript) != 0) {
-      Serial.print("Lua fallback script error: ");
-      Serial.println(lua_tostring(L, -1));
+      SLog.print("Lua fallback script error: ");
+      SLog.println(lua_tostring(L, -1));
       lua_pop(L, 1);
     }
 
@@ -4647,13 +4959,13 @@ void setupLuaVGL() {
   }
 
   String scriptPath = String(LUA_PATH) + "main.lua";
-  Serial.printf("[LUA] Reading script: %s\n", scriptPath.c_str());
+  SLog.printf("[LUA] Reading script: %s\n", scriptPath.c_str());
   String script = readFile(scriptPath.c_str());
-  Serial.printf("[LUA] Script length: %d bytes\n", script.length());
+  SLog.printf("[LUA] Script length: %d bytes\n", script.length());
 
   if (script.length() == 0) {
-    Serial.print("Lua script not found: ");
-    Serial.println(scriptPath);
+    SLog.print("Lua script not found: ");
+    SLog.println(scriptPath);
 
     const char *fallbackScript = R"(
     local root = lvgl.Object()
@@ -4671,18 +4983,18 @@ void setupLuaVGL() {
     return;
   }
 
-  Serial.print("[LUA] Executing Lua script: ");
-  Serial.println(scriptPath);
-  Serial.println("[LUA] --- luaL_dostring BEGIN ---");
+  SLog.print("[LUA] Executing Lua script: ");
+  SLog.println(scriptPath);
+  SLog.println("[LUA] --- luaL_dostring BEGIN ---");
 
   int lua_result = luaL_dostring(L, script.c_str());
 
-  Serial.printf("[LUA] --- luaL_dostring END --- result=%d\n", lua_result);
+  SLog.printf("[LUA] --- luaL_dostring END --- result=%d\n", lua_result);
 
   if (lua_result != 0) {
     const char *luaError = lua_tostring(L, -1);
-    Serial.print("Lua execution error: ");
-    Serial.println(luaError);
+    SLog.print("Lua execution error: ");
+    SLog.println(luaError);
 
     // Escape any embedded quotes or newlines
     String escapedError = String(luaError);
@@ -4704,8 +5016,8 @@ void setupLuaVGL() {
   )";
 
     if (luaL_dostring(L, fallbackScript.c_str()) != 0) {
-      Serial.print("Fallback display error: ");
-      Serial.println(lua_tostring(L, -1));
+      SLog.print("Fallback display error: ");
+      SLog.println(lua_tostring(L, -1));
     }
 
     lua_pop(L, 1);
@@ -4719,11 +5031,15 @@ void setupLuaVGL() {
 volatile bool lora_packet_ready = false;
 
 void setup() {
+  // Enlarge the UART TX buffer so the ISR drains it in the background and SLog's
+  // best-effort writes (availableForWrite-gated) almost never have to drop. Must
+  // precede begin(). ~4 KB ≈ 350 ms of backlog at 115200 before any line drops.
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
-  Serial.println("Delaying for 50ms...");
+  SLog.println("Delaying for 50ms...");
   delay(50);
 
-  Serial.println("MeshPunk LuaVGL Demo");
+  SLog.println("MeshPunk LuaVGL Demo");
 
   // Create SPI/mesh mutexes and cross-core queues before any subsystem
   // that relies on them. Safe to call before LVGL/TFT init because the
@@ -4767,28 +5083,28 @@ void setup() {
   attachInterrupt(TDECK_TRACKBALL_LEFT,  ISR_trackball_left,  FALLING);
   attachInterrupt(TDECK_TRACKBALL_RIGHT, ISR_trackball_right, FALLING);
 
-  Serial.println("Initializing display");
+  SLog.println("Initializing display");
 
   // Initialize filesystem
   if (LittleFS.begin(true)) {
     fs_mounted = true;
-    Serial.println("LittleFS mounted successfully");
+    SLog.println("LittleFS mounted successfully");
 
     // Save any module crash stashed in RTC by the previous boot before
     // anything else touches LittleFS.
     elf_crashlog_check_and_save();
 
-    Serial.println("LittleFS contents:");
+    SLog.println("LittleFS contents:");
     listDir(LittleFS, "/lua");
 
     // Load firmware preferences (tz, use_sd, clock_fmt)
     firmware_prefs_load();
   } else {
-    Serial.println("Error mounting LittleFS!!");
+    SLog.println("Error mounting LittleFS!!");
   }
 
   // Initialize SD card for persistent mesh data (survives LittleFS reflash)
-  Serial.println("===== SD CARD INIT =====");
+  SLog.println("===== SD CARD INIT =====");
 
   // The SPI bus is shared with the TFT (80 MHz) and SX1262, but every device
   // sets its own per-transaction SPISettings, so this clock only applies to SD
@@ -4798,16 +5114,16 @@ void setup() {
   for (uint32_t freq : sd_freqs) {
     if (SD.begin(BOARD_SDCARD_CS, SPI, freq)) {
       sd_mounted = true;
-      Serial.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
+      SLog.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
       break;
     }
     SD.end();
-    Serial.printf("[SD] Mount failed at %lu Hz\n", (unsigned long)freq);
+    SLog.printf("[SD] Mount failed at %lu Hz\n", (unsigned long)freq);
   }
 
   if (sd_mounted) {
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-    Serial.printf("[SD] Card mounted, size: %llu MB\n", cardSize);
+    SLog.printf("[SD] Card mounted, size: %llu MB\n", cardSize);
 
     const char* required_dirs[] = {
       "/meshpunk",
@@ -4817,7 +5133,7 @@ void setup() {
     for (auto dir : required_dirs) {
       if (!SD.exists(dir)) {
         SD.mkdir(dir);
-        Serial.printf("[SD] Created %s\n", dir);
+        SLog.printf("[SD] Created %s\n", dir);
       }
     }
 
@@ -4826,10 +5142,10 @@ void setup() {
       bool ok = copyFile(SD, "/meshpunk/firmware_prefs", LittleFS, "/firmware_prefs");
       sd_spi_release();
       if (ok) {
-        Serial.println("[FW_PREFS] Imported from SD after reflash");
+        SLog.println("[FW_PREFS] Imported from SD after reflash");
         firmware_prefs_load();
       } else {
-        Serial.println("[FW_PREFS] SD import failed, using defaults");
+        SLog.println("[FW_PREFS] SD import failed, using defaults");
       }
     }
 
@@ -4837,57 +5153,58 @@ void setup() {
       sd_spi_take();
       bool ok = copyFile(SD, "/meshpunk/wifi_creds", LittleFS, "/wifi_creds");
       sd_spi_release();
-      Serial.printf("[WIFI_CREDS] %s from SD after reflash\n", ok ? "Imported" : "Import FAILED");
+      SLog.printf("[WIFI_CREDS] %s from SD after reflash\n", ok ? "Imported" : "Import FAILED");
     }
   } else {
-    Serial.println("[SD] Card mount FAILED");
+    SLog.println("[SD] Card mount FAILED");
   }
 
   // Allocate PunkMesh in PSRAM — frees ~115 KB of internal SRAM for BLE stack.
   void* mesh_mem = heap_caps_malloc(sizeof(PunkMesh), MALLOC_CAP_SPIRAM);
   the_mesh = new (mesh_mem) PunkMesh(radio_driver, fast_rng, *new VolatileRTCClock(), tables);
-  Serial.printf("[MESH] PunkMesh allocated in PSRAM (%u bytes)\n", sizeof(PunkMesh));
+  SLog.printf("[MESH] PunkMesh allocated in PSRAM (%u bytes)\n", sizeof(PunkMesh));
 
 #if BLE_COMPANION_ENABLED
   if (ble_enabled_pref) {
     ble_companion_init_early();
   } else {
-    Serial.println("[BLE] Disabled by user preference");
+    SLog.println("[BLE] Disabled by user preference");
   }
 #endif
 
   // Decide which storage to use (use_sd_pref loaded by firmware_prefs_load)
   if (sd_mounted && use_sd_pref) {
     the_mesh->setStorage(&SD, "/meshpunk");
-    Serial.println("[SD] Mesh storage: SD:/meshpunk/");
+    SLog.println("[SD] Mesh storage: SD:/meshpunk/");
   } else {
     the_mesh->setStorage(&LittleFS, "");
     if (sd_mounted) {
-      Serial.println("[SD] SD available but user chose LittleFS");
+      SLog.println("[SD] SD available but user chose LittleFS");
     } else {
-      Serial.println("[SD] Using LittleFS (no SD card)");
+      SLog.println("[SD] Using LittleFS (no SD card)");
     }
   }
+  the_mesh->_msg_retain_days = msg_retain_days;  // routing/message retention window
 
   wifi_creds_load();
   if (wifi_enabled_pref) {
     WiFi.mode(WIFI_STA);
     if (wifi_saved_ssid.length() > 0) {
       WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
-      Serial.printf("WiFi auto-connecting to: %s\n", wifi_saved_ssid.c_str());
+      SLog.printf("WiFi auto-connecting to: %s\n", wifi_saved_ssid.c_str());
     } else {
-      Serial.println("WiFi initialized in station mode (no saved network)");
+      SLog.println("WiFi initialized in station mode (no saved network)");
     }
   } else {
     WiFi.mode(WIFI_OFF);
-    Serial.println("WiFi disabled by preference");
+    SLog.println("WiFi disabled by preference");
   }
 
   // Set touch int input
   pinMode(BOARD_TOUCH_INT, INPUT);
   delay(20);
 
-  Serial.println("Initializing GT911 touch sensor");
+  SLog.println("Initializing GT911 touch sensor");
 
   Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
 
@@ -4895,7 +5212,7 @@ void setup() {
   touch.setPins(-1, BOARD_TOUCH_INT);
   if (!touch.begin(Wire, GT911_SLAVE_ADDRESS_L)) {
     while (1) {
-      Serial.println("Failed to find GT911 - check your wiring!");
+      SLog.println("Failed to find GT911 - check your wiring!");
       delay(1000);
     }
   }
@@ -4914,7 +5231,7 @@ void setup() {
   Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
   if (Wire.endTransmission() == 0) {
     keyboard_available = true;
-    Serial.println("T-Deck keyboard found!");
+    SLog.println("T-Deck keyboard found!");
 
     // Set initial keyboard brightness
     setKeyboardDefaultBrightness(127);
@@ -4924,9 +5241,9 @@ void setup() {
     Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
     Wire.write(LILYGO_KB_MODE_RAW_CMD);
     Wire.endTransmission();
-    Serial.println("Keyboard switched to raw matrix mode");
+    SLog.println("Keyboard switched to raw matrix mode");
   } else {
-    Serial.println("T-Deck keyboard not found!");
+    SLog.println("T-Deck keyboard not found!");
   }
 
   // Initialize I2S audio output on T-Deck speaker
@@ -4934,15 +5251,15 @@ void setup() {
   audio->setPinout(TDECK_I2S_BCK, TDECK_I2S_WS, TDECK_I2S_DOUT);
   sound_init(audio, firmware_prefs_save);
   audio->setVolume(sound_get_muted() ? 0 : sound_get_volume());
-  Serial.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
+  SLog.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
 
   tft.fillScreen(TFT_GREEN);
 
   // Initialize LORA Radio
-  Serial.println(F("===== RADIO INIT ====="));
+  SLog.println(F("===== RADIO INIT ====="));
 
   int16_t state = radio.begin();
-  Serial.printf("[RADIO] begin() = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  SLog.printf("[RADIO] begin() = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   delay(100);
 
@@ -4951,52 +5268,61 @@ void setup() {
   float bw = the_mesh->getBandwidthPref();
   uint8_t sf = the_mesh->getSpreadingFactorPref();
   uint8_t cr = the_mesh->getCodingRatePref();
-  Serial.printf("[RADIO] Setting freq=%.3f MHz, BW=%.0f kHz, SF=%d, CR=%d, TX=%d dBm\n", freq, bw, sf, cr, tx_pwr);
+  SLog.printf("[RADIO] Setting freq=%.3f MHz, BW=%.0f kHz, SF=%d, CR=%d, TX=%d dBm\n", freq, bw, sf, cr, tx_pwr);
 
   state = radio.setFrequency(freq);
-  Serial.printf("[RADIO] setFrequency = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  SLog.printf("[RADIO] setFrequency = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   state = radio.setBandwidth(bw);
-  Serial.printf("[RADIO] setBandwidth = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  SLog.printf("[RADIO] setBandwidth = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   state = radio.setSpreadingFactor(sf);
-  Serial.printf("[RADIO] setSpreadingFactor = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  SLog.printf("[RADIO] setSpreadingFactor = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   state = radio.setCodingRate(cr);
-  Serial.printf("[RADIO] setCodingRate = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  SLog.printf("[RADIO] setCodingRate = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   radio.setCRC(true);
 
   state = radio.setOutputPower(tx_pwr);
-  Serial.printf("[RADIO] setOutputPower = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  SLog.printf("[RADIO] setOutputPower = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   state = radio.startReceive();
-  Serial.printf("[RADIO] startReceive = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  SLog.printf("[RADIO] startReceive = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
-  Serial.println(F("===== MESHCORE INIT ====="));
+  SLog.println(F("===== MESHCORE INIT ====="));
   fast_rng.begin(123456); // fixed seed for testing
   the_mesh->begin();
   the_mesh->showWelcome();
+
+  // Seed the clock + own-position from the last saved GPS fix until live GPS
+  // syncs (or the user manually sets the time). Storage is configured above and
+  // gps_sync_begin() already ran, so this won't be clobbered by a sync restart.
+  gps_last_load();
+
+  // Flag a boot catch-up retention sweep; pruneStep runs it incrementally from
+  // loop() once the clock is valid (seeded above, or after the first GPS fix).
+  the_mesh->_prune_due = true;
 
   // Apply RX boost from prefs (loaded in the_mesh->begin())
   if (the_mesh->_prefs.rx_boost) {
     SPI_LOCK();
     radio_driver.setRxBoostedGainMode(true);
     SPI_UNLOCK();
-    Serial.println("[RADIO] RX Boost restored from prefs: ON");
+    SLog.println("[RADIO] RX Boost restored from prefs: ON");
   }
 
-  Serial.printf("[MESH] Node name: %s\n", the_mesh->_prefs.node_name);
-  Serial.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh->_prefs.freq);
-  Serial.printf("[MESH] TX power pref: %d dBm\n", the_mesh->_prefs.tx_power_dbm);
-  Serial.printf("[MESH] Contacts loaded: %d\n", the_mesh->getNumContacts());
-  Serial.printf("[MESH] Public channel: %s\n", the_mesh->_public ? "YES" : "NO (PROBLEM!)");
-  Serial.print("[MESH] Pub key: ");
-  mesh::Utils::printHex(Serial, the_mesh->self_id.pub_key, PUB_KEY_SIZE);
-  Serial.println();
+  SLog.printf("[MESH] Node name: %s\n", the_mesh->_prefs.node_name);
+  SLog.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh->_prefs.freq);
+  SLog.printf("[MESH] TX power pref: %d dBm\n", the_mesh->_prefs.tx_power_dbm);
+  SLog.printf("[MESH] Contacts loaded: %d\n", the_mesh->getNumContacts());
+  SLog.printf("[MESH] Public channel: %s\n", the_mesh->_public ? "YES" : "NO (PROBLEM!)");
+  char pk_hex[PUB_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(pk_hex, the_mesh->self_id.pub_key, PUB_KEY_SIZE);
+  SLog.printf("[MESH] Pub key: %s\n", pk_hex);
 
   //Initialize the disply only after all other spi bus setup is finished
-  Serial.println("Initialize display");
+  SLog.println("Initialize display");
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
@@ -5014,12 +5340,12 @@ void setup() {
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_make(0x10, 0x10, 0x10), 0);
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
 
-  Serial.println("===== LUA INIT =====");
+  SLog.println("===== LUA INIT =====");
 
   // Initialize LuaVGL
   setupLuaVGL();
 
-  Serial.println("[LUA] setupLuaVGL() returned");
+  SLog.println("[LUA] setupLuaVGL() returned");
 
   // Create UI
   createUI();
@@ -5040,7 +5366,7 @@ void setup() {
   // Hand off mesh + radio to Core 1 now that the_mesh, Lua, LVGL, and the
   // RX queue are all up. Must happen AFTER createUI / setupLuaVGL so that
   // any RX events arriving from the mesh task have something to drain into.
-  Serial.printf("[TASK] setup() running on core=%d; spawning mesh_task on Core 1\n",
+  SLog.printf("[TASK] setup() running on core=%d; spawning mesh_task on Core 1\n",
                 xPortGetCoreID());
   meshpunk_spawn_mesh_task();
   meshpunk_spawn_gps_task();
@@ -5099,6 +5425,10 @@ void loop() {
   // Flush mesh RX events into Lua. lua_State is single-threaded — always
   // touched from Core 0.
   drain_rx_events();
+
+  // Incremental message/routing retention sweep (flagged on a new-day record or
+  // at boot). One file per iteration; cheap no-op when nothing is due.
+  if (the_mesh) the_mesh->pruneStep();
 
   // ── Inactivity timeouts ─────────────────────────────────────────────────
   if (screen_timeout_secs > 0 && !screen_timed_out) {

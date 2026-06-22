@@ -239,6 +239,65 @@ function M.add_timer(opts)
 end
 
 -- ── Teardown + navigation ───────────────────────────────────────────────────
+-- Tear down a (possibly large) view WITHOUT a watchdog-tripping synchronous
+-- delete. A view whose object count scales with data (e.g. a few hundred contact
+-- rows = ~3 LVGL objects each) takes long enough to delete in one call to starve
+-- Core 0 and trip the 5 s task watchdog — construction is already batched across
+-- ticks, so destruction must be too.
+--
+-- delete_leaves deletes up to `budget` LEAF objects (no children) per call,
+-- descending depth-first so a deeply nested big list (body → list → N rows) is
+-- still bounded per tick — chunking only the direct children wouldn't help when
+-- one child holds all the rows. A leaf delete is O(1) and never recurses, so the
+-- per-tick cost is bounded regardless of tree shape. Returns the leftover budget
+-- and whether `obj` is now empty.
+local BG_DELETE_CHUNK = 60   -- leaf objects deleted per tick
+local function delete_leaves(obj, budget)
+    while budget > 0 do
+        local cnt = obj:get_child_cnt()
+        if cnt <= 0 then break end
+        local child = obj:get_child(cnt - 1)        -- tail child: O(1) removal
+        local child_empty
+        budget, child_empty = delete_leaves(child, budget)
+        if not child_empty then return budget, false end  -- budget spent in subtree
+        local before = obj:get_child_cnt()
+        child:delete()
+        -- A non-Lua internal child (rare) won't actually detach via :delete();
+        -- bail to let the caller finish the small remainder synchronously rather
+        -- than spin forever on it.
+        if obj:get_child_cnt() >= before then error("undeletable child") end
+        budget = budget - 1
+    end
+    return budget, (obj:get_child_cnt() <= 0)
+end
+
+function M.delete_view(obj)
+    if not obj then return end
+    -- Clear any in-flight touch/scroll gesture's references to this subtree. A
+    -- synchronous :delete() resets the indev per object; this async drain does
+    -- not, so without this a release/scroll still pointing into the view we're
+    -- tearing down dereferences a freed ->parent once the drain frees it
+    -- (LoadProhibited @ 0x4). This is what made tapping a row in a scroll list
+    -- crash while tapping a plain button did not.
+    pcall(_indev_reset)
+    -- Hide immediately so the replacement view can build over it while the old
+    -- one drains away across the next several ticks.
+    if not pcall(function() obj:add_flag(lvgl.FLAG.HIDDEN) end) then
+        pcall(function() obj:delete() end)   -- already invalid; best-effort
+        return
+    end
+    M.add_timer({ period = 1, cb = function(t)
+        local ok, remaining, emptied = pcall(delete_leaves, obj, BG_DELETE_CHUNK)
+        -- Finalize on: error/stall (remaining == full budget → no progress made),
+        -- or the tree is fully drained. The final :delete() is on an empty (or
+        -- tiny remainder) container, so it's cheap.
+        if (not ok) or emptied or remaining == BG_DELETE_CHUNK then
+            pcall(function() obj:delete() end)
+            t:delete()
+        end
+    end })
+end
+
 -- Delete a captured set of timers then the root, pcall-guarded.
 local function destroy(scr, timers)
     for _, t in ipairs(timers or {}) do pcall(function() t:delete() end) end

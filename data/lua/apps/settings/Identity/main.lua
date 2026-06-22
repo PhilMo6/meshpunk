@@ -1,6 +1,7 @@
 local lvgl  = require("lvgl")
 local utils = require("lib/utils")
 local apps  = require("lib/apps")
+local nav   = require("lib/nav")
 
 local root = apps.new_root()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0 }
@@ -11,7 +12,7 @@ local content = root:Object {
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
     border_width = 0, pad_all = 6,
 }
-_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
 
 -- Title
 content:Label { text = "Identity", w = lvgl.PCT(70), h = 26 }
@@ -62,15 +63,14 @@ btn_gen:onClicked(function()
         x = 0, y = 0, bg_opa = 200, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
     local box = overlay:Object {
         w = 280, h = 130, align = lvgl.ALIGN.CENTER,
         border_width = 1, pad_all = 10,
         flex = { flex_direction = "row", flex_wrap = "wrap" },
     }
     box:clear_flag(lvgl.FLAG.SCROLLABLE)
-    _gridnav_add(box, GRIDNAV_ROLLOVER)
-    local popup_group = lvgl.group.get_default()
-    popup_group:add_obj(box)
+    nav.push(box)
 
     box:Label { text = "WARNING", w = lvgl.PCT(100), h = 20 }
     box:Label { text = "Generate new identity?", w = lvgl.PCT(100), h = 18 }
@@ -81,9 +81,11 @@ btn_gen:onClicked(function()
     local no = box:Button { w = lvgl.PCT(48), h = 32 }
     no:Label { text = "Cancel", align = lvgl.ALIGN.CENTER }
     no:onClicked(function()
+        nav.pop()
         overlay:delete()
     end)
     yes:onClicked(function()
+        nav.pop()
         overlay:delete()
         status.text = "Generating..."
         local ok2, err = pcall(_mesh_generate_identity)

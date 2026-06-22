@@ -5,6 +5,7 @@ local lvgl = require("lvgl")
 local clock_fmt_mod = require("lib/clock_fmt")
 local utils = require("lib/utils")
 local apps = require("lib/apps")
+local nav = require("lib/nav")
 
 -- Root
 local root = apps.new_root()
@@ -33,7 +34,7 @@ local content = root:Object {
     pad_all = 6,
 }
 
-_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
 
 -- Title
 content:Label { text = "Radio Settings", w = lvgl.PCT(70), h = 26 }
@@ -60,6 +61,7 @@ local function show_restart_popup()
         pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
 
     local box = overlay:Object {
         w = 220, h = 120,
@@ -69,9 +71,7 @@ local function show_restart_popup()
         flex = { flex_direction = "row", flex_wrap = "wrap" },
     }
     box:clear_flag(lvgl.FLAG.SCROLLABLE)
-    _gridnav_add(box, GRIDNAV_ROLLOVER)
-    local popup_group = lvgl.group.get_default()
-    popup_group:add_obj(box)
+    nav.push(box)
 
     box:Label { text = "Settings saved.", w = lvgl.PCT(100), h = 20 }
     box:Label { text = "Restart to apply?", w = lvgl.PCT(100), h = 20 }
@@ -85,6 +85,7 @@ local function show_restart_popup()
     local wait_btn = box:Button { w = lvgl.PCT(48), h = 32 }
     wait_btn:Label { text = "Wait", align = lvgl.ALIGN.CENTER }
     wait_btn:onClicked(function()
+        nav.pop()
         overlay:delete()
     end)
 end

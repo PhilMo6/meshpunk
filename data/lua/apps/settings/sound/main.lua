@@ -2,6 +2,7 @@ local lvgl  = require("lvgl")
 local sound = require("lib/sound")
 local utils = require("lib/utils")
 local apps  = require("lib/apps")
+local nav   = require("lib/nav")
 
 -- Root
 local root = apps.new_root()
@@ -23,7 +24,7 @@ local content = root:Object {
     pad_all = 6,
 }
 
-_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
 
 -- Title
 content:Label { text = "Sound Settings", w = lvgl.PCT(70), h = 26 }

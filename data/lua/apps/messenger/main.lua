@@ -9,6 +9,7 @@ local messages = require("lib/mesh/messages")
 local utils = require("lib/utils")
 local gridnav_body = require("lib/gridnav_body")
 local apps = require("lib/apps")
+local nav = require("lib/nav")
 
 -- Persistence lives on the C++ PunkMesh side (respects _storage: LittleFS
 -- root or /meshpunk on SD), so any app can access the same message history.
@@ -85,8 +86,11 @@ end
 
 -- ── Helpers ─────────────────────────────────────────────────────
 local function clear_view()
-    _nav_clear()
-    if current_view then current_view:delete(); current_view = nil end
+    nav.reset()   -- drop every nav scope (any open popup's too) before the swap
+    -- current_view can hold hundreds of rows (contacts/inbox); a synchronous
+    -- delete of that many objects starves Core 0 and trips the watchdog, so tear
+    -- it down in the background. The input bar is always small — delete it inline.
+    if current_view then apps.delete_view(current_view); current_view = nil end
     if current_input then current_input:delete(); current_input = nil end
 end
 
@@ -125,7 +129,12 @@ end
 -- a tap opens a row but a drag scrolls past it. A plain single click works (also
 -- nice for the trackball — no double-press). Returns a binder that attaches the
 -- click handler to each row.
-local function scroll_aware_list(list)
+-- `on_settle` (optional) is invoked from the single SCROLL_END handler — use it
+-- for things like windowed paging. luavgl allows only ONE callback per event
+-- code per object, so a second list:onevent(SCROLL_END,...) would replace this
+-- one (and historically hard-crashed luavgl's replace path); route extra
+-- scroll-end work through here instead.
+local function scroll_aware_list(list, on_settle)
     local scrolling = false
     local settle_timer = nil
     list:onevent(lvgl.EVENT.SCROLL_BEGIN, function()
@@ -139,6 +148,7 @@ local function scroll_aware_list(list)
         settle_timer = lvgl.Timer { period = 150, cb = function(t)
             t:delete(); settle_timer = nil; scrolling = false
         end }
+        if on_settle then on_settle() end
     end)
     return function(obj, activate)
         obj:onevent(lvgl.EVENT.RELEASED, function()
@@ -188,6 +198,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
         border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal: swallow taps on the dim area
 
     local box = overlay:Object {
         w = W - 20, h = H - 20,
@@ -197,7 +208,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
         pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    _nav_setup(box, GRIDNAV_ROLLOVER)
+    nav.push(box)
 
     local function info_label(text)
         box:Label { text = text, w = lvgl.PCT(100) }
@@ -208,6 +219,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
     local ci_btn = box:Button { w = 100, h = 22 }
     ci_btn:Label { text = "Contact Info", align = lvgl.ALIGN.CENTER }
     ci_btn:onevent(lvgl.EVENT.RELEASED, function()
+        nav.pop()
         overlay:delete()
         if on_dismiss then on_dismiss() end
         show_contact_detail(msg.from)
@@ -228,6 +240,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
             border_width = 0, pad_all = 0,
         }
         overlay2:clear_flag(lvgl.FLAG.SCROLLABLE)
+        overlay2:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
 
         local box2 = overlay2:Object {
             w = W - 10, h = H - 20,
@@ -237,7 +250,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
             pad_all = 6,
             flex = { flex_direction = "column", flex_wrap = "nowrap" },
         }
-        _nav_setup(box2, GRIDNAV_ROLLOVER)
+        nav.push(box2)
 
         box2:Label { text = "-- Message Paths --", w = lvgl.PCT(100) }
 
@@ -285,8 +298,8 @@ local function show_msg_info(msg, on_reply, on_dismiss)
         local close_btn2 = box2:Button { w = lvgl.PCT(100), h = 26 }
         close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
         close_btn2:onevent(lvgl.EVENT.RELEASED, function()
+            nav.pop()
             overlay2:delete()
-            _nav_setup(box, GRIDNAV_ROLLOVER)
         end)
     end)
 
@@ -302,6 +315,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
         local reply_btn = box:Button { w = lvgl.PCT(48), h = 26 }
         reply_btn:Label { text = "Reply", align = lvgl.ALIGN.CENTER }
         reply_btn:onevent(lvgl.EVENT.RELEASED, function()
+            nav.pop()
             overlay:delete()
             if on_dismiss then on_dismiss() end
             on_reply(msg)
@@ -311,6 +325,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
     local close_btn = box:Button { w = on_reply and lvgl.PCT(48) or lvgl.PCT(100), h = 26 }
     close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
     close_btn:onevent(lvgl.EVENT.RELEASED, function()
+        nav.pop()
         overlay:delete()
         if on_dismiss then on_dismiss() end
     end)
@@ -402,21 +417,9 @@ show_inbox = function()
         border_width = 0, pad_all = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    list:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
-
-    local in_select = false
-    list:onevent(lvgl.EVENT.RELEASED, function()
-        if in_select then return end
-        in_select = true
-        _nav_setup(list, GRIDNAV_ROLLOVER, true)
-    end)
-    list:onevent(lvgl.EVENT.KEY, function()
-        local key = lvgl.indev.get_act():get_key()
-        if key == 113 then -- 'q' returns focus to the controls
-            in_select = false
-            _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
-        end
-    end)
+    -- Tap/click the list to enter row-select (trackball steps the rows); 'q'
+    -- returns focus to the controls. nav.list owns the scope push/pop.
+    nav.list(list)
 
     local bind_click = scroll_aware_list(list)
 
@@ -577,7 +580,7 @@ show_chat = function(target)
         if context_menu_open then return end
         if in_msg_select then return end
         in_msg_select = true
-        _nav_setup(msg_list, GRIDNAV_ROLLOVER, true)
+        nav.push(msg_list, { preserve = true })
     end)
 
     msg_list:onevent(lvgl.EVENT.KEY, function()
@@ -585,13 +588,12 @@ show_chat = function(target)
         local key = indev:get_key()
         if key == 113 then -- 'q' exits message selection
             in_msg_select = false
-            _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+            nav.pop()
         end
     end)
 
     -- Build one chat bubble (a focusable direct child of msg_list).
     local function render_msg(msg)
-        msg.seen = true
         local is_me = (msg.from == me)
 
         local bubble = msg_list:Object {
@@ -639,13 +641,11 @@ show_chat = function(target)
             show_msg_info(msg, function(m)
                 textArea.text = "@[" .. (m.from or "?") .. "] "
             end, function()
+                -- show_msg_info already nav.pop()'d back to this chat's scope
+                -- (msg_list if we were row-selecting, else the body); just clear
+                -- the menu guard and re-focus the bubble we acted on.
                 context_menu_open = false
-                if in_msg_select then
-                    _nav_setup(msg_list, GRIDNAV_ROLLOVER, true)
-                    _nav_set_focused(bubble)
-                else
-                    _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
-                end
+                if in_msg_select then nav.set_focused(bubble) end
             end)
         end
 
@@ -802,9 +802,10 @@ show_chat = function(target)
             bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
         }
         overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+        overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
         local function close()
+            nav.pop()
             overlay:delete()
-            _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
         end
         local pbox = overlay:Object {
             w = W - 40, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
@@ -812,7 +813,7 @@ show_chat = function(target)
             border_width = 1, border_color = "#555555", pad_all = 8,
             flex = { flex_direction = "column", flex_wrap = "nowrap" },
         }
-        _nav_setup(pbox, GRIDNAV_ROLLOVER)
+        nav.push(pbox)
         pbox:Label { text = "Clipboard", w = lvgl.PCT(100), text_color = COL_META }
 
         local paste_b = pbox:Button { w = lvgl.PCT(100), h = 28 }
@@ -843,21 +844,18 @@ end
 
 -- ── MY NODE CARD ────────────────────────────────────────────────
 show_my_node = function()
-    local saved_view = current_view
-    if saved_view then saved_view:clear_flag(lvgl.FLAG.CLICKABLE) end
-
+    -- Modal overlay: nav.push (below) suspends the view beneath; CLICKABLE makes
+    -- the dimmed area swallow taps instead of passing them to that view.
     local overlay = root:Object {
         w = W, h = H, x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
     local function close_popup()
+        nav.pop()
         overlay:delete()
-        if saved_view then
-            saved_view:add_flag(lvgl.FLAG.CLICKABLE)
-            _nav_setup(saved_view, GRIDNAV_ROLLOVER)
-        end
     end
 
     local box = overlay:Object {
@@ -866,7 +864,7 @@ show_my_node = function()
         border_width = 1, border_color = "#555555", pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    _nav_setup(box, GRIDNAV_ROLLOVER)
+    nav.push(box)
 
     -- Full-screen QR of our own contact card, scannable by the MeshCore app.
     local function show_qr()
@@ -875,16 +873,15 @@ show_my_node = function()
         local okc, ni = pcall(_mesh_get_node_info)
         if not okc or not ni or not ni.pubkey or ni.pubkey == "" then return false end
         local card = contact_uri(ni.name, ni.pubkey, 1)
-        box:clear_flag(lvgl.FLAG.CLICKABLE)
         local qov = root:Object {
             w = W, h = H, x = 0, y = 0,
             bg_color = "#000000", bg_opa = 245, border_width = 0, pad_all = 0,
         }
         qov:clear_flag(lvgl.FLAG.SCROLLABLE)
+        qov:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
         local function qclose()
+            nav.pop()
             qov:delete()
-            box:add_flag(lvgl.FLAG.CLICKABLE)
-            _nav_setup(box, GRIDNAV_ROLLOVER)
         end
         qov:Label { text = "Scan in the MeshCore app", text_color = "#FFFFFF",
                     align = lvgl.ALIGN.TOP_MID, y = 4 }
@@ -903,7 +900,7 @@ show_my_node = function()
         local qclose_btn = qov:Button { w = 28, h = 28, align = lvgl.ALIGN.TOP_RIGHT, x = -4, y = 4 }
         qclose_btn:Label { text = "X", align = lvgl.ALIGN.CENTER }
         qclose_btn:onevent(lvgl.EVENT.RELEASED, qclose)
-        _nav_setup(qov, GRIDNAV_ROLLOVER)
+        nav.push(qov)
         return true
     end
 
@@ -974,21 +971,18 @@ end
 
 -- ── IMPORT CONTACT (paste biz card) ─────────────────────────────
 show_import_contact = function(on_done)
-    local saved_view = current_view
-    if saved_view then saved_view:clear_flag(lvgl.FLAG.CLICKABLE) end
-
+    -- Modal overlay: nav.push (below) suspends the view beneath; CLICKABLE makes
+    -- the dimmed area swallow taps instead of passing them to that view.
     local overlay = root:Object {
         w = W, h = H, x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
     local function close_popup(refresh)
+        nav.pop()
         overlay:delete()
-        if saved_view then
-            saved_view:add_flag(lvgl.FLAG.CLICKABLE)
-            _nav_setup(saved_view, GRIDNAV_ROLLOVER)
-        end
         if refresh and on_done then on_done() end
     end
 
@@ -998,7 +992,7 @@ show_import_contact = function(on_done)
         border_width = 1, border_color = "#555555", pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    _nav_setup(box, GRIDNAV_ROLLOVER)
+    nav.push(box)
 
     box:Label { text = "-- Add Contact --", w = lvgl.PCT(100) }
     box:Label { text = "Paste a meshcore:// card:", w = lvgl.PCT(100), text_color = COL_META }
@@ -1044,46 +1038,49 @@ show_clear_confirm = function()
         w = W, h = H, x = 0, y = 0, bg_opa = 200, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
     local box = overlay:Object {
         w = 220, h = 100, align = lvgl.ALIGN.CENTER,
         border_width = 1, pad_all = 10,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
     box:clear_flag(lvgl.FLAG.SCROLLABLE)
-    _gridnav_add(box, GRIDNAV_ROLLOVER)
-    lvgl.group.get_default():add_obj(box)
+    nav.push(box)
     box:Label { text = "Clear all contacts?", w = lvgl.PCT(100), h = 24 }
     local yes_btn = box:Button { w = lvgl.PCT(48), h = 32 }
     yes_btn:Label { text = "Yes", align = lvgl.ALIGN.CENTER }
     yes_btn:onevent(lvgl.EVENT.RELEASED, function()
-        pcall(_mesh_clear_contacts); overlay:delete(); show_contacts()
+        pcall(_mesh_clear_contacts); nav.pop(); overlay:delete(); show_contacts()
     end)
     local no_btn = box:Button { w = lvgl.PCT(48), h = 32 }
     no_btn:Label { text = "No", align = lvgl.ALIGN.CENTER }
-    no_btn:onevent(lvgl.EVENT.RELEASED, function() overlay:delete() end)
+    no_btn:onevent(lvgl.EVENT.RELEASED, function() nav.pop(); overlay:delete() end)
 end
 
 -- ── CONTACT SETTINGS POPUP ──────────────────────────────────────
 -- Type-visibility toggles (the "exclude" filter) plus the Add / Clear actions
 -- relocated off the main contacts row.
 show_contact_settings = function()
-    local saved_view = current_view
-    if saved_view then saved_view:clear_flag(lvgl.FLAG.CLICKABLE) end
-
+    -- Modal overlay: CLICKABLE so it swallows taps on the dimmed area instead of
+    -- letting them fall through to the contacts list behind it (nav.push already
+    -- removes that list from the focus group for the trackball/keyboard).
     local overlay = root:Object {
         w = W, h = H, x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
-    -- rebuild=true re-enters show_contacts so toggle changes take effect.
+    -- rebuild=true re-enters show_contacts so toggle changes take effect. Either
+    -- way nav.pop() resumes the contacts view beneath — no saved_view dance.
     local function close_popup(rebuild)
+        nav.pop()
         overlay:delete()
         if rebuild then
-            show_contacts()
-        elseif saved_view then
-            saved_view:add_flag(lvgl.FLAG.CLICKABLE)
-            _nav_setup(saved_view, GRIDNAV_ROLLOVER)
+            lvgl.Timer { period = 1, cb = function(t)
+                t:delete()
+                if current_mode == "contacts" then show_contacts() end
+            end }
         end
     end
 
@@ -1093,7 +1090,7 @@ show_contact_settings = function()
         border_width = 1, border_color = "#555555", pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    _nav_setup(box, GRIDNAV_ROLLOVER)
+    nav.push(box)
 
     box:Label { text = "-- Contact Settings --", w = lvgl.PCT(100) }
 
@@ -1249,23 +1246,17 @@ show_contacts = function()
         border_width = 0, pad_all = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    list:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+    -- Tap/click the list to enter row-select (trackball steps the rows); 'q'
+    -- returns focus to the controls. nav.list owns the scope push/pop.
+    nav.list(list)
 
-    local in_select = false
-    list:onevent(lvgl.EVENT.RELEASED, function()
-        if in_select then return end
-        in_select = true
-        _nav_setup(list, GRIDNAV_ROLLOVER, true)
+    -- The windowed pager hooks the list's single SCROLL_END (assigned below once
+    -- render_page exists). Routing it through scroll_aware_list avoids a second
+    -- SCROLL_END handler on `list` (luavgl is one-callback-per-code).
+    local page_on_settle
+    local bind_click = scroll_aware_list(list, function()
+        if page_on_settle then page_on_settle() end
     end)
-    list:onevent(lvgl.EVENT.KEY, function()
-        local key = lvgl.indev.get_act():get_key()
-        if key == 113 then -- 'q' returns focus to the controls
-            in_select = false
-            _nav_setup(body, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
-        end
-    end)
-
-    local bind_click = scroll_aware_list(list)
 
     -- Tap/click to open; suppressed while the list is being scrolled.
     local function bind_row(row, c_name, c_type)
@@ -1277,70 +1268,76 @@ show_contacts = function()
     end
 
 
-    -- Contact rows (batched to avoid watchdog timeout with many contacts).
-    local contacts = nil
-    local batch_idx = 0
-    local BATCH_SIZE = 6
+    -- Contact rows are WINDOWED: render a page at a time and extend the window
+    -- when the user scrolls near the bottom. This keeps the view cheap to build
+    -- and — just as importantly — cheap to tear down. Rendering every row meant a
+    -- few hundred contacts produced ~3 LVGL objects each, and deleting them all
+    -- synchronously on the next rebuild (sort/filter/settings-close) starved
+    -- Core 0 and tripped the watchdog. (Teardown is also backgrounded now; see
+    -- apps.delete_view. Windowing keeps the common case small in the first place.)
+    local PAGE = 30
     contact_rows = {}
 
-    utils.loadingPopUpAdd(root, "contacts", function()
-        if not contacts then
-            local ok, raw = pcall(_mesh_get_contacts)
-            if not ok or not raw then raw = {} end
+    local ok_c, raw = pcall(_mesh_get_contacts)
+    if not ok_c or not raw then raw = {} end
 
-            -- Filter by search text, and to favourites only in Favorites mode.
-            local filtered = {}
-            local lf = contacts_filter:lower()
-            local fav_only = (contacts_sort == "favorites")
-            for _, c in ipairs(raw) do
-                local name_ok = (lf == "" or c.name:lower():find(lf, 1, true))
-                if name_ok and (not fav_only or c.favorite)
-                   and contact_type_visible(c.type) then
-                    filtered[#filtered + 1] = c
-                end
-            end
-
-            -- Sort purely by the selected criterion. Favourites aren't pinned —
-            -- the Favorites mode filters to them; otherwise they sort like any
-            -- other contact (the '*' prefix still marks them).
-            table.sort(filtered, function(a, b)
-                if contacts_sort == "name" then
-                    return a.name:lower() < b.name:lower()
-                elseif contacts_sort == "type" then
-                    if (a.type or 0) ~= (b.type or 0) then return (a.type or 0) < (b.type or 0) end
-                    return a.name:lower() < b.name:lower()
-                end
-                return (a.lastmod or 0) > (b.lastmod or 0)
-            end)
-
-            contacts = filtered
-            if #contacts == 0 then
-                local empty_msg
-                if #raw == 0 then empty_msg = "No contacts. Send an Advert!"
-                elseif fav_only then empty_msg = "No favorite contacts."
-                else empty_msg = "No matching contacts." end
-                list:Label { text = empty_msg, w = lvgl.PCT(100), h = 20 }
-                return true
-            end
-            return false
+    -- Filter by search text, and to favourites only in Favorites mode.
+    local filtered = {}
+    local lf = contacts_filter:lower()
+    local fav_only = (contacts_sort == "favorites")
+    for _, c in ipairs(raw) do
+        local name_ok = (lf == "" or c.name:lower():find(lf, 1, true))
+        if name_ok and (not fav_only or c.favorite)
+           and contact_type_visible(c.type) then
+            filtered[#filtered + 1] = c
         end
+    end
 
-        local start_i = batch_idx * BATCH_SIZE + 1
-        local end_i = math.min(start_i + BATCH_SIZE - 1, #contacts)
-        for i = start_i, end_i do
-            local c = contacts[i]
-            local seen = (c.last_seen and c.last_seen > 0) and utils.relTime(c.last_seen) or ""
-            local row = list:Button { w = lvgl.PCT(100), h = 24 }
-            local left = row:Label { align = lvgl.ALIGN.LEFT_MID }
-            left.text = (c.favorite and "* " or "") .. type_icon(c.type) .. c.name
-            local right = row:Label { align = lvgl.ALIGN.RIGHT_MID, text = seen, text_color = COL_META }
-            bind_row(row, c.name, c.type)
-            contact_rows[c.name] = row
+    -- Sort purely by the selected criterion. Favourites aren't pinned — the
+    -- Favorites mode filters to them; otherwise they sort like any other contact
+    -- (the '*' prefix still marks them).
+    table.sort(filtered, function(a, b)
+        if contacts_sort == "name" then
+            return a.name:lower() < b.name:lower()
+        elseif contacts_sort == "type" then
+            if (a.type or 0) ~= (b.type or 0) then return (a.type or 0) < (b.type or 0) end
+            return a.name:lower() < b.name:lower()
         end
-
-        batch_idx = batch_idx + 1
-        return end_i >= #contacts
+        return (a.lastmod or 0) > (b.lastmod or 0)
     end)
+
+    if #filtered == 0 then
+        local empty_msg
+        if #raw == 0 then empty_msg = "No contacts. Send an Advert!"
+        elseif fav_only then empty_msg = "No favorite contacts."
+        else empty_msg = "No matching contacts." end
+        list:Label { text = empty_msg, w = lvgl.PCT(100), h = 20 }
+    else
+        local rendered = 0
+        local function render_page()
+            local stop = math.min(rendered + PAGE, #filtered)
+            for i = rendered + 1, stop do
+                local c = filtered[i]
+                local seen = (c.last_seen and c.last_seen > 0) and utils.relTime(c.last_seen) or ""
+                local row = list:Button { w = lvgl.PCT(100), h = 24 }
+                local left = row:Label { align = lvgl.ALIGN.LEFT_MID }
+                left.text = (c.favorite and "* " or "") .. type_icon(c.type) .. c.name
+                row:Label { align = lvgl.ALIGN.RIGHT_MID, text = seen, text_color = COL_META }
+                bind_row(row, c.name, c.type)
+                contact_rows[c.name] = row
+            end
+            rendered = stop
+        end
+        render_page()
+        -- Extend the window when scrolled within ~2 rows of the bottom. The
+        -- list's SCROLL_END (owned by scroll_aware_list) calls this on each
+        -- settle, so a flick pages in as it decelerates; adding rows grows the
+        -- scrollable area so the next settle near the bottom pages again.
+        page_on_settle = function()
+            if rendered >= #filtered then return end
+            if list:get_scroll_bottom() <= 48 then render_page() end
+        end
+    end
 
     -- Live contact updates float a contact to the top of the list.
     messages:onContactUpdate(function(name, ctype)
@@ -1375,7 +1372,7 @@ show_channels = function()
         w = W, h = H - HEADER_H, y = HEADER_H,
         border_width = 0, pad_all = 4,
     }
-    _nav_setup(body, GRIDNAV_ROLLOVER)
+    nav.replace(body)
     current_view = body
 
     local back_btn = body:Button { w = 45, h = 22 }
@@ -1448,21 +1445,18 @@ end
 
 -- ── CONTACT DETAIL POPUP ────────────────────────────────────────
 show_contact_detail = function(contact_name)
-    local saved_view = current_view
-    if saved_view then saved_view:clear_flag(lvgl.FLAG.CLICKABLE) end
-
+    -- Modal overlay: nav.push (below) suspends the view beneath; CLICKABLE makes
+    -- the dimmed area swallow taps instead of passing them to that view.
     local overlay = root:Object {
         w = W, h = H, x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
     local function close_popup()
+        nav.pop()
         overlay:delete()
-        if saved_view then
-            saved_view:add_flag(lvgl.FLAG.CLICKABLE)
-            _nav_setup(saved_view, GRIDNAV_ROLLOVER)
-        end
     end
 
     local box = overlay:Object {
@@ -1471,7 +1465,7 @@ show_contact_detail = function(contact_name)
         border_width = 1, border_color = "#555555", pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
-    _nav_setup(box, GRIDNAV_ROLLOVER)
+    nav.push(box)
 
     local function info_label(text) box:Label { text = text, w = lvgl.PCT(100) } end
 
@@ -1515,13 +1509,14 @@ show_contact_detail = function(contact_name)
             bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
         }
         overlay2:clear_flag(lvgl.FLAG.SCROLLABLE)
+        overlay2:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
         local box2 = overlay2:Object {
             w = W - 10, h = H - 20, align = lvgl.ALIGN.CENTER,
             bg_color = "#333333", radius = 6,
             border_width = 1, border_color = "#555555", pad_all = 6,
             flex = { flex_direction = "column", flex_wrap = "nowrap" },
         }
-        _nav_setup(box2, GRIDNAV_ROLLOVER)
+        nav.push(box2)
         box2:Label { text = "-- Paths: " .. contact.name .. " --", w = lvgl.PCT(100) }
         if not ok2 or not paths or #paths == 0 then
             box2:Label { text = "No path data", w = lvgl.PCT(100) }
@@ -1547,8 +1542,8 @@ show_contact_detail = function(contact_name)
         local close_btn2 = box2:Button { w = lvgl.PCT(100), h = 26 }
         close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
         close_btn2:onevent(lvgl.EVENT.RELEASED, function()
+            nav.pop()
             overlay2:delete()
-            _nav_setup(box, GRIDNAV_ROLLOVER)
         end)
     end)
 

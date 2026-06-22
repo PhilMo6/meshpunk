@@ -18,6 +18,7 @@
 local lvgl = require("lvgl")
 local topbar = require("lib/topbar")
 local apps = require("lib/apps")
+local nav = require("lib/nav")
 
 -- Module-level so build_page() can delete the previous page on a swap.
 local body = nil
@@ -26,7 +27,7 @@ local build_page  -- forward declaration (button handlers reference it)
 -- Defer a page swap out of the current event handler. Detach gridnav now (so no
 -- input reaches the dying page), then run the rebuild on the next tick.
 local function request_swap(rebuild)
-    _nav_clear()
+    nav.reset()
     lvgl.Timer({
         period = 1,
         cb = function(t)
@@ -55,7 +56,7 @@ function build_page(items, category)
         w = lvgl.HOR_RES(), h = lvgl.VER_RES(), x = 0, y = 20,
         border_width = 0, pad_all = 4,
     })
-    _nav_setup(body, GRIDNAV_ROLLOVER)
+    nav.replace(body)
     topbar.raise()
     apps.clear_current()
     apps.set_root(body)   -- the manager tears this page down when an app launches

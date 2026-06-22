@@ -1,6 +1,7 @@
 local lvgl  = require("lvgl")
 local utils = require("lib/utils")
 local apps  = require("lib/apps")
+local nav   = require("lib/nav")
 
 local root = apps.new_root()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0 }
@@ -11,7 +12,7 @@ local content = root:Object {
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
     border_width = 0, pad_all = 6,
 }
-_nav_setup(content, GRIDNAV_ROLLOVER)
+nav.replace(content)
 
 -- Title
 content:Label { text = "Notifications", w = lvgl.PCT(70), h = 26 }

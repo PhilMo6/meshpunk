@@ -5,6 +5,7 @@ local lvgl = require("lvgl")
 local clock_fmt_mod = require("lib/clock_fmt")
 local utils = require("lib/utils")
 local apps = require("lib/apps")
+local nav = require("lib/nav")
 
 local ok2, storage = pcall(_storage_get_info)
 if not ok2 or not storage then
@@ -30,7 +31,7 @@ local content = root:Object {
     border_width = 0,
     pad_all = 6,
 }
-_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
 
 -- Title
 content:Label { text = "Firmware Settings", w = lvgl.PCT(70), h = 26 }

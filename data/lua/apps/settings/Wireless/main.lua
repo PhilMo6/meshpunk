@@ -1,6 +1,7 @@
 local lvgl  = require("lvgl")
 local utils = require("lib/utils")
 local apps  = require("lib/apps")
+local nav   = require("lib/nav")
 
 local wifi_avail = type(_wifi_get_enabled) == "function"
 local ble_avail  = type(_ble_get_enabled) == "function"
@@ -14,7 +15,7 @@ local content = root:Object {
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
     border_width = 0, pad_all = 6,
 }
-_nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
 
 -- Title
 content:Label { text = "Wireless", w = lvgl.PCT(70), h = 26 }
@@ -143,24 +144,9 @@ local scan_container = content:Object {
     border_width = 0, pad_all = 0,
 }
 scan_container:clear_flag(lvgl.FLAG.SCROLLABLE)
-scan_container:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
-
-local in_scan_select = false
-
-scan_container:onevent(lvgl.EVENT.RELEASED, function()
-    if in_scan_select then return end
-    in_scan_select = true
-    _nav_setup(scan_container, GRIDNAV_ROLLOVER)
-end)
-
-scan_container:onevent(lvgl.EVENT.KEY, function()
-    local indev = lvgl.indev.get_act()
-    local key = indev:get_key()
-    if key == 113 then -- 'q' key
-        in_scan_select = false
-        _nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
-    end
-end)
+-- Tap the results to enter select (trackball steps networks); 'q' or choosing a
+-- network exits back to the controls. nav.list owns the scope push/pop.
+local exit_scan_select = nav.list(scan_container)
 
 local function show_scan_results(results)
     scan_container:clean()
@@ -178,8 +164,7 @@ local function show_scan_results(results)
         nbtn:onClicked(function()
             selected_ssid = net.ssid
             selected_secure = net.secure
-            in_scan_select = false
-            _nav_setup(content, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+            exit_scan_select()
             if net.secure then
                 show_pass_row()
                 pass_input.text = ""

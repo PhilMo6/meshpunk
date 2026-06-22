@@ -111,8 +111,8 @@ local function sound_notify()
 end
 
 function M.updateUnread()
-    unread = messages:countUnread()
-    if unread_label then unread_label:set{ text = unread .. M.mail_suffix } end
+    unread = messages:countUnread()  -- O(threads) sum of the unread counters
+    if unread_label and not paused then unread_label:set{ text = unread .. M.mail_suffix } end
 end
 
 function M.create()
@@ -141,12 +141,15 @@ function M.create()
 
     local battery_label =  bar:Label{ text = render_battery_pct(), h = 20 }
     
+    -- Recompute from the counters (O(threads)) rather than a running +1, so own
+    -- echoes don't inflate it and opening a thread (which zeroes its counter) is
+    -- reflected on the next update. DMs update the badge too now.
     messages:onMessageFirst(function(msg)
-        unread = unread + 1
-        if not paused then unread_label:set{ text = unread .. M.mail_suffix } end
+        M.updateUnread()
     end)
 
     messages:onDirectMessageFirst(function(msg)
+        M.updateUnread()
         kbd_blink_notify()
         sound_notify()
     end)
