@@ -439,6 +439,13 @@ static int luavgl_obj_get_scroll_top(lua_State *L)
   return 1;
 }
 
+static int luavgl_obj_get_scroll_bottom(lua_State *L)
+{
+  lv_obj_t *obj = luavgl_to_obj(L, 1);
+  lua_pushinteger(L, lv_obj_get_scroll_bottom(obj));
+  return 1;
+}
+
 static int luavgl_obj_move_to_index(lua_State *L)
 {
   lv_obj_t *obj = luavgl_to_obj(L, 1);
@@ -916,6 +923,7 @@ static const rotable_Reg luavgl_obj_methods[] = {
     {"scroll_to",                LUA_TFUNCTION,      {luavgl_obj_scroll_to}               },
     {"is_scrolling",             LUA_TFUNCTION,      {luavgl_obj_is_scrolling}            },
     {"get_scroll_top",           LUA_TFUNCTION,      {luavgl_obj_get_scroll_top}          },
+    {"get_scroll_bottom",        LUA_TFUNCTION,      {luavgl_obj_get_scroll_bottom}       },
     {"move_to_index",            LUA_TFUNCTION,      {luavgl_obj_move_to_index}           },
     {"is_visible",               LUA_TFUNCTION,      {luavgl_obj_is_visible}              },
     {"add_flag",                 LUA_TFUNCTION,      {luavgl_obj_add_flag}                },

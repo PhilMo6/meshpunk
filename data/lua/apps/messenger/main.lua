@@ -134,6 +134,9 @@ end
 -- code per object, so a second list:onevent(SCROLL_END,...) would replace this
 -- one (and historically hard-crashed luavgl's replace path); route extra
 -- scroll-end work through here instead.
+-- lv_indev_type_t value for a touchscreen/mouse pointer (vs keypad/encoder).
+local INDEV_POINTER = 1
+
 local function scroll_aware_list(list, on_settle)
     local scrolling = false
     local settle_timer = nil
@@ -152,7 +155,15 @@ local function scroll_aware_list(list, on_settle)
     end)
     return function(obj, activate)
         obj:onevent(lvgl.EVENT.RELEASED, function()
-            if scrolling then return end
+            -- Only a touch DRAG should suppress the tap. The trackball/keyboard
+            -- activates rows through here too, but the gridnav scrolls the
+            -- focused row into view as you step — which arms `scrolling` — so
+            -- without gating on the pointer indev the click that opens a row
+            -- (e.g. a contact) gets swallowed.
+            local indev = lvgl.indev.get_act()
+            if scrolling and indev and indev:get_type() == INDEV_POINTER then
+                return
+            end
             activate()
         end)
     end
@@ -331,6 +342,42 @@ local function show_msg_info(msg, on_reply, on_dismiss)
     end)
 end
 
+-- ── Navigation help popup (trackball/keyboard 'q' to back out) ───
+local function show_nav_help()
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128,
+        border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal: swallow taps on the dim area
+
+    local box = overlay:Object {
+        w = W - 30, h = lvgl.SIZE_CONTENT,
+        align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555",
+        pad_all = 10,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    nav.push(box)
+
+    box:Label { text = "-- Navigation Help --", w = lvgl.PCT(100) }
+    box:Label {
+        text = "When navigating with the trackball or keyboard, press Q to " ..
+               "back out of a selected list or message and return focus to " ..
+               "the buttons.",
+        w = lvgl.PCT(100),
+    }
+
+    local close_btn = box:Button { w = lvgl.PCT(100), h = 26 }
+    close_btn:Label { text = "Got it", align = lvgl.ALIGN.CENTER }
+    close_btn:onevent(lvgl.EVENT.RELEASED, function()
+        nav.pop()
+        overlay:delete()
+    end)
+end
+
 -- ── Periodic header refresh ─────────────────────────────────────
 apps.add_timer {
     period = 5000,
@@ -410,6 +457,7 @@ show_inbox = function()
     ctrl("Channels", 72, function() show_channels() end)
     ctrl("Contacts", 70, function() show_contacts() end)
     ctrl("Node", 48, function() show_my_node() end)
+    ctrl("?", 26, function() show_nav_help() end)
 
     -- Scrollable conversation list (rows live here, not in the gridnav body).
     local list = body:Object {
@@ -576,7 +624,16 @@ show_chat = function(target)
     local context_menu_open = false
     local ack_labels = {}  -- own-DM msg -> its header label, for live ack updates
 
-    msg_list:onevent(lvgl.EVENT.RELEASED, function()
+    -- Scroll-aware taps (same fix as the inbox/contacts lists): a touch DRAG
+    -- scrolls the chat instead of arming selection or opening a bubble menu.
+    -- The windowed older-message paging is routed through on_settle, since
+    -- luavgl allows only one SCROLL_END handler per object.
+    local page_load_older  -- assigned below, once history/render_msg exist
+    local bind_msg = scroll_aware_list(msg_list, function()
+        if page_load_older then page_load_older() end
+    end)
+
+    bind_msg(msg_list, function()
         if context_menu_open then return end
         if in_msg_select then return end
         in_msg_select = true
@@ -649,7 +706,7 @@ show_chat = function(target)
             end)
         end
 
-        bubble:onevent(lvgl.EVENT.RELEASED, function()
+        bind_msg(bubble, function()
             if in_msg_select then open_msg_menu() end
         end)
         bubble:onevent(lvgl.EVENT.LONG_PRESSED, open_msg_menu)
@@ -713,9 +770,11 @@ show_chat = function(target)
         }
     end
 
-    -- Auto-load older messages when scrolled to top.
+    -- Auto-load older messages when scrolled to top. Routed through
+    -- scroll_aware_list's single SCROLL_END (page_load_older) so it doesn't
+    -- clobber the scroll-suppression handler.
     local load_start = start_idx
-    msg_list:onevent(lvgl.EVENT.SCROLL_END, function()
+    page_load_older = function()
         if load_start <= 1 then return end
         if msg_list:get_scroll_top() > 5 then return end
         local new_start = math.max(1, load_start - 20)
@@ -724,7 +783,7 @@ show_chat = function(target)
             lbl:move_to_index(0)
         end
         load_start = new_start
-    end)
+    end
 
     -- Live message listener for the open thread. The thread is on screen, so
     -- anything arriving for it is already seen — clear its badge counter.
