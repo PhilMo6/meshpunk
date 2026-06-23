@@ -16,6 +16,7 @@
 #include <freertos/task.h>
 #include <esp_task_wdt.h>
 #include <esp_rom_sys.h>   // esp_rom_printf — safe to call from exception context
+#include <esp_attr.h>      // IRAM_ATTR — the ELF fault handler runs from IRAM
 #include <soc/timer_group_reg.h>  // TG1 MWDT (interrupt watchdog) register access
 #include <lvgl.h>
 #include <math.h>
@@ -111,16 +112,27 @@ static KeyEvent key_queue[KEY_QUEUE_SIZE];
 static volatile int kq_head = 0;
 static volatile int kq_tail = 0;
 
+// Core 1 ELF input task: samples the keyboard at a fixed rate independent of
+// the game loop (which monopolizes Core 0). See elf_input_start/stop.
+static TaskHandle_t   s_input_task     = nullptr;
+static volatile bool  s_input_task_run = false;
+
+// SPSC ring: producer is the Core 1 input task (kq_push), consumer is the
+// game's scanInput on Core 0 (kq_pop). The barriers make the slot's data
+// writes visible before kq_head advances (and vice-versa on the read side),
+// which matters now that the two ends live on different cores.
 static void kq_push(unsigned char key, int pressed) {
     int next = (kq_head + 1) % KEY_QUEUE_SIZE;
     if (next == kq_tail) return; // full, drop
     key_queue[kq_head].key = key;
     key_queue[kq_head].pressed = pressed;
+    __sync_synchronize();       // publish the slot before advancing head
     kq_head = next;
 }
 
 static bool kq_pop(KeyEvent* out) {
     if (kq_head == kq_tail) return false;
+    __sync_synchronize();       // see the slot writes that preceded head's advance
     *out = key_queue[kq_tail];
     kq_tail = (kq_tail + 1) % KEY_QUEUE_SIZE;
     return true;
@@ -185,7 +197,12 @@ static void parse_keymap_arg(const char* str) {
 // Poll keyboard + trackball, push key events onto queue for loaded module
 // ---------------------------------------------------------------------------
 
-static void poll_input() {
+// kb_only=true: read the keyboard matrix and queue key edges, but skip the
+// trackball velocity integration (and preserve its previous state so no
+// spurious trackball edge is generated). Used by the high-rate keyboard
+// pump in host_sleep_ms — the trackball momentum model is tuned for the
+// once-per-frame poll rate and must not be advanced ~200 times a second.
+static void poll_input(bool kb_only = false) {
     bool cur_state[INPUT_STATE_SIZE] = {0};
 
     // Read keyboard matrix via I2C
@@ -223,40 +240,47 @@ static void poll_input() {
     // Shift state
     if (shift) cur_state[0x80] = true; // pseudo-code for shift
 
-    // Trackball — momentum or legacy mode
-    if (trk_momentum) {
-        // Accumulate all pending ISR ticks into velocity
-        int up = trackball_up;    trackball_up = 0;
-        int dn = trackball_down;  trackball_down = 0;
-        int lt = trackball_left;  trackball_left = 0;
-        int rt = trackball_right; trackball_right = 0;
+    if (!kb_only) {
+        // Trackball — momentum or legacy mode
+        if (trk_momentum) {
+            // Accumulate all pending ISR ticks into velocity
+            int up = trackball_up;    trackball_up = 0;
+            int dn = trackball_down;  trackball_down = 0;
+            int lt = trackball_left;  trackball_left = 0;
+            int rt = trackball_right; trackball_right = 0;
 
-        trk_vel_y -= up * trk_impulse;
-        trk_vel_y += dn * trk_impulse;
-        trk_vel_x -= lt * trk_impulse;
-        trk_vel_x += rt * trk_impulse;
+            trk_vel_y -= up * trk_impulse;
+            trk_vel_y += dn * trk_impulse;
+            trk_vel_x -= lt * trk_impulse;
+            trk_vel_x += rt * trk_impulse;
 
-        // Apply friction
-        trk_vel_x *= trk_friction;
-        trk_vel_y *= trk_friction;
+            // Apply friction
+            trk_vel_x *= trk_friction;
+            trk_vel_y *= trk_friction;
 
-        // Snap to zero below threshold
-        if (fabsf(trk_vel_x) < trk_thresh) trk_vel_x = 0;
-        if (fabsf(trk_vel_y) < trk_thresh) trk_vel_y = 0;
+            // Snap to zero below threshold
+            if (fabsf(trk_vel_x) < trk_thresh) trk_vel_x = 0;
+            if (fabsf(trk_vel_y) < trk_thresh) trk_vel_y = 0;
 
-        // Report as held keys while velocity is above threshold
-        if (trk_vel_y < -trk_thresh) cur_state[0x81] = true;  // up
-        if (trk_vel_y >  trk_thresh) cur_state[0x82] = true;  // down
-        if (trk_vel_x < -trk_thresh) cur_state[0x83] = true;  // left
-        if (trk_vel_x >  trk_thresh) cur_state[0x84] = true;  // right
+            // Report as held keys while velocity is above threshold
+            if (trk_vel_y < -trk_thresh) cur_state[0x81] = true;  // up
+            if (trk_vel_y >  trk_thresh) cur_state[0x82] = true;  // down
+            if (trk_vel_x < -trk_thresh) cur_state[0x83] = true;  // left
+            if (trk_vel_x >  trk_thresh) cur_state[0x84] = true;  // right
+        } else {
+            // Legacy: one tick per poll cycle
+            if (trackball_up > 0)    { trackball_up--;    cur_state[0x81] = true; }
+            if (trackball_down > 0)  { trackball_down--;  cur_state[0x82] = true; }
+            if (trackball_left > 0)  { trackball_left--;  cur_state[0x83] = true; }
+            if (trackball_right > 0) { trackball_right--; cur_state[0x84] = true; }
+        }
+        if (trackball_click > 0) { trackball_click = 0; cur_state[0x85] = true; }
     } else {
-        // Legacy: one tick per poll cycle
-        if (trackball_up > 0)    { trackball_up--;    cur_state[0x81] = true; }
-        if (trackball_down > 0)  { trackball_down--;  cur_state[0x82] = true; }
-        if (trackball_left > 0)  { trackball_left--;  cur_state[0x83] = true; }
-        if (trackball_right > 0) { trackball_right--; cur_state[0x84] = true; }
+        // Keyboard-only tick: carry the trackball's previous state forward so
+        // edge detection sees no change (no spurious press/release) and the
+        // momentum integration stays exclusively on the lower-rate full poll.
+        for (int i = 0x81; i <= 0x85; i++) cur_state[i] = prev_key_state[i];
     }
-    if (trackball_click > 0) { trackball_click = 0; cur_state[0x85] = true; }
 
     // Edge detection: generate press/release events for changed keys.
     // In passthrough mode (default), all keys are pushed as-is.
@@ -288,6 +312,72 @@ static void poll_input() {
 }
 
 // ---------------------------------------------------------------------------
+// Core 1 ELF input task
+// ---------------------------------------------------------------------------
+// While an ELF module runs, the game owns Core 0 entirely (the elf_run task,
+// and loopTask blocked behind it), so the only way to sample input is once
+// per game frame — which on a heavy cart collapses to ~10 reads/sec and drops
+// any keypress shorter than a frame. This task runs on Core 1 and reads the
+// keyboard at a fixed 100Hz regardless of what the game is doing, queuing
+// edges into the same kq ring host_get_key drains. A tap is now caught and
+// latched even while Core 0 is mid-frame.
+//
+// I2C safety: _launch_elf blocks loopTask for the whole module run, so the
+// firmware's own keyboard scanning (the loop() path — untouched) is dormant;
+// this task is the sole I2C keyboard user between elf_input_start/stop, and
+// stop() returns only once it has fully exited, before loopTask resumes.
+//
+// The keyboard is read every tick (100Hz); the trackball's momentum model is
+// integrated only every 3rd tick (~33Hz) so its tuned feel is unchanged by
+// the higher keyboard rate (poll_input's kb_only path skips the trackball).
+
+#define ELF_INPUT_PERIOD_MS   10   // 100 Hz keyboard sampling
+#define ELF_INPUT_TRK_EVERY   3    // integrate trackball every Nth tick (~33 Hz)
+
+static void elf_input_task_body(void* param) {
+    (void)param;
+    TickType_t last = xTaskGetTickCount();
+    uint32_t tick = 0;
+    while (s_input_task_run) {
+        bool do_trackball = (tick % ELF_INPUT_TRK_EVERY) == 0;
+        poll_input(/*kb_only=*/!do_trackball);
+        tick++;
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(ELF_INPUT_PERIOD_MS));
+    }
+    s_input_task = nullptr;   // signal stop() that we've exited (no more I2C)
+    vTaskDelete(nullptr);
+}
+
+// Start the Core 1 input task. Resets the queue + edge state so the module
+// starts from a clean slate. Called from _launch_elf just before the module
+// runs; idempotent if already running.
+static void elf_input_start() {
+    if (s_input_task) return;
+    kq_head = kq_tail = 0;
+    memset(prev_key_state, 0, INPUT_STATE_SIZE);
+    esc_held = false;
+    s_input_task_run = true;
+    if (xTaskCreatePinnedToCore(elf_input_task_body, "elf_input", 3072,
+                                nullptr, 2, &s_input_task, 1 /* Core 1 */) != pdPASS) {
+        // Couldn't spawn — fall back to host_get_key's own polling.
+        s_input_task = nullptr;
+        s_input_task_run = false;
+        SLog.println("[elf_host] WARN: input task spawn failed, using per-frame polling");
+    }
+}
+
+// Stop the Core 1 input task and wait for it to fully exit before returning,
+// so no I2C read is in flight when loopTask resumes its own keyboard scan.
+static void elf_input_stop() {
+    if (!s_input_task) return;
+    s_input_task_run = false;
+    for (int i = 0; i < 100 && s_input_task; i++) {  // ~200ms safety cap
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    s_input_task = nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // Host function implementations
 // ---------------------------------------------------------------------------
 
@@ -312,8 +402,18 @@ void host_blit_frame(const uint16_t* rgb565, int w, int h) {
 // ── Async blit ───────────────────────────────────────────────────────────────
 // A Core-1 task owns the (blocking) SPI push so the module keeps running on
 // Core 0 during the transfer. The module double-buffers and hands over a
-// frame pointer; back-pressure is one frame deep. Priority 2 keeps it below
-// the sound task (3) so audio mixing preempts the push.
+// frame pointer; back-pressure is one frame deep.
+//
+// Priority 3 (tied with the sound task, above the mesh task at 2). At the old
+// priority 2 the push lost CPU to both synth (3) and the radio task (2) and to
+// the shared spi_bus_mutex, so an ~11.5 ms transfer couldn't finish inside a
+// 50-72 ms Core-0 step — Core 0 then stalled ~a full transfer every frame
+// (blitwait ~= 11.5 ms). At 3 it preempts the radio task and, via the mutex's
+// priority inheritance, gets the SPI bus released to it sooner; tied with synth
+// (which is mostly blocked waiting on I2S) keeps audio fed. DMA isn't an option
+// here: the TFT shares one register-level SPI bus with the radio and SD, so
+// TFT_eSPI initDMA() would install the esp-idf driver on it and break them.
+// If audio underruns/crackles after this, drop back to 2.
 static TaskHandle_t      s_blit_task = nullptr;
 static SemaphoreHandle_t s_blit_idle = nullptr;   // given when no push in flight
 static const uint16_t* volatile s_blit_buf = nullptr;
@@ -336,7 +436,7 @@ void host_blit_frame_async(const uint16_t* rgb565, int w, int h) {
             xSemaphoreGive(s_blit_idle);
         }
         xTaskCreatePinnedToCore(blit_task_body, "elf_blit", 4096, nullptr,
-                                2, &s_blit_task, 1 /* Core 1 */);
+                                3, &s_blit_task, 1 /* Core 1 */);
         if (!s_blit_task) { host_blit_frame(rgb565, w, h); return; }
     }
     // Wait until the previous frame is on the wire — after this the caller's
@@ -378,7 +478,9 @@ void host_sleep_ms(uint32_t ms) {
 }
 
 int host_get_key(int* pressed, unsigned char* key) {
-    poll_input();
+    // Normally the Core 1 input task fills the queue; only self-poll if that
+    // task isn't running (spawn failed), so the queue never has two producers.
+    if (!s_input_task) poll_input();
     KeyEvent ev;
     if (kq_pop(&ev)) {
         *pressed = ev.pressed;
@@ -449,7 +551,7 @@ int host_write_file(const char* path, const void* data, uint32_t size) {
 }
 
 void host_log(const char* msg) {
-    Serial.printf("[elf_mod] %s\n", msg);
+    SLog.printf("[elf_mod] %s\n", msg);
 }
 
 // Module-callable internal-heap integrity probe. Prints the tag FIRST, so if
@@ -1129,7 +1231,7 @@ static void elf_set_core1_handlers(bool install) {
     TaskHandle_t t = nullptr;
     bool ok = (xTaskCreatePinnedToCore(elf_c1_op_task, "elf_c1op", 2560, &op, 10, &t, 1) == pdPASS);
     if (ok) xSemaphoreTake(done, portMAX_DELAY);
-    Serial.printf("[elf_host] Core1 fault handlers %s (%s)\n",
+    SLog.printf("[elf_host] Core1 fault handlers %s (%s)\n",
                   install ? "installed" : "restored", ok ? "ok" : "TASK-CREATE-FAILED");
     vSemaphoreDelete(done);
 }
@@ -1139,7 +1241,7 @@ static void elf_run_task(void* param) {
 
     // Report current SP so a fault address can be compared against the stack range.
     uint32_t sp_top = (uint32_t)__builtin_frame_address(0);
-    Serial.printf("[elf_host] elf_run task started, SP~0x%x\n", sp_top);
+    SLog.printf("[elf_host] elf_run task started, SP~0x%x\n", sp_top);
 
     // Intercept module faults on Core 0 (Core 1 is set up separately by caller).
     elf_install_handlers(0);
@@ -1150,7 +1252,7 @@ static void elf_run_task(void* param) {
     elf_restore_handlers(0);
 
     // High-water mark tells us how close we came to overflowing (for tuning).
-    Serial.printf("[elf_host] module task finished (result=%d), min stack free: %u bytes\n",
+    SLog.printf("[elf_host] module task finished (result=%d), min stack free: %u bytes\n",
                   ctx->result, (unsigned)uxTaskGetStackHighWaterMark(NULL));
     xSemaphoreGive(ctx->done);
     vTaskDelete(NULL);
@@ -1173,8 +1275,8 @@ static int lua_launch_elf(lua_State* L) {
     }
     argv[argc] = NULL;
 
-    Serial.printf("[elf_host] loading %s\n", path);
-    Serial.printf("[elf_host] PSRAM free: %u, largest block: %u\n",
+    SLog.printf("[elf_host] loading %s\n", path);
+    SLog.printf("[elf_host] PSRAM free: %u, largest block: %u\n",
                   heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                   heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 
@@ -1187,7 +1289,7 @@ static int lua_launch_elf(lua_State* L) {
         lua_pushstring(L, "failed to read ELF file");
         return 2;
     }
-    Serial.printf("[elf_host] read %u bytes\n", elf_size);
+    SLog.printf("[elf_host] read %u bytes\n", elf_size);
 
     // Suspend LVGL, mesh task, BLE companion, and watchdog for module execution.
     lvgl_ticker.detach();
@@ -1202,7 +1304,7 @@ static int lua_launch_elf(lua_State* L) {
         REG_WRITE(TIMG_WDTCONFIG0_REG(1), before & ~(1U << 31));  // clear EN bit 31
         uint32_t after = REG_READ(TIMG_WDTCONFIG0_REG(1));
         REG_WRITE(TIMG_WDTWPROTECT_REG(1), 0);            // re-lock
-        Serial.printf("[elf_host] TG1 WDT: before=0x%08x after=0x%08x\n", before, after);
+        SLog.printf("[elf_host] TG1 WDT: before=0x%08x after=0x%08x\n", before, after);
     }
     // Sound stays active — module audio is routed through the firmware's mixer
     // via host_audio_push() → sound_extern_push().
@@ -1229,16 +1331,16 @@ static int lua_launch_elf(lua_State* L) {
     if (keymap_str && strcmp(keymap_str, "passthrough") == 0) {
         keymap_passthrough = true;
         memset(keymap_table, 0, sizeof(keymap_table));
-        Serial.println("[elf_host] keymap: passthrough (raw key codes)");
+        SLog.println("[elf_host] keymap: passthrough (raw key codes)");
     } else if (keymap_str) {
         keymap_passthrough = false;
         parse_keymap_arg(keymap_str);
-        Serial.printf("[elf_host] keymap: custom (%d chars)\n", (int)strlen(keymap_str));
+        SLog.printf("[elf_host] keymap: custom (%d chars)\n", (int)strlen(keymap_str));
     } else {
         // No -keymap argument: default to passthrough
         keymap_passthrough = true;
         memset(keymap_table, 0, sizeof(keymap_table));
-        Serial.println("[elf_host] keymap: passthrough (default)");
+        SLog.println("[elf_host] keymap: passthrough (default)");
     }
 
     // Parse trackball momentum settings: "enabled,impulse*10,friction*100,threshold*10"
@@ -1251,7 +1353,7 @@ static int lua_launch_elf(lua_State* L) {
         trk_impulse  = imp / 10.0f;
         trk_friction = fri / 100.0f;
         trk_thresh   = thr / 10.0f;
-        Serial.printf("[elf_host] trackball: momentum=%d impulse=%.1f friction=%.2f thresh=%.1f\n",
+        SLog.printf("[elf_host] trackball: momentum=%d impulse=%.1f friction=%.2f thresh=%.1f\n",
                       trk_momentum, trk_impulse, trk_friction, trk_thresh);
     } else {
         // Defaults
@@ -1272,18 +1374,23 @@ static int lua_launch_elf(lua_State* L) {
 
     // Dump mesh object pointer region to detect corruption
     extern PunkMesh* the_mesh;
-    Serial.printf("[elf_host] the_mesh=%p, first 16 bytes:", the_mesh);
+    SLog.printf("[elf_host] the_mesh=%p, first 16 bytes:", the_mesh);
     if (the_mesh) {
         uint8_t* p = (uint8_t*)the_mesh;
-        for (int i = 0; i < 16; i++) Serial.printf(" %02x", p[i]);
+        for (int i = 0; i < 16; i++) SLog.printf(" %02x", p[i]);
     }
-    Serial.println();
+    SLog.println();
 
     int result = -1;
     if (mod) {
-        Serial.printf("[elf_host] heap OK before run: %s\n",
+        SLog.printf("[elf_host] heap OK before run: %s\n",
                       heap_caps_check_integrity(MALLOC_CAP_SPIRAM, false) ? "yes" : "NO!");
-        Serial.printf("[elf_host] the_mesh at: 0x%08x\n", (uint32_t)the_mesh);
+        SLog.printf("[elf_host] the_mesh at: 0x%08x\n", (uint32_t)the_mesh);
+
+        // Start the Core 1 keyboard sampler so input stays responsive even
+        // while the module pins Core 0 (see elf_input_task_body). Stopped
+        // below before this call returns and loopTask resumes its own scan.
+        elf_input_start();
 
         // Run the module on a dedicated large-stack task pinned to Core 0
         // (the UI core; LVGL is suspended and mesh is paused, so Core 0 is
@@ -1302,22 +1409,26 @@ static int lua_launch_elf(lua_State* L) {
                     &ctx, 1 /* priority == loopTask */, &task, 0 /* Core 0 */);
                 if (ok == pdPASS) {
                     stack_used = candidate;
-                    Serial.printf("[elf_host] task created with %uKB stack\n", candidate / 1024);
+                    SLog.printf("[elf_host] task created with %uKB stack\n", candidate / 1024);
                     break;
                 }
-                Serial.printf("[elf_host] %uKB stack failed, trying smaller...\n", candidate / 1024);
+                SLog.printf("[elf_host] %uKB stack failed, trying smaller...\n", candidate / 1024);
             }
         }
         if (ok == pdPASS) {
             xSemaphoreTake(done, portMAX_DELAY); // wait for module to return
             result = ctx.result;
-            Serial.printf("[elf_host] module returned %d\n", result);
+            SLog.printf("[elf_host] module returned %d\n", result);
         } else {
             result = -2; // distinct from -1 (module ran but exit() called)
-            Serial.printf("[elf_host] FAILED to create module task — largest internal block: %u bytes\n",
+            SLog.printf("[elf_host] FAILED to create module task — largest internal block: %u bytes\n",
                           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         }
         if (done) vSemaphoreDelete(done);
+        // Stop the Core 1 keyboard sampler and wait for it to exit before any
+        // further cleanup, so its I2C reads can't overlap loopTask's once the
+        // firmware's own keyboard scan resumes.
+        elf_input_stop();
         // The pull callback (and the Audio state it reads) lives in module
         // memory; unregister before any of it is freed. Blocks until the
         // mixer is outside the callback. The module normally does this in
@@ -1326,7 +1437,7 @@ static int lua_launch_elf(lua_State* L) {
         blit_drain();  // an async push may still be reading module BSS
         elf_unload(mod);
     } else {
-        Serial.println("[elf_host] elf_load failed");
+        SLog.println("[elf_host] elf_load failed");
     }
 
     free(argv);
@@ -1346,7 +1457,7 @@ static int lua_launch_elf(lua_State* L) {
     // Reset audio rate tracking so the next module's first push sets it fresh
     s_audio_last_rate = 0;
 
-    Serial.printf("[elf_host] PSRAM after cleanup: %u free, largest block: %u\n",
+    SLog.printf("[elf_host] PSRAM after cleanup: %u free, largest block: %u\n",
                   heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                   heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 

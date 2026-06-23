@@ -12,24 +12,36 @@
 
 #include "synth.h"
 
-#include <cmath>     // std::fabs, std::fmod
-#include <cstdlib>   // rand
+#include <cmath>     // std::fabs
+#include <cstdint>   // uint32_t
 
 namespace z8
 {
 
-// Simple random function returning float in range [-1, 1]
-static float rand_float()
+// Fast positive-float fractional parts. For 0 <= x < 2^31 these are bit-exact
+// equal to fmod(x,1) / fmod(x,2) but skip the software fmod() call, which
+// otherwise ran on every per-sample, per-channel waveform evaluation.
+static inline float fract1(float x) { return x - (float)(int)x; }
+static inline float fract2(float x) { return x - 2.f * (float)(int)(x * 0.5f); }
+
+// Noise PRNG. Replaces rand()/RAND_MAX (a libc call plus a per-sample divide)
+// with an inline xorshift mapped to a uniform [-1,1). Different sequence than
+// rand() but the same distribution, so noise/drums sound the same.
+static uint32_t s_noise_rng = 0x2545F491u;
+static inline float rand_float()
 {
-    return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+    uint32_t x = s_noise_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    s_noise_rng = x;
+    return (float)(x >> 8) * (1.0f / 8388608.0f) - 1.0f; // (x>>8)/2^23 - 1 -> [-1,1)
 }
 
 float synth::waveform(synth_param &params)
 {
-    using std::fabs, std::fmod;
+    using std::fabs;
 
     float advance = params.phi;
-    float t = fmod(advance, 1.f);
+    float t = fract1(advance);
     float ret = 0.f;
 
     bool noiz = params.filters & 0x2;
@@ -60,7 +72,7 @@ float synth::waveform(synth_param &params)
         case INST_SAW:
             ret = (t < 0.5f ? t : t - 1.f);
             // slight offset looping on 2x period
-            if (buzz) ret = ret * 0.83f - (fabs(fmod(advance, 2.f) - 1.0f) < 0.5 ? 0.085f : 0.0f);
+            if (buzz) ret = ret * 0.83f - (fabs(fract2(advance) - 1.0f) < 0.5 ? 0.085f : 0.0f);
             return 0.653f * ret;
         case INST_SQUARE:
             return t < (buzz ? 0.4f : 0.5f) ? 0.25f : -0.25f;
@@ -102,14 +114,14 @@ float synth::waveform(synth_param &params)
             // the ratio between the frequency seems to be around 110 for c2
             // but it is 97 for c0 and 127 for c5, not sure how to adjust that
             ret = 2.f - fabs(8.f * t - 4.f);
-            ret += 1.f - fabs(4.f * fmod(advance * 109.f/110.f, 1.f) - 2.f);
+            ret += 1.f - fabs(4.f * fract1(advance * (109.f/110.f)) - 2.f);
             if (buzz)
             {
                 // original triangle has freq 1, 3, 5, 7, 9 ...
                 // add waves at 2, 6, 10, 14
-                ret += 0.25f - fabs(1.f * fmod(advance * 2.0f + 0.5f, 1.f) - 0.5f);
+                ret += 0.25f - fabs(1.f * fract1(advance * 2.0f + 0.5f) - 0.5f);
                 // add waves at 4, 12, 20, 28
-                ret += 0.125f - fabs(0.5f * fmod(advance * 4.0f, 1.f) - 0.25f);
+                ret += 0.125f - fabs(0.5f * fract1(advance * 4.0f) - 0.25f);
             }
             return ret / 6.f;
         }

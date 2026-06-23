@@ -22,7 +22,12 @@ extern int g_p8_audio_mode;
 // on FPUs without hardware divide/exp these expressions dominate the mix cost.
 static float s_key_freq_lut[64];          // key_to_freq(0..63)
 static float s_offset_per_second_lut[256]; // 22050/(183*speed), speed 1..255
+static float s_vol_lut[8];                 // getVolume()/7 (0..7), avoids a per-sample divide
 static float key_to_freq(float key);
+
+// Fast positive-float fractional part (== fmodf(x,1) for 0<=x<2^31), skips the
+// software fmodf() call on the per-sample, per-channel effect/phase path.
+static inline float fract1f(float x) { return x - (float)(int)x; }
 
 Audio::Audio(PicoRam* memory){
     _memory = memory;
@@ -33,6 +38,8 @@ Audio::Audio(PicoRam* memory){
     s_offset_per_second_lut[0] = 22050.0f / 183.0f; // speed clamped to >= 1
     for (int s = 1; s < 256; s++)
         s_offset_per_second_lut[s] = 22050.0f / (183.0f * s);
+    for (int v = 0; v < 8; v++)
+        s_vol_lut[v] = (float)v / 7.f;
 
     resetAudioState();
 }
@@ -490,7 +497,7 @@ void Audio::update_sfx_state(sfx_state& cur_sfx, z8::synth_param& new_synth,
         int const next_note_id = (int)next_offset;
 
         uint8_t key = sfx_data.notes[note_id].getKey();
-        float volume = sfx_data.notes[note_id].getVolume() / 7.f;
+        float volume = s_vol_lut[sfx_data.notes[note_id].getVolume() & 7];
         float freq = s_key_freq_lut[key & 63] * freq_factor;
 
         if (volume > 0.f)
@@ -504,7 +511,7 @@ void Audio::update_sfx_state(sfx_state& cur_sfx, z8::synth_param& new_synth,
                 break;
             case FX_SLIDE:
             {
-                float t = fmodf(offset, 1.0f);
+                float t = fract1f(offset);
                 // From the documentation: "Slide to the next note and volume",
                 // but it's actually _from_ the _prev_ note and volume.
                 freq = lerp(s_key_freq_lut[cur_sfx.prev_key & 63], freq, t);
@@ -516,19 +523,19 @@ void Audio::update_sfx_state(sfx_state& cur_sfx, z8::synth_param& new_synth,
             {
                 // 7.5f and 0.25f were found empirically by matching
                 // frequency graphs of PICO-8 instruments.
-                float t = fabsf(fmodf(7.5f * offset / offset_per_second, 1.0f)) - 0.5f - 0.25f;
+                float t = fabsf(fract1f(7.5f * offset / offset_per_second)) - 0.5f - 0.25f;
                 // Vibrato half a semi-tone, so multiply by pow(2,1/12)
                 freq = lerp(freq, freq * 1.059463094359f, t);
                 break;
             }
             case FX_DROP:
-                freq *= 1.f - fmodf(offset, 1.0f);
+                freq *= 1.f - fract1f(offset);
                 break;
             case FX_FADE_IN:
-                volume *= fmodf(offset, 1.0f);
+                volume *= fract1f(offset);
                 break;
             case FX_FADE_OUT:
-                volume *= 1.f - fmodf(offset, 1.0f);
+                volume *= 1.f - fract1f(offset);
                 break;
             case FX_ARP_FAST:
             case FX_ARP_SLOW:
@@ -561,7 +568,7 @@ void Audio::update_sfx_state(sfx_state& cur_sfx, z8::synth_param& new_synth,
         if (next_note_id != note_id)
         {
             cur_sfx.prev_key = sfx_data.notes[note_id].getKey();
-            cur_sfx.prev_vol = sfx_data.notes[note_id].getVolume() / 7.f;
+            cur_sfx.prev_vol = s_vol_lut[sfx_data.notes[note_id].getVolume() & 7];
         }
         // Do NOT rebase phi here to fight float-ulp drift on held notes:
         // the detune/phaser second waves derive their phase as phi*factor
@@ -778,11 +785,11 @@ void Audio::FillAudioBuffer(void *audioBuffer, size_t offset, size_t size){
                 // fade only partially masks. Own mode so its audibility can
                 // be A/B'd on speaker.
                 if (g_p8_audio_mode == 3) {
-                    float const w = new_synth.phi - std::fmod(new_synth.phi, 1.0f);
+                    float const w = (float)(int)new_synth.phi; // floor(phi) for phi>=0
                     new_synth.phi -= w;
                     new_synth.last_advance -= w;
                 } else {
-                    new_synth.phi = std::fmod(new_synth.phi, 1.0f);
+                    new_synth.phi = fract1f(new_synth.phi);
                 }
             }
             last_synth = new_synth;
@@ -1034,11 +1041,11 @@ void Audio::FillMonoAudioBuffer(void *audioBuffer, size_t offset, size_t size){
                 // fade only partially masks. Own mode so its audibility can
                 // be A/B'd on speaker.
                 if (g_p8_audio_mode == 3) {
-                    float const w = new_synth.phi - std::fmod(new_synth.phi, 1.0f);
+                    float const w = (float)(int)new_synth.phi; // floor(phi) for phi>=0
                     new_synth.phi -= w;
                     new_synth.last_advance -= w;
                 } else {
-                    new_synth.phi = std::fmod(new_synth.phi, 1.0f);
+                    new_synth.phi = fract1f(new_synth.phi);
                 }
             }
             last_synth = new_synth;

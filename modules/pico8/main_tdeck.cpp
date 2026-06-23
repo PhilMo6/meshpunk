@@ -20,6 +20,7 @@ extern "C" {
     extern void     host_check_heap(const char* tag);
 
     extern int  printf(const char*, ...);
+    extern int  snprintf(char*, size_t, const char*, ...);
     extern void free(void*);
     extern void* malloc(size_t);
 }
@@ -110,8 +111,6 @@ extern "C" int main(int argc, char** argv) {
     }
 
     vm->vm_run();
-
-    host_check_heap("post-cart-load");  // corruption-hunt baseline
 
     // Main loop — GameLoop handles input, update, draw, and frame timing.
     // It calls host->shouldRunMainLoop() each frame, which checks host_should_exit().

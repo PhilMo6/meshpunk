@@ -5090,10 +5090,6 @@ void setup() {
     fs_mounted = true;
     SLog.println("LittleFS mounted successfully");
 
-    // Save any module crash stashed in RTC by the previous boot before
-    // anything else touches LittleFS.
-    elf_crashlog_check_and_save();
-
     SLog.println("LittleFS contents:");
     listDir(LittleFS, "/lua");
 

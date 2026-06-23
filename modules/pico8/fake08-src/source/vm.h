@@ -43,6 +43,11 @@ class Vm {
     int _targetFps;
 
     int _picoFrameCount;
+    // Frame of the last input drain — update_buttons() is called twice per
+    // frame (glue before _update, then flip() after _draw); draining only
+    // once per frame keeps a mid-frame press edge from being consumed by the
+    // redundant call. -1 so the first frame always drains.
+    int _lastInputFrame = -1;
     //bool _hasUpdate;
     //bool _hasDraw;
 

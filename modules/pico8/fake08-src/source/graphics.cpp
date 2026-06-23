@@ -92,6 +92,11 @@ void Graphics::copySpriteToScreen(
 	const uint8_t writeMask = hwState.colorBitmask & 15;
 	const uint8_t readMask = hwState.colorBitmask >> 4;
 
+	// Default (no colorBitmask): the read-modify mask below resolves to the
+	// source color unchanged, so skip the per-pixel screen read + mask math
+	// entirely. This is the common case for every spr() and map() tile.
+	const bool noMask = (hwState.colorBitmask == 0xff);
+
 	scr_x -= drawState.camera_x;
 	scr_y -= drawState.camera_y;
 
@@ -167,17 +172,19 @@ void Graphics::copySpriteToScreen(
 				if (!(drawState.drawPaletteMap[lc] >> 4)){
 					lc = drawState.drawPaletteMap[lc] & 0x0f;
 
-					int screenPixelIdx = COMBINED_IDX(finalx, finaly);
-					if (lastScreenBuffIdx != screenPixelIdx) {
-						lastScreenBuffByte = screenBuffer[screenPixelIdx];
-						lastScreenBuffIdx = screenPixelIdx;
+					if (!noMask) {
+						int screenPixelIdx = COMBINED_IDX(finalx, finaly);
+						if (lastScreenBuffIdx != screenPixelIdx) {
+							lastScreenBuffByte = screenBuffer[screenPixelIdx];
+							lastScreenBuffIdx = screenPixelIdx;
+						}
+
+						uint8_t source = (BITMASK(0) & finalx) == 0
+							? lastScreenBuffByte & 0x0f //just first 4 bits
+							: lastScreenBuffByte >> 4;
+
+						lc = (source & ~writeMask) | (lc & writeMask & readMask);
 					}
-
-					uint8_t source = (BITMASK(0) & finalx) == 0 
-						? lastScreenBuffByte & 0x0f //just first 4 bits
-						: lastScreenBuffByte >> 4;
-
-					lc = (source & ~writeMask) | (lc & writeMask & readMask);
 
 					setPixelNibble(finalx, finaly, lc, screenBuffer);
 				}
@@ -195,17 +202,19 @@ void Graphics::copySpriteToScreen(
 				if (!(drawState.drawPaletteMap[rc] >> 4)){
 					rc = drawState.drawPaletteMap[rc] & 0x0f;
 
-					int screenPixelIdx = COMBINED_IDX(finalx, finaly);
-					if (lastScreenBuffIdx != screenPixelIdx) {
-						lastScreenBuffByte = screenBuffer[screenPixelIdx];
-						lastScreenBuffIdx = screenPixelIdx;
+					if (!noMask) {
+						int screenPixelIdx = COMBINED_IDX(finalx, finaly);
+						if (lastScreenBuffIdx != screenPixelIdx) {
+							lastScreenBuffByte = screenBuffer[screenPixelIdx];
+							lastScreenBuffIdx = screenPixelIdx;
+						}
+
+						uint8_t source = (BITMASK(0) & finalx) == 0
+							? lastScreenBuffByte & 0x0f //just first 4 bits
+							: lastScreenBuffByte >> 4;
+
+						rc = (source & ~writeMask) | (rc & writeMask & readMask);
 					}
-
-					uint8_t source = (BITMASK(0) & finalx) == 0 
-						? lastScreenBuffByte & 0x0f //just first 4 bits
-						: lastScreenBuffByte >> 4;
-
-					rc = (source & ~writeMask) | (rc & writeMask & readMask);
 
 					setPixelNibble(finalx, finaly, rc, screenBuffer);
 				}
@@ -1911,11 +1920,19 @@ void Graphics::map(int celx, int cely, int sx, int sy, int celw, int celh) {
 }
 
 void Graphics::map(int celx, int cely, int sx, int sy, int celw, int celh, uint8_t layer) {
+	// Hoist the sprite-sheet pointer out of the per-tile loop and blit each
+	// 8x8 tile straight through copySpriteToScreen, skipping spr()'s per-call
+	// overhead: two software fix32 multiplies (w*8, h*8) and the sprite-buffer
+	// accessor branch chain — paid 256x/frame on a full-screen tile draw.
+	uint8_t* spriteBuffer = GetP8SpriteSheetBuffer();
 	for (int y = 0; y < celh; y++) {
 		for (int x = 0; x < celw; x++) {
 			uint8_t cell = mget(celx + x, cely + y);
 			if (cell && ((layer == 0) || (fget(cell) & layer))) {
-				spr(cell, sx + x * 8, sy + y * 8);
+				int spr_x = (cell % 16) * 8;
+				int spr_y = (cell / 16) * 8;
+				copySpriteToScreen(spriteBuffer, sx + x * 8, sy + y * 8,
+				                   spr_x, spr_y, 8, 8, false, false);
 			}
 		}
 	}

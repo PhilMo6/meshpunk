@@ -107,21 +107,6 @@ int g_p8_audio_mode = 0;
 static uint32_t s_last_frame_ms = 0;
 static uint32_t s_target_frame_ms = 16; // ~60 fps
 
-// ---------------------------------------------------------------------------
-// Perf stats — averaged over 300-frame windows, printed to serial
-// ---------------------------------------------------------------------------
-static uint32_t s_perf_frames    = 0;
-static uint32_t s_perf_window_t0 = 0;  // us timestamp of window start
-static uint32_t s_step_us  = 0;        // Step() (Lua update+draw calls)
-static uint32_t s_scale_us = 0;        // 128->240 palette expansion
-static uint32_t s_blit_us  = 0;        // wait for previous async blit only
-static uint32_t s_work_us  = 0;        // whole frame minus the fps-cap sleep
-static uint32_t s_frame_start_us = 0;  // set when waitForTargetFps returns
-// Written by the pull callback on Core 1, read/reset by the stats print on
-// Core 0 — stats-only, a lost increment at a window boundary is fine.
-static volatile uint32_t s_synth_us = 0;       // synth time, now on Core 1
-static volatile uint32_t s_audio_samples = 0;  // samples pulled by the mixer
-
 // Input state — accumulated from host_get_key polling
 static uint8_t s_keys_down = 0;
 static uint8_t s_keys_held = 0;
@@ -172,11 +157,6 @@ void Host::oneTimeSetup(Audio* audio) {
     host_clear_screen();
 
     s_last_frame_ms = host_get_ticks_ms();
-    s_frame_start_us = 0;
-    s_perf_frames = 0;
-    s_perf_window_t0 = host_get_ticks_us();
-    s_step_us = s_scale_us = s_blit_us = s_synth_us = s_work_us = 0;
-    s_audio_samples = 0;
 
     g_p8_audio_mode = 0;
     {
@@ -286,10 +266,6 @@ InputState_t Host::scanInput() {
 // ---------------------------------------------------------------------------
 
 void Host::drawFrame(uint8_t* picoFb, uint8_t* screenPaletteMap, uint8_t drawMode) {
-    uint32_t t0 = host_get_ticks_us();
-    if (s_frame_start_us != 0)
-        s_step_us += t0 - s_frame_start_us;
-
     uint16_t* fb = s_framebuf[s_fb_idx];
 
     // Per-frame palette: nibble (0-15) -> swapped RGB565 via the screen map
@@ -330,14 +306,11 @@ void Host::drawFrame(uint8_t* picoFb, uint8_t* screenPaletteMap, uint8_t drawMod
         }
         prev_row = row;
     }
-    uint32_t t1 = host_get_ticks_us();
-    s_scale_us += t1 - t0;
 
     // Hand the finished buffer to the Core-1 blit task and flip; only waits
     // if the previous frame's SPI push is still in flight.
     host_blit_frame_async(fb, FB_SIZE, FB_SIZE);
     s_fb_idx ^= 1;
-    s_blit_us += host_get_ticks_us() - t1;
 }
 
 // ---------------------------------------------------------------------------
@@ -349,31 +322,6 @@ void Host::waitForTargetFps() {
     check_ram_guards();
 
 
-    uint32_t now_us = host_get_ticks_us();
-    if (s_frame_start_us != 0) {
-        s_work_us += now_us - s_frame_start_us;
-        s_perf_frames++;
-        if (s_perf_frames >= 300) {
-            uint32_t window_us = now_us - s_perf_window_t0;
-            float n = (float)s_perf_frames;
-            printf("[pico8 perf] fps=%.1f work=%.1f step=%.1f scale=%.1f blitwait=%.1f synth=%.1f ms/f audio=%u smp/s\n",
-                   n * 1e6f / (float)window_us,
-                   s_work_us  / n / 1000.0f,
-                   s_step_us  / n / 1000.0f,
-                   s_scale_us / n / 1000.0f,
-                   s_blit_us  / n / 1000.0f,
-                   s_synth_us / n / 1000.0f,
-                   (unsigned)((uint64_t)s_audio_samples * 1000000u / window_us));
-            s_perf_frames = 0;
-            s_perf_window_t0 = now_us;
-            s_step_us = s_scale_us = s_blit_us = s_synth_us = s_work_us = 0;
-            s_audio_samples = 0;
-            // (The per-window host_check_heap walk is gone: it cost a ~12ms
-            // frame hiccup every 10s, and the firmware's HEAP_HUNT ambient
-            // walks cover detection at 250ms cadence from Core 1.)
-        }
-    }
-
     uint32_t now = host_get_ticks_ms();
     uint32_t elapsed = now - s_last_frame_ms;
 
@@ -382,7 +330,6 @@ void Host::waitForTargetFps() {
     }
 
     s_last_frame_ms = host_get_ticks_ms();
-    s_frame_start_us = host_get_ticks_us();
 }
 
 double Host::deltaTMs() {
@@ -400,10 +347,7 @@ double Host::deltaTMs() {
 // pacing: the I2S pipeline's own consumption is the clock now. Must not
 // block or allocate (the host's module-alloc tracker is single-task).
 static void audio_pull_cb(int16_t* out, int count) {
-    uint32_t t0 = host_get_ticks_us();
     s_audio_obj->FillMonoAudioBuffer(out, 0, (size_t)count);
-    s_synth_us += host_get_ticks_us() - t0;
-    s_audio_samples += (uint32_t)count;
 }
 
 // The GameLoop fill path is dead with pull-model audio registered.

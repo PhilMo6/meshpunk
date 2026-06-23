@@ -571,24 +571,80 @@ void luaV_finishOp (lua_State *L) {
         } \
         else { Protect(luaV_arith(L, ra, rb, rb, tm)); } }
 
-#define vmdispatch(o)	switch(o)
-#define vmcase(l,b)	case l: {b}  break;
-#define vmcasenb(l,b)	case l: {b}		/* nb = no break */
+// Per-instruction fetch (shared by the switch and computed-goto dispatchers).
+#define vmfetch() { \
+    i = *(ci->u.l.savedpc++); \
+    if ((L->hookmask & (LUA_MASKLINE | LUA_MASKCOUNT)) && \
+        (--L->hookcount == 0 || L->hookmask & LUA_MASKLINE)) { \
+      Protect(traceexec(L)); \
+    } \
+    /* WARNING: several calls may realloc the stack and invalidate `ra' */ \
+    ra = RA(i); \
+    lua_assert(base == ci->u.l.base); \
+    lua_assert(base <= L->top && L->top < L->stack + L->stacksize); }
 
-//turn off optimizations for this method.
-//OP_FORLOOP doesn't correctly detect wrapping in certain cases if optimization is on and aggressive
-#if __clang__
-[[clang::optnone]]
-void luaV_execute (lua_State *L) {
-#elif __GNUC__
-void __attribute__((optimize("O0"))) luaV_execute (lua_State *L) {
+// On GCC use a computed-goto jump table: a separate indirect branch per
+// opcode (better prediction) and no switch range check. The table is built
+// at runtime from &&label (see luaV_execute) so it needs no relocated static
+// data, and is keyed by opcode so the order can never drift from the enum.
+// Define LUA_NO_COMPUTED_GOTO to fall back to the plain switch (debug escape).
+#if defined(__GNUC__) && !defined(LUA_NO_COMPUTED_GOTO)
+#define LUA_USE_COMPUTED_GOTO
+#define vmdispatch(o)	goto *disptab[o];
+#define vmcase(l,b)	L_##l: { b } vmbreak
+#define vmcasenb(l,b)	L_##l: { b }		/* nb = no break (falls through) */
+#define vmbreak		vmfetch(); vmdispatch(GET_OPCODE(i));
 #else
-void luaV_execute (lua_State *L) {
+#define vmdispatch(o)	switch(o)
+#define vmcase(l,b)	case l: { b } vmbreak
+#define vmcasenb(l,b)	case l: { b }		/* nb = no break */
+#define vmbreak		break;
 #endif
+
+// luaV_execute runs at the file's -O2 (z8lua builds -O2). The OP_FORLOOP
+// integer-overflow wrap check below needs idx=old+step to actually wrap on
+// signed overflow; that is guaranteed by -fwrapv in COMMON_FLAGS, so the old
+// -O0 pin (which forced the same behavior before -fwrapv existed) is no
+// longer needed and was costing the whole interpreter loop its optimization
+// (fix32 ops weren't inlined). If a for-loop-heavy cart ever hangs or
+// mis-bounds, restore the -O0 attribute here, or harden the wrap test alone.
+void luaV_execute (lua_State *L) {
   CallInfo *ci = L->ci;
   LClosure *cl;
   TValue *k;
   StkId base;
+  Instruction i;
+  StkId ra;
+#ifdef LUA_USE_COMPUTED_GOTO
+  // Built once per entry from &&label (the running instruction-side address),
+  // assigned by opcode index so it is correct regardless of the case order
+  // below (z8lua's enum order differs — e.g. OP_NOT vs OP_PEEK). Explicit
+  // assignment because C++ rejects designated initializers with runtime
+  // values. The array has no initializer, so `goto newframe` may legally jump
+  // past it; the values set on the initial entry persist across frame changes.
+  void *disptab[NUM_OPCODES];
+  disptab[OP_MOVE]=&&L_OP_MOVE; disptab[OP_LOADK]=&&L_OP_LOADK; disptab[OP_LOADKX]=&&L_OP_LOADKX;
+  disptab[OP_LOADBOOL]=&&L_OP_LOADBOOL; disptab[OP_LOADNIL]=&&L_OP_LOADNIL;
+  disptab[OP_GETUPVAL]=&&L_OP_GETUPVAL; disptab[OP_GETTABUP]=&&L_OP_GETTABUP;
+  disptab[OP_GETTABLE]=&&L_OP_GETTABLE; disptab[OP_SETTABUP]=&&L_OP_SETTABUP;
+  disptab[OP_SETUPVAL]=&&L_OP_SETUPVAL; disptab[OP_SETTABLE]=&&L_OP_SETTABLE;
+  disptab[OP_NEWTABLE]=&&L_OP_NEWTABLE; disptab[OP_SELF]=&&L_OP_SELF;
+  disptab[OP_ADD]=&&L_OP_ADD; disptab[OP_SUB]=&&L_OP_SUB; disptab[OP_MUL]=&&L_OP_MUL;
+  disptab[OP_DIV]=&&L_OP_DIV; disptab[OP_MOD]=&&L_OP_MOD; disptab[OP_POW]=&&L_OP_POW;
+  disptab[OP_IDIV]=&&L_OP_IDIV; disptab[OP_BAND]=&&L_OP_BAND; disptab[OP_BOR]=&&L_OP_BOR;
+  disptab[OP_BXOR]=&&L_OP_BXOR; disptab[OP_SHL]=&&L_OP_SHL; disptab[OP_SHR]=&&L_OP_SHR;
+  disptab[OP_LSHR]=&&L_OP_LSHR; disptab[OP_ROTL]=&&L_OP_ROTL; disptab[OP_ROTR]=&&L_OP_ROTR;
+  disptab[OP_UNM]=&&L_OP_UNM; disptab[OP_BNOT]=&&L_OP_BNOT; disptab[OP_PEEK]=&&L_OP_PEEK;
+  disptab[OP_PEEK2]=&&L_OP_PEEK2; disptab[OP_PEEK4]=&&L_OP_PEEK4; disptab[OP_NOT]=&&L_OP_NOT;
+  disptab[OP_LEN]=&&L_OP_LEN; disptab[OP_CONCAT]=&&L_OP_CONCAT; disptab[OP_JMP]=&&L_OP_JMP;
+  disptab[OP_EQ]=&&L_OP_EQ; disptab[OP_LT]=&&L_OP_LT; disptab[OP_LE]=&&L_OP_LE;
+  disptab[OP_TEST]=&&L_OP_TEST; disptab[OP_TESTSET]=&&L_OP_TESTSET; disptab[OP_CALL]=&&L_OP_CALL;
+  disptab[OP_TAILCALL]=&&L_OP_TAILCALL; disptab[OP_RETURN]=&&L_OP_RETURN;
+  disptab[OP_FORLOOP]=&&L_OP_FORLOOP; disptab[OP_FORPREP]=&&L_OP_FORPREP;
+  disptab[OP_TFORCALL]=&&L_OP_TFORCALL; disptab[OP_TFORLOOP]=&&L_OP_TFORLOOP;
+  disptab[OP_SETLIST]=&&L_OP_SETLIST; disptab[OP_CLOSURE]=&&L_OP_CLOSURE;
+  disptab[OP_VARARG]=&&L_OP_VARARG; disptab[OP_EXTRAARG]=&&L_OP_EXTRAARG;
+#endif
  newframe:  /* reentry point when frame changes (call/return) */
   lua_assert(ci == L->ci);
   cl = clLvalue(ci->func);
@@ -596,16 +652,7 @@ void luaV_execute (lua_State *L) {
   base = ci->u.l.base;
   /* main loop of interpreter */
   for (;;) {
-    Instruction i = *(ci->u.l.savedpc++);
-    StkId ra;
-    if ((L->hookmask & (LUA_MASKLINE | LUA_MASKCOUNT)) &&
-        (--L->hookcount == 0 || L->hookmask & LUA_MASKLINE)) {
-      Protect(traceexec(L));
-    }
-    /* WARNING: several calls may realloc the stack and invalidate `ra' */
-    ra = RA(i);
-    lua_assert(base == ci->u.l.base);
-    lua_assert(base <= L->top && L->top < L->stack + L->stacksize);
+    vmfetch();
     vmdispatch (GET_OPCODE(i)) {
       vmcase(OP_MOVE,
         setobjs2s(L, ra, RB(i));
@@ -645,14 +692,26 @@ void luaV_execute (lua_State *L) {
         // an allowlist or something. Again, not really sure, don't really love this 
         // solution, but I guess it works for now.
         // Note that this was observed in Jan 2026, PICO-8 version 0.2.7, Ex-Terra dated 2024-09-23 fucntion called draw_gbullets_old
+        // Only the real global environment (_ENV) falls back to the sandbox.
+        // Lua compiles BOTH global reads (`_ENV.x`) AND captured-table field
+        // reads (`e.kl`, where `e` is a closure upvalue) to OP_GETTABUP, so
+        // the opcode alone can't tell them apart — distinguish by the
+        // upvalue's name. Without this guard a nil field on a captured table
+        // resolved to the same-named global: moonrace's `not e.kl` hit the
+        // global kill function `kl`, so its "press X to continue" gate could
+        // never fire (the finish-screen freeze). This is the twin of the
+        // OP_GETTABLE fallback removal that fixed prototype-OOP carts.
         if (ttisnil(ra) && ttisstring(RKC(i))) {
-          Table *reg = hvalue(&G(L)->l_registry);
-          TString *sandboxKey = luaS_newliteral(L, "__PICO8_SANDBOX");
-          const TValue *sandbox = luaH_getstr(reg, sandboxKey);
-          if (ttistable(sandbox)) {
-            const TValue *sandboxRes = luaH_get(hvalue(sandbox), RKC(i));
-            if (!ttisnil(sandboxRes)) {
-              setobj2s(L, ra, sandboxRes);
+          TString *uvname = (b < cl->p->sizeupvalues) ? cl->p->upvalues[b].name : NULL;
+          if (uvname && strcmp(getstr(uvname), "_ENV") == 0) {
+            Table *reg = hvalue(&G(L)->l_registry);
+            TString *sandboxKey = luaS_newliteral(L, "__PICO8_SANDBOX");
+            const TValue *sandbox = luaH_getstr(reg, sandboxKey);
+            if (ttistable(sandbox)) {
+              const TValue *sandboxRes = luaH_get(hvalue(sandbox), RKC(i));
+              if (!ttisnil(sandboxRes)) {
+                setobj2s(L, ra, sandboxRes);
+              }
             }
           }
         }

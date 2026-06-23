@@ -1322,6 +1322,21 @@ void Vm::api_srand(fix32 seed)
 }
 
 void Vm::update_buttons() {
+    // Drain input at most once per frame. The cart-loop glue calls this
+    // before _update(), then flip() calls it again after _draw() — both in
+    // the same Step (same _picoFrameCount). Draining twice lets flip()'s
+    // call consume a press edge that arrived mid-frame and zero KDown before
+    // the cart's next btnp() check, dropping the press (crippling at the low
+    // frame rates heavy carts hit — see moonrace/crowded_dungeon). Skipping
+    // the redundant same-frame call leaves each queued edge in place until
+    // the cart actually reads it (≤1 frame latency instead of a lost press).
+    // Manual-flip carts (no _update/_draw) call flip() once per Step, so each
+    // of their flips is a new frame and still drains.
+    if (_lastInputFrame == _picoFrameCount) {
+        return;
+    }
+    _lastInputFrame = _picoFrameCount;
+
     //get button states from hardware
     auto inputState = _host->scanInput();
     

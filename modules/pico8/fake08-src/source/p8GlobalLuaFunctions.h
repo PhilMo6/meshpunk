@@ -486,6 +486,18 @@ function create_sandbox()
     t["⬇️"] = 3
     t["🅾️"] = 4
     t["❎"] = 5
+    -- .p8.png carts carry the button glyphs as single P8SCII bytes, not the
+    -- UTF-8 emoji above, and the T-Deck build stubs the utf8<->pico8
+    -- conversion that would normally fold them together — so bind the
+    -- single-byte names too, or btn(<glyph>)/btnp(<glyph>) reads nil and any
+    -- glyph-only control (e.g. moonrace's ❎-to-confirm) is dead. Byte code is
+    -- 0x80 + (letter-'A') for Shift+letter: L/R/U/D=dir, O/X=action.
+    t["\x8b"] = 0  -- ⬅️ left
+    t["\x91"] = 1  -- ➡️ right
+    t["\x94"] = 2  -- ⬆️ up
+    t["\x83"] = 3  -- ⬇️ down
+    t["\x8e"] = 4  -- 🅾️ O
+    t["\x97"] = 5  -- ❎ X
     -- Fill pattern emoji variables
     t["█"] = 0
     t["▒"] = 0x5a5a.8

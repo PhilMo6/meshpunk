@@ -341,6 +341,9 @@ static int luavgl_canvas_draw_image(lua_State *L)
   dsc.rotation = canvas_get_int_field(L, 2, "rotation", 0);
   dsc.scale_x  = canvas_get_int_field(L, 2, "scale_x", 256);
   dsc.scale_y  = canvas_get_int_field(L, 2, "scale_y", 256);
+  /* antialias: pass 0 for a crisp/blocky (nearest-neighbour) scale, 1 for the
+     smooth (bilinear) default. Absent -> keep LVGL's default. */
+  dsc.antialias = canvas_get_int_field(L, 2, "antialias", dsc.antialias) ? 1 : 0;
 
   lua_getfield(L, 2, "pivot");
   if (lua_istable(L, -1)) {
@@ -371,6 +374,36 @@ static int luavgl_canvas_draw_image(lua_State *L)
   return 0;
 }
 
+/*
+ * Return the canvas' image descriptor as a light userdata pointer.
+ *
+ * The returned value can be passed straight back as the `src` of another
+ * canvas' draw_image{}, which makes it possible to pre-render ("bake") an
+ * object into an off-screen canvas once and then blit it -- with rotation,
+ * scale and a pivot -- every frame, instead of re-issuing its primitives.
+ *
+ * The pointer stays valid for the canvas' lifetime and always reflects the
+ * canvas' current pixels, so keep the source canvas object alive while in use.
+ *
+ * local sprite = lvgl.Canvas{ w = 48, h = 48, cf = lvgl.COLOR_FORMAT.ARGB8888 }
+ * sprite:fill_bg("#000000", 0)        -- transparent
+ * sprite:draw_rect{ ... }             -- bake the texture once
+ * local src = sprite:get_image()
+ * scene:draw_image{ src = src, rotation = 450, pivot = { x = 24, y = 24 },
+ *                   x1 = px, y1 = py, x2 = px + 47, y2 = py + 47 }
+ */
+static int luavgl_canvas_get_image(lua_State *L)
+{
+  lv_obj_t *obj = luavgl_to_obj(L, 1);
+  lv_image_dsc_t *dsc = lv_canvas_get_image(obj);
+  if (dsc == NULL) {
+    lua_pushnil(L);
+  } else {
+    lua_pushlightuserdata(L, dsc);
+  }
+  return 1;
+}
+
 static const rotable_Reg luavgl_canvas_methods[] = {
     {"fill_bg",       LUA_TFUNCTION, {luavgl_canvas_fill_bg}      },
     {"set_px",        LUA_TFUNCTION, {luavgl_canvas_set_px}       },
@@ -382,6 +415,7 @@ static const rotable_Reg luavgl_canvas_methods[] = {
     {"draw_label",    LUA_TFUNCTION, {luavgl_canvas_draw_label}   },
     {"draw_triangle", LUA_TFUNCTION, {luavgl_canvas_draw_triangle}},
     {"draw_image",    LUA_TFUNCTION, {luavgl_canvas_draw_image}   },
+    {"get_image",     LUA_TFUNCTION, {luavgl_canvas_get_image}    },
     {0,               0,             {0}                          },
 };
 
