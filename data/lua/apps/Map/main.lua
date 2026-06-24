@@ -1,6 +1,7 @@
 local lvgl = require("lvgl")
 local messages = require("lib/mesh/messages")
 local apps = require("lib/apps")
+local utils = require("lib/utils")  -- utils.now() = device RTC (os.time() isn't RTC-synced)
 
 print("[Map] starting")
 
@@ -9,7 +10,7 @@ local H = lvgl.VER_RES()
 local TILE_SIZE = 256
 local CACHE_ROOT = "/meshpunk/map_cache"
 local TILE_URL = "https://tile.openstreetmap.org"
-local MIN_ZOOM = 5
+local MIN_ZOOM = 4   -- z4 ≈ continent/region view, for taking in a large mesh
 local MAX_ZOOM = 16
 local GRID = 4          -- 16 tiles × 128KB = 2MB (fits 3MB cache)
 local FETCH_GRID = 6    -- pre-cache buffer ring around visible
@@ -28,7 +29,8 @@ local app_dir = ...
 -- ---------------------------------------------------------------------------
 local PREFS_PATH = "L:/map_prefs"
 
--- Prefs file: key=value lines (anim, arch, color, hop, halo_w, halo_opa)
+-- Prefs file: key=value lines (anim, arch, trail, hashes, color, hop, halo_w,
+-- halo_opa, and the meshprint mp1/mp2/mptri/mpalgo/mp2nd keys)
 local function load_map_prefs()
     local prefs = {
         anim = true,           -- live packet path animation on/off
@@ -39,6 +41,14 @@ local function load_map_prefs()
         halo_opa = 140,        -- halo opacity 0-255
         trail = true,          -- reveal the path hop by hop behind the dot
         hashes = true,         -- label animated waypoints with their path hash
+        -- Meshprint (sender triangulation) layer:
+        mp_c1 = "#00e0ff",     -- 1st-hop repeater markers (cyan)
+        mp_c2 = "#ffe000",     -- 2nd-hop repeater markers (yellow)
+        mp_tri = "#ff00cc",    -- triangulated sender point (magenta)
+        mp_algo = 1,           -- 1=weighted centroid, 2=plain centroid, 3=geometric median
+        mp_second = false,     -- also collect/show 2nd-hop repeaters
+        mp_second_calc = false,-- feed 2nd-hop repeaters into triangulation + cull
+        mp_cull = 3,           -- final-cull multiplier (0=off, 2/3/4×): drop outliers
     }
     local f = io.open(PREFS_PATH, "r")
     if not f then return prefs end
@@ -48,8 +58,17 @@ local function load_map_prefs()
     if string.find(txt, "arch=1", 1, true) then prefs.archived = true end
     if string.find(txt, "trail=0", 1, true) then prefs.trail = false end
     if string.find(txt, "hashes=0", 1, true) then prefs.hashes = false end
+    if string.find(txt, "mp2nd=1", 1, true) then prefs.mp_second = true end
+    if string.find(txt, "mp2calc=1", 1, true) then prefs.mp_second_calc = true end
     local c = string.match(txt, "color=(#%x%x%x%x%x%x)")
     if c then prefs.anim_color = c end
+    local m1 = string.match(txt, "mp1=(#%x%x%x%x%x%x)");   if m1 then prefs.mp_c1 = m1 end
+    local m2 = string.match(txt, "mp2=(#%x%x%x%x%x%x)");   if m2 then prefs.mp_c2 = m2 end
+    local mt = string.match(txt, "mptri=(#%x%x%x%x%x%x)"); if mt then prefs.mp_tri = mt end
+    local ma = tonumber(string.match(txt, "mpalgo=(%d+)") or "")
+    if ma and ma >= 1 and ma <= 3 then prefs.mp_algo = ma end
+    local mcl = tonumber(string.match(txt, "mpcull=(%d+)") or "")
+    if mcl and (mcl == 0 or (mcl >= 2 and mcl <= 4)) then prefs.mp_cull = mcl end
     local hop = tonumber(string.match(txt, "hop=(%d+)") or "")
     if hop and hop >= 100 and hop <= 5000 then prefs.anim_hop = hop end
     local hw = tonumber(string.match(txt, "halo_w=(%d+)") or "")
@@ -73,6 +92,13 @@ local function save_map_prefs()
         "hop=" .. map_prefs.anim_hop,
         "halo_w=" .. map_prefs.halo_w,
         "halo_opa=" .. map_prefs.halo_opa,
+        map_prefs.mp_second and "mp2nd=1" or "mp2nd=0",
+        map_prefs.mp_second_calc and "mp2calc=1" or "mp2calc=0",
+        "mp1=" .. map_prefs.mp_c1,
+        "mp2=" .. map_prefs.mp_c2,
+        "mptri=" .. map_prefs.mp_tri,
+        "mpalgo=" .. map_prefs.mp_algo,
+        "mpcull=" .. map_prefs.mp_cull,
     }, "\n"))
     f:close()
 end
@@ -89,10 +115,8 @@ local map = {
     tooltip = nil,
     drag = nil,
     vx = 0, vy = 0,
-    marker_ref_vl = nil,
+    marker_ref_vl = nil,  -- view at last marker redraw (oversized canvas slide ref)
     marker_ref_vt = nil,
-    anim_ref_vl = nil,
-    anim_ref_vt = nil,
     base_tx = nil,
     base_ty = nil,
     canvas_zoom = nil,
@@ -123,6 +147,8 @@ end
 -- Tile cache
 -- ---------------------------------------------------------------------------
 local bin_cache = {}  -- in-memory set of tiles known to have .bin on SD
+local bin_cache_n = 0           -- approx entry count (bounds memory growth)
+local BIN_CACHE_CAP = 4000      -- panning a wide area would otherwise grow forever
 local loaded_srcs = {}  -- src paths currently decoded in the LVGL image cache
 
 local function tile_bin_path(z, tx, ty)
@@ -136,25 +162,30 @@ end
 local function tile_cached(z, tx, ty)
     local key = z .. "/" .. tx .. "/" .. ty
     if bin_cache[key] ~= nil then return bin_cache[key] end
+    -- Bound the cache: panning/precaching a wide area would otherwise add an
+    -- entry per tile forever. It's only a perf cache (SD-existence memo), so
+    -- wiping it just re-stats tiles as they're revisited.
+    if bin_cache_n >= BIN_CACHE_CAP then bin_cache = {}; bin_cache_n = 0 end
     -- Tile conversion uses atomic write (.tmp → .bin rename), so any .bin
     -- that exists on SD is guaranteed complete. Simple existence check.
     local ok, exists = pcall(_file_exists_sd, tile_bin_path(z, tx, ty))
-    if ok and exists then
-        bin_cache[key] = true
-        return true
-    end
-    bin_cache[key] = false
-    return false
+    local result = (ok and exists) and true or false
+    bin_cache[key] = result
+    bin_cache_n = bin_cache_n + 1
+    return result
 end
 
 local dirs_created = {}
+local dirs_created_n = 0
 local function ensure_tile_dirs(z, tx)
     local key = z .. "/" .. tx
     if dirs_created[key] then return end
+    if dirs_created_n >= 2000 then dirs_created = {}; dirs_created_n = 0 end  -- bound growth
     _mkdir_sd(CACHE_ROOT)
     _mkdir_sd(CACHE_ROOT .. "/" .. z)
     _mkdir_sd(CACHE_ROOT .. "/" .. z .. "/" .. tx)
     dirs_created[key] = true
+    dirs_created_n = dirs_created_n + 1
 end
 
 local function enqueue_download(z, tx, ty, visible)
@@ -211,6 +242,16 @@ end
 local replay = { list = {}, idx = 0, total = 0, active = false, paused = false }
 local stop_replay  -- forward-declare; defined with the playback engine
 local update_replay_buttons  -- forward-declare; defined with the engine
+
+-- Meshprint: sender-triangulation layer on its own screen-sized canvas.
+-- reps1/reps2 are {lat,lon,pubkey,count} of the resolved 1st/2nd-hop repeaters;
+-- tri is the estimated sender point. Redrawn against the current view on
+-- pan/zoom (like the marker/anim canvases). Persists until explicitly cleared.
+local meshprint = { active = false, reps1 = {}, reps2 = {}, tri = nil }
+local redraw_meshprint_canvas  -- forward-declare; defined after redraw_markers
+local clear_meshprint          -- forward-declare; defined with the engine
+local run_meshprint            -- forward-declare
+local show_meshprint_screen    -- forward-declare; defined after the replay screen
 
 -- Packet path color, halo and speed live in map_prefs (user-tunable from
 -- the replay screen). The dark halo is what keeps any color readable on
@@ -277,6 +318,11 @@ local function feed_tile_fetches()
         elseif pending_fetches[item.key] then
             table.remove(map.download_queue, 1)  -- already in flight
         else
+            -- About to start a download burst (nothing in flight): the worker
+            -- will decode PNGs into the shared PSRAM heap, which needs a big
+            -- contiguous block. Compact the heap first so the decode has room.
+            -- Once-per-burst (fetch_outstanding stays >0 while it runs).
+            if fetch_outstanding == 0 then collectgarbage("collect") end
             ensure_tile_dirs(item.z, item.tx)
             local url = TILE_URL .. "/" .. item.z .. "/" .. item.tx .. "/" .. item.ty .. ".png"
             if not _tile_fetch_start(url, "S:" .. tile_bin_path(item.z, item.tx, item.ty), item.key) then
@@ -311,7 +357,9 @@ local function radius_at_zoom(radius_z14, z)
     end
 end
 
--- Build flat list of candidate tile coordinates (fast, no SD I/O)
+-- Build flat list of candidate tile coordinates (fast, no SD I/O). Each carries
+-- its squared distance from the zoom's center so the estimate can hand the
+-- uncached subset straight to the downloader (zoom asc, then nearest-first).
 local function build_tile_coords(lat, lon, min_z, max_z, radius_z14)
     local coords = {}
     for z = min_z, max_z do
@@ -325,43 +373,12 @@ local function build_tile_coords(lat, lon, min_z, max_z, radius_z14)
                 local tx = ctx + dx
                 local ty = cty + dy
                 if tx >= 0 and ty >= 0 and tx <= max_tile and ty <= max_tile then
-                    coords[#coords + 1] = { z = z, tx = tx, ty = ty }
+                    coords[#coords + 1] = { z = z, tx = tx, ty = ty, dist = dx * dx + dy * dy }
                 end
             end
         end
     end
     return coords
-end
-
-local function build_precache_list(lat, lon, min_z, max_z, radius_z14)
-    local tiles = {}
-    for z = min_z, max_z do
-        local px, py = lat_lon_to_world_px(lat, lon, z)
-        local ctx = math.floor(px / TILE_SIZE)
-        local cty = math.floor(py / TILE_SIZE)
-        local r = radius_at_zoom(radius_z14, z)
-        local max_tile = 2 ^ z - 1
-        local zoom_tiles = {}
-        for dy = -r, r do
-            for dx = -r, r do
-                local tx = ctx + dx
-                local ty = cty + dy
-                if tx >= 0 and ty >= 0 and tx <= max_tile and ty <= max_tile then
-                    if not tile_cached(z, tx, ty) then
-                        table.insert(zoom_tiles, {
-                            z = z, tx = tx, ty = ty,
-                            dist = dx * dx + dy * dy,
-                        })
-                    end
-                end
-            end
-        end
-        table.sort(zoom_tiles, function(a, b) return a.dist < b.dist end)
-        for _, t in ipairs(zoom_tiles) do
-            table.insert(tiles, t)
-        end
-    end
-    return tiles
 end
 
 -- ---------------------------------------------------------------------------
@@ -407,38 +424,82 @@ local touch_layer = root:Object({
 touch_layer:add_flag(lvgl.FLAG.CLICKABLE)
 touch_layer:clear_flag(lvgl.FLAG.SCROLLABLE)
 
--- Marker canvas (oversized for scroll buffering, redrawn when edge nears viewport)
+-- Marker canvas is OVERSIZED (W+2·PAD) and SLID on pan — drawn once, then just
+-- repositioned each frame, with a full redraw only when the slide nears the
+-- margin. Redrawing hundreds of marker rects every frame (screen-sized) was far
+-- too laggy. The anim canvas stays SCREEN-SIZED + redrawn (its path is a handful
+-- of elements, cheap, and only while a packet animates). ~915KB marker (freed
+-- during a meshprint) + ~307KB anim. create_base_canvases re-establishes draw
+-- order tile_layer < marker < anim < (meshprint/HUD) via move_background (pushes
+-- to index 0 → call in reverse order). Alloc is pcall-guarded (failure → both
+-- nil, nil-guards keep the app alive with markers hidden, never crashes).
 local MARKER_PAD = 100
 local MCANVAS_W = W + 2 * MARKER_PAD
 local MCANVAS_H = H + 2 * MARKER_PAD
-local marker_canvas = root:Canvas({
-    w = MCANVAS_W, h = MCANVAS_H,
-    cf = lvgl.COLOR_FORMAT.ARGB8888,
-    x = -MARKER_PAD, y = -MARKER_PAD,
-})
-marker_canvas:fill_bg("#000000", 0)
-marker_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
-marker_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
+local marker_canvas, anim_canvas  -- created by create_base_canvases()
+local function create_base_canvases()
+    if marker_canvas and anim_canvas then return end
+    local function mk(w, h, x, y)
+        local okc, cv = pcall(function()
+            return root:Canvas({ w = w, h = h, cf = lvgl.COLOR_FORMAT.ARGB8888, x = x, y = y })
+        end)
+        return okc and cv or nil
+    end
+    local mc = mk(MCANVAS_W, MCANVAS_H, -MARKER_PAD, -MARKER_PAD)  -- oversized
+    local ac = mk(W, H, 0, 0)                                     -- screen-sized
+    if not mc or not ac then
+        print("[Map] base canvas alloc FAILED m=" .. tostring(mc ~= nil) .. " a=" .. tostring(ac ~= nil))
+        if mc then mc:delete() end
+        if ac then ac:delete() end
+        return  -- both stay nil; nil-guards keep the app alive (markers hidden)
+    end
+    marker_canvas = mc
+    marker_canvas:fill_bg("#000000", 0)
+    marker_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
+    marker_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
 
--- Animation canvas: the packet path (lines, hop squares, hash chips) lives
--- on its own layer with its own slide reference, decoupled from the marker
--- canvas — markers redraw freely (contact updates, archive toggles) without
--- repainting a paused/playing path, and trail reveals don't repaint 500
--- markers. Costs ~915KB PSRAM + one more full-screen blend per frame;
--- deliberate trade (Noah, 2026-06-12).
-local anim_canvas = root:Canvas({
-    w = MCANVAS_W, h = MCANVAS_H,
-    cf = lvgl.COLOR_FORMAT.ARGB8888,
-    x = -MARKER_PAD, y = -MARKER_PAD,
-})
-anim_canvas:fill_bg("#000000", 0)
-anim_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
-anim_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
--- Hidden while no animation runs: a hidden layer is skipped by the
--- renderer entirely, so the second full-screen blend only costs anything
--- while a packet is actually flying (or paused). Unhidden in
--- redraw_anim_canvas when an animation starts.
-anim_canvas:add_flag(lvgl.FLAG.HIDDEN)
+    anim_canvas = ac
+    anim_canvas:fill_bg("#000000", 0)
+    anim_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
+    anim_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
+    anim_canvas:add_flag(lvgl.FLAG.HIDDEN)  -- hidden = skipped by renderer
+
+    -- tile_layer (bottom) < marker_canvas < anim_canvas < everything above.
+    pcall(_obj_move_background, anim_canvas)
+    pcall(_obj_move_background, marker_canvas)
+    pcall(_obj_move_background, tile_layer)
+end
+local function free_base_canvases()
+    if anim_canvas then anim_canvas:delete(); anim_canvas = nil end
+    if marker_canvas then marker_canvas:delete(); marker_canvas = nil end
+end
+create_base_canvases()
+
+-- Meshprint canvas: sender-triangulation markers on their own layer. SCREEN-
+-- SIZED (W×H ~307KB) and REDRAWN on pan/zoom like the anim canvas (few dots).
+-- Allocated LAZILY when a meshprint runs (ensure_meshprint_canvas) and freed in
+-- clear_meshprint, so steady state stays at 2 canvases. Created on top of the
+-- HUD; harmless since it's transparent except for small dots and input-
+-- transparent (CLICKABLE/SCROLLABLE cleared), so taps/pans pass through.
+local meshprint_canvas = nil
+local function ensure_meshprint_canvas()
+    if meshprint_canvas then return true end
+    local ok, cv = pcall(function()
+        return root:Canvas({
+            w = W, h = H,
+            cf = lvgl.COLOR_FORMAT.ARGB8888,
+            x = 0, y = 0,
+        })
+    end)
+    if not ok or not cv then
+        return false
+    end
+    meshprint_canvas = cv
+    meshprint_canvas:fill_bg("#000000", 0)
+    meshprint_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
+    meshprint_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
+    return true
+end
 
 -- Moving packet dot for the path animation (above both canvases, below
 -- the HUD). One widget repositioned per tick — far cheaper than repainting
@@ -451,6 +512,14 @@ local anim_dot = root:Object({
 anim_dot:add_flag(lvgl.FLAG.HIDDEN)
 anim_dot:clear_flag(lvgl.FLAG.CLICKABLE)
 anim_dot:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+-- On-map "Clear MP" button (top-right): visible only while a meshprint is on
+-- screen; clears the meshprint layer. clear_meshprint is forward-declared.
+local mp_clear_btn = root:Button({ w = 80, h = 28, x = W - 86, y = 24 })
+mp_clear_btn:Label({ text = "Clear MP", align = lvgl.ALIGN.CENTER })
+mp_clear_btn:add_flag(lvgl.FLAG.HIDDEN)
+mp_clear_btn:clear_flag(lvgl.FLAG.SCROLLABLE)
+mp_clear_btn:onClicked(function() if clear_meshprint then clear_meshprint() end end)
 
 -- Replay info popup (top-left corner under the status bar): who the
 -- currently replayed packet is from, plus progress through the replay.
@@ -597,13 +666,20 @@ local function evict_offscreen_tiles()
             end
         end
     end
-    local dropped = 0
+    local dropped = false
     for src in pairs(loaded_srcs) do
         if not visible[src] then
             pcall(_lvgl_image_cache_drop, src)
             loaded_srcs[src] = nil
-            dropped = dropped + 1
+            dropped = true
         end
+    end
+    -- We just freed decoded-tile buffers (~128KB each). Compact the (shared)
+    -- PSRAM heap so that memory becomes a contiguous block again — but only when
+    -- the view has settled, so a full GC can't hitch an active fling (during a
+    -- fling no downloads run anyway, so there's nothing to make room for yet).
+    if dropped and map.vx == 0 and map.vy == 0 then
+        collectgarbage("collect")
     end
 end
 
@@ -611,8 +687,29 @@ local redraw_markers      -- forward declaration (defined after refresh_tiles)
 local redraw_anim_canvas  -- forward declaration (defined after refresh_tiles)
 local update_status       -- forward declaration (defined after refresh_tiles)
 
+-- Contact-marker projection cache. A marker's world-pixel position depends only
+-- on (lat/lon, zoom) — NOT on pan — so we project every contact once and reuse
+-- it across the per-frame pan redraws (a fling no longer re-projects hundreds of
+-- contacts with trig every 30ms). Rebuilt only when marked dirty: zoom change,
+-- contact-set change (refresh_tiles on settle/boundary, archive toggle), or the
+-- meshprint restoring the layer. Own position stays live (GPS moves).
+-- pts is reused in place (entries updated, count in n) so a rebuild doesn't
+-- churn ~hundreds of Lua tables through the (PSRAM) heap each time.
+local marker_cache = { zoom = nil, dirty = true, pts = {}, n = 0 }
+local function invalidate_markers() marker_cache.dirty = true end
+
+-- Progressive archived-marker loader. When "show archived" is on, archived
+-- contacts are streamed from the disk log in batches (one per timer tick) and
+-- drawn onto the marker canvas as they arrive — the live map stays interactive
+-- the whole time. pts[i] = { c = <archived contact table>, px, py } (px/py
+-- projected at draw_zoom; re-projected by redraw_markers on zoom). No dedup yet
+-- (Noah: draw all incl. doubles for now). redraw_markers draws these in gray;
+-- find_nearest also searches them so taps on a gray dot open its re-add popup.
+local arch_load = { offset = 0, pts = {}, draw_zoom = nil, timer = nil }
+
 local function refresh_tiles()
     if not map.running then return end
+    invalidate_markers()  -- settle/boundary/zoom: refresh contact projections
 
     -- Discard stale queues — only the current view matters
     map.download_queue = {}
@@ -711,6 +808,7 @@ local function refresh_tiles()
 
     redraw_markers()
     if anim.active then redraw_anim_canvas() end  -- re-anchor path at new view/zoom
+    if meshprint.active then redraw_meshprint_canvas() end  -- reposition dots at new zoom
     update_status()
     update_dl_status()
 end
@@ -719,14 +817,16 @@ end
 -- Markers (drawn onto canvas — 1 widget vs 262)
 -- ---------------------------------------------------------------------------
 
--- Draw the active packet path polyline onto the ANIMATION canvas (canvas
--- coordinates follow map.anim_ref_vl/vt, so canvas slides keep it aligned).
+-- Draw the active packet path polyline onto the ANIMATION canvas, positioned
+-- against the current view (screen-sized canvas; redrawn on pan/zoom).
 -- Segments touching a synthesized waypoint (repeater with unknown position)
 -- are dashed; real repeater hops get a small node square.
 local function draw_active_path()
-    if not anim.active or not map.anim_ref_vl then return end
+    if not anim.active then return end
     local a = anim.active
     local pts = a.points
+    local view_left = map.cx - math.floor(W / 2)
+    local view_top  = map.cy - math.floor(H / 2)
     -- Trail mode: only segments the dot has finished are drawn, so the path
     -- reveals itself hop by hop instead of appearing all at once (anim_tick
     -- triggers a canvas redraw at each hop transition).
@@ -737,8 +837,8 @@ local function draw_active_path()
     local prev_x, prev_y, prev_real
     for i, p in ipairs(pts) do
         local wx, wy = lat_lon_to_world_px(p.lat, p.lon, map.zoom)
-        local cx = wx - map.anim_ref_vl + MARKER_PAD
-        local cy = wy - map.anim_ref_vt + MARKER_PAD
+        local cx = wx - view_left
+        local cy = wy - view_top
         if prev_x and i <= reached then
             local certain = p.real and prev_real
             -- Dark halo first, bright line on top — keeps the path readable
@@ -781,8 +881,8 @@ local function draw_active_path()
         for _, p in ipairs(pts) do
             if p.hash then
                 local wx, wy = lat_lon_to_world_px(p.lat, p.lon, map.zoom)
-                local cx = wx - map.anim_ref_vl + MARKER_PAD
-                local cy = wy - map.anim_ref_vt + MARKER_PAD
+                local cx = wx - view_left
+                local cy = wy - view_top
                 local tw = 4 + #p.hash * 8
                 local bx, by = cx + 6, cy - 20
                 anim_canvas:draw_rect({
@@ -799,39 +899,63 @@ local function draw_active_path()
     end
 end
 
--- Repaint the animation canvas: re-anchor its slide reference to the
--- current view, clear, and draw the active path (clears when none).
+-- Repaint the animation canvas against the current view (clears when no path).
 redraw_anim_canvas = function()
     if not map.running then return end
+    if not anim_canvas then return end  -- freed while a meshprint is active
     if not anim.active then
-        map.anim_ref_vl = nil
-        map.anim_ref_vt = nil
         anim_canvas:add_flag(lvgl.FLAG.HIDDEN)  -- zero render cost while idle
         return
     end
     anim_canvas:clear_flag(lvgl.FLAG.HIDDEN)
-    anim_canvas:set({ x = -MARKER_PAD, y = -MARKER_PAD })
+    anim_canvas:set({ x = 0, y = 0 })
     anim_canvas:fill_bg("#000000", 0)
-    map.anim_ref_vl = map.cx - math.floor(W / 2)
-    map.anim_ref_vt = map.cy - math.floor(H / 2)
     draw_active_path()
 end
 
 redraw_markers = function()
     if not map.running then return end
+    if not marker_canvas then return end  -- freed while a meshprint is active
 
-    local half_w = math.floor(W / 2)
-    local half_h = math.floor(H / 2)
-    local view_left = map.cx - half_w
-    local view_top  = map.cy - half_h
-
-    -- Store reference for canvas sliding
+    local view_left = map.cx - math.floor(W / 2)
+    local view_top  = map.cy - math.floor(H / 2)
+    -- Oversized canvas: anchor it at its home offset and record the view so
+    -- reposition_tiles can slide it (cheap) until the slide nears the margin.
     map.marker_ref_vl = view_left
     map.marker_ref_vt = view_top
     marker_canvas:set({ x = -MARKER_PAD, y = -MARKER_PAD })
     marker_canvas:fill_bg("#000000", 0)
 
-    -- Own position
+    -- Rebuild the projected-position cache only when dirty or the zoom changed;
+    -- panning reuses it (cheap subtraction, no trig, no _mesh_get_contacts).
+    -- Entries are updated in place (only grows the array when contacts grow),
+    -- so a rebuild allocates nothing in steady state. LIVE contacts only —
+    -- archived are drawn separately from arch_load (progressive loader).
+    if marker_cache.dirty or marker_cache.zoom ~= map.zoom then
+        local pts = marker_cache.pts
+        local n = 0
+        local ok, contacts = pcall(_mesh_get_contacts, false)
+        if ok and contacts then
+            for _, c in ipairs(contacts) do
+                if c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
+                    local px, py = lat_lon_to_world_px(c.lat, c.lon, map.zoom)
+                    n = n + 1
+                    local p = pts[n]
+                    if p then
+                        p.px, p.py, p.archived = px, py, c.archived
+                    else
+                        pts[n] = { px = px, py = py, archived = c.archived }
+                    end
+                end
+            end
+        end
+        for i = #pts, n + 1, -1 do pts[i] = nil end  -- drop leftover tail entries
+        marker_cache.n = n
+        marker_cache.zoom = map.zoom
+        marker_cache.dirty = false
+    end
+
+    -- Own position (live — GPS moves; a single projection is negligible)
     local prefs = _mesh_get_node_info()
     local gps_ok, _, _, gps_has_loc, gps_lat, gps_lon = pcall(_gps_info)
     local own_lat = (gps_ok and gps_has_loc and gps_lat) or (prefs and prefs.lat) or 0
@@ -848,26 +972,148 @@ redraw_markers = function()
         })
     end
 
-    -- Contact markers (archived ones render gray)
-    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
-    if ok and contacts then
-        for _, c in ipairs(contacts) do
+    -- Live contact markers (red) from the cache. Drawn across the whole oversized
+    -- canvas (the PAD margin) so they're already there when the canvas slides in.
+    local pts = marker_cache.pts
+    for i = 1, marker_cache.n do
+        local p = pts[i]
+        local cx = p.px - view_left + MARKER_PAD
+        local cy = p.py - view_top + MARKER_PAD
+        if cx >= -4 and cx < MCANVAS_W + 4 and cy >= -4 and cy < MCANVAS_H + 4 then
+            marker_canvas:draw_rect({
+                x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
+                bg_color = "#ff6644", bg_opa = 255, radius = 4,
+                border_color = "#ffffff", border_width = 1, border_opa = 255,
+            })
+        end
+    end
+
+    -- Archived contact markers (gray), progressively loaded from disk. Re-project
+    -- on zoom change; positions stay in arch_load so pan-redraws/slides keep them.
+    if show_archived and #arch_load.pts > 0 then
+        if arch_load.draw_zoom ~= map.zoom then
+            for _, p in ipairs(arch_load.pts) do
+                p.px, p.py = lat_lon_to_world_px(p.lat, p.lon, map.zoom)
+            end
+            arch_load.draw_zoom = map.zoom
+        end
+        for _, p in ipairs(arch_load.pts) do
+            local cx = p.px - view_left + MARKER_PAD
+            local cy = p.py - view_top + MARKER_PAD
+            if cx >= -4 and cx < MCANVAS_W + 4 and cy >= -4 and cy < MCANVAS_H + 4 then
+                marker_canvas:draw_rect({
+                    x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
+                    bg_color = "#888888", bg_opa = 255, radius = 4,
+                    border_color = "#ffffff", border_width = 1, border_opa = 255,
+                })
+            end
+        end
+    end
+end
+
+-- ── Progressive archived-marker loader ──────────────────────────────────────
+local function arch_load_stop()
+    if arch_load.timer then arch_load.timer:delete(); arch_load.timer = nil end
+end
+
+local function arch_load_reset()
+    arch_load_stop()
+    arch_load.offset = 0
+    arch_load.pts = {}
+    arch_load.draw_zoom = nil
+end
+
+-- One batch: pull ~150 archived contacts from the disk log, project them, append
+-- to arch_load.pts, and additively draw each gray dot (no full redraw). Stops at
+-- EOF. The map stays interactive between ticks; the load can't trip the watchdog
+-- (≤150 parsed per tick) and never blocks a draw.
+local function arch_load_step()
+    if not map.running or not show_archived then arch_load_stop(); return end
+    local ok, batch, next_off, done = pcall(_mesh_archive_read, arch_load.offset, 150)
+    if not ok then arch_load_stop(); return end
+    if next_off then arch_load.offset = next_off end
+
+    -- Draw against the canvas's current slide reference (set by redraw_markers);
+    -- fall back to the live view before the first redraw.
+    local vl = map.marker_ref_vl or (map.cx - math.floor(W / 2))
+    local vt = map.marker_ref_vt or (map.cy - math.floor(H / 2))
+    arch_load.draw_zoom = map.zoom  -- new pts are projected at the current zoom
+
+    if type(batch) == "table" then
+        for _, c in ipairs(batch) do
             if c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
                 local px, py = lat_lon_to_world_px(c.lat, c.lon, map.zoom)
-                local cx = px - view_left + MARKER_PAD
-                local cy = py - view_top + MARKER_PAD
-                if cx >= -4 and cx < MCANVAS_W + 4 and cy >= -4 and cy < MCANVAS_H + 4 then
-                    marker_canvas:draw_rect({
-                        x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
-                        bg_color = c.archived and "#888888" or "#ff6644",
-                        bg_opa = 255, radius = 4,
-                        border_color = "#ffffff", border_width = 1, border_opa = 255,
-                    })
+                -- One table per archived contact: stash px/py as fields on the lean
+                -- contact table itself (no per-entry wrapper) to halve table count.
+                c.px = px; c.py = py
+                arch_load.pts[#arch_load.pts + 1] = c
+                if marker_canvas then
+                    local cx = px - vl + MARKER_PAD
+                    local cy = py - vt + MARKER_PAD
+                    if cx >= -4 and cx < MCANVAS_W + 4 and cy >= -4 and cy < MCANVAS_H + 4 then
+                        marker_canvas:draw_rect({
+                            x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
+                            bg_color = "#888888", bg_opa = 255, radius = 4,
+                            border_color = "#ffffff", border_width = 1, border_opa = 255,
+                        })
+                    end
                 end
             end
         end
     end
+    if done then arch_load_stop(); return end
+    -- Memory-aware: keep loading only while there's comfortable PSRAM headroom
+    -- (these tables + their draws share the pool). Stop — keeping what we've got
+    -- — when the largest free block gets tight, so we never load into an OOM.
+    local okh, _, largest = pcall(_heap_info)
+    if okh and largest and largest < 700 * 1024 then
+        print("[Map] archive load stopped at " .. #arch_load.pts .. " (low PSRAM)")
+        arch_load_stop()
+    end
+end
 
+-- (Re)start the progressive load from the top. Called when "show archived" turns
+-- on and at map start if it's already on.
+local function arch_load_start()
+    arch_load_reset()
+    if not show_archived then return end
+    arch_load.timer = lvgl.Timer({ period = 100, cb = function(t) arch_load_step() end })
+end
+
+-- Repaint the screen-sized meshprint canvas: draw the resolved repeaters (2nd
+-- hops under 1st hops) plus the triangulated sender point on top, each in its
+-- configured color, positioned against the CURRENT view (no slide). Called on
+-- every pan/zoom; cheap since it's only a handful of dots. Hidden when idle.
+redraw_meshprint_canvas = function()
+    if not map.running then return end
+    if not meshprint.active then
+        if meshprint_canvas then meshprint_canvas:add_flag(lvgl.FLAG.HIDDEN) end
+        return
+    end
+    if not meshprint_canvas then return end
+    meshprint_canvas:clear_flag(lvgl.FLAG.HIDDEN)
+    meshprint_canvas:set({ x = 0, y = 0 })
+    meshprint_canvas:fill_bg("#000000", 0)
+
+    local view_left = map.cx - math.floor(W / 2)
+    local view_top  = map.cy - math.floor(H / 2)
+
+    local function draw_pt(lat, lon, color, size, border)
+        local px, py = lat_lon_to_world_px(lat, lon, map.zoom)
+        local cx = px - view_left
+        local cy = py - view_top
+        if cx >= -size and cx < W + size and cy >= -size and cy < H + size then
+            meshprint_canvas:draw_rect({
+                x1 = cx - size, y1 = cy - size, x2 = cx + size - 1, y2 = cy + size - 1,
+                bg_color = color, bg_opa = 255, radius = size,
+                border_color = "#ffffff", border_width = border, border_opa = 255,
+            })
+        end
+    end
+
+    for _, r in ipairs(meshprint.reps2) do draw_pt(r.lat, r.lon, map_prefs.mp_c2, 5, 1) end
+    for _, r in ipairs(meshprint.reps1) do draw_pt(r.lat, r.lon, map_prefs.mp_c1, 5, 1) end
+    if meshprint.tri then draw_pt(meshprint.tri.lat, meshprint.tri.lon, map_prefs.mp_tri, 8, 2) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -894,13 +1140,23 @@ end
 --    settles consecutive collisions
 --  * hash matches nothing (repeater not in contacts / no GPS) -> synthetic
 --    waypoint at the midpoint of the previous position and the next known one
-local function resolve_path_waypoints(msg)
-    local own_lat, own_lon = own_position()
-    if not own_lat then return nil end  -- no end point — nothing to animate to
+local function resolve_path_waypoints(msg, fallback_to_own)
+    -- Endpoint = where WE were when the message arrived (saved per-message), not
+    -- the live position. A replayed message with no saved location has NO
+    -- endpoint, so the path stops at the last resolved repeater; live traffic
+    -- (no saved loc) falls back to the current position.
+    local end_lat, end_lon
+    if msg.lat and msg.lon and (msg.lat ~= 0 or msg.lon ~= 0) then
+        end_lat, end_lon = msg.lat, msg.lon
+    elseif fallback_to_own then
+        end_lat, end_lon = own_position()
+        if not end_lat then return nil end  -- nothing to animate to
+    end
 
-    -- Archived repeaters (when enabled) count as positioned candidates too —
-    -- a repeater the mesh evicted can still anchor a hop on the animation.
-    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
+    -- Live contacts only: path resolution no longer reads the archive (it's
+    -- disk-only now, and a per-message file read would be far too costly). An
+    -- evicted repeater simply won't anchor a hop until it re-adverts.
+    local ok, contacts = pcall(_mesh_get_contacts, false)
     if not ok or not contacts then return nil end
 
     -- Sender position (start point), matched by name
@@ -940,12 +1196,13 @@ local function resolve_path_waypoints(msg)
         end
     end
 
-    -- Next known position after hop i (resolved hop, else our own position)
+    -- Next known position after hop i (resolved hop, else the endpoint, which
+    -- may be nil when this message has no saved location).
     local function next_anchor(i)
         for j = i + 1, n do
             if hops[j].lat then return hops[j].lat, hops[j].lon end
         end
-        return own_lat, own_lon
+        return end_lat, end_lon
     end
 
     -- Pass 2: collisions — nearest candidate to the prev/next midpoint
@@ -957,18 +1214,22 @@ local function resolve_path_waypoints(msg)
         elseif #h.cands > 1 then
             local na_lat, na_lon = next_anchor(i)
             local ref_lat, ref_lon
-            if prev_lat then
+            if prev_lat and na_lat then
                 ref_lat, ref_lon = (prev_lat + na_lat) / 2, (prev_lon + na_lon) / 2
-            else
-                ref_lat, ref_lon = na_lat, na_lon  -- no anchor before this hop yet
+            elseif prev_lat then
+                ref_lat, ref_lon = prev_lat, prev_lon  -- no next anchor (no endpoint)
+            elseif na_lat then
+                ref_lat, ref_lon = na_lat, na_lon       -- no anchor before this hop yet
             end
-            local best, best_d
-            for _, c in ipairs(h.cands) do
-                local d = geo_dist2(c.lat, c.lon, ref_lat, ref_lon)
-                if not best_d or d < best_d then best, best_d = c, d end
+            if ref_lat then
+                local best, best_d
+                for _, c in ipairs(h.cands) do
+                    local d = geo_dist2(c.lat, c.lon, ref_lat, ref_lon)
+                    if not best_d or d < best_d then best, best_d = c, d end
+                end
+                h.lat, h.lon, h.real = best.lat, best.lon, true
+                prev_lat, prev_lon = h.lat, h.lon
             end
-            h.lat, h.lon, h.real = best.lat, best.lon, true
-            prev_lat, prev_lon = h.lat, h.lon
         end
     end
 
@@ -980,15 +1241,19 @@ local function resolve_path_waypoints(msg)
             prev_lat, prev_lon = h.lat, h.lon
         elseif prev_lat then
             local na_lat, na_lon = next_anchor(i)
-            h.lat = (prev_lat + na_lat) / 2
-            h.lon = (prev_lon + na_lon) / 2
-            h.real = false
-            prev_lat, prev_lon = h.lat, h.lon
+            if na_lat then
+                h.lat = (prev_lat + na_lat) / 2
+                h.lon = (prev_lon + na_lon) / 2
+                h.real = false
+                prev_lat, prev_lon = h.lat, h.lon
+            end
+            -- no next anchor (no endpoint, no later hop): leave unresolved
         end
         -- no previous anchor and unknown sender: hop stays unresolved (skipped)
     end
 
-    -- Assemble: sender -> hops -> us. Need at least one segment.
+    -- Assemble: sender -> hops -> (endpoint, only if this message has one).
+    -- With no endpoint the path simply stops at the last resolved repeater.
     local points = {}
     if start_lat then
         points[#points + 1] = { lat = start_lat, lon = start_lon, real = true }
@@ -999,7 +1264,9 @@ local function resolve_path_waypoints(msg)
                                     real = hops[i].real, hash = hops[i].hash }
         end
     end
-    points[#points + 1] = { lat = own_lat, lon = own_lon, real = true }
+    if end_lat then
+        points[#points + 1] = { lat = end_lat, lon = end_lon, real = true }
+    end
     if #points < 2 then return nil end
     return points
 end
@@ -1054,6 +1321,7 @@ local function anim_start_next()
 end
 
 local function anim_tick(period)
+    if meshprint.active then return end  -- anim canvas is freed during a meshprint
     if not anim.active then
         -- Replay feeder: when idle, pull the next replayable message
         -- (skipping ones whose path can't be resolved any more).
@@ -1064,7 +1332,9 @@ local function anim_tick(period)
                 replay.idx = replay.idx + 1
                 tries = tries + 1
                 local m = replay.list[replay.idx]
-                local points = resolve_path_waypoints(m)
+                -- Replay: end at the saved receive location, or stop at the last
+                -- repeater if the message has none (no current-position fallback).
+                local points = resolve_path_waypoints(m, false)
                 if points then
                     anim.queue[#anim.queue + 1] = {
                         points = points, replay = true,
@@ -1164,22 +1434,24 @@ local REPLAY_MAX = 50  -- newest N when the window matches more
 local function start_replay(window_secs, name_filter, skip_1byte)
     stop_replay()
 
-    local cutoff = (window_secs and window_secs > 0) and (os.time() - window_secs) or 0
+    local cutoff = (window_secs and window_secs > 0) and (utils.now() - window_secs) or 0
     local filter = name_filter and string.lower(name_filter) or ""
     filter = filter:gsub("^%s+", ""):gsub("%s+$", "")
     if filter == "" then filter = nil end
 
+    -- Routing store, windowed by `cutoff` (since_ts). The query matches senders
+    -- exactly, so the prefix `filter` is applied here in Lua. Records are channel
+    -- traffic only (no DMs) carrying { from, timestamp, lat, lon, path }.
     local list = {}
-    for ch = 0, 7 do
-        local ok, msgs = pcall(_mesh_get_channel_messages, ch)
-        if ok and type(msgs) == "table" then
-            for _, m in ipairs(msgs) do
+    do
+        local ok, recs = pcall(_mesh_routing_query, nil, cutoff, 0)
+        if ok and type(recs) == "table" then
+            for _, m in ipairs(recs) do
                 -- All hashes in one packet's path share a size; 1-byte
                 -- hashes are 2 hex chars. Zero-hop (empty path) messages
                 -- contain no 1-byte hashes, so the skip leaves them in.
                 local one_byte = m.path and #m.path > 0 and #m.path[1] <= 2
-                if m.from and (m.timestamp or 0) >= cutoff
-                   and not m.is_dm
+                if m.from
                    and (not own_name or m.from ~= own_name)
                    and (not filter or string.lower(m.from):sub(1, #filter) == filter)
                    and not (skip_1byte and one_byte)
@@ -1210,6 +1482,307 @@ local function start_replay(window_secs, name_filter, skip_1byte)
 end
 
 -- ---------------------------------------------------------------------------
+-- Meshprint: triangulate a sender from the first repeater of each of its msgs
+-- ---------------------------------------------------------------------------
+-- Tally a resolved repeater into list `into` (frequency keyed by pubkey).
+local function meshprint_tally(into, c)
+    for _, e in ipairs(into) do
+        if e.pubkey == c.pubkey then e.count = e.count + 1; return end
+    end
+    into[#into + 1] = { lat = c.lat, lon = c.lon, pubkey = c.pubkey, count = 1 }
+end
+
+-- Estimate the sender from the 1st-hop repeaters. algo: 1=weighted centroid
+-- (by frequency), 2=plain centroid, 3=geometric median (Weiszfeld iteration).
+local function meshprint_triangulate(reps, algo)
+    if #reps == 0 then return nil end
+    if #reps == 1 then return { lat = reps[1].lat, lon = reps[1].lon } end
+    if algo == 2 then
+        local slat, slon = 0, 0
+        for _, r in ipairs(reps) do slat = slat + r.lat; slon = slon + r.lon end
+        return { lat = slat / #reps, lon = slon / #reps }
+    end
+    -- weighted centroid (also the seed for the geometric median)
+    local slat, slon, sw = 0, 0, 0
+    for _, r in ipairs(reps) do
+        slat = slat + r.lat * r.count
+        slon = slon + r.lon * r.count
+        sw = sw + r.count
+    end
+    local cx, cy = slat / sw, slon / sw
+    if algo ~= 3 then return { lat = cx, lon = cy } end
+    for _ = 1, 40 do  -- Weiszfeld, count-weighted, geo_dist2 as the metric
+        local nx, ny, wsum = 0, 0, 0
+        for _, r in ipairs(reps) do
+            local d = math.sqrt(geo_dist2(cx, cy, r.lat, r.lon))
+            if d < 1e-9 then d = 1e-9 end
+            local w = r.count / d
+            nx = nx + r.lat * w; ny = ny + r.lon * w; wsum = wsum + w
+        end
+        if wsum == 0 then break end
+        nx, ny = nx / wsum, ny / wsum
+        if math.abs(nx - cx) < 1e-7 and math.abs(ny - cy) < 1e-7 then cx, cy = nx, ny; break end
+        cx, cy = nx, ny
+    end
+    return { lat = cx, lon = cy }
+end
+
+-- Final cull: before triangulating, drop 1st-hop repeaters that sit way off the
+-- pack — almost always a bad hash resolution (collision picked the wrong distant
+-- node). For each node we compare its mean distance to the others against the
+-- mean pairwise distance AMONG the others (leave-one-out, so one far outlier
+-- can't inflate its own baseline). A node further than `mult`× that baseline is
+-- removed. Needs ≥3 nodes to judge an outlier and never culls below 2 survivors.
+-- Returns a (possibly shorter) list; the originals are left untouched.
+local function meshprint_cull(reps, mult)
+    local n = #reps
+    if not mult or mult < 2 or n < 3 then return reps end  -- mult<2 (incl. 0/Off): no cull
+    -- O(n²) pairwise sums (n = distinct repeaters, small). row[i] = Σ dist(i, j≠i);
+    -- total = Σ over unordered pairs.
+    local row = {}
+    for i = 1, n do row[i] = 0 end
+    local total = 0
+    for i = 1, n - 1 do
+        for j = i + 1, n do
+            local d = math.sqrt(geo_dist2(reps[i].lat, reps[i].lon, reps[j].lat, reps[j].lon))
+            row[i] = row[i] + d
+            row[j] = row[j] + d
+            total = total + d
+        end
+    end
+    local pairs_excl = (n - 1) * (n - 2) / 2  -- pairs not involving a given node (n≥3 ⇒ ≥1)
+    local kept = {}
+    for i = 1, n do
+        local mean_i = row[i] / (n - 1)              -- node i's mean distance to the others
+        local base = (total - row[i]) / pairs_excl   -- mean pairwise distance among the others
+        if base <= 0 or mean_i <= mult * base then
+            kept[#kept + 1] = reps[i]
+        end
+    end
+    if #kept >= 2 then return kept end
+    return reps  -- degenerate geometry (collinear/coincident): keep all, don't void the estimate
+end
+
+-- Position-sample set for triangulation: the (culled) 1st-hop repeaters, plus the
+-- 2nd-hop repeaters when BOTH "map" and "calculate" 2nd-hop toggles are on. Reads
+-- the stored meshprint.reps* so the run and the live Method re-triangulate agree.
+local function meshprint_tri_input()
+    local r1 = meshprint.reps1 or {}
+    if map_prefs.mp_second and map_prefs.mp_second_calc
+       and meshprint.reps2 and #meshprint.reps2 > 0 then
+        local t = {}
+        for _, r in ipairs(r1) do t[#t + 1] = r end
+        for _, r in ipairs(meshprint.reps2) do t[#t + 1] = r end
+        return t
+    end
+    return r1
+end
+
+-- Run a meshprint for `node_name`. ONE batched scan over a timer (watchdog-safe
+-- AND memory-flat: messages are resolved INLINE and only the tallied result is
+-- kept — no per-message route storage, which previously piled up thousands of
+-- tables and OOM'd). For each message the node sent, the backward cull resolves
+-- its path to a single contact per hop, and the 1st (and optional 2nd) hop are
+-- tallied by frequency, then triangulated. on_progress(done,total,phase);
+-- on_done(#reps1); on_done(-1) = out of memory for the canvas layer.
+run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, calc_second, on_progress, on_done)
+    local nl = node_name and node_name:lower():gsub("^%s+", ""):gsub("%s+$", "") or ""
+    if nl == "" then if on_done then on_done(0) end return end
+    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
+    if not ok or not contacts then
+        if on_done then on_done(0) end return
+    end
+
+    if meshprint.scan_timer then meshprint.scan_timer:delete(); meshprint.scan_timer = nil end
+    collectgarbage("collect")  -- maximize free heap before building the LUT
+
+    -- Free the marker + animation canvases (~1.8MB) for the whole meshprint:
+    -- gives the scan and the meshprint canvas plenty of room, and the map shows
+    -- tiles + meshprint dots only (markers/anim restored in clear_meshprint, or
+    -- on the failure paths below). Stop any animation first (it owns anim_canvas).
+    if anim.active then anim_stop() end
+    anim.queue = {}
+    free_base_canvases()
+    -- Mark active now (before the scan) so anim_tick early-returns for the whole
+    -- run and never touches the freed anim canvas. Cleared again on any failure.
+    meshprint.active = true
+    collectgarbage("collect")
+
+    -- prefix -> { positioned candidate contacts at this hash size }. Keeps
+    -- colliding contacts so the cull can pick between them. Sizes 1-4 bytes =
+    -- 2/4/6/8 hex chars. Buckets reference the existing contact subtables (no
+    -- copies — Lua keeps them alive; the C cache won't free them under us).
+    local prefix_lut = {}
+    for _, c in ipairs(contacts) do
+        if c.pubkey and c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
+            local pk = c.pubkey:lower()
+            for _, hlen in ipairs({2, 4, 6, 8}) do
+                if #pk >= hlen then
+                    local prefix = pk:sub(1, hlen)
+                    local bucket = prefix_lut[prefix]
+                    if not bucket then bucket = {}; prefix_lut[prefix] = bucket end
+                    bucket[#bucket + 1] = c
+                end
+            end
+        end
+    end
+
+    -- Repeater-preferred candidate set for a hash (repeaters if any match,
+    -- else all matches). Cached per hash; cached arrays are read-only/shared.
+    local cand_cache = {}
+    local function cands_for(hash)
+        local key = hash:lower()
+        local cached = cand_cache[key]
+        if cached ~= nil then return cached or nil end
+        local bucket = prefix_lut[key]
+        if not bucket then cand_cache[key] = false; return nil end
+        local reps = nil
+        for _, c in ipairs(bucket) do
+            if c.type_name and c.type_name:lower():find("repeater", 1, true) then
+                reps = reps or {}; reps[#reps + 1] = c
+            end
+        end
+        local result = reps or bucket
+        cand_cache[key] = result
+        return result
+    end
+
+    -- Pull only this node's records from the routing store (sender-indexed) —
+    -- no more scanning every channel's full history. Records carry the same
+    -- { from, timestamp, lat, lon, path } shape the scan loop expects.
+    local all_msgs = {}
+    do
+        local okm, recs = pcall(_mesh_routing_query, nl, 0, 0)  -- nl: trimmed, lowercased
+        if okm and type(recs) == "table" then all_msgs = recs end
+    end
+
+    local total = #all_msgs
+    if on_progress then on_progress(0, total, "scan") end
+
+    local of_lat, of_lon = own_position()  -- fallback receiver location
+
+    -- Backward cull for one message's path: walk from the receiver end (last
+    -- hop, nearest us) toward the sender, anchor starting at our receive
+    -- location. Each conflicting hop resolves to whichever candidate is closest
+    -- to the anchor (the next hop toward us), then becomes the new anchor. A
+    -- lone candidate is taken as-is; nothing is dropped for a conflict. Returns
+    -- the resolved 1st and 2nd hop contacts (or nil). No per-call allocation.
+    local function cull(path, alat, alon)
+        local p1, p2
+        for j = #path, 1, -1 do
+            local cs = cands_for(path[j])
+            local pick
+            if cs and #cs > 0 then
+                if #cs == 1 then
+                    pick = cs[1]
+                elseif alat then
+                    local best, bd
+                    for _, c in ipairs(cs) do
+                        local d = geo_dist2(alat, alon, c.lat, c.lon)
+                        if not bd or d < bd then bd = d; best = c end
+                    end
+                    pick = best
+                else
+                    pick = cs[1]  -- no anchor (no GPS at all): never drop
+                end
+                if pick then alat, alon = pick.lat, pick.lon end
+            end
+            if j == 1 then p1 = pick elseif j == 2 then p2 = pick end
+        end
+        return p1, p2
+    end
+
+    local reps1, reps2 = {}, {}
+
+    local idx = 1
+    local BATCH = 20
+    meshprint.scan_timer = lvgl.Timer({ period = 30, cb = function(t)
+        if not map.running then t:delete(); meshprint.scan_timer = nil; return end
+        local stop = math.min(idx + BATCH - 1, total)
+        for i = idx, stop do
+            local m = all_msgs[i]
+            -- this node's channel msgs only: skip DMs, pathless msgs, and (when
+            -- skip_1byte is on) 1-byte-hash paths.
+            if m.from and m.from:lower() == nl and not m.is_dm
+               and m.path and #m.path > 0
+               and not (skip_1byte and #m.path[1] <= 2) then
+                local alat, alon = of_lat, of_lon
+                if m.lat and m.lon and (m.lat ~= 0 or m.lon ~= 0) then
+                    alat, alon = m.lat, m.lon
+                end
+                local p1, p2 = cull(m.path, alat, alon)
+                if p1 then meshprint_tally(reps1, p1) end
+                if want_second and p2 then meshprint_tally(reps2, p2) end
+            end
+        end
+        idx = stop + 1
+        if on_progress then on_progress(math.min(idx - 1, total), total, "scan") end
+        if idx > total then
+            t:delete(); meshprint.scan_timer = nil
+            if #reps1 == 0 then
+                meshprint.active = false
+                create_base_canvases()  -- nothing to show; restore markers/anim
+                invalidate_markers()
+                redraw_markers()
+                if on_done then on_done(0) end return
+            end
+            -- Drop everything the scan built (message list, prefix LUT, candidate
+            -- cache, the contacts array) so the canvas has contiguous PSRAM.
+            -- These are scan-only; reps1/reps2 hold copies of lat/lon/pubkey, so
+            -- nothing we still need is referenced. cull/cands_for aren't called
+            -- again past this point.
+            all_msgs = nil
+            prefix_lut = nil
+            cand_cache = nil
+            contacts = nil
+            collectgarbage("collect")
+            if not ensure_meshprint_canvas() then
+                meshprint.active = false
+                create_base_canvases()  -- restore markers/anim since MP failed
+                invalidate_markers()
+                redraw_markers()
+                if on_done then on_done(-1) end
+                return
+            end
+            -- Final cull: remove outliers (bad hash resolutions) before triangulating.
+            -- The culled sets also feed the displayed markers, so a node judged bogus
+            -- doesn't show as a repeater either. 1st and 2nd hops are culled SEPARATELY
+            -- (each against its own ring) so a legitimately-further 2nd hop isn't
+            -- dropped just for being a ring out from the 1st hops.
+            reps1 = meshprint_cull(reps1, cull_mult)
+            if want_second and calc_second then
+                reps2 = meshprint_cull(reps2, cull_mult)
+            end
+            meshprint.reps1 = reps1
+            meshprint.reps2 = want_second and reps2 or {}
+            -- Triangulate from 1st hops (+ 2nd hops when "calculate" is on).
+            meshprint.tri = meshprint_triangulate(meshprint_tri_input(), algo)
+            meshprint.active = true
+            redraw_meshprint_canvas()
+            mp_clear_btn:clear_flag(lvgl.FLAG.HIDDEN)
+            if on_done then on_done(#reps1) end
+        end
+    end })
+end
+
+clear_meshprint = function()
+    if meshprint.scan_timer then meshprint.scan_timer:delete(); meshprint.scan_timer = nil end
+    meshprint.active = false
+    meshprint.reps1, meshprint.reps2, meshprint.tri = {}, {}, nil
+    -- Free the ~307KB layer; it's re-allocated on the next meshprint run.
+    if meshprint_canvas then
+        meshprint_canvas:delete()
+        meshprint_canvas = nil
+    end
+    -- Restore the marker + animation canvases that were freed for the meshprint,
+    -- and repaint the contact markers for the current view.
+    create_base_canvases()
+    invalidate_markers()  -- contacts may have changed during the meshprint
+    redraw_markers()
+    mp_clear_btn:add_flag(lvgl.FLAG.HIDDEN)
+end
+
+-- ---------------------------------------------------------------------------
 -- Status / HUD
 -- ---------------------------------------------------------------------------
 update_status = function()
@@ -1219,22 +1792,26 @@ update_status = function()
     zoom_label:set({ text = "z" .. map.zoom })
 end
 
--- Hit-test contact markers: find the nearest contact to a world-pixel position
+-- Hit-test contact markers: find the nearest contact to a world-pixel position.
+-- Live contacts from the mesh table + the progressively-loaded archived ones, so
+-- a tap on a gray archived dot opens its popup (and "Re-add to mesh") too.
 local HIT_RADIUS = 20  -- px tolerance for tap/center selection
 local function find_nearest_contact(wx, wy)
-    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
-    if not ok or not contacts then return nil end
     local best, best_dist = nil, HIT_RADIUS * HIT_RADIUS + 0.0
-    for _, c in ipairs(contacts) do
+    local function consider(c)
         if c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
             local px, py = lat_lon_to_world_px(c.lat, c.lon, map.zoom)
             local dx, dy = (px - wx) + 0.0, (py - wy) + 0.0  -- float to avoid int32 overflow
             local d2 = dx * dx + dy * dy
-            if d2 < best_dist then
-                best = c
-                best_dist = d2
-            end
+            if d2 < best_dist then best = c; best_dist = d2 end
         end
+    end
+    local ok, contacts = pcall(_mesh_get_contacts, false)
+    if ok and contacts then
+        for _, c in ipairs(contacts) do consider(c) end
+    end
+    if show_archived then
+        for _, p in ipairs(arch_load.pts) do consider(p) end
     end
     return best
 end
@@ -1344,7 +1921,7 @@ local function show_contact_popup(contact)
 
     -- Last seen
     if contact.last_seen and contact.last_seen > 0 then
-        local now = os.time()
+        local now = utils.now()
         local ago = now - contact.last_seen
         local ago_text
         if ago < 60 then
@@ -1429,6 +2006,8 @@ local pc = {
     start_time = nil,
     inflight = 0,     -- worker fetches owned by the pre-cache run
     fail_streak = 0,  -- consecutive network failures (WiFi-loss detector)
+    est_tiles = nil,  -- uncached tiles collected by the (batched) estimate; the
+                      -- Download reuses these so it never re-scans SD synchronously
 }
 
 local pc_overlay = nil
@@ -1534,6 +2113,7 @@ hide_precache_screen = function()
     if pc.calc_timer then pcall(function() pc.calc_timer:delete() end); pc.calc_timer = nil end
     if pc.done_timer then pcall(function() pc.done_timer:delete() end); pc.done_timer = nil end
     pc.queue = {}
+    pc.est_tiles = nil
     pc.total = 0
     pc.completed = 0
     pc.start_time = nil
@@ -1745,10 +2325,11 @@ show_precache_screen = function()
         eta_lbl:set({ text = "" })
         warn_lbl:add_flag(lvgl.FLAG.HIDDEN)
 
-        -- Block Download until the estimate finishes — clicking mid-calc would
-        -- run build_precache_list's cache checks synchronously (SD stat storm
-        -- on uncached tiles, possible watchdog reset on big areas).
+        -- Block Download until the estimate finishes: the estimate is what does
+        -- the SD stat-storm safely (batched below) AND collects the uncached
+        -- tile list the downloader reuses, so Download never re-scans SD itself.
         download_btn:add_state(lvgl.STATE.DISABLED)
+        pc.est_tiles = nil
 
         -- Cancel previous calculation
         if pc.calc_timer then pcall(function() pc.calc_timer:delete() end); pc.calc_timer = nil end
@@ -1756,15 +2337,16 @@ show_precache_screen = function()
         -- Build coordinate list (fast, no SD I/O)
         local coords = build_tile_coords(lat, lon, min_z, max_z, area.radius)
         local check_idx = 1
-        local uncached = 0
+        local uncached_tiles = {}
 
-        -- Check cache status in batches to avoid watchdog timeout
+        -- Check cache status in batches to avoid watchdog timeout; collect the
+        -- uncached tiles (cheap append) so the Download can use them directly.
         pc.calc_timer = lvgl.Timer({ period = 10, cb = function(t)
             local end_idx = math.min(check_idx + CALC_BATCH - 1, #coords)
             for i = check_idx, end_idx do
                 local c = coords[i]
                 if not tile_cached(c.z, c.tx, c.ty) then
-                    uncached = uncached + 1
+                    uncached_tiles[#uncached_tiles + 1] = c
                 end
             end
             check_idx = end_idx + 1
@@ -1772,6 +2354,13 @@ show_precache_screen = function()
             if check_idx > #coords then
                 t:delete()
                 pc.calc_timer = nil
+                -- Download priority: zoom ascending, then nearest-first per zoom.
+                table.sort(uncached_tiles, function(a, b)
+                    if a.z ~= b.z then return a.z < b.z end
+                    return a.dist < b.dist
+                end)
+                pc.est_tiles = uncached_tiles
+                local uncached = #uncached_tiles
                 count_lbl:set({ text = "Tiles to download: " .. uncached })
                 local est_mb = uncached * 128 / 1024  -- 128KB per tile (256x256 RGB565 .bin)
                 local size_str
@@ -1809,14 +2398,11 @@ show_precache_screen = function()
             return
         end
 
-        local ai = area_dd:get("selected") + 1
-        local area = AREA_PRESETS[ai]
-        local min_z = MIN_ZOOM + minz_dd:get("selected")
-        local max_z = MIN_ZOOM + maxz_dd:get("selected")
-        if min_z > max_z then max_z = min_z end
-
-        local queue = build_precache_list(lat, lon, min_z, max_z, area.radius)
-        if #queue == 0 then
+        -- Reuse the uncached list the estimate already gathered (batched, SD-safe)
+        -- instead of re-scanning SD synchronously. Download is gated on the
+        -- estimate completing, so this always matches the current selection.
+        local queue = pc.est_tiles
+        if not queue or #queue == 0 then
             warn_lbl:set({ text = "All tiles already cached!" })
             warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
             return
@@ -2143,6 +2729,360 @@ local function show_replay_screen()
 end
 
 -- ---------------------------------------------------------------------------
+-- Meshprint screen
+-- ---------------------------------------------------------------------------
+local meshprint_overlay = nil
+
+local function close_meshprint_screen()
+    if not meshprint_overlay then return end
+    local ov = meshprint_overlay
+    meshprint_overlay = nil
+    -- Same deferred teardown as the replay screen (textareas closing from a
+    -- click event): drop gridnav, move focus off, hide now, delete next tick.
+    _nav_clear()
+    lvgl.group.focus_obj(root)
+    ov:add_flag(lvgl.FLAG.HIDDEN)
+    lvgl.Timer({ period = 20, cb = function(t)
+        t:delete()
+        pcall(function() ov:delete() end)
+    end })
+end
+
+show_meshprint_screen = function()
+    if meshprint_overlay then return end
+    meshprint_overlay = root:Object({
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#1a1a2e", bg_opa = 255,
+        pad_all = 8, border_width = 0,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    })
+
+    meshprint_overlay:Label({
+        text = "Meshprint Node", text_color = "#FFFFFF", w = lvgl.PCT(100), h = 24,
+    })
+    meshprint_overlay:Label({
+        text = "Estimate a sender from the first repeater of each message it sent.",
+        text_color = "#888888", w = lvgl.PCT(100), h = 30,
+    })
+
+    -- Find target by search (like the messenger contacts search). Type, Find,
+    -- tap a match to set the target. With "Scan messages" on, after the known
+    -- contacts the search also walks all stored messages (watchdog-safe batched,
+    -- like the meshprint scan) for sender names in `from`, surfacing nodes you've
+    -- never added as a contact.
+    local selected_node = nil
+    local scan_msgs = false
+    local search_scan_timer = nil
+    local search_ta, target_lbl, list_holder  -- assigned below; used by refresh_list
+
+    -- Build the tappable result list from an array of names (+ optional note).
+    local function render_results(names, note)
+        if not meshprint_overlay then return end
+        list_holder:clean()
+        for _, cn in ipairs(names) do
+            local b = list_holder:Button({ w = W - 16, h = 28 })
+            b:Label({ text = cn, align = lvgl.ALIGN.LEFT_MID })
+            b:onClicked(function()
+                selected_node = cn
+                target_lbl:set({ text = "Target: " .. cn, text_color = "#24ba24" })
+            end)
+        end
+        if note then
+            list_holder:Label({ text = note, text_color = "#888888", w = lvgl.PCT(100), h = 18 })
+        elseif #names == 0 then
+            list_holder:Label({ text = "No matches", text_color = "#888888", w = lvgl.PCT(100), h = 18 })
+        end
+        _nav_setup(meshprint_overlay, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+    end
+
+    -- Batch-scan every channel's messages for sender names matching `q` that
+    -- aren't already in `seen`; append unique finds to `names`, then re-render.
+    -- Self-cancels if the screen closes; superseded if a new search starts.
+    local function scan_message_senders(q, names, seen)
+        -- Sender names come straight from the routing index: _mesh_routing_senders
+        -- streams the .idx files in C (one at a time, dropped before the next) and
+        -- returns only distinct matching names — no message bodies are ever pulled
+        -- into RAM (the old "load every channel's full history" path was a multi-MB
+        -- PSRAM spike). Deferred a tick so the "Scanning..." note paints first.
+        if search_scan_timer then search_scan_timer:delete() end
+        search_scan_timer = lvgl.Timer({ period = 10, cb = function(t)
+            t:delete(); search_scan_timer = nil
+            if not meshprint_overlay then return end
+            local okm, more = pcall(_mesh_routing_senders, q, 40)
+            if okm and type(more) == "table" then
+                for _, nm in ipairs(more) do
+                    local lk = nm:lower()
+                    if not seen[lk] then
+                        seen[lk] = true
+                        names[#names + 1] = nm
+                    end
+                end
+            end
+            table.sort(names, function(a, b) return a:lower() < b:lower() end)
+            render_results(names)
+        end })
+    end
+
+    local function refresh_list()
+        if search_scan_timer then search_scan_timer:delete(); search_scan_timer = nil end
+        local q = (search_ta.text or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+        if q == "" then
+            render_results({}, "Type a name, then Find")
+            return
+        end
+        -- Known contacts first.
+        local names, seen = {}, {}
+        local ok, contacts = pcall(_mesh_get_contacts, show_archived)
+        if ok and contacts then
+            for _, c in ipairs(contacts) do
+                if c.name then
+                    local lk = c.name:lower()
+                    if not seen[lk] and lk:find(q, 1, true) then
+                        seen[lk] = true
+                        names[#names + 1] = c.name
+                        if #names >= 12 and not scan_msgs then break end
+                    end
+                end
+            end
+        end
+        table.sort(names, function(a, b) return a:lower() < b:lower() end)
+        if scan_msgs then
+            render_results(names, "Scanning messages...")
+            scan_message_senders(q, names, seen)
+        else
+            render_results(names)
+        end
+    end
+
+    local search_row = meshprint_overlay:Object({
+        w = W - 16, h = 34, bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    })
+    search_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    search_row:Label({ text = "Find: ", text_color = "#AAAAAA", w = 50, h = 30 })
+    search_ta = search_row:Textarea({
+        password_mode = false, one_line = true, text = "",
+        placeholder_text = "node name", w = W - 16 - 104, h = 30,
+    })
+    search_ta:clear_flag(lvgl.FLAG.SCROLLABLE)
+    local find_btn = search_row:Button({ w = 50, h = 30 })
+    find_btn:Label({ text = "Find", align = lvgl.ALIGN.CENTER })
+
+    -- Toggle: also scan message history for senders who aren't contacts.
+    local function scan_text()
+        return (scan_msgs and "[x]" or "[ ]") .. " Scan messages for senders"
+    end
+    local scan_btn = meshprint_overlay:Button({ w = W - 16, h = 30 })
+    local scan_lbl = scan_btn:Label({ text = scan_text(), align = lvgl.ALIGN.LEFT_MID })
+    scan_btn:onClicked(function()
+        scan_msgs = not scan_msgs
+        scan_lbl:set({ text = scan_text() })
+    end)
+
+    target_lbl = meshprint_overlay:Label({
+        text = "Target: (none)", text_color = "#AAAAAA", w = lvgl.PCT(100), h = 18,
+    })
+
+    list_holder = meshprint_overlay:Object({
+        w = W - 16, h = lvgl.SIZE_CONTENT, bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    })
+    list_holder:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local function do_search()
+        selected_node = nil
+        target_lbl:set({ text = "Target: (none)", text_color = "#AAAAAA" })
+        if search_scan_timer then search_scan_timer:delete(); search_scan_timer = nil end
+        -- Immediate "Searching..." so the press is acknowledged; defer the real
+        -- work one tick so the indicator paints before any synchronous filter.
+        list_holder:clean()
+        list_holder:Label({ text = "Searching...", text_color = "#cccccc", w = lvgl.PCT(100), h = 18 })
+        _nav_setup(meshprint_overlay, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+        lvgl.Timer({ period = 10, cb = function(t)
+            t:delete()
+            if meshprint_overlay then refresh_list() end
+        end })
+    end
+    find_btn:onClicked(do_search)
+    search_ta:onevent(lvgl.EVENT.KEY, function()
+        if lvgl.indev.get_act():get_key() == lvgl.KEY.ENTER then do_search() end
+    end)
+
+    -- Also collect/show 2nd-hop repeaters
+    local second_calc_btn  -- created just below; visible only while mp_second is on
+    local function second_text()
+        return (map_prefs.mp_second and "[x]" or "[ ]") .. " Also map 2nd-hop repeaters"
+    end
+    local second_btn = meshprint_overlay:Button({ w = W - 16, h = 32 })
+    local second_lbl = second_btn:Label({ text = second_text(), align = lvgl.ALIGN.LEFT_MID })
+    second_btn:onClicked(function()
+        map_prefs.mp_second = not map_prefs.mp_second
+        save_map_prefs()
+        second_lbl:set({ text = second_text() })
+        -- The "calculate" toggle is only meaningful when 2nd hops are mapped.
+        if map_prefs.mp_second then
+            second_calc_btn:clear_flag(lvgl.FLAG.HIDDEN)
+        else
+            second_calc_btn:add_flag(lvgl.FLAG.HIDDEN)
+        end
+        _nav_setup(meshprint_overlay, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+    end)
+
+    -- Feed the 2nd-hop repeaters into the triangulation + final cull (applies on
+    -- the next Run). Hidden unless "Also map 2nd-hop repeaters" is on.
+    local function second_calc_text()
+        return (map_prefs.mp_second_calc and "[x]" or "[ ]") .. " Calculate 2nd-hop repeaters"
+    end
+    second_calc_btn = meshprint_overlay:Button({ w = W - 16, h = 32 })
+    local second_calc_lbl = second_calc_btn:Label({ text = second_calc_text(), align = lvgl.ALIGN.LEFT_MID })
+    second_calc_btn:onClicked(function()
+        map_prefs.mp_second_calc = not map_prefs.mp_second_calc
+        save_map_prefs()
+        second_calc_lbl:set({ text = second_calc_text() })
+    end)
+    if not map_prefs.mp_second then second_calc_btn:add_flag(lvgl.FLAG.HIDDEN) end
+
+    local mp_skip_1b = false
+    local function skip_1b_text()
+        return (mp_skip_1b and "[x]" or "[ ]") .. " Skip 1-byte hash paths"
+    end
+    local skip_btn = meshprint_overlay:Button({ w = W - 16, h = 32 })
+    local skip_lbl = skip_btn:Label({ text = skip_1b_text(), align = lvgl.ALIGN.LEFT_MID })
+    skip_btn:onClicked(function()
+        mp_skip_1b = not mp_skip_1b
+        skip_lbl:set({ text = skip_1b_text() })
+    end)
+
+    -- Triangulation method
+    local algo_row = meshprint_overlay:Object({
+        w = W - 16, h = 34, bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    })
+    algo_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    algo_row:Label({ text = "Method: ", text_color = "#AAAAAA", w = 75, h = 30 })
+    local algo_dd = algo_row:Dropdown({
+        options = "Weighted centroid\nPlain centroid\nGeometric median",
+        w = 180, h = 30,
+    })
+    algo_dd:set({ selected = (map_prefs.mp_algo or 1) - 1 })
+    algo_dd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+        map_prefs.mp_algo = algo_dd:get("selected") + 1
+        save_map_prefs()
+        -- Re-triangulate the current result live with the new method (same sample
+        -- set the run used, incl. 2nd hops when "calculate" is on).
+        if meshprint.active then
+            meshprint.tri = meshprint_triangulate(meshprint_tri_input(), map_prefs.mp_algo)
+            redraw_meshprint_canvas()
+        end
+    end)
+
+    -- Final cull: how far past the pack a 1st-hop node may sit before it's
+    -- dropped as a bad hash resolution. Applies on the next Run.
+    local cull_row = meshprint_overlay:Object({
+        w = W - 16, h = 34, bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    })
+    cull_row:clear_flag(lvgl.FLAG.SCROLLABLE)
+    cull_row:Label({ text = "Final cull: ", text_color = "#AAAAAA", w = 90, h = 30 })
+    local CULL_VALUES = { 0, 2, 3, 4 }  -- 0 = Off
+    local cull_dd = cull_row:Dropdown({ options = "Off\n2x\n3x\n4x", w = 90, h = 30 })
+    local cull_sel = 3  -- default 3x
+    for i, v in ipairs(CULL_VALUES) do if v == map_prefs.mp_cull then cull_sel = i; break end end
+    cull_dd:set({ selected = cull_sel - 1 })
+    cull_dd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+        map_prefs.mp_cull = CULL_VALUES[cull_dd:get("selected") + 1] or 3
+        save_map_prefs()
+    end)
+
+    -- Color pickers (same selector style as the replay screen)
+    local COLOR_VALUES = { "#ff00cc", "#00e0ff", "#ffe000", "#ff8800", "#00ff66", "#ffffff" }
+    local COLOR_NAMES = "Magenta\nCyan\nYellow\nOrange\nGreen\nWhite"
+    local function color_picker(label, get, set)
+        local row = meshprint_overlay:Object({
+            w = W - 16, h = 34, bg_opa = 0, border_width = 0, pad_all = 0,
+            flex = { flex_direction = "row", flex_wrap = "nowrap" },
+        })
+        row:clear_flag(lvgl.FLAG.SCROLLABLE)
+        row:Label({ text = label, text_color = "#AAAAAA", w = 110, h = 30 })
+        local dd = row:Dropdown({ options = COLOR_NAMES, w = 120, h = 30 })
+        local sel = 1
+        for i, v in ipairs(COLOR_VALUES) do if v == get() then sel = i break end end
+        dd:set({ selected = sel - 1 })
+        dd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+            set(COLOR_VALUES[dd:get("selected") + 1] or COLOR_VALUES[1])
+            save_map_prefs()
+            if meshprint.active then redraw_meshprint_canvas() end
+        end)
+    end
+    color_picker("1st repeater: ", function() return map_prefs.mp_c1 end,
+                                   function(v) map_prefs.mp_c1 = v end)
+    color_picker("2nd repeater: ", function() return map_prefs.mp_c2 end,
+                                   function(v) map_prefs.mp_c2 = v end)
+    color_picker("Sender point: ", function() return map_prefs.mp_tri end,
+                                   function(v) map_prefs.mp_tri = v end)
+
+    local warn_lbl = meshprint_overlay:Label({
+        text = "", text_color = "#FF4444", w = lvgl.PCT(100), h = 18,
+    })
+    warn_lbl:add_flag(lvgl.FLAG.HIDDEN)
+
+    -- Run
+    local run_btn = meshprint_overlay:Button({ w = W - 16, h = 32 })
+    run_btn:Label({ text = "Run meshprint", align = lvgl.ALIGN.CENTER })
+    run_btn:onClicked(function()
+        local name = selected_node or search_ta.text or ""
+        if name:gsub("%s+", "") == "" then
+            warn_lbl:set({ text = "Search and pick a node", text_color = "#FF4444" })
+            warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
+            return
+        end
+        -- Show "Searching..." immediately, then defer the heavy run_meshprint
+        -- setup (free canvases, LUT build, message gather) one tick so the label
+        -- paints before the synchronous work blocks the UI.
+        warn_lbl:set({ text = "Searching...", text_color = "#AAAAAA" })
+        warn_lbl:clear_flag(lvgl.FLAG.HIDDEN)
+        lvgl.Timer({ period = 10, cb = function(t)
+            t:delete()
+            if not meshprint_overlay then return end
+            run_meshprint(name, map_prefs.mp_second, map_prefs.mp_algo, mp_skip_1b, map_prefs.mp_cull,
+                map_prefs.mp_second_calc,
+                function(done, total)
+                    if not meshprint_overlay then return end  -- screen closed mid-scan
+                    warn_lbl:set({ text = "Scanning " .. done .. "/" .. total .. "...",
+                                   text_color = "#AAAAAA" })
+                end,
+                function(n)
+                    if not meshprint_overlay then return end  -- screen closed mid-scan
+                    if n == -1 then
+                        warn_lbl:set({ text = "Out of memory for meshprint layer",
+                                       text_color = "#FF4444" })
+                    elseif n == 0 then
+                        warn_lbl:set({ text = "No positioned first-hop repeaters found",
+                                       text_color = "#FF4444" })
+                    else
+                        close_meshprint_screen()
+                    end
+                end)
+        end })
+    end)
+
+    -- Clear the meshprint layer
+    local clear_btn = meshprint_overlay:Button({ w = W - 16, h = 32 })
+    clear_btn:Label({ text = "Clear meshprint", align = lvgl.ALIGN.CENTER })
+    clear_btn:onClicked(function()
+        clear_meshprint()
+        close_meshprint_screen()
+    end)
+
+    -- Close
+    local back_btn = meshprint_overlay:Button({ w = W - 16, h = 32 })
+    back_btn:Label({ text = "Close", align = lvgl.ALIGN.CENTER })
+    back_btn:onClicked(function() close_meshprint_screen() end)
+
+    _nav_setup(meshprint_overlay, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+end
+
+-- ---------------------------------------------------------------------------
 -- Settings screen
 -- ---------------------------------------------------------------------------
 local settings_overlay = nil
@@ -2172,7 +3112,6 @@ local function show_settings_screen()
         pad_all = 8, border_width = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     })
-    settings_overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
 
     settings_overlay:Label({
         text = "Map Settings",
@@ -2208,7 +3147,13 @@ local function show_settings_screen()
         map_prefs.archived = show_archived
         save_map_prefs()
         arch_lbl:set({ text = arch_toggle_text() })
-        redraw_markers()  -- reflect immediately
+        if show_archived then
+            arch_load_start()       -- begin streaming archived markers from disk
+        else
+            arch_load_reset()       -- drop them + stop the loader
+        end
+        invalidate_markers()
+        redraw_markers()  -- reflect immediately (archived fill in progressively)
     end)
 
     -- Replay packet paths from message history
@@ -2217,6 +3162,14 @@ local function show_settings_screen()
     replay_btn:onClicked(function()
         close_settings_screen()
         show_replay_screen()
+    end)
+
+    -- Meshprint: triangulate a sender from its messages' first repeaters
+    local meshprint_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    meshprint_btn:Label({ text = "Meshprint node...", align = lvgl.ALIGN.LEFT_MID })
+    meshprint_btn:onClicked(function()
+        close_settings_screen()
+        show_meshprint_screen()
     end)
 
     -- Tile pre-cache download (validates SD/WiFi on its own screen)
@@ -2261,26 +3214,20 @@ local function reposition_tiles()
             y = map.base_ty * TILE_SIZE - view_top,
         })
     end
-    -- Slide marker canvas
-    if map.marker_ref_vl then
+    -- Slide the oversized marker canvas (cheap) and only redraw when the slide
+    -- nears its margin — this is what keeps panning smooth with many markers.
+    -- (nil while a meshprint has it freed.)
+    if marker_canvas and map.marker_ref_vl then
         local dx = map.marker_ref_vl - view_left
         local dy = map.marker_ref_vt - view_top
         marker_canvas:set({ x = dx - MARKER_PAD, y = dy - MARKER_PAD })
-        -- Recenter canvas when edge nears viewport
         if math.abs(dx) > MARKER_PAD - 20 or math.abs(dy) > MARKER_PAD - 20 then
             redraw_markers()
         end
     end
-    -- Slide the animation canvas on its own reference (decoupled from the
-    -- markers; recentering it repaints only the path)
-    if anim.active and map.anim_ref_vl then
-        local adx = map.anim_ref_vl - view_left
-        local ady = map.anim_ref_vt - view_top
-        anim_canvas:set({ x = adx - MARKER_PAD, y = ady - MARKER_PAD })
-        if math.abs(adx) > MARKER_PAD - 20 or math.abs(ady) > MARKER_PAD - 20 then
-            redraw_anim_canvas()
-        end
-    end
+    -- anim/meshprint are screen-sized (few elements): redraw against the new view.
+    if anim.active and anim_canvas then redraw_anim_canvas() end
+    if meshprint.active and meshprint_canvas then redraw_meshprint_canvas() end
 end
 
 -- Momentum constants (shared by trackball and touch)
@@ -2332,6 +3279,14 @@ end
 
 local function shutdown()
     map.running = false                               -- stops timer-tick work
+    arch_load_stop()                                  -- untracked timer — stop explicitly
+    -- The meshprint scan timer is untracked and can outlive a closed MP screen
+    -- (it keeps running to draw on the map). Stop it here or it fires into the
+    -- freed root after apps.go_home() deletes everything.
+    if meshprint.scan_timer then
+        meshprint.scan_timer:delete()
+        meshprint.scan_timer = nil
+    end
     pcall(function() messages:onAnyMessage(nil) end)  -- release the hub slot
     apps.go_home()   -- manager: _nav_clear, delete tracked timers, then the root
 end
@@ -2367,6 +3322,10 @@ root:onevent(lvgl.EVENT.KEY, function()
             close_replay_screen()
         elseif settings_overlay then
             close_settings_screen()
+        elseif meshprint_overlay then
+            close_meshprint_screen()  -- close the overlay, NOT the app (scan keeps drawing)
+        elseif pc_overlay then
+            hide_precache_screen()    -- close the overlay (also stops its dl/calc timers)
         elseif contact_popup then
             close_contact_popup()
         else
@@ -2637,9 +3596,15 @@ messages:onAnyMessage(function(msg)
     if not map.running or not anim.enabled then return end
     if msg.is_dm then return end
     if own_name and msg.from == own_name then return end
-    local points = resolve_path_waypoints(msg)
+    -- Resolving a path per message (a full _mesh_get_contacts fetch + per-hop
+    -- iteration) is the dominant Lua-heap garbage source on a busy mesh. Only
+    -- resolve when the animator is idle: paths still animate one at a time, but a
+    -- message storm can't churn the (PSRAM-backed) heap into an OOM.
+    if anim.active or #anim.queue > 0 then return end
+    -- Live traffic: end at the saved location if present, else the current
+    -- position (the message is arriving here, now).
+    local points = resolve_path_waypoints(msg, true)
     if not points then return end
-    if #anim.queue >= 3 then table.remove(anim.queue, 1) end
     anim.queue[#anim.queue + 1] = { points = points }
 end)
 
@@ -2650,4 +3615,5 @@ local group = lvgl.group.get_default()
 group:add_obj(root)
 lvgl.group.focus_obj(root)
 init_view()
+if show_archived then arch_load_start() end  -- stream archived markers if enabled
 print("[Map] ready")

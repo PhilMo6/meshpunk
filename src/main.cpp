@@ -2749,6 +2749,31 @@ static int lua_mesh_set_channel(lua_State *L) {
   return 1;
 }
 
+// Public chat (slot 0) delete / restore / state. Public is now a normal deletable
+// channel; the deletion persists (channels-file marker) so it survives reboot, and
+// it can be re-added with its well-known PSK.
+static int lua_mesh_delete_public(lua_State *L) {
+  MESH_LOCK();
+  the_mesh->deletePublic();
+  MESH_UNLOCK();
+  lua_pushboolean(L, 1);
+  return 1;
+}
+static int lua_mesh_restore_public(lua_State *L) {
+  MESH_LOCK();
+  the_mesh->restorePublic();
+  MESH_UNLOCK();
+  lua_pushboolean(L, 1);
+  return 1;
+}
+static int lua_mesh_public_deleted(lua_State *L) {
+  MESH_LOCK();
+  bool d = the_mesh->isPublicDeleted();
+  MESH_UNLOCK();
+  lua_pushboolean(L, d ? 1 : 0);
+  return 1;
+}
+
 // Send a message to a specific channel by index
 // Usage: _mesh_send_channel(1, "Hello channel!")
 static int lua_mesh_send_channel(lua_State *L) {
@@ -4117,6 +4142,9 @@ void setupLuaVGL() {
 
   // Register new MeshCore integration bridge functions
   lua_register(L, "_mesh_get_channels", lua_mesh_get_channels);
+  lua_register(L, "_mesh_delete_public", lua_mesh_delete_public);
+  lua_register(L, "_mesh_restore_public", lua_mesh_restore_public);
+  lua_register(L, "_mesh_public_deleted", lua_mesh_public_deleted);
   lua_register(L, "_mesh_set_channel", lua_mesh_set_channel);
   lua_register(L, "_mesh_send_channel", lua_mesh_send_channel);
   lua_register(L, "_mesh_remove_contact", lua_mesh_remove_contact);

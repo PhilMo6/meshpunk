@@ -640,6 +640,9 @@ void PunkMesh::loadChannels()
                 line[len] = '\0';
                 if (len == 0) continue;
 
+                // Marker line (no tabs): Public was explicitly deleted by the user.
+                if (strcmp(line, "pubdel") == 0) { _public_deleted = true; continue; }
+
                 // Format: slot_idx \t name \t secret_hex
                 char *fields[3];
                 int nf = 0;
@@ -678,6 +681,8 @@ void PunkMesh::saveChannels()
     File file = _storage->open(path.c_str(), "w", true);
     if (file)
     {
+        // Persist the Public deletion so boot doesn't recreate it.
+        if (_public_deleted) file.print("pubdel\n");
         for (int i = 1; i < MAX_GROUP_CHANNELS; i++) {
             ChannelDetails cd;
             getChannel(i, cd);
@@ -691,6 +696,27 @@ void PunkMesh::saveChannels()
     }
 
     if (is_sd) sd_spi_release();
+}
+
+// Delete the Public channel (slot 0) and persist the deletion so boot won't
+// recreate it. _public is nulled — send/welcome paths already guard for null.
+void PunkMesh::deletePublic()
+{
+    ChannelDetails cd;
+    memset(&cd, 0, sizeof(cd));
+    setChannel(0, cd);
+    _public = nullptr;
+    _public_deleted = true;
+    saveChannels();
+}
+
+// Re-add Public with the well-known PSK (back into slot 0, the lowest free slot)
+// and clear the persisted deletion.
+void PunkMesh::restorePublic()
+{
+    _public = addChannel("Public", PUBLIC_GROUP_PSK);
+    _public_deleted = false;
+    saveChannels();
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -3133,17 +3159,24 @@ void PunkMesh::begin()
     loadContacts();
     SLog.printf("[MESH INIT] Loaded %d contacts from flash\n", getNumContacts());
 
-    _public = addChannel("Public", PUBLIC_GROUP_PSK);
-    if (_public) {
-        SLog.println("[MESH INIT] Public channel created OK");
-        char ch_hex[13];
-        mesh::Utils::toHex(ch_hex, _public->channel.hash, 6);
-        SLog.printf("[MESH INIT] Channel hash: %s\n", ch_hex);
-    } else {
-        SLog.println("[MESH INIT] ERROR: addChannel returned NULL!");
-    }
-
+    // Restore saved channels (slots 1-7) FIRST — this also sets _public_deleted
+    // from the channels-file "pubdel" marker, so we know whether to recreate Public.
     loadChannels();
+
+    if (!_public_deleted) {
+        _public = addChannel("Public", PUBLIC_GROUP_PSK);
+        if (_public) {
+            SLog.println("[MESH INIT] Public channel created OK");
+            char ch_hex[13];
+            mesh::Utils::toHex(ch_hex, _public->channel.hash, 6);
+            SLog.printf("[MESH INIT] Channel hash: %s\n", ch_hex);
+        } else {
+            SLog.println("[MESH INIT] ERROR: addChannel returned NULL!");
+        }
+    } else {
+        _public = nullptr;
+        SLog.println("[MESH INIT] Public channel previously deleted — not recreating");
+    }
 }
 
 void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {

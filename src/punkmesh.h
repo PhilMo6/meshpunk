@@ -173,6 +173,7 @@ public:
   NodePrefs _prefs;
   uint32_t expected_ack_crc;
   ChannelDetails *_public;
+  bool _public_deleted = false;  // user deleted Public; persisted via the channels file ("pubdel")
   unsigned long last_msg_sent;
   ContactInfo *curr_recipient;
   char command[512 + 10];
@@ -243,6 +244,11 @@ public:
   void saveOneContact(const ContactInfo& c);    // O(1) in-place single-slot write
   void loadChannels();
   void saveChannels();
+  // Public chat is slot 0 but, like any channel, can be deleted and re-added.
+  // The deletion persists (channels-file "pubdel" marker) so boot won't recreate it.
+  void deletePublic();
+  void restorePublic();
+  bool isPublicDeleted() const { return _public_deleted; }
 
   // ── Unified send + persist helpers ──────────────────────────
   struct SendResult {
