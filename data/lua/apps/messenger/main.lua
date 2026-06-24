@@ -726,7 +726,11 @@ show_chat = function(target)
                 }
                 local poll_hash = msg.hash
                 local timer
-                timer = lvgl.Timer {
+                -- Manager-tracked so exiting the app (go_home) tears it down
+                -- immediately — an untracked one would otherwise tick once more
+                -- after teardown (harmless, self-heals via the ok_poll guard
+                -- below, but a wasted poll + error each session).
+                timer = apps.add_timer {
                     period = 3000,
                     cb = function()
                         local ok_poll = pcall(function()
@@ -1586,7 +1590,7 @@ show_channels = function()
     local public_present = false
     for _, ch in ipairs(channels) do
         local unread = messages:unreadInChannel(ch.idx)
-        local chat_btn = body:Button { w = lvgl.PCT(65), h = 24 }
+        local chat_btn = body:Button { w = lvgl.PCT(72), h = 24 }
         local lbl = chat_btn:Label { align = lvgl.ALIGN.LEFT_MID }
         lbl.text = ch.name .. (unread > 0 and ("  (" .. unread .. ")") or "")
         if unread > 0 then lbl:set { text_color = COL_ACCENT } end
@@ -1612,7 +1616,7 @@ show_channels = function()
     if not public_present then
         body:Label {
             text = "Public (off)", align = lvgl.ALIGN.LEFT_MID,
-            w = lvgl.PCT(65), h = 24, text_color = "#888888",
+            w = lvgl.PCT(72), h = 24, text_color = "#888888",
         }
         local add_btn = body:Button { w = 50, h = 24 }
         add_btn:Label { text = "Add", align = lvgl.ALIGN.CENTER }

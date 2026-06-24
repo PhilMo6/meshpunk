@@ -317,6 +317,14 @@ function M.go_home()
     lvgl.Timer({ period = 1, cb = function(t)
         t:delete()
         destroy(scr, timers)
+        -- Drop the captured refs and force a full GC before building the
+        -- launcher: luavgl frees a deleted timer's memory only at __gc (delete()
+        -- just pauses it), and the closed app's closures/wrappers are now
+        -- garbage. Reclaiming them here keeps the largest-free PSRAM block
+        -- healthy app-to-app on this tight device; any hitch is masked by the
+        -- screen rebuild.
+        scr, timers = nil, nil
+        collectgarbage("collect")
         M._busy = false
         require("launcher").create()
     end })
