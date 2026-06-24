@@ -1542,13 +1542,13 @@ show_channels = function()
     -- Add channel: name (+ optional PSK). For #hashtag names the key is derived.
     local ch_input = body:Textarea {
         password_mode = false, one_line = true, text = "#",
-        w = lvgl.PCT(46), h = 28,
+        w = lvgl.PCT(36), h = 28,
     }
     ch_input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
     local psk_input = body:Textarea {
-        password_mode = false, one_line = true, placeholder_text = "PSK (opt)",
-        w = lvgl.PCT(30), h = 28,
+        password_mode = false, one_line = true, placeholder_text = "PSK",
+        w = lvgl.PCT(22), h = 28,
     }
     psk_input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
@@ -1583,23 +1583,42 @@ show_channels = function()
     local ok, channels = pcall(_mesh_get_channels)
     if not ok or not channels then channels = {} end
 
+    local public_present = false
     for _, ch in ipairs(channels) do
         local unread = messages:unreadInChannel(ch.idx)
-        local chat_btn = body:Button { w = ch.idx > 0 and lvgl.PCT(65) or lvgl.PCT(100), h = 24 }
+        local chat_btn = body:Button { w = lvgl.PCT(65), h = 24 }
         local lbl = chat_btn:Label { align = lvgl.ALIGN.LEFT_MID }
         lbl.text = ch.name .. (unread > 0 and ("  (" .. unread .. ")") or "")
         if unread > 0 then lbl:set { text_color = COL_ACCENT } end
         local ch_copy = { type = "channel", idx = ch.idx, name = ch.name }
         chat_btn:onevent(lvgl.EVENT.RELEASED, function() show_chat(ch_copy) end)
 
-        if ch.idx > 0 then
-            local del_btn = body:Button { w = 50, h = 24 }
-            del_btn:Label { text = "Del", align = lvgl.ALIGN.CENTER }
-            local ch_idx = ch.idx
-            del_btn:onevent(lvgl.EVENT.RELEASED, function()
-                _mesh_set_channel(ch_idx, "", ""); show_channels()
-            end)
-        end
+        -- Every channel can be deleted, incl. Public. Public is matched by NAME
+        -- (its slot is incidental) and routes through _mesh_delete_public so the
+        -- deletion persists across reboot.
+        local del_btn = body:Button { w = 50, h = 24 }
+        del_btn:Label { text = "Del", align = lvgl.ALIGN.CENTER }
+        local ch_idx = ch.idx
+        local is_public = (ch.name == "Public")
+        if is_public then public_present = true end
+        del_btn:onevent(lvgl.EVENT.RELEASED, function()
+            if is_public then _mesh_delete_public() else _mesh_set_channel(ch_idx, "", "") end
+            show_channels()
+        end)
+    end
+
+    -- Public absent (deleted) → show an Add row to bring it back. Driven by actual
+    -- presence in the channel list, not a flag, so it can never disagree with reality.
+    if not public_present then
+        body:Label {
+            text = "Public (off)", align = lvgl.ALIGN.LEFT_MID,
+            w = lvgl.PCT(65), h = 24, text_color = "#888888",
+        }
+        local add_btn = body:Button { w = 50, h = 24 }
+        add_btn:Label { text = "Add", align = lvgl.ALIGN.CENTER }
+        add_btn:onevent(lvgl.EVENT.RELEASED, function()
+            _mesh_restore_public(); show_channels()
+        end)
     end
 end
 

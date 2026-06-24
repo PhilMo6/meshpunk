@@ -687,6 +687,7 @@ void PunkMesh::saveChannels()
             ChannelDetails cd;
             getChannel(i, cd);
             if (cd.name[0] == '\0') continue;
+            if (strcmp(cd.name, "Public") == 0) continue;  // Public is owned by boot + the pubdel marker, never persisted as a slot
 
             char secret_hex[65];
             mesh::Utils::toHex(secret_hex, cd.channel.secret, 32);
@@ -698,23 +699,51 @@ void PunkMesh::saveChannels()
     if (is_sd) sd_spi_release();
 }
 
-// Delete the Public channel (slot 0) and persist the deletion so boot won't
-// recreate it. _public is nulled — send/welcome paths already guard for null.
+// Slot of the channel named "Public", or -1 if there isn't one. Public is treated
+// as a normal channel (no cached pointer), so callers resolve it by name on demand.
+int PunkMesh::publicChannelIdx()
+{
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+        ChannelDetails cd;
+        if (getChannel(i, cd) && strcmp(cd.name, "Public") == 0) return i;
+    }
+    return -1;
+}
+
+// Delete the Public channel and persist the deletion so boot won't recreate it.
 void PunkMesh::deletePublic()
 {
-    ChannelDetails cd;
-    memset(&cd, 0, sizeof(cd));
-    setChannel(0, cd);
-    _public = nullptr;
+    // Find the Public channel by NAME (its slot is incidental) and clear it.
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+        ChannelDetails cd;
+        if (getChannel(i, cd) && strcmp(cd.name, "Public") == 0) {
+            ChannelDetails empty;
+            memset(&empty, 0, sizeof(empty));
+            setChannel(i, empty);
+        }
+    }
     _public_deleted = true;
     saveChannels();
 }
 
-// Re-add Public with the well-known PSK (back into slot 0, the lowest free slot)
-// and clear the persisted deletion.
+// Re-add Public with the well-known PSK and clear the persisted deletion.
 void PunkMesh::restorePublic()
 {
-    _public = addChannel("Public", PUBLIC_GROUP_PSK);
+    // Place Public in the first free slot via setChannel — NOT addChannel, whose
+    // num_channels high-water index can overwrite a user channel after a restore.
+    // The slot is incidental; callers resolve Public by name (publicChannelIdx).
+    ChannelDetails cd;
+    memset(&cd, 0, sizeof(cd));
+    strncpy(cd.name, "Public", sizeof(cd.name) - 1);
+    extern unsigned int decode_base64(unsigned char const *src, unsigned int slen, unsigned char *target);
+    decode_base64((unsigned char *)PUBLIC_GROUP_PSK, strlen(PUBLIC_GROUP_PSK), cd.channel.secret);
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+        ChannelDetails ex;
+        if (getChannel(i, ex) && ex.name[0] == '\0') {
+            setChannel(i, cd);   // computes the channel hash from the secret
+            break;
+        }
+    }
     _public_deleted = false;
     saveChannels();
 }
@@ -3164,19 +3193,23 @@ void PunkMesh::begin()
     loadChannels();
 
     if (!_public_deleted) {
-        _public = addChannel("Public", PUBLIC_GROUP_PSK);
-        if (_public) {
+        ChannelDetails* pub = addChannel("Public", PUBLIC_GROUP_PSK);
+        if (pub) {
             SLog.println("[MESH INIT] Public channel created OK");
             char ch_hex[13];
-            mesh::Utils::toHex(ch_hex, _public->channel.hash, 6);
+            mesh::Utils::toHex(ch_hex, pub->channel.hash, 6);
             SLog.printf("[MESH INIT] Channel hash: %s\n", ch_hex);
         } else {
             SLog.println("[MESH INIT] ERROR: addChannel returned NULL!");
         }
     } else {
-        _public = nullptr;
         SLog.println("[MESH INIT] Public channel previously deleted — not recreating");
     }
+
+    // Presence in the channel table is authoritative: reconcile the flag so it can
+    // never disagree with reality (e.g. a stale channels file that recorded both a
+    // Public entry AND a pubdel marker). After this, "deleted" == "not in the table".
+    _public_deleted = (publicChannelIdx() < 0);
 }
 
 void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {
@@ -3406,13 +3439,15 @@ void PunkMesh::handleCommand(const char *command)
     { // send GroupChannel msg
         SLog.printf("[MESH TX] Serial 'public' command, text=\"%s\"\n", &command[7]);
 
-        if (!_public) {
-            SLog.println("[MESH TX] ERROR: _public channel is NULL!");
+        int pub_idx = publicChannelIdx();
+        ChannelDetails pub_cd;
+        if (pub_idx < 0 || !getChannel(pub_idx, pub_cd)) {
+            SLog.println("[MESH TX] ERROR: no public channel");
         } else {
             uint32_t timestamp = getRTCClock()->getCurrentTime();
             SLog.printf("[MESH TX] timestamp=%u, sender=%s\n", timestamp, _prefs.node_name);
 
-            bool ok = sendGroupMessage(timestamp, _public->channel, _prefs.node_name, &command[7], strlen(&command[7]));
+            bool ok = sendGroupMessage(timestamp, pub_cd.channel, _prefs.node_name, &command[7], strlen(&command[7]));
             SLog.printf("[MESH TX] sendGroupMessage returned %s\n", ok ? "true" : "false");
         }
     }
@@ -3592,7 +3627,7 @@ void PunkMesh::handleCommand(const char *command)
         mesh::Utils::toHex(pk_hex, self_id.pub_key, PUB_KEY_SIZE);
         SLog.printf("  Pub key: %s\n", pk_hex);
         SLog.printf("  Num contacts: %d\n", getNumContacts());
-        SLog.printf("  Public channel: %s\n", _public ? "configured" : "NULL (PROBLEM!)");
+        SLog.printf("  Public channel: %s\n", publicChannelIdx() >= 0 ? "configured" : "deleted");
         SLog.printf("  Lua runtime: %s\n", lua_runtime ? "attached" : "NULL (PROBLEM!)");
         SLog.printf("  RTC clock: %u\n", getRTCClock()->getCurrentTime());
         SLog.printf("  Uptime: %lu ms\n", millis());

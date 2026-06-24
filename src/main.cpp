@@ -1959,7 +1959,8 @@ static int lua_mesh_send_public(lua_State *L) {
   SLog.printf("[MESH TX] lua_mesh_send_public called, text=\"%s\"\n", text);
 
   MESH_LOCK();
-  if (!the_mesh->_public) {
+  int pub_idx = the_mesh->publicChannelIdx();   // Public is a normal channel; resolve by name
+  if (pub_idx < 0) {
     MESH_UNLOCK();
     SLog.println("[MESH TX] ERROR: No public channel configured!");
     lua_pushboolean(L, 0);
@@ -1969,7 +1970,7 @@ static int lua_mesh_send_public(lua_State *L) {
 
   uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
   uint8_t tx_hash[MAX_HASH_SIZE];
-  bool ok = the_mesh->sendAndPersistChannelMsg(0, timestamp, text, strlen(text), tx_hash);
+  bool ok = the_mesh->sendAndPersistChannelMsg(pub_idx, timestamp, text, strlen(text), tx_hash);
   MESH_UNLOCK();
 
   lua_pushboolean(L, ok ? 1 : 0);
@@ -5429,7 +5430,7 @@ void setup() {
   SLog.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh->_prefs.freq);
   SLog.printf("[MESH] TX power pref: %d dBm\n", the_mesh->_prefs.tx_power_dbm);
   SLog.printf("[MESH] Contacts loaded: %d\n", the_mesh->getNumContacts());
-  SLog.printf("[MESH] Public channel: %s\n", the_mesh->_public ? "YES" : "NO (PROBLEM!)");
+  SLog.printf("[MESH] Public channel: %s\n", the_mesh->publicChannelIdx() >= 0 ? "YES" : "deleted");
   char pk_hex[PUB_KEY_SIZE * 2 + 1];
   mesh::Utils::toHex(pk_hex, the_mesh->self_id.pub_key, PUB_KEY_SIZE);
   SLog.printf("[MESH] Pub key: %s\n", pk_hex);

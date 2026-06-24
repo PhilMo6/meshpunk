@@ -513,6 +513,11 @@ anim_dot:add_flag(lvgl.FLAG.HIDDEN)
 anim_dot:clear_flag(lvgl.FLAG.CLICKABLE)
 anim_dot:clear_flag(lvgl.FLAG.SCROLLABLE)
 
+-- Archived-contacts paging: the cycle handler + its button updater are defined
+-- with the arch_load engine below; forward-declared here so the button can bind
+-- them.
+local arch_cycle, update_arch_button
+
 -- On-map "Clear MP" button (top-right): visible only while a meshprint is on
 -- screen; clears the meshprint layer. clear_meshprint is forward-declared.
 local mp_clear_btn = root:Button({ w = 80, h = 28, x = W - 86, y = 24 })
@@ -520,6 +525,18 @@ mp_clear_btn:Label({ text = "Clear MP", align = lvgl.ALIGN.CENTER })
 mp_clear_btn:add_flag(lvgl.FLAG.HIDDEN)
 mp_clear_btn:clear_flag(lvgl.FLAG.SCROLLABLE)
 mp_clear_btn:onClicked(function() if clear_meshprint then clear_meshprint() end end)
+
+-- On-map archive cycle button (top-right, just below the status bar): visible
+-- while the archived display is on and no meshprint owns the layer. Each tap
+-- loads the next ARCH_PAGE_SIZE-record window of the archive, wrapping back to
+-- the first. Label shows the 1-based page; " >" = more pages, " <" = wraps to 1.
+-- Shares the corner with Clear MP (y=24) — they're never visible at once (the
+-- arch button hides during a meshprint).
+local arch_cycle_btn = root:Button({ w = 92, h = 28, x = W - 98, y = 24 })
+local arch_cycle_lbl = arch_cycle_btn:Label({ text = "Arch 1", align = lvgl.ALIGN.CENTER })
+arch_cycle_btn:add_flag(lvgl.FLAG.HIDDEN)
+arch_cycle_btn:clear_flag(lvgl.FLAG.SCROLLABLE)
+arch_cycle_btn:onClicked(function() if arch_cycle then arch_cycle() end end)
 
 -- Replay info popup (top-left corner under the status bar): who the
 -- currently replayed packet is from, plus progress through the replay.
@@ -705,7 +722,25 @@ local function invalidate_markers() marker_cache.dirty = true end
 -- projected at draw_zoom; re-projected by redraw_markers on zoom). No dedup yet
 -- (Noah: draw all incl. doubles for now). redraw_markers draws these in gray;
 -- find_nearest also searches them so taps on a gray dot open its re-add popup.
-local arch_load = { offset = 0, pts = {}, draw_zoom = nil, timer = nil }
+-- Archived markers load in pages of ARCH_PAGE_SIZE records (the cycle button
+-- steps through them, wrapping at the end) so the working set — Lua tables plus
+-- their canvas draws — is bounded; an unbounded load starved PSRAM and
+-- hard-faulted LVGL's draw path. ARCH_MIN_FREE is the largest-free-block floor
+-- enforced BEFORE each read/draw batch (display) and before each archive batch
+-- the meshprint streams, so no allocation is attempted without headroom.
+local ARCH_PAGE_SIZE = 1000
+local ARCH_MIN_FREE = 700 * 1024
+local arch_load = {
+    offset = 0,       -- streaming cursor (byte offset) within the current page
+    page = 0,         -- current page index (0-based)
+    page_start = 0,   -- byte offset where the current page begins
+    next_off = 0,     -- byte offset where the next page begins (when has_next)
+    read = 0,         -- records pulled into the current page so far
+    has_next = false, -- more records exist on disk past this page
+    pts = {},
+    draw_zoom = nil,
+    timer = nil,
+}
 
 local function refresh_tiles()
     if not map.running then return end
@@ -1011,27 +1046,63 @@ redraw_markers = function()
     end
 end
 
--- ── Progressive archived-marker loader ──────────────────────────────────────
+-- ── Progressive archived-marker loader (paged) ──────────────────────────────
 local function arch_load_stop()
     if arch_load.timer then arch_load.timer:delete(); arch_load.timer = nil end
 end
 
-local function arch_load_reset()
-    arch_load_stop()
-    arch_load.offset = 0
-    arch_load.pts = {}
-    arch_load.draw_zoom = nil
+-- Refresh the on-map cycle button: label = 1-based page (" >" = more pages on
+-- disk, " <" = next tap wraps to page 1). Shown only while the archived display
+-- is on and no meshprint owns the layer.
+update_arch_button = function()
+    if not arch_cycle_btn then return end
+    if show_archived and not meshprint.active then
+        arch_cycle_lbl:set({ text = "Arch " .. (arch_load.page + 1)
+                                    .. (arch_load.has_next and " >" or " <") })
+        arch_cycle_btn:clear_flag(lvgl.FLAG.HIDDEN)
+    else
+        arch_cycle_btn:add_flag(lvgl.FLAG.HIDDEN)
+    end
 end
 
--- One batch: pull ~150 archived contacts from the disk log, project them, append
--- to arch_load.pts, and additively draw each gray dot (no full redraw). Stops at
--- EOF. The map stays interactive between ticks; the load can't trip the watchdog
--- (≤150 parsed per tick) and never blocks a draw.
+-- One batch of the current page: pre-check PSRAM, pull up to 300 archived
+-- records, project + additively draw the positioned ones, advance the cursor.
+-- Stops (keeping what's drawn) at the page cap (ARCH_PAGE_SIZE records), at EOF,
+-- or when PSRAM headroom drops below ARCH_MIN_FREE. Stays interactive between
+-- ticks and never blocks a draw.
 local function arch_load_step()
     if not map.running or not show_archived then arch_load_stop(); return end
-    local ok, batch, next_off, done = pcall(_mesh_archive_read, arch_load.offset, 150)
+
+    -- Pre-check: a draw_rect allocates an LVGL draw descriptor; under a starved
+    -- heap that malloc returns NULL and the draw path hard-faults
+    -- (StoreProhibited). Never read/draw a batch without headroom — stop the
+    -- page here and keep what's already shown.
+    local okh, _, largest = pcall(_heap_info)
+    if okh and largest and largest < ARCH_MIN_FREE then
+        -- The Lua heap IS PSRAM and its incremental GC lags badly on churn
+        -- (each page drops ~1000 lean tables). A low reading here is usually
+        -- just uncollected garbage — force a full GC and re-measure before
+        -- giving up, so a transient dip can't permanently wedge loading.
+        collectgarbage("collect")
+        okh, _, largest = pcall(_heap_info)
+    end
+    if okh and largest and largest < ARCH_MIN_FREE then
+        print("[Map] archive page stopped at " .. #arch_load.pts
+              .. " largest=" .. tostring(largest) .. " (low PSRAM)")
+        arch_load_stop()
+        arch_load.has_next = true   -- unknown remainder on disk; allow cycling on
+        arch_load.next_off = arch_load.offset
+        update_arch_button()
+        return
+    end
+
+    local want = math.min(300, ARCH_PAGE_SIZE - arch_load.read)
+    if want < 1 then arch_load_stop(); return end
+
+    local ok, batch, next_off, done = pcall(_mesh_archive_read, arch_load.offset, want)
     if not ok then arch_load_stop(); return end
     if next_off then arch_load.offset = next_off end
+    if type(batch) == "table" then arch_load.read = arch_load.read + #batch end
 
     -- Draw against the canvas's current slide reference (set by redraw_markers);
     -- fall back to the live view before the first redraw.
@@ -1061,23 +1132,78 @@ local function arch_load_step()
             end
         end
     end
-    if done then arch_load_stop(); return end
-    -- Memory-aware: keep loading only while there's comfortable PSRAM headroom
-    -- (these tables + their draws share the pool). Stop — keeping what we've got
-    -- — when the largest free block gets tight, so we never load into an OOM.
-    local okh, _, largest = pcall(_heap_info)
-    if okh and largest and largest < 700 * 1024 then
-        print("[Map] archive load stopped at " .. #arch_load.pts .. " (low PSRAM)")
+
+    -- Page full: stop and remember whether the disk holds more beyond it.
+    if arch_load.read >= ARCH_PAGE_SIZE then
         arch_load_stop()
+        arch_load.has_next = not done
+        arch_load.next_off = arch_load.offset
+        update_arch_button()
+        return
+    end
+    -- EOF before the cap: last page.
+    if done then
+        arch_load_stop()
+        arch_load.has_next = false
+        update_arch_button()
+        return
     end
 end
 
--- (Re)start the progressive load from the top. Called when "show archived" turns
--- on and at map start if it's already on.
-local function arch_load_start()
-    arch_load_reset()
+-- Stream the CURRENT page (from page_start), clearing the prior page's counters
+-- first. Used by both the initial load and the cycle button. arch_load_step
+-- must be defined above so this closure can call it.
+local function arch_load_begin_page()
+    arch_load_stop()
+    arch_load.pts = {}
+    arch_load.read = 0
+    arch_load.offset = arch_load.page_start
+    arch_load.draw_zoom = nil
+    -- Reclaim the page we just dropped (its ~1000 lean tables are now garbage)
+    -- before streaming the next one — the incremental GC won't keep up on its
+    -- own, so the largest-free floor would otherwise climb across cycles.
+    collectgarbage("collect")
     if not show_archived then return end
     arch_load.timer = lvgl.Timer({ period = 100, cb = function(t) arch_load_step() end })
+end
+
+-- Full reset back to page 0 (toggling "show archived" on / map start).
+local function arch_load_reset()
+    arch_load_stop()
+    arch_load.offset = 0
+    arch_load.page = 0
+    arch_load.page_start = 0
+    arch_load.next_off = 0
+    arch_load.read = 0
+    arch_load.has_next = false
+    arch_load.pts = {}
+    arch_load.draw_zoom = nil
+end
+
+-- (Re)start the paged load from page 0. Called when "show archived" turns on and
+-- at map start if it's already on.
+local function arch_load_start()
+    arch_load_reset()
+    if show_archived then arch_load_begin_page() end
+    update_arch_button()
+end
+
+-- Advance to the next page (or wrap to the first) and stream it in, clearing the
+-- prior page's gray markers.
+arch_cycle = function()
+    if not show_archived then return end
+    if arch_load.has_next then
+        arch_load.page = arch_load.page + 1
+        arch_load.page_start = arch_load.next_off or 0
+    else
+        arch_load.page = 0
+        arch_load.page_start = 0
+    end
+    arch_load.has_next = false
+    invalidate_markers()
+    arch_load_begin_page()  -- clears pts + starts streaming the new page
+    redraw_markers()        -- wipe old gray dots + repaint live (new page draws on top)
+    update_arch_button()
 end
 
 -- Repaint the screen-sized meshprint canvas: draw the resolved repeaters (2nd
@@ -1588,7 +1714,10 @@ end
 run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, calc_second, on_progress, on_done)
     local nl = node_name and node_name:lower():gsub("^%s+", ""):gsub("%s+$", "") or ""
     if nl == "" then if on_done then on_done(0) end return end
-    local ok, contacts = pcall(_mesh_get_contacts, show_archived)
+    -- Live contacts only here. When "Show archived" is on, the FULL archive is
+    -- streamed into the LUT below (not the 1000-cap union _mesh_get_contacts(true)
+    -- returns) so every archived repeater can anchor a hop.
+    local ok, contacts = pcall(_mesh_get_contacts, false)
     if not ok or not contacts then
         if on_done then on_done(0) end return
     end
@@ -1602,10 +1731,12 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
     -- on the failure paths below). Stop any animation first (it owns anim_canvas).
     if anim.active then anim_stop() end
     anim.queue = {}
+    arch_load_stop()  -- suspend archived-contact loader to free PSRAM for the scan
     free_base_canvases()
     -- Mark active now (before the scan) so anim_tick early-returns for the whole
     -- run and never touches the freed anim canvas. Cleared again on any failure.
     meshprint.active = true
+    update_arch_button()  -- hide the archive cycle button while the MP owns the layer
     collectgarbage("collect")
 
     -- prefix -> { positioned candidate contacts at this hash size }. Keeps
@@ -1647,6 +1778,10 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
         return result
     end
 
+    -- Scan phase: resolve this node's stored messages against the LUT, tally its
+    -- 1st/2nd-hop repeaters, then triangulate. Wrapped in a closure so the
+    -- archive phase below can finish building the LUT first, then hand off.
+    local function start_scan()
     -- Pull only this node's records from the routing store (sender-indexed) —
     -- no more scanning every channel's full history. Records carry the same
     -- { from, timestamp, lat, lon, path } shape the scan loop expects.
@@ -1720,10 +1855,14 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
         if idx > total then
             t:delete(); meshprint.scan_timer = nil
             if #reps1 == 0 then
+                all_msgs = nil; prefix_lut = nil; cand_cache = nil; contacts = nil
+                if meshprint_canvas then meshprint_canvas:delete(); meshprint_canvas = nil end
                 meshprint.active = false
+                collectgarbage("collect")
                 create_base_canvases()  -- nothing to show; restore markers/anim
                 invalidate_markers()
                 redraw_markers()
+                if show_archived then arch_load_start() end
                 if on_done then on_done(0) end return
             end
             -- Drop everything the scan built (message list, prefix LUT, candidate
@@ -1741,6 +1880,7 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
                 create_base_canvases()  -- restore markers/anim since MP failed
                 invalidate_markers()
                 redraw_markers()
+                if show_archived then arch_load_start() end
                 if on_done then on_done(-1) end
                 return
             end
@@ -1763,6 +1903,68 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
             if on_done then on_done(#reps1) end
         end
     end })
+    end  -- start_scan
+
+    -- Fold one lean archived contact into the prefix LUT under each hash size
+    -- (same shape the live-contacts loop builds above).
+    local function fold_into_lut(c)
+        local pk = c.pubkey:lower()
+        for _, hlen in ipairs({2, 4, 6, 8}) do
+            if #pk >= hlen then
+                local prefix = pk:sub(1, hlen)
+                local bucket = prefix_lut[prefix]
+                if not bucket then bucket = {}; prefix_lut[prefix] = bucket end
+                bucket[#bucket + 1] = c
+            end
+        end
+    end
+
+    -- Archive phase: with "Show archived" on, stream the FULL on-disk archive
+    -- into prefix_lut before scanning, so repeaters since evicted to disk can
+    -- still anchor a hop. Deduped by pubkey (newest-wins), positioned entries
+    -- only, batched + memory-guarded — a low-PSRAM stop just proceeds best-effort
+    -- with what was gathered (never aborts the run for memory). The base canvases
+    -- are freed by now (~1.2MB headroom), so this is the safe moment. The timer
+    -- reuses meshprint.scan_timer so shutdown/clear tear it down too.
+    if not show_archived then
+        start_scan()
+    else
+        local seen, nseen, aoff = {}, 0, 0
+        if on_progress then on_progress(0, 0, "archive") end
+        meshprint.scan_timer = lvgl.Timer({ period = 20, cb = function(t)
+            if not map.running then t:delete(); meshprint.scan_timer = nil; return end
+            local okh, _, largest = pcall(_heap_info)
+            if okh and largest and largest < ARCH_MIN_FREE then
+                collectgarbage("collect")  -- drop lagged garbage before judging low
+                okh, _, largest = pcall(_heap_info)
+            end
+            local low = okh and largest and largest < ARCH_MIN_FREE
+            local batch, next_off, done
+            if not low then
+                local okr
+                okr, batch, next_off, done = pcall(_mesh_archive_read, aoff, 300)
+                if not okr then done = true end
+            end
+            if type(batch) == "table" then
+                for _, c in ipairs(batch) do
+                    if c.pubkey and c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
+                        local k = c.pubkey:lower()
+                        if seen[k] == nil then nseen = nseen + 1 end
+                        seen[k] = c   -- newest-wins (a later disk line supersedes)
+                    end
+                end
+            end
+            if next_off then aoff = next_off end
+            if on_progress then on_progress(nseen, 0, "archive") end
+            if low or done or type(batch) ~= "table" then
+                t:delete(); meshprint.scan_timer = nil
+                for _, c in pairs(seen) do fold_into_lut(c) end
+                seen = nil
+                collectgarbage("collect")
+                start_scan()
+            end
+        end })
+    end
 end
 
 clear_meshprint = function()
@@ -1779,6 +1981,7 @@ clear_meshprint = function()
     create_base_canvases()
     invalidate_markers()  -- contacts may have changed during the meshprint
     redraw_markers()
+    if show_archived then arch_load_start() end
     mp_clear_btn:add_flag(lvgl.FLAG.HIDDEN)
 end
 
@@ -3046,10 +3249,15 @@ show_meshprint_screen = function()
             if not meshprint_overlay then return end
             run_meshprint(name, map_prefs.mp_second, map_prefs.mp_algo, mp_skip_1b, map_prefs.mp_cull,
                 map_prefs.mp_second_calc,
-                function(done, total)
+                function(done, total, phase)
                     if not meshprint_overlay then return end  -- screen closed mid-scan
-                    warn_lbl:set({ text = "Scanning " .. done .. "/" .. total .. "...",
-                                   text_color = "#AAAAAA" })
+                    if phase == "archive" then
+                        warn_lbl:set({ text = "Loading archive " .. done .. "...",
+                                       text_color = "#AAAAAA" })
+                    else
+                        warn_lbl:set({ text = "Scanning " .. done .. "/" .. total .. "...",
+                                       text_color = "#AAAAAA" })
+                    end
                 end,
                 function(n)
                     if not meshprint_overlay then return end  -- screen closed mid-scan
@@ -3152,6 +3360,7 @@ local function show_settings_screen()
         else
             arch_load_reset()       -- drop them + stop the loader
         end
+        update_arch_button()        -- show/hide the cycle button to match
         invalidate_markers()
         redraw_markers()  -- reflect immediately (archived fill in progressively)
     end)
