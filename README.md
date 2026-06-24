@@ -12,13 +12,14 @@
 - WiFi support
 - GPS automatically gets time
 - Loads Lua scripts from the filesystem automatically as apps
-- Integrates MeshCore networking
+- Full MeshCore support
 - Emoji support
-- Map app with offline tile caching and message path animations.
+- Map app with offline tile caching, message path animations, message path replay, and meshprint sender triangulation!
 - Lua games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of development)
 - Elf file loader
 - Doom! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
-- Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts.
+- Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts. (thanks to https://github.com/mintylinux)
+- 
 
 ## Installation 
 
@@ -54,11 +55,16 @@ The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. T
 
 - Pre-cache Downloads
 
-Press the **DL** button (visible when WiFi and SD are available) to bulk-download tiles for offline use. Choose an area size and zoom range, then download. Tiles are written atomically to SD so interrupted downloads won't leave corrupt files.
+In the map settings you can download map tiles to bulk-download tiles for offline use. Choose an area size and zoom range, then download. Tiles are written atomically to SD so interrupted downloads won't leave corrupt files.
 
 - Contact Selection
 
 Long-press on a contact marker (touchscreen) or center the trackball on one and press Enter to view contact details including name, type, distance, hop count, and last seen time.
+
+- Meshprint
+
+With enough mesh data you can run a meshprint on the sender of a message to try to capture the first and second hop repeaters which will then be used to triangulate the senders general locaton.
+The more data you have the better your results will be!
 
 ## Project Structure
 
@@ -149,6 +155,8 @@ MIT
 - Emojis from https://github.com/googlefonts/noto-emoji
 - Emoji converted to .bin with ImageMagick
 - doomgeneric https://github.com/ozkl/doomgeneric
+- Pico8 emulation done with fake08 https://github.com/jtothebell/fake-08
+   conversion of fake08 to meshpunk elf done by https://github.com/mintylinux
 
 ## Branch
 This branch of the Meshpunk project focuses on extending functionality.

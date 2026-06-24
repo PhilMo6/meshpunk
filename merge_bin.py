@@ -9,7 +9,7 @@ OFFSETS = {
     "partitions": "0x8000",
     "boot_app0": "0xe000",
     "firmware":   "0x10000",
-    "littlefs":   "0xc90000",
+    "littlefs":   "0x410000",
 }
 
 def git_version(project_dir):
