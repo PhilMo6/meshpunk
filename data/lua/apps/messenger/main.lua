@@ -199,7 +199,7 @@ end
 -- Forward declarations
 local show_inbox, show_chat, show_contacts, show_channels
 local show_contact_detail, show_my_node, show_import_contact
-local show_contact_settings, show_clear_confirm
+local show_contact_settings, show_clear_confirm, show_flood_scope
 
 -- ── Long-press popup showing message metadata ───────────────────
 local function show_msg_info(msg, on_reply, on_dismiss)
@@ -596,6 +596,11 @@ show_chat = function(target)
     local back_btn = body:Button { w = 45, h = 20 }
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
     back_btn:onevent(lvgl.EVENT.RELEASED, function() show_inbox() end)
+
+    -- Region / flood-scope settings (the default scope applies to all sends).
+    local scope_btn = body:Button { w = 45, h = 20 }
+    scope_btn:Label { text = "Rgn", align = lvgl.ALIGN.CENTER }
+    scope_btn:onevent(lvgl.EVENT.RELEASED, function() show_flood_scope() end)
 
     if target.type == "dm" then
         local info_btn = body:Button { w = 45, h = 20 }
@@ -1172,25 +1177,50 @@ show_contact_settings = function()
     toggle_btn("Sensors", function() return contacts_show_sensors end,
                         function(v) contacts_show_sensors = v end)
 
-    -- Do not add: stops the firmware from auto-adding these advert types as
-    -- contacts in the first place (persisted via _prefs.no_add_mask). Checked =
-    -- excluded. Gracefully no-ops if the firmware lacks the bridge yet.
-    local no_users, no_reps, no_rooms, no_sensors = false, false, false, false
-    local ok_na, x1, x2, x3, x4 = pcall(_mesh_get_no_add)
-    if ok_na then no_users, no_reps, no_rooms, no_sensors = x1, x2, x3, x4 end
-    local function persist_no_add()
-        pcall(_mesh_set_no_add, no_users, no_reps, no_rooms, no_sensors)
+    -- Auto add: mirrors the BLE companion app. "Auto add all" (default) adds
+    -- every discovered advert type; turn it off to auto-add only the selected
+    -- types below. The type checkboxes stay visible in all-mode but are ignored
+    -- until "Auto add all" is off. Persisted via _prefs.manual_add_contacts +
+    -- autoadd_config. Gracefully no-ops if the firmware lacks the bridge yet.
+    local aa_selected, aa_chat, aa_reps, aa_rooms, aa_sensors =
+        false, false, false, false, false
+    local ok_aa, m, c1, c2, c3, c4 = pcall(_mesh_get_autoadd)
+    if ok_aa then aa_selected, aa_chat, aa_reps, aa_rooms, aa_sensors = m, c1, c2, c3, c4 end
+    local function persist_autoadd()
+        pcall(_mesh_set_autoadd, aa_selected, aa_chat, aa_reps, aa_rooms, aa_sensors)
     end
 
-    box:Label { text = "Do not add:", w = lvgl.PCT(100), text_color = COL_META }
-    toggle_btn("Users", function() return no_users end,
-                        function(v) no_users = v; persist_no_add() end)
-    toggle_btn("Repeaters", function() return no_reps end,
-                        function(v) no_reps = v; persist_no_add() end)
-    toggle_btn("Rooms", function() return no_rooms end,
-                        function(v) no_rooms = v; persist_no_add() end)
-    toggle_btn("Sensors", function() return no_sensors end,
-                        function(v) no_sensors = v; persist_no_add() end)
+    box:Label { text = "Auto add:", w = lvgl.PCT(100), text_color = COL_META }
+    -- Checked "Auto add all" == NOT selected-mode.
+    toggle_btn("Auto add all", function() return not aa_selected end,
+                        function(v) aa_selected = not v; persist_autoadd() end)
+    toggle_btn("Users", function() return aa_chat end,
+                        function(v) aa_chat = v; persist_autoadd() end)
+    toggle_btn("Repeaters", function() return aa_reps end,
+                        function(v) aa_reps = v; persist_autoadd() end)
+    toggle_btn("Rooms", function() return aa_rooms end,
+                        function(v) aa_rooms = v; persist_autoadd() end)
+    toggle_btn("Sensors", function() return aa_sensors end,
+                        function(v) aa_sensors = v; persist_autoadd() end)
+
+    -- Auto-add hop limit: how far away an advert may be and still auto-add.
+    box:Label { text = "Auto-add max hops:", w = lvgl.PCT(100), text_color = COL_META }
+    local mh_vals = { 0, 1, 2, 3, 4 }  -- dropdown index -> autoadd_max_hops value
+    local cur_mh = 0
+    local ok_mh, mh = pcall(_mesh_get_autoadd_max_hops)
+    if ok_mh and mh then cur_mh = mh end
+    local mh_sel = 0
+    for i = 1, #mh_vals do
+        if mh_vals[i] == cur_mh then mh_sel = i - 1; break end
+    end
+    local mh_dd = box:Dropdown {
+        options = "Any\nDirect only\nUp to 1 hop\nUp to 2 hops\nUp to 3 hops",
+        w = lvgl.PCT(100), h = 30, dir = lvgl.DIR.BOTTOM,
+    }
+    mh_dd:set({ selected = mh_sel })
+    mh_dd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+        pcall(_mesh_set_autoadd_max_hops, mh_vals[mh_dd:get("selected") + 1] or 0)
+    end)
 
     -- When the contact list is full: overwrite the oldest non-favourite, or
     -- discard the new one (and archiving of contacts leaving the active list).
@@ -1224,6 +1254,77 @@ show_contact_settings = function()
     local close_btn = box:Button { w = lvgl.PCT(100), h = 28 }
     close_btn:Label { text = "Apply & Close", align = lvgl.ALIGN.CENTER }
     close_btn:onevent(lvgl.EVENT.RELEASED, function() close_popup(true) end)
+end
+
+-- Region / flood-scope settings popup. Floods (DMs + channel msgs) are only
+-- accepted by nodes sharing the same region name (the name derives a transport
+-- key on the firmware side); blank = global. Opened from the contacts view.
+show_flood_scope = function()
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)
+
+    local function close_popup()
+        nav.pop()
+        overlay:delete()
+    end
+
+    -- Fixed height (not SIZE_CONTENT) so the flex column scrolls when its
+    -- content is taller than the box; the box keeps its default SCROLLABLE flag.
+    local box = overlay:Object {
+        w = W - 20, h = H - 20, align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555", pad_all = 8,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    nav.push(box)
+
+    box:Label { text = "-- Region / Flood Scope --", w = lvgl.PCT(100) }
+    box:Label {
+        text = "Floods reach only nodes with the same region name (blank = global). Must match other nodes exactly.",
+        w = lvgl.PCT(100), text_color = COL_META,
+    }
+
+    local cur = ""
+    local ok_fs, name = pcall(_mesh_get_flood_scope)
+    if ok_fs and name then cur = name end
+
+    local input = box:Textarea {
+        one_line = true, text = cur, placeholder_text = "region name",
+        w = lvgl.PCT(100), h = 32,
+    }
+    input:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local status = box:Label {
+        text = (cur ~= "" and ("Current: " .. cur)) or "Current: global",
+        w = lvgl.PCT(100), text_color = COL_META,
+    }
+
+    local save_btn = box:Button { w = lvgl.PCT(100), h = 30 }
+    save_btn:Label { text = "Save", align = lvgl.ALIGN.CENTER }
+    save_btn:onevent(lvgl.EVENT.RELEASED, function()
+        local n = input.text or ""
+        if pcall(_mesh_set_flood_scope, n) then
+            status.text = (n ~= "") and ("Set: " .. n) or "Cleared (global)"
+        else
+            status.text = "Failed to save"
+        end
+    end)
+
+    local clear_btn = box:Button { w = lvgl.PCT(100), h = 30 }
+    clear_btn:Label { text = "Clear (global)", align = lvgl.ALIGN.CENTER }
+    clear_btn:onevent(lvgl.EVENT.RELEASED, function()
+        input.text = ""
+        pcall(_mesh_set_flood_scope, "")
+        status.text = "Cleared (global)"
+    end)
+
+    local close_btn = box:Button { w = lvgl.PCT(100), h = 30 }
+    close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+    close_btn:onevent(lvgl.EVENT.RELEASED, close_popup)
 end
 
 -- ── CONTACTS VIEW ───────────────────────────────────────────────

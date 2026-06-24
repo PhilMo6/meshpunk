@@ -293,6 +293,27 @@ overwrite_apply_btn:onClicked(function()
     end
 end)
 
+-- ── Advert Location ──
+content:Label { text = "-- Advert Location --", w = lvgl.PCT(100), h = 16 }
+
+local ok_al, al = pcall(_mesh_get_advert_loc)
+local advert_loc_on = ok_al and (al == true)  -- default: off (privacy)
+
+local function get_advert_loc_text()
+    return advert_loc_on and "[x] Share location in adverts" or "[ ] Share location in adverts"
+end
+
+local advert_loc_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+local advert_loc_label = advert_loc_btn:Label { text = get_advert_loc_text(), align = lvgl.ALIGN.CENTER }
+advert_loc_btn:onClicked(function()
+    advert_loc_on = not advert_loc_on
+    advert_loc_label.text = get_advert_loc_text()
+    local ok_set = pcall(_mesh_set_advert_loc, advert_loc_on)
+    status_label.text = ok_set
+        and ("Advert location: " .. (advert_loc_on and "shared" or "hidden"))
+        or "Error saving advert location"
+end)
+
 -- ── Message Repeat ──
 content:Label { text = "-- Message Repeat --", w = lvgl.PCT(100), h = 16 }
 
@@ -342,6 +363,33 @@ repeat_apply_btn:onClicked(function()
         status_label.text = "Msg Repeat: " .. (repeat_enabled and "ON" or "OFF")
     else
         status_label.text = "Error: " .. tostring(err)
+    end
+end)
+
+-- ── Multi-byte IDs (path hash size) ──
+content:Label { text = "-- Multi-byte IDs --", w = lvgl.PCT(100), h = 16 }
+content:Label {
+    text = "Bytes per hop in routed paths. Higher = fewer ID collisions in dense meshes, but bigger packets and fewer hops.",
+    w = lvgl.PCT(100), h = 44,
+}
+
+local path_hash_mode = (function()
+    local ok_p, m = pcall(_mesh_get_path_hash_mode)
+    return (ok_p and m) or 0
+end)()
+
+local phm_dd = content:Dropdown {
+    options = "1 byte (default)\n2 bytes\n3 bytes",
+    w = lvgl.PCT(65), h = 30, dir = lvgl.DIR.TOP,
+}
+phm_dd:set({ selected = path_hash_mode })
+phm_dd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
+    local mode = phm_dd:get("selected")
+    local ok_s = pcall(_mesh_set_path_hash_mode, mode)
+    if ok_s then
+        status_label.text = "Path hash: " .. (mode + 1) .. ((mode == 0) and " byte" or " bytes")
+    else
+        status_label.text = "Failed to set path hash"
     end
 end)
 

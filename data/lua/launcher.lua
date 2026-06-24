@@ -51,9 +51,14 @@ function build_page(items, category)
             flex_wrap = "wrap",
             justify_content = "center",
             align_items = "center",
-            align_content = "center",
+            -- Stack wrapped rows from the top (not centered) so an overflowing
+            -- page scrolls cleanly downward instead of clipping its first rows.
+            align_content = "flex-start",
         },
-        w = lvgl.HOR_RES(), h = lvgl.VER_RES(), x = 0, y = 20,
+        -- Fit the visible area below the 20px topbar; the wrapped app grid then
+        -- scrolls vertically (Objects keep their default SCROLLABLE flag) so a
+        -- category with many apps isn't cut off at the bottom of the screen.
+        w = lvgl.HOR_RES(), h = lvgl.VER_RES() - 20, x = 0, y = 20,
         border_width = 0, pad_all = 4,
     })
     nav.replace(body)
@@ -63,6 +68,8 @@ function build_page(items, category)
 
     if category then
         body:Label{text = category, align = lvgl.ALIGN.CENTER, w = 260, h = 40}
+    else
+        body:Label{text = "Home", align = lvgl.ALIGN.CENTER, w = 260, h = 40}
     end
 
     for _, app in ipairs(items) do

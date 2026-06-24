@@ -1,6 +1,8 @@
 #include "punkmesh.h"
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
+#include <helpers/TransportKeyStore.h>
+#include <SHA256.h>
 #include "meshpunk_sync.h"
 #include "ble_companion.h"
 
@@ -290,17 +292,22 @@ const char *PunkMesh::getTypeName(uint8_t type) const
     return "??"; // unknown
 }
 
-// "Do not add" exclusions: return false to stop the base mesh from auto-adding
-// a discovered contact of this type. Driven by _prefs.no_add_mask
-// (bit0=chat/user, bit1=repeater, bit2=room, bit3=sensor). Only affects NEW
-// adverts; already added contacts of an excluded type keep updating.
+// Auto-add gate: return false to stop the base mesh from auto-adding a
+// discovered contact of this type. Mirrors the MeshCore companion model —
+// "auto-add all" (manual_add_contacts bit0 clear) adds every type; "auto-add
+// selected" (bit0 set) adds only the types whose bit is set in autoadd_config
+// (chat 0x02 / repeater 0x04 / room 0x08 / sensor 0x10). Only affects NEW
+// adverts; already added contacts keep updating.
 bool PunkMesh::shouldAutoAddContactType(uint8_t type) const
 {
-    if (type == ADV_TYPE_CHAT     && (_prefs.no_add_mask & 0x01)) return false;
-    if (type == ADV_TYPE_REPEATER && (_prefs.no_add_mask & 0x02)) return false;
-    if (type == ADV_TYPE_ROOM     && (_prefs.no_add_mask & 0x04)) return false;
-    if (type == ADV_TYPE_SENSOR   && (_prefs.no_add_mask & 0x08)) return false;
-    return true;
+    if ((_prefs.manual_add_contacts & 0x01) == 0) return true;  // auto-add all
+    switch (type) {
+        case ADV_TYPE_CHAT:     return (_prefs.autoadd_config & 0x02) != 0;
+        case ADV_TYPE_REPEATER: return (_prefs.autoadd_config & 0x04) != 0;
+        case ADV_TYPE_ROOM:     return (_prefs.autoadd_config & 0x08) != 0;
+        case ADV_TYPE_SENSOR:   return (_prefs.autoadd_config & 0x10) != 0;
+        default:                return false;
+    }
 }
 
 
@@ -799,9 +806,11 @@ static void fill_stored_msg(StoredMsg& m, int channel_idx, const char* from,
                             uint8_t hops, bool direct, bool is_dm,
                             uint16_t path_len = 0, const uint8_t* path_data = nullptr,
                             const uint8_t* pkt_hash = nullptr,
-                            const uint8_t* pub_key = nullptr) {
+                            const uint8_t* pub_key = nullptr,
+                            uint32_t sender_ts = 0) {
     memset(&m, 0, sizeof(m));
-    m.timestamp   = timestamp;
+    m.timestamp   = timestamp;   // authoritative (our RX/send clock)
+    m.sender_ts   = sender_ts;   // sender's claimed clock — recorded only
     m.snr         = snr;
     m.rssi        = rssi;
     m.channel_idx = (int8_t)channel_idx;
@@ -971,7 +980,8 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
 
     File f = storage->open(fpath.c_str(), "a", true);
     if (f) {
-        f.printf("ts=%u\n", m.timestamp);
+        f.printf("ts=%u\n", m.timestamp);          // authoritative (our RX/send clock)
+        if (m.sender_ts) f.printf("sender_ts=%u\n", m.sender_ts);  // sender's claimed clock
         f.printf("from=%s\n", m.from);
         if (m.peer[0]) f.printf("peer=%s\n", m.peer);
         f.printf("text=%s\n", m.text);
@@ -1018,6 +1028,10 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
 static String route_dir(const String& prefix) { return prefix + "/route"; }
 
 static void route_date_str(uint32_t ts, char* out /* >= 11 bytes */) {
+    // RTClib's DateTime(uint32_t) subtracts SECONDS_FROM_1970_TO_2000, so any ts
+    // below that offset underflows into the far future (~2106). Bucket those under
+    // a sentinel that sorts before every real date instead of misdating them.
+    if (ts < 946684800u) { strcpy(out, "0000-00-00"); return; }  // SECONDS_FROM_1970_TO_2000
     DateTime dt = DateTime(ts);
     snprintf(out, 11, "%04d-%02d-%02d", dt.year(), dt.month(), dt.day());
 }
@@ -1205,12 +1219,12 @@ void PunkMesh::appendChannelMessage(int channel_idx, const char* from, const cha
                                     uint32_t timestamp, float snr, float rssi,
                                     uint8_t hops, bool direct,
                                     uint16_t path_len, const uint8_t* path,
-                                    const uint8_t* pkt_hash) {
+                                    const uint8_t* pkt_hash, uint32_t sender_ts) {
     if (channel_idx < 0) return;
     StoredMsg m;
     fill_stored_msg(m, channel_idx, from, /*peer*/ "", text,
                     timestamp, snr, rssi, hops, direct, /*is_dm*/ false,
-                    path_len, path, pkt_hash);
+                    path_len, path, pkt_hash, /*pub_key*/ nullptr, sender_ts);
     String ch_name = channel_name_for_idx(*this, channel_idx);
     append_msg_text(_storage, _storage_prefix,
                     channel_msg_path(_storage_prefix, ch_name.c_str()),
@@ -1281,9 +1295,14 @@ int PunkMesh::pushRoutingQuery(lua_State* L, const char* sender,
     bool filter_sender = sender && sender[0];
     if (filter_sender) { strncpy(want, sender, sizeof(want) - 1); str_tolower_buf(want); }
 
+    // 0 means "open" on each side. Do NOT feed 0 to route_date_str: RTClib's
+    // DateTime(uint32_t) subtracts the 1970→2000 offset, so 0 underflows to ~2106
+    // and would exclude every real file. Use bound strings that sort past any date.
     char since_date[11], until_date[11];
-    route_date_str(since_ts, since_date);                        // since==0 → 1970 → all
-    route_date_str(until_ts ? until_ts : 0xFFFFFFFFu, until_date);
+    if (since_ts == 0) strcpy(since_date, "0000-00-00");
+    else               route_date_str(since_ts, since_date);
+    if (until_ts == 0) strcpy(until_date, "9999-99-99");
+    else               route_date_str(until_ts, until_date);
 
     if (is_sd) sd_spi_take();
     String dir = route_dir(_storage_prefix);
@@ -1359,6 +1378,81 @@ int PunkMesh::pushRoutingQuery(lua_State* L, const char* sender,
     return 1;
 }
 
+// Distinct sender names from the routing-store index, matching the optional
+// lowercased substring `query` (nullptr/"" = all). Built for the meshprint node
+// search: the .idx files are {from_len, from, offset} per record, so we read just
+// the names — never message bodies. Streams ONE .idx at a time and drops it before
+// opening the next; only the bounded distinct-name set is held. Returns a Lua array
+// of up to `max` original-case names. .idx files are tiny, so the whole sweep is a
+// quick bounded read (no per-record yield needed).
+int PunkMesh::pushRoutingSenders(lua_State* L, const char* query, int max) {
+    lua_newtable(L);
+    if (!_storage) return 1;
+    bool is_sd = (_storage != &LittleFS);
+
+    char want[32] = {0};
+    bool filter = query && query[0];
+    if (filter) { strncpy(want, query, sizeof(want) - 1); str_tolower_buf(want); }
+
+    if (max <= 0 || max > 128) max = 64;
+    const int NAMESZ = 32;
+    char* seen = (char*)malloc((size_t)max * NAMESZ);   // distinct-name set (lowercased)
+    if (!seen) return 1;
+    int nseen = 0, out_idx = 1;
+
+    if (is_sd) sd_spi_take();
+    String dir = route_dir(_storage_prefix);
+    File root = _storage->open(dir.c_str());
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        if (is_sd) sd_spi_release();
+        free(seen);
+        return 1;
+    }
+
+    File entry = root.openNextFile();
+    while (entry && nseen < max) {
+        if (!entry.isDirectory()) {
+            String name = entry.name();
+            int slash = name.lastIndexOf('/');
+            String base = (slash >= 0) ? name.substring(slash + 1) : name;
+            if (base.endsWith(".idx")) {
+                // Index record: u8 from_len | from | u32 offset.
+                while (entry.available() && nseen < max) {
+                    uint8_t fl = 0;
+                    if (entry.read(&fl, 1) != 1) break;
+                    if (fl > 31) fl = 31;
+                    char fn[32] = {0};
+                    if (entry.read((uint8_t*)fn, fl) != (int)fl) break;
+                    fn[fl] = '\0';
+                    uint32_t off;
+                    if (entry.read((uint8_t*)&off, 4) != 4) break;  // advance past offset
+
+                    char lc[32];
+                    strncpy(lc, fn, sizeof(lc) - 1); lc[sizeof(lc) - 1] = '\0';
+                    str_tolower_buf(lc);
+                    if (filter && !strstr(lc, want)) continue;
+                    bool dup = false;
+                    for (int i = 0; i < nseen; i++) {
+                        if (strcmp(seen + (size_t)i * NAMESZ, lc) == 0) { dup = true; break; }
+                    }
+                    if (dup) continue;
+                    strncpy(seen + (size_t)nseen * NAMESZ, lc, NAMESZ - 1);
+                    seen[(size_t)nseen * NAMESZ + NAMESZ - 1] = '\0';
+                    nseen++;
+                    lua_pushstring(L, fn);            // original case for display
+                    lua_rawseti(L, -2, out_idx++);
+                }
+            }
+        }
+        entry = root.openNextFile();   // drop this file before the next
+    }
+    root.close();
+    if (is_sd) sd_spi_release();
+    free(seen);
+    return 1;
+}
+
 // Incremental retention sweep, driven by _prune_due (set on a new-day routing
 // record or at boot). Called from the Core-0 main loop. Phase 1 (first call
 // after the flag) deletes old routing day-files and snapshots the text-log list;
@@ -1399,12 +1493,12 @@ void PunkMesh::appendDMMessage(const char* peer, const char* from, const char* t
                                uint8_t hops, bool direct,
                                uint16_t path_len, const uint8_t* path,
                                const uint8_t* pkt_hash,
-                               const uint8_t* sender_pub_key) {
+                               const uint8_t* sender_pub_key, uint32_t sender_ts) {
     if (!peer || peer[0] == '\0') return;
     StoredMsg m;
     fill_stored_msg(m, /*ch_idx*/ -1, from, peer, text,
                     timestamp, snr, rssi, hops, direct, /*is_dm*/ true,
-                    path_len, path, pkt_hash, sender_pub_key);
+                    path_len, path, pkt_hash, sender_pub_key, sender_ts);
     append_msg_text(_storage, _storage_prefix,
                     dm_msg_path(_storage_prefix, peer),
                     m, _max_messages);
@@ -1415,7 +1509,8 @@ static void push_stored_msg_table(lua_State* L, const StoredMsg& m) {
     lua_pushstring(L, m.from);      lua_setfield(L, -2, "from");
     lua_pushstring(L, m.peer);      lua_setfield(L, -2, "peer");
     lua_pushstring(L, m.text);      lua_setfield(L, -2, "text");
-    lua_pushinteger(L, m.timestamp); lua_setfield(L, -2, "timestamp");
+    lua_pushinteger(L, m.timestamp); lua_setfield(L, -2, "timestamp");   // authoritative
+    lua_pushinteger(L, m.sender_ts); lua_setfield(L, -2, "sender_ts");   // recorded extra
     lua_pushinteger(L, m.hops);      lua_setfield(L, -2, "hops");
     lua_pushnumber(L, m.snr);        lua_setfield(L, -2, "snr");
     lua_pushnumber(L, m.rssi);       lua_setfield(L, -2, "rssi");
@@ -1534,6 +1629,7 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
         const char* val = eq + 1;
 
         if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
+        else if (strcmp(key, "sender_ts") == 0) m.sender_ts = strtoul(val, nullptr, 10);
         else if (strcmp(key, "from") == 0) strncpy(m.from, val, sizeof(m.from) - 1);
         else if (strcmp(key, "peer") == 0) strncpy(m.peer, val, sizeof(m.peer) - 1);
         else if (strcmp(key, "text") == 0) strncpy(m.text, val, sizeof(m.text) - 1);
@@ -1725,6 +1821,7 @@ static bool read_one_record(File& f, StoredMsg& m) {
         has_data = true;
 
         if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
+        else if (strcmp(key, "sender_ts") == 0) m.sender_ts = strtoul(val, nullptr, 10);
         else if (strcmp(key, "from") == 0) strncpy(m.from, val, sizeof(m.from) - 1);
         else if (strcmp(key, "peer") == 0) strncpy(m.peer, val, sizeof(m.peer) - 1);
         else if (strcmp(key, "text") == 0) strncpy(m.text, val, sizeof(m.text) - 1);
@@ -2055,10 +2152,21 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
         return;
     }
 
+    // Auto-add hop limit (autoadd_max_hops): the base mesh declines to add a
+    // contact whose advert arrived too far away and notifies us with a temp
+    // contact. Ignore those — don't archive distant nodes we deliberately chose
+    // not to auto-add. (path_len's low 6 bits are the hop count.)
+    if (is_new && _prefs.autoadd_max_hops > 0
+        && (path_len & 0x3F) >= _prefs.autoadd_max_hops) {
+        SLog.printf("[MESH RX] Advert beyond %u-hop auto-add limit — not adding\n",
+                      _prefs.autoadd_max_hops);
+        return;
+    }
+
     // New advert the base mesh did NOT add to the live table — i.e. the list is
-    // full and overwrite-when-full is off (excluded types returned above; the
-    // hop-limit path is disabled). Archive it (a no-op when archiving is off) so
-    // it can be re-added later, then stop: it's not a live contact, so don't
+    // full and overwrite-when-full is off (excluded types and over-hop-limit
+    // adverts returned above). Archive it (a no-op when archiving is off) so it
+    // can be re-added later, then stop: it's not a live contact, so don't
     // record path / persist / notify the UI.
     if (is_new && !lookupContactByPubKey(contact.id.pub_key, PUB_KEY_SIZE)) {
         SLog.printf("[MESH RX] List full — %s discarded new contact: %s\n",
@@ -2076,6 +2184,11 @@ void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t pa
 
     recordPath(contact.id.pub_key, path_len, path,
                last_rx_snr, last_rx_rssi, PATH_SRC_ADVERT, false);
+
+    // "Last seen" = when WE heard this advert (our clock), not the sender's advert
+    // timestamp. lastmod is in-RAM (reset to 0 on boot), so it reads 0 until the
+    // first advert post-boot — consumers treat 0 as "unknown".
+    contact.lastmod = getRTCClock()->getCurrentTime();
 
     saveOneContact(contact);  // O(1): just this contact's slot, not the whole file
 
@@ -2152,11 +2265,14 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
     char norm_text[160];
     normalize_smart_quotes(text, norm_text, sizeof(norm_text));
 
+    // Authoritative time = OUR clock at receipt; the sender's value is recorded only.
+    uint32_t rx_ts = getRTCClock()->getCurrentTime();
+
     // Persist incoming DM — peer and from are both the sender for incoming.
-    appendDMMessage(from.name, from.name, norm_text, sender_timestamp,
+    appendDMMessage(from.name, from.name, norm_text, rx_ts,
                     last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
                     pkt->isRouteDirect(), pkt->path_len, pkt->path,
-                    _last_pkt_hash, from.id.pub_key);
+                    _last_pkt_hash, from.id.pub_key, /*sender_ts=*/sender_timestamp);
 
     recordPath(from.id.pub_key, pkt->path_len, pkt->path,
                last_rx_snr, last_rx_rssi, PATH_SRC_MSG_RX, pkt->isRouteDirect());
@@ -2183,7 +2299,7 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
         ev.sender[sizeof(ev.sender) - 1] = '\0';
         strncpy(ev.text, norm_text, sizeof(ev.text) - 1);
         ev.text[sizeof(ev.text) - 1] = '\0';
-        ev.timestamp = sender_timestamp;
+        ev.timestamp = rx_ts;   // our RX clock; the live UI sorts/displays on this
         ev.snr       = last_rx_snr;
         ev.rssi      = last_rx_rssi;
         ev.path_len  = pkt->path_len;
@@ -2237,11 +2353,15 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
     char norm_msg[160];
     normalize_smart_quotes(msg_text, norm_msg, sizeof(norm_msg));
 
+    // Authoritative time = OUR clock at receipt. The sender's `timestamp` is
+    // unreliable (often unset/0 across the mesh), so it's recorded only.
+    uint32_t rx_ts = getRTCClock()->getCurrentTime();
+
     // Persist to disk (no-op if channel_idx < 0)
-    appendChannelMessage(channel_idx, sender_name, norm_msg, timestamp,
+    appendChannelMessage(channel_idx, sender_name, norm_msg, rx_ts,
                          last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
                          pkt->isRouteDirect(), pkt->path_len, pkt->path,
-                         _last_pkt_hash);
+                         _last_pkt_hash, /*sender_ts=*/timestamp);
 
     MsgPathEntry* mpe = findMsgPaths(_last_pkt_hash);
     if (mpe) {
@@ -2262,7 +2382,7 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
         ev.sender[sizeof(ev.sender) - 1] = '\0';
         strncpy(ev.text, norm_msg, sizeof(ev.text) - 1);
         ev.text[sizeof(ev.text) - 1] = '\0';
-        ev.timestamp = timestamp;
+        ev.timestamp = rx_ts;   // our RX clock; the live UI sorts/displays on this
         ev.snr       = last_rx_snr;
         ev.rssi      = last_rx_rssi;
         ev.path_len  = pkt->path_len;
@@ -2659,6 +2779,35 @@ void PunkMesh::preRegisterSentHash(const uint8_t* hash, bool is_dm,
     }
 }
 
+void PunkMesh::setDefaultScope(const char* name) {
+    if (!name || name[0] == '\0') {
+        memset(_prefs.default_scope_name, 0, sizeof(_prefs.default_scope_name));
+        memset(_prefs.default_scope_key, 0, sizeof(_prefs.default_scope_key));
+    } else {
+        strncpy(_prefs.default_scope_name, name, sizeof(_prefs.default_scope_name) - 1);
+        _prefs.default_scope_name[sizeof(_prefs.default_scope_name) - 1] = '\0';
+        // Region key = SHA256(name) truncated to 16 bytes — same derivation as
+        // MeshCore TransportKeyStore::getAutoKeyFor for a hashtag-region name.
+        SHA256 sha;
+        sha.update((const uint8_t*)_prefs.default_scope_name, strlen(_prefs.default_scope_name));
+        sha.finalize(_prefs.default_scope_key, sizeof(_prefs.default_scope_key));
+    }
+    savePrefs();
+}
+
+void PunkMesh::sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis) {
+    TransportKey scope;
+    memcpy(scope.key, _prefs.default_scope_key, sizeof(scope.key));
+    if (scope.isNull()) {
+        sendFlood(pkt, delay_millis, pathHashSize());
+    } else {
+        uint16_t codes[2];
+        codes[0] = scope.calcTransportCode(pkt);
+        codes[1] = 0;  // single scope; second code reserved (region/return)
+        sendFlood(pkt, codes, delay_millis, pathHashSize());
+    }
+}
+
 void PunkMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis) {
     pkt->calculatePacketHash(_last_tx_hash);
 
@@ -2669,7 +2818,10 @@ void PunkMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, 
         memcpy(saved_payload, pkt->payload, pkt->payload_len);
     }
 
-    BaseChatMesh::sendFloodScoped(recipient, pkt, delay_millis);
+    // Base sendFloodScoped ignores the recipient and floods unscoped with a
+    // 1-byte path hash; route through sendFloodWithScope so the multi-byte path
+    // size AND the configured default transport scope (region) are applied.
+    sendFloodWithScope(pkt, delay_millis);
 
     if (_prefs.msg_repeat_enabled) {
         registerPendingRepeat(_last_tx_hash, saved_header, saved_payload, saved_len);
@@ -2686,7 +2838,10 @@ void PunkMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* 
         memcpy(saved_payload, pkt->payload, pkt->payload_len);
     }
 
-    BaseChatMesh::sendFloodScoped(channel, pkt, delay_millis);
+    // Base sendFloodScoped ignores the channel and floods unscoped with a
+    // 1-byte path hash; route through sendFloodWithScope so the multi-byte path
+    // size AND the configured default transport scope (region) are applied.
+    sendFloodWithScope(pkt, delay_millis);
 
     if (_prefs.msg_repeat_enabled) {
         registerPendingRepeat(_last_tx_hash, saved_header, saved_payload, saved_len);
@@ -2757,7 +2912,7 @@ void PunkMesh::checkPendingRepeats() {
         pkt->header = pr.header;
         memcpy(pkt->payload, pr.payload, pr.payload_len);
         pkt->payload_len = pr.payload_len;
-        sendFlood(pkt, (uint32_t)0);
+        sendFlood(pkt, (uint32_t)0, pathHashSize());
 
         pr.attempts_remaining--;
         pr.next_retry_time = now + (unsigned long)_prefs.msg_repeat_interval_secs * 1000UL;
@@ -2802,6 +2957,8 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
     _prefs.path_hash_mode = 0;
     _prefs.autoadd_config = 0;
     _prefs.autoadd_max_hops = 0;
+    _prefs.manual_add_contacts = 0;  // auto-add all advert types (default)
+    _prefs.advert_loc_policy = 0;    // don't share GPS location in adverts (privacy default)
     _prefs.msg_repeat_enabled = 0;
     _prefs.msg_repeat_max = 3;
     _prefs.msg_repeat_interval_secs = 30;
@@ -2951,10 +3108,8 @@ void PunkMesh::begin()
                 else if (strcmp(key, "path_hash_mode") == 0) _prefs.path_hash_mode = atoi(val);
                 else if (strcmp(key, "autoadd_config") == 0) _prefs.autoadd_config = atoi(val);
                 else if (strcmp(key, "autoadd_max_hops") == 0) _prefs.autoadd_max_hops = atoi(val);
-                else if (strcmp(key, "no_add_users") == 0)     { if (atoi(val)) _prefs.no_add_mask |= 0x01; else _prefs.no_add_mask &= ~0x01; }
-                else if (strcmp(key, "no_add_repeaters") == 0) { if (atoi(val)) _prefs.no_add_mask |= 0x02; else _prefs.no_add_mask &= ~0x02; }
-                else if (strcmp(key, "no_add_rooms") == 0)     { if (atoi(val)) _prefs.no_add_mask |= 0x04; else _prefs.no_add_mask &= ~0x04; }
-                else if (strcmp(key, "no_add_sensors") == 0)   { if (atoi(val)) _prefs.no_add_mask |= 0x08; else _prefs.no_add_mask &= ~0x08; }
+                else if (strcmp(key, "manual_add_contacts") == 0) _prefs.manual_add_contacts = atoi(val);
+                else if (strcmp(key, "advert_loc_policy") == 0) _prefs.advert_loc_policy = atoi(val);
                 else if (strcmp(key, "archive_contacts") == 0) _prefs.archive_contacts = atoi(val);
                 else if (strcmp(key, "default_scope_name") == 0) strncpy(_prefs.default_scope_name, val, 30);
                 else if (strcmp(key, "default_scope_key") == 0) {
@@ -3042,11 +3197,8 @@ static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
         file.printf("msg_repeat_enabled=%d\n", p.msg_repeat_enabled);
         file.printf("msg_repeat_max=%d\n", p.msg_repeat_max);
         file.printf("msg_repeat_interval=%d\n", p.msg_repeat_interval_secs);
-        // Stored as four readable booleans (internally a bitmask).
-        file.printf("no_add_users=%d\n",     (p.no_add_mask & 0x01) ? 1 : 0);
-        file.printf("no_add_repeaters=%d\n", (p.no_add_mask & 0x02) ? 1 : 0);
-        file.printf("no_add_rooms=%d\n",     (p.no_add_mask & 0x04) ? 1 : 0);
-        file.printf("no_add_sensors=%d\n",   (p.no_add_mask & 0x08) ? 1 : 0);
+        file.printf("manual_add_contacts=%d\n", p.manual_add_contacts);
+        file.printf("advert_loc_policy=%d\n", p.advert_loc_policy);
         file.printf("archive_contacts=%d\n", p.archive_contacts);
         if (p.default_scope_name[0]) {
             file.printf("default_scope_name=%s\n", p.default_scope_name);
@@ -3166,11 +3318,11 @@ void PunkMesh::showWelcome()
 void PunkMesh::sendSelfAdvert(int delay_millis)
 {
     SLog.printf("[MESH TX] sendSelfAdvert: name=%s, delay=%d ms\n", _prefs.node_name, delay_millis);
-    auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
+    auto pkt = buildSelfAdvert();
     if (pkt)
     {
         SLog.printf("[MESH TX] Advert packet created, payload_len=%d, sending flood...\n", pkt->payload_len);
-        sendFlood(pkt, delay_millis);
+        sendFlood(pkt, delay_millis, pathHashSize());
         SLog.println("[MESH TX] Advert flood sent.");
     }
     else
@@ -3276,7 +3428,7 @@ void PunkMesh::handleCommand(const char *command)
     }
     else if (strcmp(command, "advert") == 0)
     {
-        auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
+        auto pkt = buildSelfAdvert();
         if (pkt)
         {
             sendZeroHop(pkt);
@@ -3299,7 +3451,7 @@ void PunkMesh::handleCommand(const char *command)
     else if (memcmp(command, "card", 4) == 0)
     {
         SLog.printf("Hello %s\n", _prefs.node_name);
-        auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
+        auto pkt = buildSelfAdvert();
         if (pkt)
         {
             uint8_t len = pkt->writeTo(tmp_buf);

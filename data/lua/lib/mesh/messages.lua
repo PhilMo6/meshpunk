@@ -37,6 +37,15 @@ local M = {
 -- Avoid double-loading if an app calls loadPersisted() more than once
 M._loaded = false
 
+-- Device RTC epoch (UTC). os.time() is NOT synced to the RTC on this firmware, so
+-- never use it for message timestamps — the C side persists our sent messages with
+-- the RTC clock, and this keeps the in-RAM echo consistent with that.
+local function now_ts()
+    local ok, t = pcall(_rtc_time)
+    if ok and t and t > 0 then return t end
+    return os.time()
+end
+
 -- Cap each in-RAM list so a busy mesh can't grow it without bound (it shares the
 -- PSRAM heap with LVGL's draw allocator, which hard-crashes on alloc failure).
 -- Mirrors the on-disk _max_messages cap; trims in a SLACK batch so the O(n) shift
@@ -150,7 +159,7 @@ function M:broadcast(text)
     local msg = {
         from = info and info.name or "me",
         text = text,
-        timestamp = os.time(),
+        timestamp = now_ts(),
         direct = false,
         hops = 0,
         is_dm = false,
@@ -184,7 +193,7 @@ function M:sendDirect(name_prefix, text)
     local msg = {
         from = info and info.name or "me",
         text = text,
-        timestamp = os.time(),
+        timestamp = now_ts(),
         direct = true,
         hops = 0,
         is_dm = true,
@@ -224,7 +233,7 @@ function M:sendToChannel(ch_idx, text)
     local msg = {
         from = info and info.name or "me",
         text = text,
-        timestamp = os.time(),
+        timestamp = now_ts(),
         direct = false,
         hops = 0,
         is_dm = false,

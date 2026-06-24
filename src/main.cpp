@@ -2151,11 +2151,14 @@ static void push_contact_table(lua_State *L, const ContactInfo &c, bool archived
   lua_pushinteger(L, c.out_path_len);
   lua_setfield(L, -2, "path_len");
 
-  lua_pushinteger(L, c.last_advert_timestamp);
+  lua_pushinteger(L, c.lastmod);   // "last seen" = our RX clock (0 = unheard since boot)
   lua_setfield(L, -2, "last_seen");
 
   lua_pushinteger(L, c.lastmod);
   lua_setfield(L, -2, "lastmod");
+
+  lua_pushinteger(L, c.last_advert_timestamp);   // sender's advert clock — recorded only
+  lua_setfield(L, -2, "sender_advert_ts");
 
   char hex[PUB_KEY_SIZE * 2 + 1];
   mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
@@ -2359,7 +2362,7 @@ static int lua_mesh_archive_read(lua_State *L) {
     mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
     lua_pushstring(L, hex);                             lua_setfield(L, -2, "pubkey");
     lua_pushstring(L, the_mesh->getTypeName(c.type));   lua_setfield(L, -2, "type_name");
-    lua_pushinteger(L, (lua_Integer)c.last_advert_timestamp); lua_setfield(L, -2, "last_seen");
+    lua_pushinteger(L, (lua_Integer)c.lastmod); lua_setfield(L, -2, "last_seen");  // our RX clock
     lua_pushnumber(L, c.gps_lat / 1000000.0);           lua_setfield(L, -2, "lat");
     lua_pushnumber(L, c.gps_lon / 1000000.0);           lua_setfield(L, -2, "lon");
     lua_pushboolean(L, 1);                              lua_setfield(L, -2, "archived");
@@ -2540,7 +2543,7 @@ static int lua_mesh_send_advert(lua_State *L) {
     if (strcmp(mode, "zerohop") == 0) {
       the_mesh->sendZeroHop(pkt, (uint32_t)0);
     } else {
-      the_mesh->sendFlood(pkt, (uint32_t)0);
+      the_mesh->sendFlood(pkt, (uint32_t)0, the_mesh->pathHashSize());
     }
   }
   MESH_UNLOCK();
@@ -3022,32 +3025,38 @@ static int lua_mesh_set_rx_boost(lua_State *L) {
   return 0;
 }
 
-// ── "Do not add" contact-type exclusions ─────────────────────────
-// Returns four booleans (users, repeaters, rooms, sensors) — true = do NOT
-// auto-add that advert type. Mirrors _prefs.no_add_mask bits 0/1/2/3.
-static int lua_mesh_get_no_add(lua_State *L) {
+// ── Auto-add contact config (matches the BLE companion model) ─────
+// _mesh_get_autoadd() → selected_mode, chat, repeater, room, sensor.
+//   selected_mode false = "auto-add all"; true = "auto-add selected" (the four
+//   type booleans say which types are added). Type bits map to the MeshCore
+//   spec: chat 0x02 / repeater 0x04 / room 0x08 / sensor 0x10.
+static int lua_mesh_get_autoadd(lua_State *L) {
   MESH_LOCK();
-  uint8_t m = the_mesh->_prefs.no_add_mask;
+  uint8_t mode = the_mesh->_prefs.manual_add_contacts;
+  uint8_t cfg  = the_mesh->_prefs.autoadd_config;
   MESH_UNLOCK();
-  lua_pushboolean(L, (m & 0x01) != 0);
-  lua_pushboolean(L, (m & 0x02) != 0);
-  lua_pushboolean(L, (m & 0x04) != 0);
-  lua_pushboolean(L, (m & 0x08) != 0);
-  return 4;
+  lua_pushboolean(L, (mode & 0x01) != 0);
+  lua_pushboolean(L, (cfg & 0x02) != 0);
+  lua_pushboolean(L, (cfg & 0x04) != 0);
+  lua_pushboolean(L, (cfg & 0x08) != 0);
+  lua_pushboolean(L, (cfg & 0x10) != 0);
+  return 5;
 }
 
-// _mesh_set_no_add(no_users, no_repeaters, no_rooms, no_sensors)
-static int lua_mesh_set_no_add(lua_State *L) {
-  uint8_t m = 0;
-  if (lua_toboolean(L, 1)) m |= 0x01;
-  if (lua_toboolean(L, 2)) m |= 0x02;
-  if (lua_toboolean(L, 3)) m |= 0x04;
-  if (lua_toboolean(L, 4)) m |= 0x08;
+// _mesh_set_autoadd(selected_mode, chat, repeater, room, sensor)
+static int lua_mesh_set_autoadd(lua_State *L) {
+  uint8_t mode = lua_toboolean(L, 1) ? 0x01 : 0x00;
+  uint8_t cfg = 0;
+  if (lua_toboolean(L, 2)) cfg |= 0x02;
+  if (lua_toboolean(L, 3)) cfg |= 0x04;
+  if (lua_toboolean(L, 4)) cfg |= 0x08;
+  if (lua_toboolean(L, 5)) cfg |= 0x10;
   MESH_LOCK();
-  the_mesh->_prefs.no_add_mask = m;
+  the_mesh->_prefs.manual_add_contacts = mode;
+  the_mesh->_prefs.autoadd_config = cfg;
   the_mesh->savePrefs();
   MESH_UNLOCK();
-  SLog.printf("[MESH] no_add_mask set to 0x%02X\n", m);
+  SLog.printf("[MESH] autoadd mode=%s cfg=0x%02X\n", mode ? "selected" : "all", cfg);
   return 0;
 }
 
@@ -3117,6 +3126,15 @@ static int lua_mesh_routing_query(lua_State *L) {
   uint32_t since = (uint32_t)luaL_optinteger(L, 2, 0);
   uint32_t until = (uint32_t)luaL_optinteger(L, 3, 0);
   return the_mesh->pushRoutingQuery(L, sender, since, until);
+}
+
+// _mesh_routing_senders(query_or_nil, max) -> array of distinct sender names from
+// the routing index matching the (case-insensitive substring) query. Streams the
+// .idx files in C — no message bodies loaded into Lua.
+static int lua_mesh_routing_senders(lua_State *L) {
+  const char *query = lua_isnoneornil(L, 1) ? nullptr : luaL_checkstring(L, 1);
+  int max = (int)luaL_optinteger(L, 2, 64);
+  return the_mesh->pushRoutingSenders(L, query, max);
 }
 
 // Read all stored messages for a DM thread.
@@ -4115,8 +4133,58 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
   lua_register(L, "_mesh_get_rx_boost", lua_mesh_get_rx_boost);
   lua_register(L, "_mesh_set_rx_boost", lua_mesh_set_rx_boost);
-  lua_register(L, "_mesh_get_no_add", lua_mesh_get_no_add);
-  lua_register(L, "_mesh_set_no_add", lua_mesh_set_no_add);
+  lua_register(L, "_mesh_get_autoadd", lua_mesh_get_autoadd);
+  lua_register(L, "_mesh_set_autoadd", lua_mesh_set_autoadd);
+  // Auto-add hop limit (0 = any). Surfaced in the messenger Contact Settings.
+  lua_register(L, "_mesh_get_autoadd_max_hops", [](lua_State *L) -> int {
+    MESH_LOCK();
+    int v = the_mesh ? the_mesh->_prefs.autoadd_max_hops : 0;
+    MESH_UNLOCK();
+    lua_pushinteger(L, v);
+    return 1;
+  });
+  lua_register(L, "_mesh_set_autoadd_max_hops", [](lua_State *L) -> int {
+    int v = (int)luaL_checkinteger(L, 1);
+    if (v < 0) v = 0;
+    if (v > 64) v = 64;
+    MESH_LOCK();
+    if (the_mesh) { the_mesh->_prefs.autoadd_max_hops = (uint8_t)v; the_mesh->savePrefs(); }
+    MESH_UNLOCK();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+  // Advert location-sharing policy (0 = omit GPS location from self-adverts).
+  lua_register(L, "_mesh_get_advert_loc", [](lua_State *L) -> int {
+    MESH_LOCK();
+    bool on = the_mesh ? (the_mesh->_prefs.advert_loc_policy != 0) : false;
+    MESH_UNLOCK();
+    lua_pushboolean(L, on);
+    return 1;
+  });
+  lua_register(L, "_mesh_set_advert_loc", [](lua_State *L) -> int {
+    bool on = lua_toboolean(L, 1);
+    MESH_LOCK();
+    if (the_mesh) { the_mesh->_prefs.advert_loc_policy = on ? 1 : 0; the_mesh->savePrefs(); }
+    MESH_UNLOCK();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+  // Default flood scope / region (name -> SHA256 transport key; "" clears it).
+  lua_register(L, "_mesh_get_flood_scope", [](lua_State *L) -> int {
+    MESH_LOCK();
+    const char* n = the_mesh ? the_mesh->getDefaultScopeName() : "";
+    lua_pushstring(L, n ? n : "");
+    MESH_UNLOCK();
+    return 1;
+  });
+  lua_register(L, "_mesh_set_flood_scope", [](lua_State *L) -> int {
+    const char* name = luaL_optstring(L, 1, "");
+    MESH_LOCK();
+    if (the_mesh) the_mesh->setDefaultScope(name);
+    MESH_UNLOCK();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
   lua_register(L, "_mesh_get_contact_paths", lua_mesh_get_contact_paths);
   lua_register(L, "_mesh_get_message_paths", lua_mesh_get_message_paths);
   lua_register(L, "_mesh_get_msg_repeat", lua_mesh_get_msg_repeat);
@@ -4126,6 +4194,7 @@ void setupLuaVGL() {
   // Persistent message history APIs — available to any app, not just messenger
   lua_register(L, "_mesh_get_channel_messages", lua_mesh_get_channel_messages);
   lua_register(L, "_mesh_routing_query", lua_mesh_routing_query);
+  lua_register(L, "_mesh_routing_senders", lua_mesh_routing_senders);
   lua_register(L, "_mesh_get_dm_messages", lua_mesh_get_dm_messages);
   lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
   lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
@@ -4160,6 +4229,26 @@ void setupLuaVGL() {
     lua_pushboolean(L, 1);
     return 1;
   });
+
+  // Multi-byte path hash ("path hash mode"): bytes of each repeater's key
+  // appended per hop in a flood path. 0=1 byte (default), 1=2 bytes, 2=3 bytes.
+  // Lives in the mesh's own prefs (savePrefs), same value the BLE companion sets.
+  lua_register(L, "_mesh_get_path_hash_mode", [](lua_State *L) -> int {
+    lua_pushinteger(L, the_mesh ? the_mesh->_prefs.path_hash_mode : 0);
+    return 1;
+  });
+  lua_register(L, "_mesh_set_path_hash_mode", [](lua_State *L) -> int {
+    int v = (int)luaL_checkinteger(L, 1);
+    if (v < 0) v = 0;
+    if (v > 2) v = 2;
+    if (the_mesh) {
+      the_mesh->_prefs.path_hash_mode = (uint8_t)v;
+      the_mesh->savePrefs();
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
   lua_register(L, "_emoji_preload", lua_emoji_preload);
 
   // Register Filesystem bridge functions

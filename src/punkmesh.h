@@ -39,15 +39,20 @@ struct NodePrefs
   uint8_t path_hash_mode;
   uint8_t autoadd_config;
   uint8_t autoadd_max_hops;
+  // Advert location-sharing policy (MeshCore companion "advert_loc_policy"):
+  // 0 = omit GPS location from self-adverts, 1 = share it. Default 0 (privacy).
+  uint8_t advert_loc_policy;
   char default_scope_name[31];
   uint8_t default_scope_key[16];
   uint8_t msg_repeat_enabled;
   uint8_t msg_repeat_max;
   uint8_t msg_repeat_interval_secs;
-  // "Do not add" auto-add exclusions by advert type (bit0=chat/user,
-  // bit1=repeater, bit2=room, bit3=sensor). 0 = add all. Appended last so older
-  // (shorter) prefs files just keep the zero default.
-  uint8_t no_add_mask;
+  // Auto-add mode (matches the MeshCore companion "manual_add_contacts" byte):
+  // bit0 clear = auto-add ALL advert types; bit0 set = auto-add only the types
+  // selected in autoadd_config (chat 0x02 / repeater 0x04 / room 0x08 /
+  // sensor 0x10). 0 = add all. Appended last so older (shorter) prefs files
+  // just keep the zero default.
+  uint8_t manual_add_contacts;
   // Archive contacts to file as they leave the active table (evict/remove) so
   // they can be re-added later. 1 = on (default behaviour). When on AND
   // overwrite-when-full is off, a new contact that can't fit is archived
@@ -92,7 +97,9 @@ struct MsgPathEntry {
 // Channel logs: <storage_prefix>/messages/ch_<idx>.log
 // DM logs:      <storage_prefix>/messages/dm_<sanitized_peer>.log
 struct StoredMsg {
-  uint32_t timestamp;
+  uint32_t timestamp;    // AUTHORITATIVE time: our RX clock (received) or send clock (sent).
+                         // Used for ALL time logic (bucketing, sort, window, retention).
+  uint32_t sender_ts;    // sender's claimed clock — RECORDED ONLY, never used for time logic.
   float    snr;
   float    rssi;
   int8_t   channel_idx;  // -1 for DM, 0..N for channel slot
@@ -267,17 +274,21 @@ public:
 
   // Write paths (called from RX handlers and Lua send bindings).
   // `channel_idx < 0` on appendChannelMessage is a no-op (unknown channel).
+  // `timestamp` is the AUTHORITATIVE time (our RX/send clock); `sender_ts` is the
+  // sender's claimed clock, stored as a labeled extra and never used for time logic.
   void appendChannelMessage(int channel_idx, const char* from, const char* text,
                             uint32_t timestamp, float snr, float rssi,
                             uint8_t hops, bool direct,
                             uint16_t path_len = 0, const uint8_t* path = nullptr,
-                            const uint8_t* pkt_hash = nullptr);
+                            const uint8_t* pkt_hash = nullptr,
+                            uint32_t sender_ts = 0);
   void appendDMMessage(const char* peer, const char* from, const char* text,
                        uint32_t timestamp, float snr, float rssi,
                        uint8_t hops, bool direct,
                        uint16_t path_len = 0, const uint8_t* path = nullptr,
                        const uint8_t* pkt_hash = nullptr,
-                       const uint8_t* sender_pub_key = nullptr);
+                       const uint8_t* sender_pub_key = nullptr,
+                       uint32_t sender_ts = 0);
 
   // ── Per-contact path history ────────────────────────────────────
   ContactPathHistory _path_history[MAX_PATH_CONTACTS];
@@ -322,6 +333,9 @@ public:
   // Routing store (Phase 3): pushes {from,timestamp,lat,lon,path} records for a
   // sender (empty/null = all) within [since_ts, until_ts] (0 = open bound).
   int pushRoutingQuery(lua_State* L, const char* sender, uint32_t since_ts, uint32_t until_ts);
+  // Distinct sender names from the routing index, matching an optional lowercased
+  // substring (nullptr/"" = all). Streams one .idx at a time; bounded memory.
+  int pushRoutingSenders(lua_State* L, const char* query, int max);
   // Incremental days-based retention sweep (routing + text logs), driven by
   // _prune_due and run one file per call from the Core-0 main loop, so it never
   // blocks the radio/UI for more than a single file's rewrite.
@@ -365,11 +379,36 @@ public:
   // "Do not add" exclusions: gate which advert types get auto-added (defined in
   // punkmesh.cpp where the ADV_TYPE_* constants are in scope).
   bool shouldAutoAddContactType(uint8_t type) const override;
+  // Auto-add hop limit: 0 = no limit, 1 = direct only (0 hops), N = up to N-1
+  // hops. The base mesh consults this when deciding whether to add a contact.
+  uint8_t getAutoAddMaxHops() const override { return _prefs.autoadd_max_hops; }
   void clearContacts() { resetContacts(); }
+
+  // Multi-byte path hash ("path hash mode"): each repeater appends
+  // path_hash_mode+1 bytes (1/2/3) of its key to a flood path. Apply the
+  // configured size to every flood we originate; RX/forward reads the size
+  // from each packet, so receiving is already size-agnostic.
+  uint8_t pathHashSize() const { return (uint8_t)(_prefs.path_hash_mode + 1); }
+
+  // Build a self-advert, honoring the advert location-sharing policy
+  // (advert_loc_policy 0 = omit GPS location from the advert).
+  mesh::Packet* buildSelfAdvert() {
+    return _prefs.advert_loc_policy
+      ? createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon)
+      : createSelfAdvert(_prefs.node_name);
+  }
+
+  // Default flood scope ("region"): the name derives a 16-byte transport key
+  // via SHA256 (matches MeshCore's hashtag-region derivation). Empty = global.
+  const char* getDefaultScopeName() const { return _prefs.default_scope_name; }
+  void setDefaultScope(const char* name);
 
 protected:
   void sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override;
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
+  // Flood through the configured default transport scope (region key) when one
+  // is set, else an unscoped flood. Applies the multi-byte path size.
+  void sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis);
   void logRx(mesh::Packet *pkt, int len, float score) override;
   float getAirtimeBudgetFactor() const override;
   int calcRxDelay(float score, uint32_t air_time) const override;
