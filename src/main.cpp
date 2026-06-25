@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <esp_heap_caps.h> // DMA-capable buffer allocation for LVGL
+#include <mbedtls/platform.h> // runtime override of mbedTLS allocator (TLS -> PSRAM)
 #include <lvgl.h>
 #include "theme/lv_theme_meshpunk.h"
 #include "emoji_font.h"
@@ -5148,6 +5149,21 @@ void setupLuaVGL() {
 
 volatile bool lora_packet_ready = false;
 
+// Route mbedTLS's heap allocations (the ~32-48 KB of TLS record/handshake/X.509
+// buffers per HTTPS session) to PSRAM. The Arduino framework is built with
+// CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC, so by default they land in internal SRAM —
+// which, alongside resident BLE + WiFi, leaves no room for the handshake's
+// hardware-SHA DMA buffer ("esp-sha: Failed to allocate buf memory"), blocking
+// all HTTPS map-tile downloads. MBEDTLS_PLATFORM_MEMORY is defined in the
+// framework's mbedtls config, so we override the allocator at runtime — the
+// equivalent of CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC without a framework rebuild.
+// The small hardware SHA/AES DMA buffers are allocated separately by the
+// esp_sha/esp_aes drivers and stay internal; moving the big buffers out is what
+// frees the internal headroom those DMA allocs need.
+static void *mbedtls_psram_calloc(size_t n, size_t size) {
+  return heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
 void setup() {
   // Enlarge the UART TX buffer so the ISR drains it in the background and SLog's
   // best-effort writes (availableForWrite-gated) almost never have to drop. Must
@@ -5158,6 +5174,11 @@ void setup() {
   delay(50);
 
   SLog.println("MeshPunk LuaVGL Demo");
+
+  // Push all mbedTLS allocations to PSRAM before any subsystem can open a TLS
+  // session (BLE/WiFi come up later in setup). Frees the internal SRAM the HTTPS
+  // tile handshake's hardware-SHA DMA buffer needs. See mbedtls_psram_calloc.
+  mbedtls_platform_set_calloc_free(mbedtls_psram_calloc, heap_caps_free);
 
   // Create SPI/mesh mutexes and cross-core queues before any subsystem
   // that relies on them. Safe to call before LVGL/TFT init because the
