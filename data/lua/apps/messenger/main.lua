@@ -10,6 +10,7 @@ local utils = require("lib/utils")
 local gridnav_body = require("lib/gridnav_body")
 local apps = require("lib/apps")
 local nav = require("lib/nav")
+local theme = require("lib/theme")
 
 -- Persistence lives on the C++ PunkMesh side (respects _storage: LittleFS
 -- root or /meshpunk on SD), so any app can access the same message history.
@@ -28,8 +29,13 @@ local group = lvgl.group.get_default()
 
 -- Root container
 local root = apps.new_root()
-root:set { w = W, h = H, pad_all = 0, border_width = 0 }
+root:set { w = W, h = H, pad_all = 0, border_width = 0, bg_opa = 0 }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+-- Themed wallpaper behind the messenger (header, view bodies and scroll lists are
+-- transparent; chat bubbles and list rows stay opaque). Lightweight app, so the
+-- background's PSRAM is fine here.
+theme.show_background()
 
 -- ── Theme ───────────────────────────────────────────────────────
 local COL_ME_BG       = "#0b3d2e"   -- own message bubble
@@ -72,7 +78,7 @@ end
 -- ── Header (always visible) ─────────────────────────────────────
 local header = root:Object {
     w = W, h = HEADER_H, y = 0,
-    border_width = 0, pad_left = 4, pad_right = 4,
+    border_width = 0, pad_left = 4, pad_right = 4, bg_opa = 0,
 }
 header:clear_flag(lvgl.FLAG.SCROLLABLE)
 
@@ -436,7 +442,7 @@ show_inbox = function()
     -- you can drag-scroll, and a row only opens on a second tap/click — or a
     -- long-press, which opens immediately.
     local body = gridnav_body(root, HEADER_H, H - HEADER_H,
-                              GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+                              GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST, true)
     current_view = body
 
     -- Control buttons (narrow, wrap into the top row).
@@ -462,7 +468,7 @@ show_inbox = function()
     -- Scrollable conversation list (rows live here, not in the gridnav body).
     local list = body:Object {
         w = lvgl.PCT(100), h = H - HEADER_H - 36,
-        border_width = 0, pad_all = 0,
+        border_width = 0, pad_all = 0, bg_opa = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
     -- Tap/click the list to enter row-select (trackball steps the rows); 'q'
@@ -589,7 +595,7 @@ show_chat = function(target)
     local title = (target.type == "dm") and ("@" .. target.name) or target.name
     set_header(title, "")
 
-    local body = gridnav_body(root, HEADER_H, H - HEADER_H, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+    local body = gridnav_body(root, HEADER_H, H - HEADER_H, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST, true)
     current_view = body
 
     -- Top buttons (narrow, wrap in first row)
@@ -619,7 +625,7 @@ show_chat = function(target)
     local MSG_H = H - HEADER_H - 20 - 34 - 24
     msg_list = body:Object {
         w = lvgl.PCT(100), h = MSG_H,
-        border_width = 0, pad_all = 2,
+        border_width = 0, pad_all = 2, bg_opa = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
     msg_list:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
@@ -1341,7 +1347,7 @@ show_contacts = function()
     -- list with the same tap-to-arm / long-press scheme as the inbox and chat,
     -- so touch drags scroll the list instead of opening a contact.
     local body = gridnav_body(root, HEADER_H, H - HEADER_H,
-                              GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST)
+                              GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST, true)
     current_view = body
 
     -- Row 1 controls: Back, Sort (dropdown), Add, Clear
@@ -1407,7 +1413,7 @@ show_contacts = function()
     -- Scrollable contact list (rows live here, not in the gridnav body).
     local list = body:Object {
         w = lvgl.PCT(100), h = H - HEADER_H - 66,
-        border_width = 0, pad_all = 0,
+        border_width = 0, pad_all = 0, bg_opa = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
     -- Tap/click the list to enter row-select (trackball steps the rows); 'q'
@@ -1534,7 +1540,7 @@ show_channels = function()
     local body = root:Object {
         flex = { flex_direction = "row", flex_wrap = "wrap" },
         w = W, h = H - HEADER_H, y = HEADER_H,
-        border_width = 0, pad_all = 4,
+        border_width = 0, pad_all = 4, bg_opa = 0,
     }
     nav.replace(body)
     current_view = body

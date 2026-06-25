@@ -6,6 +6,7 @@ local clock_fmt_mod = require("lib/clock_fmt")
 local utils = require("lib/utils")
 local apps = require("lib/apps")
 local nav = require("lib/nav")
+local theme = require("lib/theme")
 
 -- Root
 local root = apps.new_root()
@@ -14,8 +15,12 @@ root:set {
     h = lvgl.VER_RES(),
     pad_all = 0,
     border_width = 0,
+    bg_opa = 0,
 }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+-- Themed wallpaper behind this (lightweight) screen; containers below are transparent.
+theme.show_background()
 
 -- Safely get info
 local ok, info = pcall(_mesh_get_node_info)
@@ -32,6 +37,7 @@ local content = root:Object {
     y = 0,
     border_width = 0,
     pad_all = 6,
+    bg_opa = 0,
 }
 
 nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })

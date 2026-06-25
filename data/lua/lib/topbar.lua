@@ -128,7 +128,9 @@ function M.create()
     bar = lvgl.Object({
         flex = { flex_direction = "row", flex_wrap = "nowrap", justify_content = "space-between" },
         w = 320, h = 20, x = 0, y = 0,
-        border_width = 0, pad_all = 4, pad_top = 2, pad_bottom = 0,
+        -- Transparent so the themed background shows behind the status text;
+        -- otherwise the plain Object gets the opaque card style from the theme.
+        border_width = 0, pad_all = 4, pad_top = 2, pad_bottom = 0, bg_opa = 0,
     })
     bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 
@@ -184,16 +186,30 @@ function M.pause()
     sat_tick = sat_tick_max --we want to gps info to update on unpause
 end
 
+-- Fully hide the bar with FLAG.HIDDEN so it never renders, regardless of what's
+-- above it. App bodies are now transparent (for theming), so a z-order drop no
+-- longer hides the bar — it would show through. The object stays alive, so
+-- M.raise() can reveal it on demand (e.g. to peek the time/notifications while
+-- an app is running).
+function M.hide()
+    M.pause()
+    if bar then pcall(function() bar:add_flag(lvgl.FLAG.HIDDEN) end) end
+end
+
 function M.raise()
     paused = false
     if updateTimer then updateTimer:resume() end
-    if bar then pcall(_obj_move_foreground, bar) end
+    if bar then
+        pcall(function() bar:clear_flag(lvgl.FLAG.HIDDEN) end)
+        pcall(_obj_move_foreground, bar)
+    end
     M.updateUnread()
 end
 
+-- Back-compat alias: dropping the bar below other widgets no longer hides it
+-- (transparent app bodies), so route the old "lower" through the HIDDEN flag.
 function M.lower()
-    M.pause()
-    if bar then pcall(_obj_move_background, bar) end
+    M.hide()
 end
 
 return M

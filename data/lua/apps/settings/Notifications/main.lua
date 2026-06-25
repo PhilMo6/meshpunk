@@ -2,15 +2,19 @@ local lvgl  = require("lvgl")
 local utils = require("lib/utils")
 local apps  = require("lib/apps")
 local nav   = require("lib/nav")
+local theme = require("lib/theme")
 
 local root = apps.new_root()
-root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0 }
+root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0, bg_opa = 0 }
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+-- Themed wallpaper behind this (lightweight) screen; containers below are transparent.
+theme.show_background()
 
 local content = root:Object {
     flex = { flex_direction = "row", flex_wrap = "wrap" },
     w = lvgl.HOR_RES(), h = lvgl.VER_RES(),
-    border_width = 0, pad_all = 6,
+    border_width = 0, pad_all = 6, bg_opa = 0,
 }
 nav.replace(content)
 

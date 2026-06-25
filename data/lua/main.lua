@@ -16,5 +16,9 @@ require("lib/clipboard")
 -- the cache instead of re-scanning the filesystem every time.
 require("lib/apps").refresh()
 
+-- Apply the saved UI theme: pushes its palette to the C theme (live) and draws
+-- the home-screen background. Falls back to the default theme if unset/unknown.
+require("lib/theme").apply(_theme_pref_get())
+
 local launcher = require("launcher")
 launcher.create()

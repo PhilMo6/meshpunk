@@ -177,6 +177,11 @@ static int32_t tz_effective_offset_minutes() {
 extern bool sd_mounted;
 void sd_spi_release();
 
+// Selected UI theme id (a folder name under /lua/themes; see lib/theme). Empty
+// means "use the default theme". The palette + background it maps to live in
+// Lua; only this id is persisted here.
+static String theme_pref_str = "";
+
 static void write_firmware_prefs(fs::FS& fs, const char* path) {
   File f = fs.open(path, "w", true);
   if (!f) { SLog.printf("[FW_PREFS] cannot write %s\n", path); return; }
@@ -199,6 +204,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("trackball_sens=%d\n", trackball_sensitivity_ms);
   f.printf("trackball_roll=%d\n", trackball_roll_ms);
   f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
+  f.printf("theme=%s\n", theme_pref_str.c_str());
   f.close();
   SLog.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -331,6 +337,9 @@ static void firmware_prefs_load() {
       if (v >= 0 && v <= 500) trackball_roll_ms = (uint16_t)v;
     } else if (strcmp(key, "sym_toggle") == 0) {
       kb_sym_toggle_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "theme") == 0) {
+      theme_pref_str = String(val);
+      theme_pref_str.trim();
     }
   }
   f.close();
@@ -4416,6 +4425,52 @@ void setupLuaVGL() {
     const char *v = luaL_checkstring(L, 1);
     clock_fmt_str = (strcmp(v, "12") == 0) ? "12" : "24";
     firmware_prefs_save();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  // ── UI Theme ───────────────────────────────────────────────────────────────
+  // The selected theme id is persisted here; the palette it maps to is pushed
+  // live to the LVGL theme via _theme_apply_palette, and its background is drawn
+  // entirely in Lua (lib/theme + lib/background).
+  lua_register(L, "_theme_pref_get", [](lua_State *L) -> int {
+    lua_pushstring(L, theme_pref_str.c_str());
+    return 1;
+  });
+
+  lua_register(L, "_theme_pref_set", [](lua_State *L) -> int {
+    const char *v = luaL_checkstring(L, 1);
+    // Idempotent: theme.apply() runs at every boot, so only touch flash when the
+    // selection actually changed (avoids a needless write each power-on).
+    if (theme_pref_str != v) {
+      theme_pref_str = String(v);
+      firmware_prefs_save();
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  // _theme_apply_palette(scr, card, text, grey, accent, btn_text, dark)
+  // Each color is a "#rrggbb"/"rrggbb" string or a 0xRRGGBB integer. Re-cascades
+  // to every live widget (no reboot); a no-op on the C side if unchanged.
+  lua_register(L, "_theme_apply_palette", [](lua_State *L) -> int {
+    auto parse = [&](int idx) -> uint32_t {
+      if (lua_type(L, idx) == LUA_TNUMBER) {
+        return (uint32_t)lua_tointeger(L, idx) & 0xFFFFFFu;
+      }
+      const char *s = lua_tostring(L, idx);
+      if (!s) return 0;
+      if (*s == '#') s++;
+      return (uint32_t)strtoul(s, nullptr, 16) & 0xFFFFFFu;
+    };
+    uint32_t scr      = parse(1);
+    uint32_t card     = parse(2);
+    uint32_t text     = parse(3);
+    uint32_t grey     = parse(4);
+    uint32_t accent   = parse(5);
+    uint32_t btn_text = parse(6);
+    bool dark = lua_isnoneornil(L, 7) ? true : (lua_toboolean(L, 7) != 0);
+    lv_theme_meshpunk_set_palette(scr, card, text, grey, accent, btn_text, dark);
     lua_pushboolean(L, 1);
     return 1;
   });

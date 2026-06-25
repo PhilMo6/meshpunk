@@ -19,6 +19,7 @@ local lvgl = require("lvgl")
 local topbar = require("lib/topbar")
 local apps = require("lib/apps")
 local nav = require("lib/nav")
+local theme = require("lib/theme")
 
 -- Module-level so build_page() can delete the previous page on a swap.
 local body = nil
@@ -59,10 +60,15 @@ function build_page(items, category)
         -- scrolls vertically (Objects keep their default SCROLLABLE flag) so a
         -- category with many apps isn't cut off at the bottom of the screen.
         w = lvgl.HOR_RES(), h = lvgl.VER_RES() - 20, x = 0, y = 20,
-        border_width = 0, pad_all = 4,
+        -- Transparent so the themed background (lib/background) shows on the home
+        -- screen; the plain Object would otherwise get the opaque card style.
+        border_width = 0, pad_all = 4, bg_opa = 0,
     })
     nav.replace(body)
     topbar.raise()
+    -- Redraw the wallpaper if an app freed it (no-op when already present, e.g.
+    -- category page swaps that never left the launcher).
+    theme.ensure_background()
     apps.clear_current()
     apps.set_root(body)   -- the manager tears this page down when an app launches
 

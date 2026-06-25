@@ -20,7 +20,18 @@
 struct _my_theme_t;
 typedef struct _my_theme_t my_theme_t;
 
-#define theme_def (*(my_theme_t **)(&LV_GLOBAL_DEFAULT()->theme_default))
+/* Our theme's own struct, in a module-static pointer.
+ *
+ * Upstream stored this in LV_GLOBAL's `theme_default` slot, but lv_display_create()
+ * also initializes lv_theme_default into that SAME slot. So reading
+ * theme_def->inited actually inspected the default theme's memory at our struct's
+ * `inited` offset — a latent collision. It read 0 by luck until a struct-layout
+ * change shifted the offset, after which `inited` read non-zero, the fresh
+ * allocation was skipped, and style_init_reset ran lv_style_reset over garbage
+ * (freeing a junk pointer → heap assert at boot). A plain static keeps the styles
+ * alive just as well (the original code notes this is fine outside MicroPython-
+ * style bindings) and removes the collision entirely. */
+static my_theme_t * theme_def = NULL;
 
 #define MODE_DARK 1
 #define RADIUS_MESHPUNK 2
@@ -168,6 +179,7 @@ struct _my_theme_t {
     lv_color_t color_card;
     lv_color_t color_grey;
     lv_color_t color_hotpink;
+    lv_color_t color_btn_text;
     bool inited;
     my_theme_styles_t styles;
 
@@ -180,6 +192,21 @@ struct _my_theme_t {
 #endif
 };
 
+/* Active palette pushed from Lua (lib/theme) via lv_theme_meshpunk_set_palette.
+ * While `valid` is false the theme uses the built-in dark/light macros, so the
+ * very first frame at boot — before Lua applies the saved theme — looks exactly
+ * as it did before this system existed. */
+typedef struct {
+    lv_color_t scr;
+    lv_color_t card;
+    lv_color_t text;
+    lv_color_t grey;
+    lv_color_t accent;
+    lv_color_t btn_text;
+    bool dark;
+    bool valid;
+} meshpunk_palette_t;
+
 /**********************
  *  STATIC PROTOTYPES
  **********************/
@@ -189,6 +216,7 @@ static void style_init_reset(lv_style_t * style);
 /**********************
  *  STATIC VARIABLES
  **********************/
+static meshpunk_palette_t s_palette = { .valid = false };
 
 /**********************
  *      MACROS
@@ -225,11 +253,27 @@ static void style_init(my_theme_t * theme)
     };
 #endif
 
-    theme->color_scr = theme->base.flags & MODE_DARK ? DARK_COLOR_SCR : LIGHT_COLOR_SCR;
-    theme->color_text = theme->base.flags & MODE_DARK ? DARK_COLOR_TEXT : LIGHT_COLOR_TEXT;
-    theme->color_card = theme->base.flags & MODE_DARK ? DARK_COLOR_CARD : LIGHT_COLOR_CARD;
-    theme->color_grey = theme->base.flags & MODE_DARK ? DARK_COLOR_GREY : LIGHT_COLOR_GREY;
-    theme->color_hotpink = lv_color_hex(0xFF00AA);
+    bool is_dark = theme->base.flags & MODE_DARK;
+    if(s_palette.valid) {
+        theme->color_scr      = s_palette.scr;
+        theme->color_text     = s_palette.text;
+        theme->color_card     = s_palette.card;
+        theme->color_grey     = s_palette.grey;
+        theme->color_hotpink  = s_palette.accent;
+        theme->color_btn_text = s_palette.btn_text;
+        /* The accent IS the primary/brand color: this drives button fills
+         * (bg_color_primary), focus outlines (outline_primary) and the other
+         * "primary" chrome, so a theme's highlight color shows everywhere. */
+        theme->base.color_primary = s_palette.accent;
+    }
+    else {
+        theme->color_scr      = is_dark ? DARK_COLOR_SCR : LIGHT_COLOR_SCR;
+        theme->color_text     = is_dark ? DARK_COLOR_TEXT : LIGHT_COLOR_TEXT;
+        theme->color_card     = is_dark ? DARK_COLOR_CARD : LIGHT_COLOR_CARD;
+        theme->color_grey     = is_dark ? DARK_COLOR_GREY : LIGHT_COLOR_GREY;
+        theme->color_hotpink  = lv_color_hex(0xFF00AA);
+        theme->color_btn_text = theme->color_text;
+    }
 
     style_init_reset(&theme->styles.transition_delayed);
     style_init_reset(&theme->styles.transition_normal);
@@ -294,8 +338,12 @@ static void style_init(my_theme_t * theme)
     lv_style_set_outline_opa(&theme->styles.outline_secondary, LV_OPA_50);
 
     style_init_reset(&theme->styles.focus_key_bg);
-    lv_style_set_bg_color(&theme->styles.focus_key_bg, lv_color_hex(0xAAAAAA));
-    lv_style_set_bg_opa(&theme->styles.focus_key_bg, LV_OPA_COVER);
+    /* Selected/focused item highlight. Themed: a translucent wash of the accent
+     * (so the item's own text stays readable) instead of the old opaque grey. */
+    lv_style_set_bg_color(&theme->styles.focus_key_bg,
+                          s_palette.valid ? s_palette.accent : lv_color_hex(0xAAAAAA));
+    lv_style_set_bg_opa(&theme->styles.focus_key_bg,
+                        s_palette.valid ? LV_OPA_50 : LV_OPA_COVER);
 
     style_init_reset(&theme->styles.btn);
     lv_style_set_radius(&theme->styles.btn, RADIUS_MESHPUNK);
@@ -307,7 +355,7 @@ static void style_init(my_theme_t * theme)
         lv_style_set_shadow_opa(&theme->styles.btn, LV_OPA_50);
         lv_style_set_shadow_offset_y(&theme->styles.btn, LV_DPX_CALC(theme->disp_dpi, LV_DPX(4)));
     }
-    lv_style_set_text_color(&theme->styles.btn, theme->color_text);
+    lv_style_set_text_color(&theme->styles.btn, theme->color_btn_text);
     lv_style_set_pad_hor(&theme->styles.btn, PAD_DEF);
     lv_style_set_pad_ver(&theme->styles.btn, PAD_SMALL);
     lv_style_set_pad_column(&theme->styles.btn, LV_DPX_CALC(theme->disp_dpi, 5));
@@ -359,7 +407,9 @@ static void style_init(my_theme_t * theme)
 
     style_init_reset(&theme->styles.bg_color_primary);
     lv_style_set_bg_color(&theme->styles.bg_color_primary, theme->base.color_primary);
-    lv_style_set_text_color(&theme->styles.bg_color_primary, lv_color_white());
+    /* Label color for accent-filled chrome (buttons): follow the palette's
+     * btn_text instead of always-white, so it contrasts the chosen accent. */
+    lv_style_set_text_color(&theme->styles.bg_color_primary, theme->color_btn_text);
     lv_style_set_bg_opa(&theme->styles.bg_color_primary, LV_OPA_COVER);
 
     style_init_reset(&theme->styles.bg_color_primary_muted);
@@ -693,6 +743,43 @@ lv_theme_t * lv_theme_meshpunk_init(lv_display_t * disp, lv_color_t color_primar
     theme->inited = true;
 
     return (lv_theme_t *) theme;
+}
+
+void lv_theme_meshpunk_set_palette(uint32_t scr, uint32_t card, uint32_t text,
+                                   uint32_t grey, uint32_t accent, uint32_t btn_text,
+                                   bool dark)
+{
+    if(!lv_theme_meshpunk_is_inited()) return;
+    my_theme_t * theme = theme_def;
+
+    meshpunk_palette_t p;
+    p.scr      = lv_color_hex(scr);
+    p.card     = lv_color_hex(card);
+    p.text     = lv_color_hex(text);
+    p.grey     = lv_color_hex(grey);
+    p.accent   = lv_color_hex(accent);
+    p.btn_text = lv_color_hex(btn_text);
+    p.dark     = dark;
+    p.valid    = true;
+
+    /* Idempotent: a theme re-applied on every home entry (ensure_background)
+     * must not repeatedly walk every widget. Skip the re-cascade if the palette
+     * is byte-for-byte what we already pushed. */
+    if(s_palette.valid &&
+       s_palette.dark == p.dark &&
+       lv_color_eq(s_palette.scr, p.scr) &&
+       lv_color_eq(s_palette.card, p.card) &&
+       lv_color_eq(s_palette.text, p.text) &&
+       lv_color_eq(s_palette.grey, p.grey) &&
+       lv_color_eq(s_palette.accent, p.accent) &&
+       lv_color_eq(s_palette.btn_text, p.btn_text)) {
+        return;
+    }
+
+    s_palette = p;
+    theme->base.flags = dark ? MODE_DARK : 0;
+    style_init(theme);
+    lv_obj_report_style_change(NULL);
 }
 
 void lv_theme_meshpunk_deinit(void)

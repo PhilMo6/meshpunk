@@ -27,6 +27,7 @@
 local lvgl = require("lvgl")
 local utils = require("lib/utils")
 local topbar = require("lib/topbar")
+local background = require("lib/background")
 
 local M = {}
 
@@ -356,10 +357,19 @@ function M.launch(name_or_record)
     local function finish_err(msg)
         print("[apps] launch error: " .. tostring(msg))
         M._screen, M._timers = prev_screen, prev_timers   -- restore; keep current screen
+        -- We stay on the launcher, so put back the chrome we tore down for the
+        -- launch attempt: resume the topbar and redraw the freed wallpaper.
+        topbar.raise()
+        pcall(function() require("lib/theme").ensure_background() end)
         M._busy = false
     end
 
-    topbar.pause()
+    -- Free the home-screen wallpaper BEFORE the app's chunk runs: a full-screen
+    -- canvas/image is ~150-300KB of PSRAM the heavy apps (PICO-8/Doom/Map) need.
+    -- ensure_background() redraws it when we return home (or on a failed launch).
+    background.free()
+    topbar.hide()   -- fully hidden (not just paused) so it can't bleed through a
+                    -- transparent app body; raise() reveals it again on demand
     local step, compiled_chunk, deferred_init = 0, nil, nil
     utils.loadingPopUpAdd(nil, rec.name, function()
         step = step + 1
