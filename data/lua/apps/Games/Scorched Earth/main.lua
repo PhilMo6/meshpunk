@@ -27,6 +27,13 @@ local DIRECT_HIT_DMG  = 40
 local NEAR_HIT_DMG    = 15
 local EXP_FRAMES      = 6
 local EXP_FRAME_MS    = 30
+local RESULT_MS       = 1800   -- pause showing HIT!/MISS before the turn passes
+
+-- Wind: re-rolled each turn. game.wind is an integer strength in
+-- [-WIND_MAX, WIND_MAX]; the per-tick horizontal acceleration applied to a
+-- projectile is game.wind * WIND_ACCEL. Positive wind blows to the right.
+local WIND_MAX        = 10
+local WIND_ACCEL      = 0.0022
 
 local CLR_SKY        = "#0a0a2e"
 local CLR_TERRAIN    = "#4a7a2e"
@@ -56,6 +63,8 @@ local game = {
     playing = false,
     timers  = {},
     state   = "menu",
+    mode    = "single",   -- "single" (vs AI) or "two" (local hot-seat)
+    wind    = 0,          -- current turn's wind strength
 }
 
 function game:alive() return self.running end
@@ -128,6 +137,10 @@ end
 local player = { x = 0, y = 0, hp = 100, angle = 60,  power = 50 }
 local ai     = { x = 0, y = 0, hp = 100, angle = 120, power = 50 }
 
+-- The tank whose turn it currently is. In single player this is always `player`
+-- when a human is aiming; in two-player both `player` and `ai` are human-driven.
+local activeTank = player
+
 local function tankCenterX(t) return t.x end
 local function tankCenterY(t) return t.y - math.floor(TANK_H / 2) end
 
@@ -151,9 +164,69 @@ local function sinkTanks()
 end
 
 -- ============================================================
+-- Turn / wind helpers
+-- ============================================================
+local function newWind()
+    game.wind = math.random(-WIND_MAX, WIND_MAX)
+end
+
+-- In two-player mode both tanks are controlled by a person; in single player
+-- only `player` is.
+local function isHuman(t)
+    if game.mode == "two" then return true end
+    return t == player
+end
+
+local function turnName(t)
+    if game.mode == "single" then
+        return (t == player) and "YOUR TURN" or "AI TURN"
+    end
+    return (t == player) and "PLAYER 1" or "PLAYER 2"
+end
+
+local function focusGame()
+    if game.scr then
+        pcall(function() lvgl.group.focus_obj(game.scr) end)
+    end
+end
+
+-- ============================================================
 -- Drawing: terrain canvas
 -- ============================================================
 local terrain_canvas = nil
+
+-- Wind read-out near the top-centre of the play field: "WIND <n>" plus an arrow
+-- whose length and direction track the current wind. Drawn onto the terrain
+-- canvas (the transparent projectile canvas sits on top, so it stays visible).
+local function drawWindIndicator()
+    if not terrain_canvas then return end
+    local cx  = math.floor(GAME_W / 2)
+    local w   = game.wind
+    local mag = math.abs(w)
+
+    terrain_canvas:draw_label({
+        text = (w == 0) and "WIND --" or ("WIND " .. mag),
+        color = CLR_DIM, opa = 255,
+        x1 = cx - 30, y1 = 2, x2 = cx + 40, y2 = 16,
+    })
+    if w == 0 then return end
+
+    local dir = (w > 0) and 1 or -1
+    local len = math.min(mag * 4, 40)
+    local ay  = 21
+    local tip = cx + dir * len
+    terrain_canvas:draw_line({
+        p1 = { x = cx, y = ay }, p2 = { x = tip, y = ay },
+        color = CLR_TEXT, width = 2, opa = 255,
+    })
+    local hs = 4
+    terrain_canvas:draw_triangle({
+        p1 = { x = tip,            y = ay },
+        p2 = { x = tip - dir * hs, y = ay - hs },
+        p3 = { x = tip - dir * hs, y = ay + hs },
+        bg_color = CLR_TEXT, bg_opa = 255,
+    })
+end
 
 local function drawTerrainCanvas()
     if not terrain_canvas then return end
@@ -200,6 +273,8 @@ local function drawTerrainCanvas()
 
     drawTank(player, CLR_P1_TANK, CLR_P1_BARREL)
     drawTank(ai, CLR_AI_TANK, CLR_AI_BARREL)
+
+    drawWindIndicator()
 end
 
 -- ============================================================
@@ -286,14 +361,24 @@ local function createUI(scr)
         text_color = CLR_TEXT,
     }
     ui.turn:add_flag(lvgl.FLAG.HIDDEN)
+
+    ui.result = scr:Label{
+        text = "",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
+        align = { type = lvgl.ALIGN.CENTER },
+        text_color = CLR_TEXT,
+    }
+    ui.result:add_flag(lvgl.FLAG.HIDDEN)
 end
 
 local function updateUI()
     if not game.running then return end
+    local me = activeTank or player
+    local oppName = (game.mode == "single") and "AI" or "P2"
     ui.p1_hp:set{ text = "P1:" .. player.hp, text_color = hpColor(player.hp) }
-    ui.ai_hp:set{ text = "AI:" .. ai.hp, text_color = hpColor(ai.hp) }
-    ui.angle:set{ text = string.format("ANG:%03d", player.angle) }
-    ui.power:set{ text = string.format("PWR:%03d", player.power) }
+    ui.ai_hp:set{ text = oppName .. ":" .. ai.hp, text_color = hpColor(ai.hp) }
+    ui.angle:set{ text = string.format("ANG:%03d", me.angle) }
+    ui.power:set{ text = string.format("PWR:%03d", me.power) }
 end
 
 local function showTurnLabel(txt)
@@ -309,6 +394,20 @@ local function showTurnLabel(txt)
         end
     }
     game:trackTimer(t)
+end
+
+local function showResult(hit)
+    if not game.running or not ui.result then return end
+    if hit then
+        ui.result:set{ text = "HIT!", text_color = CLR_HP_OK }
+    else
+        ui.result:set{ text = "MISS", text_color = CLR_DIM }
+    end
+    ui.result:clear_flag(lvgl.FLAG.HIDDEN)
+end
+
+local function hideResult()
+    if ui.result then ui.result:add_flag(lvgl.FLAG.HIDDEN) end
 end
 
 -- ============================================================
@@ -348,7 +447,31 @@ local function checkWin()
 end
 
 -- Forward declarations
-local switchTurn, showGameOver, initGame
+local switchTurn, showGameOver, initGame, beginTurn, showHandoff, advanceHandoff
+
+-- Hold on the HIT!/MISS read-out for a beat so the round doesn't whip past, then
+-- either end the game or hand off to the next turn. Used both after an explosion
+-- and after a shot that sails off the screen.
+local function resolveTurn(hit)
+    if not game.running then return end
+    game.state = "resolving"
+    showResult(hit)
+    local t = lvgl.Timer{
+        period = RESULT_MS,
+        cb = function(timer)
+            timer:delete()
+            if not game.running then return end
+            hideResult()
+            local winner = checkWin()
+            if winner then
+                showGameOver(winner)
+            else
+                switchTurn()
+            end
+        end
+    }
+    game:trackTimer(t)
+end
 
 local function startExplosion(ex, ey)
     if not game.running then return end
@@ -365,17 +488,16 @@ local function startExplosion(ex, ey)
                 timer:delete()
                 clearProjCanvas()
                 deformTerrain(ex, ey)
+
+                -- A "hit" means the shooter damaged their opponent.
+                local target = (currentShooter == player) and ai or player
+                local hpBefore = target.hp
                 applyDamage(ex, ey)
                 sinkTanks()
                 drawTerrainCanvas()
                 updateUI()
 
-                local winner = checkWin()
-                if winner then
-                    showGameOver(winner)
-                else
-                    switchTurn()
-                end
+                resolveTurn(target.hp < hpBefore)
                 return
             end
             drawExplosionFrame(ex, ey, frame * r_step)
@@ -417,13 +539,14 @@ local function fireShot(shooter)
             proj.x  = proj.x + proj.vx
             proj.y  = proj.y + proj.vy
             proj.vy = proj.vy + GRAVITY
+            proj.vx = proj.vx + game.wind * WIND_ACCEL
 
             local ix = clamp(math.floor(proj.x), 0, GAME_W - 1)
 
             if proj.x < -20 or proj.x > GAME_W + 20 or proj.y > GAME_H + 20 then
                 timer:delete()
                 clearProjCanvas()
-                switchTurn()
+                resolveTurn(false)   -- flew off the map: a miss
                 return
             end
 
@@ -470,6 +593,10 @@ local function doAITurn()
     ai.angle = clamp(base_angle + math.random(-25, 25), 95, 175)
     ai.power = math.random(30, 80)
 
+    -- The AI fires leftward at the player. Wind blowing right (positive) pushes
+    -- the shell back toward the AI, so it needs more power; a left wind helps.
+    ai.power = clamp(ai.power + math.floor(game.wind * 1.2), 25, 95)
+
     drawTerrainCanvas()
 
     local t = lvgl.Timer{
@@ -486,16 +613,107 @@ end
 -- ============================================================
 -- Turn management
 -- ============================================================
-switchTurn = function()
+-- Roll a fresh wind, then hand the turn to `tank`. A human tank gets an aiming
+-- turn; the AI fires on its own.
+beginTurn = function(tank)
     if not game.running then return end
-    if currentShooter == player or currentShooter == nil then
-        doAITurn()
-    else
+    activeTank = tank
+    newWind()
+    if isHuman(tank) then
         game.state = "player_turn"
         game.playing = true
-        showTurnLabel("YOUR TURN")
+        focusGame()
+        drawTerrainCanvas()
         updateUI()
+        showTurnLabel(turnName(tank))
+    else
+        doAITurn()   -- sets its own aim, redraws, schedules the shot
     end
+end
+
+switchTurn = function()
+    if not game.running then return end
+    -- Whoever just shot is currentShooter; the other tank is up next.
+    local nextTank = (currentShooter == ai) and player or ai
+    if game.mode == "two" then
+        showHandoff(nextTank)   -- explicit "pass the device" gate
+    else
+        beginTurn(nextTank)
+    end
+end
+
+-- ============================================================
+-- Two-player handoff ("pass the device") gate
+-- ============================================================
+local handoffBox  = nil
+local pendingTank = nil
+
+local function clearHandoff()
+    if handoffBox then
+        pcall(function() handoffBox:delete() end)
+        handoffBox = nil
+    end
+end
+
+advanceHandoff = function()
+    if not game.running then return end
+    if game.state ~= "handoff" then return end
+    clearHandoff()
+    focusGame()
+    beginTurn(pendingTank)
+end
+
+-- Full-screen prompt shown between turns in two-player mode so players can hand
+-- the device over deliberately. Dismissed by a tap or ENTER. It deliberately
+-- does NOT join the nav group/gridnav: the screen keeps keyboard focus so its
+-- KEY handler sees ENTER, and the box is CLICKABLE so a tap anywhere advances.
+showHandoff = function(tank)
+    if not game.running then return end
+    game.state = "handoff"
+    game.playing = false
+    pendingTank = tank
+    clearHandoff()
+
+    local name = (tank == player) and "PLAYER 1" or "PLAYER 2"
+    local clr  = (tank == player) and CLR_P1_TANK or CLR_AI_TANK
+
+    handoffBox = game.scr:Object{
+        w = W, h = H,
+        bg_color = CLR_MENU_BG, bg_opa = 255,
+        border_width = 0, pad_all = 0,
+        flex = {
+            flex_direction = "column",
+            flex_wrap = "nowrap",
+            justify_content = "center",
+            align_items = "center",
+            align_content = "center",
+        }
+    }
+    handoffBox:clear_flag(lvgl.FLAG.SCROLLABLE)
+    handoffBox:add_flag(lvgl.FLAG.CLICKABLE)
+
+    handoffBox:Label{
+        text = "PASS DEVICE TO",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        text_color = CLR_DIM,
+    }
+    handoffBox:Label{
+        text = name,
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
+        text_color = clr,
+    }
+    handoffBox:Object{ w = 10, h = 16 }:clear_flag(lvgl.FLAG.SCROLLABLE)
+    handoffBox:Label{
+        text = "Tap or press ENTER",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        text_color = CLR_TEXT,
+    }
+
+    handoffBox:onevent(lvgl.EVENT.CLICKED, function()
+        advanceHandoff()
+    end)
+
+    focusGame()
 end
 
 -- ============================================================
@@ -514,9 +732,15 @@ showGameOver = function(winner)
     if not game.running then return end
     game.state = "game_over"
     game.playing = false
+    clearHandoff()
     clearOverlay()
 
-    local msg = (winner == "player") and "YOU WIN!" or "AI WINS!"
+    local msg
+    if game.mode == "single" then
+        msg = (winner == "player") and "YOU WIN!" or "AI WINS!"
+    else
+        msg = (winner == "player") and "PLAYER 1 WINS!" or "PLAYER 2 WINS!"
+    end
 
     overlayBox = game.scr:Object{
         w = 200, h = 120,
@@ -577,13 +801,9 @@ showGameOver = function(winner)
         clearOverlay()
         generateTerrain()
         placeTanks()
-        drawTerrainCanvas()
         clearProjCanvas()
         currentShooter = nil
-        game.state = "player_turn"
-        game.playing = true
-        showTurnLabel("YOUR TURN")
-        updateUI()
+        beginTurn(player)   -- same mode, P1 starts; rolls wind + redraws
     end)
 
     exitBtn:onevent(lvgl.EVENT.CLICKED, function()
@@ -607,7 +827,7 @@ local function showMenu(scr)
     menuBox = scr:Object{
         w = W, h = H,
         bg_color = CLR_MENU_BG, bg_opa = 255,
-        border_width = 0, pad_all = 0,
+        border_width = 0, pad_all = 0, pad_row = 12,
         flex = {
             flex_direction = "column",
             flex_wrap = "nowrap",
@@ -629,8 +849,6 @@ local function showMenu(scr)
         text_color = CLR_EXP_MID,
     }
 
-    menuBox:Object{ w = 10, h = 20 }:clear_flag(lvgl.FLAG.SCROLLABLE)
-
     local spBtn = menuBox:Object{
         w = 180, h = 36,
         bg_color = CLR_BTN, bg_opa = 255,
@@ -645,7 +863,19 @@ local function showMenu(scr)
         text_color = CLR_TEXT,
     }
 
-    menuBox:Object{ w = 10, h = 8 }:clear_flag(lvgl.FLAG.SCROLLABLE)
+    local mpBtn = menuBox:Object{
+        w = 180, h = 36,
+        bg_color = CLR_BTN, bg_opa = 255,
+        radius = 6, pad_all = 4,
+    }
+    mpBtn:clear_flag(lvgl.FLAG.SCROLLABLE)
+    mpBtn:add_flag(lvgl.FLAG.CLICKABLE)
+    mpBtn:Label{
+        text = "2 Players (Local)",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        align = { type = lvgl.ALIGN.CENTER },
+        text_color = CLR_TEXT,
+    }
 
     local exitBtn = menuBox:Object{
         w = 180, h = 36,
@@ -667,6 +897,14 @@ local function showMenu(scr)
 
     spBtn:onevent(lvgl.EVENT.CLICKED, function()
         if not game.running then return end
+        game.mode = "single"
+        clearMenu()
+        initGame()
+    end)
+
+    mpBtn:onevent(lvgl.EVENT.CLICKED, function()
+        if not game.running then return end
+        game.mode = "two"
         clearMenu()
         initGame()
     end)
@@ -699,14 +937,10 @@ initGame = function()
     })
 
     createUI(game.scr)
-    drawTerrainCanvas()
     clearProjCanvas()
 
     currentShooter = nil
-    game.state = "player_turn"
-    game.playing = true
-    showTurnLabel("YOUR TURN")
-    updateUI()
+    beginTurn(player)   -- P1 starts in both modes; rolls wind + draws
 end
 
 -- ============================================================
@@ -726,30 +960,39 @@ local function setupInput(scr)
 
     scr:onevent(lvgl.EVENT.KEY, function(obj, code)
         if not game.running then return end
-        if game.state ~= "player_turn" then return end
 
         local indev = lvgl.indev.get_act()
         local key = indev:get_key()
 
+        -- Between-turn handoff in two-player mode: ENTER advances.
+        if game.state == "handoff" then
+            if key == lvgl.KEY.ENTER then advanceHandoff() end
+            return
+        end
+
+        if game.state ~= "player_turn" then return end
+
+        local me = activeTank or player
+
         if key == lvgl.KEY.ENTER then
             game.playing = false
-            fireShot(player)
+            fireShot(me)
             return
         end
 
         local changed = false
 
         if key == lvgl.KEY.UP or key == KEY_W then
-            player.angle = clamp(player.angle + 2, 1, 179)
+            me.angle = clamp(me.angle + 2, 1, 179)
             changed = true
         elseif key == lvgl.KEY.DOWN or key == KEY_S then
-            player.angle = clamp(player.angle - 2, 1, 179)
+            me.angle = clamp(me.angle - 2, 1, 179)
             changed = true
         elseif key == lvgl.KEY.LEFT or key == KEY_A then
-            player.power = clamp(player.power - 2, 5, 100)
+            me.power = clamp(me.power - 2, 5, 100)
             changed = true
         elseif key == lvgl.KEY.RIGHT or key == KEY_D then
-            player.power = clamp(player.power + 2, 5, 100)
+            me.power = clamp(me.power + 2, 5, 100)
             changed = true
         end
 
