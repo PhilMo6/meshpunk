@@ -6,6 +6,7 @@
 .vscode/ipch
 .DS_Store
 pico8 carts
+releases
 Todo.txt
 docs
 meshpunk-*-merged.bin
