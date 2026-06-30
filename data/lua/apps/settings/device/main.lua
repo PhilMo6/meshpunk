@@ -1,8 +1,9 @@
-local lvgl  = require("lvgl")
-local utils = require("lib/utils")
-local apps  = require("lib/apps")
-local nav   = require("lib/nav")
-local theme = require("lib/theme")
+local lvgl   = require("lvgl")
+local utils  = require("lib/utils")
+local apps   = require("lib/apps")
+local nav    = require("lib/nav")
+local theme  = require("lib/theme")
+local topbar = require("lib/topbar")
 
 local root = apps.new_root()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0, bg_opa = 0 }
@@ -92,6 +93,22 @@ scr_to_btn:onClicked(function()
     end
     _screen_timeout_set(math.floor(v))
     status.text = "Screen timeout: " .. math.floor(v) .. "s"
+end)
+
+-- Top bar: transparent (themed wallpaper shows behind the status bar) vs opaque
+-- (solid themed panel). Applies live; visible on the home screen.
+local topbar_transp_on = _topbar_transparant_get()
+local function topbar_transp_text()
+    return (topbar_transp_on and "[x]" or "[ ]") .. " Transparent top bar"
+end
+local topbar_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+local topbar_lbl = topbar_btn:Label { text = topbar_transp_text(), align = lvgl.ALIGN.LEFT_MID }
+topbar_btn:onClicked(function()
+    topbar_transp_on = not topbar_transp_on
+    _topbar_transparant_set(topbar_transp_on)
+    topbar.apply_transparency()
+    topbar_lbl:set({ text = topbar_transp_text() })
+    status.text = topbar_transp_on and "Top bar: transparent" or "Top bar: opaque"
 end)
 
 -- ── Keyboard Backlight ───────────────────────────────────────────────────────

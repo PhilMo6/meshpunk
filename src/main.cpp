@@ -156,6 +156,9 @@ static bool     kbd_timed_out        = false;
 static bool     notify_kbd_enabled   = true;   // keyboard blink on DM / @mention
 static bool     notify_sound_enabled = true;   // melody on DM / @mention
 
+// ── Topbar Preferences ─────────────────────────────────────────────
+static bool     topbar_transparant = false;   // can you see the background though the topbar
+
 static int32_t tz_auto_offset_minutes() {
   if (!gps_location_valid_at_fix) return 0;
   // 1° longitude = 4 minutes of solar time.
@@ -205,6 +208,8 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("trackball_roll=%d\n", trackball_roll_ms);
   f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
   f.printf("theme=%s\n", theme_pref_str.c_str());
+  f.printf("topbar_transparant=%d\n", topbar_transparant ? 1 : 0);
+  
   f.close();
   SLog.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -340,6 +345,8 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "theme") == 0) {
       theme_pref_str = String(val);
       theme_pref_str.trim();
+    } else if (strcmp(key, "topbar_transparant") == 0) {
+      topbar_transparant = (atoi(val) == 1);
     }
   }
   f.close();

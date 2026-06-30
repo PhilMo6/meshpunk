@@ -5,6 +5,15 @@ local sound = require("lib/sound")
 
 local M = {}
 
+-- bg_opa for the status bar, following the `topbar_transparant` device setting:
+-- transparent (0) lets the themed wallpaper show through; opaque (255) gives the
+-- bar its themed card background. pcall-guarded so it is safe before the binding
+-- exists.
+local function topbar_bg_opa()
+    local ok, transp = pcall(_topbar_transparant_get)
+    return (ok and transp) and 0 or 255
+end
+
 local function format_epoch(ts, fmt)
     if not ts or ts < 1 then return "--:--:--" end
     local SECS_PER_DAY = 86400
@@ -116,7 +125,15 @@ function M.updateUnread()
 end
 
 function M.create()
-    messages:loadPersisted()
+    -- Do NOT loadPersisted() here. The topbar only needs the live unread COUNTERS
+    -- (countUnread sums __channel_unread/__dm_unread, bumped by live __dispatch) —
+    -- it never reads the message history. loadPersisted pulls EVERY channel + DM
+    -- thread from disk into Lua tables (~1.7MB with a busy mesh); called at boot
+    -- that baseline sat resident in the Lua heap forever, fragmenting PSRAM so the
+    -- heavy apps (Doom/Map/PICO-8) couldn't get a big contiguous block. The
+    -- Messenger app is the only consumer of the history and calls loadPersisted()
+    -- itself on open; C++ persists every message before dispatch, so deferring the
+    -- load loses nothing (and the unread badge is unaffected — it's counter-based).
 
     notify_melody = sound.generateMelody({
         {freq=523, ms=150}, {freq=0, ms=30},
@@ -128,9 +145,10 @@ function M.create()
     bar = lvgl.Object({
         flex = { flex_direction = "row", flex_wrap = "nowrap", justify_content = "space-between" },
         w = 320, h = 20, x = 0, y = 0,
-        -- Transparent so the themed background shows behind the status text;
-        -- otherwise the plain Object gets the opaque card style from the theme.
-        border_width = 0, pad_all = 4, pad_top = 2, pad_bottom = 0, bg_opa = 0,
+        -- bg_opa follows the topbar_transparant device setting: transparent lets
+        -- the themed wallpaper show behind the status text; opaque gives the plain
+        -- Object its themed card background. apply_transparency() updates it live.
+        border_width = 0, pad_all = 4, pad_top = 2, pad_bottom = 0, bg_opa = topbar_bg_opa(),
     })
     bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 
@@ -210,6 +228,13 @@ end
 -- (transparent app bodies), so route the old "lower" through the HIDDEN flag.
 function M.lower()
     M.hide()
+end
+
+-- Re-read the topbar_transparant setting and apply it to the live bar. The bar
+-- is created once at boot and persists, so the Device Settings toggle calls this
+-- to take effect without a reboot (visible next time the bar is shown).
+function M.apply_transparency()
+    if bar then pcall(function() bar:set({ bg_opa = topbar_bg_opa() }) end) end
 end
 
 return M
