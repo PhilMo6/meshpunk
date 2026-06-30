@@ -19,7 +19,7 @@ function utils.formatTime(timestamp)
     return string.format("%02d:%02d", time.hour, time.min)
 end
 
--- ── RTC-aware time helpers ──────────────────────────────────────────────────
+-- RTC-aware time helpers
 -- Messages/contacts carry RTC epoch seconds (UTC). These mirror topbar's
 -- civil-date maths so chat/inbox timestamps honour the device clock + tz
 -- offset without depending on the Lua os clock being set.

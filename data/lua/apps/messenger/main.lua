@@ -130,50 +130,11 @@ local function contact_type_visible(t)
     return true
 end
 
--- Make a scrollable list's rows "scroll-aware": while the list is being dragged
--- (touch scroll) row clicks are suppressed, then re-enabled once it settles, so
--- a tap opens a row but a drag scrolls past it. A plain single click works (also
--- nice for the trackball — no double-press). Returns a binder that attaches the
--- click handler to each row.
--- `on_settle` (optional) is invoked from the single SCROLL_END handler — use it
--- for things like windowed paging. luavgl allows only ONE callback per event
--- code per object, so a second list:onevent(SCROLL_END,...) would replace this
--- one (and historically hard-crashed luavgl's replace path); route extra
--- scroll-end work through here instead.
--- lv_indev_type_t value for a touchscreen/mouse pointer (vs keypad/encoder).
-local INDEV_POINTER = 1
-
-local function scroll_aware_list(list, on_settle)
-    local scrolling = false
-    local settle_timer = nil
-    list:onevent(lvgl.EVENT.SCROLL_BEGIN, function()
-        scrolling = true
-        if settle_timer then settle_timer:delete(); settle_timer = nil end
-    end)
-    list:onevent(lvgl.EVENT.SCROLL_END, function()
-        -- Hold the suppression briefly past the scroll so the release that
-        -- finishes the drag isn't taken as a tap.
-        if settle_timer then settle_timer:delete() end
-        settle_timer = lvgl.Timer { period = 150, cb = function(t)
-            t:delete(); settle_timer = nil; scrolling = false
-        end }
-        if on_settle then on_settle() end
-    end)
-    return function(obj, activate)
-        obj:onevent(lvgl.EVENT.RELEASED, function()
-            -- Only a touch DRAG should suppress the tap. The trackball/keyboard
-            -- activates rows through here too, but the gridnav scrolls the
-            -- focused row into view as you step — which arms `scrolling` — so
-            -- without gating on the pointer indev the click that opens a row
-            -- (e.g. a contact) gets swallowed.
-            local indev = lvgl.indev.get_act()
-            if scrolling and indev and indev:get_type() == INDEV_POINTER then
-                return
-            end
-            activate()
-        end)
-    end
-end
+-- Scroll-aware row taps live in lib/nav (shared with the launcher and any other
+-- app): nav.scroll_aware(list, on_settle) returns a binder(row, fn) that opens a
+-- row on a tap but lets a drag scroll past it; on_settle runs from the list's
+-- single SCROLL_END (used here for windowed paging).
+local scroll_aware_list = nav.scroll_aware
 
 -- Delivery word shown after the time on our own DM bubbles.
 local function dm_status_text(status)
@@ -271,52 +232,66 @@ local function show_msg_info(msg, on_reply, on_dismiss)
 
         box2:Label { text = "-- Message Paths --", w = lvgl.PCT(100) }
 
-        local paths = nil
-        if msg.hash then
-            local peer = msg.peer or msg.to or msg.from
-            local ch = msg.is_dm and -1 or (msg.channel_idx or 0)
-            local ok2, result = pcall(_mesh_get_message_paths, msg.hash, ch, peer)
-            if ok2 and result and #result > 0 then paths = result end
-        end
-
-        if not paths or #paths == 0 then
-            if msg.path and #msg.path > 0 then
-                box2:Label { text = "1 path (first arrival only)", w = lvgl.PCT(100) }
-                local rc = msg.direct and "Direct" or table.concat(msg.path, " > ")
-                box2:Label {
-                    text = string.format("#1 h:%d snr:%.0f rssi:%.0f %s",
-                        msg.hops or 0, msg.snr or 0, msg.rssi or 0,
-                        msg.direct and "DIRECT" or "FLOOD"),
-                    w = lvgl.PCT(100),
-                }
-                box2:Label { text = "  " .. rc, w = lvgl.PCT(100) }
-            else
-                box2:Label { text = "No paths observed", w = lvgl.PCT(100) }
-            end
-        else
-            box2:Label { text = #paths .. " path(s) seen", w = lvgl.PCT(100) }
-            for i, rec in ipairs(paths) do
-                local rc = "Direct"
-                if not rec.direct and rec.path and #rec.path > 0 then
-                    rc = table.concat(rec.path, " > ")
-                elseif not rec.direct then
-                    rc = "Flood (no path)"
+        -- Render the path list + Close button into box2. Called after the loading
+        -- popup has painted, since the disk read blocks LVGL until it returns.
+        local function render(paths)
+            if not paths or #paths == 0 then
+                if msg.path and #msg.path > 0 then
+                    box2:Label { text = "1 path (first arrival only)", w = lvgl.PCT(100) }
+                    local rc = msg.direct and "Direct" or table.concat(msg.path, " > ")
+                    box2:Label {
+                        text = string.format("#1 h:%d snr:%.0f rssi:%.0f %s",
+                            msg.hops or 0, msg.snr or 0, msg.rssi or 0,
+                            msg.direct and "DIRECT" or "FLOOD"),
+                        w = lvgl.PCT(100),
+                    }
+                    box2:Label { text = "  " .. rc, w = lvgl.PCT(100) }
+                else
+                    box2:Label { text = "No paths observed", w = lvgl.PCT(100) }
                 end
-                box2:Label {
-                    text = string.format("#%d h:%d snr:%.0f rssi:%.0f %s",
-                        i, rec.hops or 0, rec.snr or 0, rec.rssi or 0,
-                        rec.direct and "DIRECT" or "FLOOD"),
-                    w = lvgl.PCT(100),
-                }
-                box2:Label { text = "  " .. rc, w = lvgl.PCT(100) }
+            else
+                box2:Label { text = #paths .. " path(s) seen", w = lvgl.PCT(100) }
+                for i, rec in ipairs(paths) do
+                    local rc = "Direct"
+                    if not rec.direct and rec.path and #rec.path > 0 then
+                        rc = table.concat(rec.path, " > ")
+                    elseif not rec.direct then
+                        rc = "Flood (no path)"
+                    end
+                    box2:Label {
+                        text = string.format("#%d h:%d snr:%.0f rssi:%.0f %s",
+                            i, rec.hops or 0, rec.snr or 0, rec.rssi or 0,
+                            rec.direct and "DIRECT" or "FLOOD"),
+                        w = lvgl.PCT(100),
+                    }
+                    box2:Label { text = "  " .. rc, w = lvgl.PCT(100) }
+                end
             end
+
+            local close_btn2 = box2:Button { w = lvgl.PCT(100), h = 26 }
+            close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+            close_btn2:onevent(lvgl.EVENT.RELEASED, function()
+                nav.pop()
+                overlay2:delete()
+            end)
         end
 
-        local close_btn2 = box2:Button { w = lvgl.PCT(100), h = 26 }
-        close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
-        close_btn2:onevent(lvgl.EVENT.RELEASED, function()
-            nav.pop()
-            overlay2:delete()
+        -- The path lookup scans the conversation log on disk, which can lag on a
+        -- large channel. Show the loading popup and defer the read one tick so the
+        -- modal paints first (the C read blocks rendering until it returns).
+        local step = 0
+        utils.loadingPopUpAdd(overlay2, "paths", function()
+            step = step + 1
+            if step == 1 then return false end   -- let the popup paint
+            local paths = nil
+            if msg.hash then
+                local peer = msg.peer or msg.to or msg.from
+                local ch = msg.is_dm and -1 or (msg.channel_idx or 0)
+                local ok2, result = pcall(_mesh_get_message_paths, msg.hash, ch, peer)
+                if ok2 and result and #result > 0 then paths = result end
+            end
+            pcall(render, paths)
+            return true
         end)
     end)
 
@@ -458,6 +433,16 @@ show_inbox = function()
         messages:onDirectMessage(nil)
         messages:onContactUpdate(nil)
         messages:onAck(nil)
+        -- Drop the in-RAM message history we loaded on open (~1.7MB on a busy
+        -- mesh). The Messenger is its only consumer; freeing it here returns that
+        -- PSRAM (and un-fragments the heap) for the heavy apps. Reloaded verbatim
+        -- from disk via loadPersisted() the next time the Messenger opens. The
+        -- unread badge is counter-based, so it's unaffected.
+        messages:freePersisted()
+        -- Also drop the cached 500-contact Lua table (~388KB, pinned in the
+        -- registry by _mesh_get_contacts) — the Messenger is its other consumer.
+        -- go_home's collectgarbage reclaims it; rebuilt on demand next open.
+        pcall(_mesh_drop_contacts_cache)
         apps.go_home()
     end)
     ctrl("Channels", 72, function() show_channels() end)
@@ -678,13 +663,10 @@ show_chat = function(target)
         bubble:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
         bubble:set_style({ border_color = COL_FOCUS }, lvgl.STATE.FOCUS_KEY)
 
-        -- Header line: sender + time (+ hop count for received). Signal detail
-        -- (SNR/RSSI) lives in the long-press info popup, not the bubble.
+        -- Header line: sender + time. Hop count and signal detail (SNR/RSSI)
+        -- live in the long-press info popup, not the bubble.
         local hdr = is_me and "You" or (msg.from or "?")
         local meta = utils.clockHM(msg.timestamp)
-        if not is_me and msg.hops and msg.hops > 0 then
-            meta = meta .. "  " .. msg.hops .. "h"
-        end
         -- Live sends carry msg.status (sent/delivered/failed); persisted/received
         -- messages don't, so they show no delivery word.
         local track_status = is_me and target.type == "dm" and msg.status ~= nil

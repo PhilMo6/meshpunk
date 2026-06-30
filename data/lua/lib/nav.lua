@@ -1,4 +1,4 @@
--- ── Navigation scope stack ──────────────────────────────────────────────────
+--  Navigation scope stack + touch-input helpers
 -- Thin Lua front for the C nav controller (a STACK of gridnav scopes). The top
 -- scope is the interactive one; pushing suspends the scope below, popping
 -- resumes it. Apps should prefer these over the raw _nav_* bindings:
@@ -8,6 +8,8 @@
 --   nav.pop()                -- close the top scope, resume the one beneath
 --   nav.reset()              -- tear down the whole stack (app exit)
 --   nav.list(list, opts)     -- wire a scroll list's tap→row-select, 'q'→back
+--   nav.tap(obj, fn)         -- tap-not-swipe activation for any widget
+--   nav.scroll_aware(list, on_settle) -> binder(row, fn) -- scroll-aware row taps
 --
 -- opts = { flags = nav.ROLLOVER (default), focus = <child>, preserve = <bool> }.
 -- `preserve` keeps a scrolled list's position and focuses the first on-screen
@@ -89,6 +91,60 @@ function nav.list(list, opts)
         if lvgl.indev.get_act():get_key() == 113 then exit_select() end
     end)
     return exit_select
+end
+
+-- ── Touchscreen tap-vs-swipe (any widget, not just nav scopes) ──────────────
+-- Fire `activate` on a tap (a near-stationary touch press/release) but NOT when
+-- the finger drags to scroll a parent list/page. The decision is finger travel
+-- between PRESSED and RELEASED — not LVGL's scroll flag — so it can't get stuck
+-- (a flag set on SCROLL_BEGIN that fails to clear) and a small wobble still
+-- counts as a tap. The trackball/keyboard (a non-pointer indev) always fires.
+
+-- lv_indev_type_t value for a touchscreen/mouse pointer (vs keypad/encoder).
+local INDEV_POINTER = 1
+-- Max finger travel (px, squared) from press to release still counted as a tap.
+nav.TAP_SLOP_SQ = 16 * 16
+
+-- Bind a tap-vs-swipe activation to one widget (button, row, bubble, ...).
+function nav.tap(obj, activate)
+    local px, py  -- press point, pointer (touch) only
+    obj:onevent(lvgl.EVENT.PRESSED, function()
+        local indev = lvgl.indev.get_act()
+        if indev and indev:get_type() == INDEV_POINTER then
+            px, py = indev:get_point()
+        else
+            px, py = nil, nil
+        end
+    end)
+    obj:onevent(lvgl.EVENT.RELEASED, function()
+        local indev = lvgl.indev.get_act()
+        -- Trackball / keyboard (non-pointer): always activate.
+        if not (indev and indev:get_type() == INDEV_POINTER) then
+            activate()
+            return
+        end
+        -- Touch: only a near-stationary press (a tap) activates; a drag scrolls.
+        if px == nil then activate(); return end
+        local x, y = indev:get_point()
+        local dx, dy = x - px, y - py
+        if dx * dx + dy * dy <= nav.TAP_SLOP_SQ then
+            activate()
+        end
+    end)
+end
+
+-- For a scrollable list: returns a binder( row, activate ) that attaches a
+-- scroll-aware tap (nav.tap) to each row, so a tap opens a row but a drag
+-- scrolls past it. `on_settle` (optional) runs from the list's single SCROLL_END
+-- handler — route windowed-paging work through it, since luavgl allows only ONE
+-- callback per event code per object (a second SCROLL_END would replace this).
+function nav.scroll_aware(list, on_settle)
+    if on_settle then
+        list:onevent(lvgl.EVENT.SCROLL_END, function() on_settle() end)
+    end
+    return function(obj, activate)
+        nav.tap(obj, activate)
+    end
 end
 
 return nav

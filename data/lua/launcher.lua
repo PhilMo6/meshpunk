@@ -38,6 +38,10 @@ local function request_swap(rebuild)
     })
 end
 
+-- Tap-vs-swipe button activation (so a drag to scroll the page doesn't launch
+-- an app) lives in lib/nav, shared with the messenger and any other app.
+local bind_tap = nav.tap
+
 -- Build a page. category = nil for the root page, or a category name for a
 -- sub-page (adds a title + Back button).
 function build_page(items, category)
@@ -85,11 +89,11 @@ function build_page(items, category)
         if app.is_category then
             local folder = app.raw_name or app.name
             local cat_name = app.name
-            btn:onevent(lvgl.EVENT.RELEASED, function()
+            bind_tap(btn, function()
                 request_swap(function() build_page(apps.list(folder), cat_name) end)
             end)
         else
-            btn:onevent(lvgl.EVENT.RELEASED, function()
+            bind_tap(btn, function()
                 apps.launch(app)
             end)
         end
@@ -105,7 +109,7 @@ function build_page(items, category)
     if category then
         local back_btn = body:Button{w = 140, h = 40}
         back_btn:Label{text = "Back", align = lvgl.ALIGN.CENTER}
-        back_btn:onevent(lvgl.EVENT.RELEASED, function()
+        bind_tap(back_btn, function()
             request_swap(function() build_page(apps.list(), nil) end)
         end)
     end
