@@ -50,7 +50,7 @@ local M = {}
 
 local INTERNAL_DIR = "/lua/themes"
 local SD_DIR = "/meshpunk/themes"
-local DEFAULT_ID = "midnight"
+local DEFAULT_ID = "default"
 
 local current_id = nil    -- id of the last applied theme
 local current_rec = nil   -- its resolved record, so ensure_background needn't rescan

@@ -24,12 +24,29 @@ local content = root:Object {
 }
 nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
 
-content:Label { text = "UI Theme", w = lvgl.PCT(70), h = 26 }
+local status   -- forward-declared; the status row is created below the header
+
+content:Label { text = "UI Theme", w = 86, h = 26 }
+
+-- Quick access to the global selection-highlight style (also in Settings >
+-- Device): a translucent "highlighted fill" ([ ]) vs an opaque solid block ([x]).
+-- Applies live, so it previews on the focused items right here.
+local sel_solid_on = _theme_focus_solid_get()
+local function sel_text() return (sel_solid_on and "[x]" or "[ ]") .. " Solid" end
+local sel_btn = content:Button { w = 116, h = 22 }
+local sel_lbl = sel_btn:Label { text = sel_text(), align = lvgl.ALIGN.CENTER }
+sel_btn:onClicked(function()
+    sel_solid_on = not sel_solid_on
+    _theme_focus_solid_set(sel_solid_on)
+    sel_lbl:set { text = sel_text() }
+    status.text = sel_solid_on and "Selection: solid" or "Selection: highlighted fill"
+end)
+
 local back_btn = content:Button { w = 50, h = 22 }
 back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
 back_btn:onClicked(function() apps.go_home() end)
 
-local status = content:Label { text = "Tap a theme to apply", w = lvgl.PCT(100), h = 16 }
+status = content:Label { text = "Tap a theme to apply", w = lvgl.PCT(100), h = 16 }
 
 local current_id = theme.current()
 local rows = {}   -- { { id, name, lbl }, ... } so we can refresh the selection mark

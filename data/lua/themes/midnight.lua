@@ -1,4 +1,4 @@
--- Midnight — the default MeshPunk look: dark slate chrome, dark-purple accent.
+-- Midnight — dark slate chrome with a dark-purple accent.
 -- Solid background (no canvas), so it costs no PSRAM.
 return {
     name = "Midnight",

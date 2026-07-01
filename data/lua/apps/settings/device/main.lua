@@ -111,6 +111,36 @@ topbar_btn:onClicked(function()
     status.text = topbar_transp_on and "Top bar: transparent" or "Top bar: opaque"
 end)
 
+-- Selection highlight: a translucent "highlighted fill" wash (off) vs an opaque
+-- solid block (on). Global — applies to every theme. Applies live.
+local sel_solid_on = _theme_focus_solid_get()
+local function sel_solid_text()
+    return (sel_solid_on and "[x]" or "[ ]") .. " Solid selection highlight"
+end
+local sel_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+local sel_lbl = sel_btn:Label { text = sel_solid_text(), align = lvgl.ALIGN.LEFT_MID }
+sel_btn:onClicked(function()
+    sel_solid_on = not sel_solid_on
+    _theme_focus_solid_set(sel_solid_on)
+    sel_lbl:set({ text = sel_solid_text() })
+    status.text = sel_solid_on and "Selection: solid" or "Selection: highlighted fill"
+end)
+
+-- Selection tint direction: brighten the selected item vs darken it. Global —
+-- applies to every theme. Brighten can wash out light accents; darken is the fix.
+local sel_darken_on = _theme_focus_darken_get()
+local function sel_dir_text()
+    return "Selection tint: " .. (sel_darken_on and "Darken" or "Brighten")
+end
+local seldir_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+local seldir_lbl = seldir_btn:Label { text = sel_dir_text(), align = lvgl.ALIGN.LEFT_MID }
+seldir_btn:onClicked(function()
+    sel_darken_on = not sel_darken_on
+    _theme_focus_darken_set(sel_darken_on)
+    seldir_lbl:set({ text = sel_dir_text() })
+    status.text = sel_darken_on and "Selection: darken" or "Selection: brighten"
+end)
+
 -- ── Keyboard Backlight ───────────────────────────────────────────────────────
 content:Label { text = "-- Keyboard --", w = lvgl.PCT(100), h = 16 }
 

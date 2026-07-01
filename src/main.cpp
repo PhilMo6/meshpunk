@@ -174,6 +174,10 @@ static bool     notify_sound_enabled = true;   // melody on DM / @mention
 // ── Topbar Preferences ─────────────────────────────────────────────
 static bool     topbar_transparant = false;   // can you see the background though the topbar
 
+// ── Theme Preferences ─────────────────────────────────────────────
+static bool     theme_focus_solid  = false;   // selection highlight: false=translucent fill, true=opaque
+static bool     theme_focus_darken = false;   // selection tint: false=brighten, true=darken
+
 static int32_t tz_auto_offset_minutes() {
   if (!gps_location_valid_at_fix) return 0;
   // 1° longitude = 4 minutes of solar time.
@@ -224,7 +228,9 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
   f.printf("theme=%s\n", theme_pref_str.c_str());
   f.printf("topbar_transparant=%d\n", topbar_transparant ? 1 : 0);
-  
+  f.printf("sel_solid=%d\n", theme_focus_solid ? 1 : 0);
+  f.printf("sel_darken=%d\n", theme_focus_darken ? 1 : 0);
+
   f.close();
   SLog.printf("[FW_PREFS] saved to %s\n", path);
 }
@@ -362,6 +368,10 @@ static void firmware_prefs_load() {
       theme_pref_str.trim();
     } else if (strcmp(key, "topbar_transparant") == 0) {
       topbar_transparant = (atoi(val) == 1);
+    } else if (strcmp(key, "sel_solid") == 0) {
+      theme_focus_solid = (atoi(val) == 1);
+    } else if (strcmp(key, "sel_darken") == 0) {
+      theme_focus_darken = (atoi(val) == 1);
     }
   }
   f.close();
@@ -5037,6 +5047,31 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // Selection/focus highlight fill style (global, applies to every theme):
+  // false = translucent "highlighted fill", true = opaque solid. Applies live.
+  lua_register(L, "_theme_focus_solid_set", [](lua_State* L) -> int {
+    theme_focus_solid = lua_toboolean(L, 1);
+    lv_theme_meshpunk_set_focus_solid(theme_focus_solid);
+    firmware_prefs_save();
+    return 0;
+  });
+  lua_register(L, "_theme_focus_solid_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, theme_focus_solid ? 1 : 0);
+    return 1;
+  });
+
+  // Selection/focus tint direction (global): false = brighten, true = darken.
+  lua_register(L, "_theme_focus_darken_set", [](lua_State* L) -> int {
+    theme_focus_darken = lua_toboolean(L, 1);
+    lv_theme_meshpunk_set_focus_darken(theme_focus_darken);
+    firmware_prefs_save();
+    return 0;
+  });
+  lua_register(L, "_theme_focus_darken_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, theme_focus_darken ? 1 : 0);
+    return 1;
+  });
+
   // QR code: create an lv_qrcode child inside a Lua object, encoding `text`.
   // Usage: local ok = _qr_create(parent_obj, "meshcore://...", size_px)
   // The QR is centered in the parent; deleting the parent removes it.
@@ -5729,6 +5764,10 @@ void setup() {
 
     // Load firmware preferences (tz, use_sd, clock_fmt)
     firmware_prefs_load();
+    // Push the selection-highlight preferences into the live theme (the theme is
+    // already inited; Lua applies the palette later and re-reads these).
+    lv_theme_meshpunk_set_focus_solid(theme_focus_solid);
+    lv_theme_meshpunk_set_focus_darken(theme_focus_darken);
   } else {
     SLog.println("Error mounting LittleFS!!");
   }

@@ -218,6 +218,21 @@ static void style_init_reset(lv_style_t * style);
  **********************/
 static meshpunk_palette_t s_palette = { .valid = false };
 
+/* Selection/focus highlight style, a global user preference that applies to
+ * every theme. false = a translucent "highlighted fill" wash (the original
+ * look); true = an opaque solid fill. The highlight COLOR stays theme-driven
+ * (accent for palette themes, grey for the factory default). */
+static bool       s_focus_solid = false;
+
+/* Selection/focus tint DIRECTION, another global user preference: false =
+ * brighten the selected item (tint the accent toward white), true = darken it
+ * (tint toward black). Brighten washes out on light accents; darken is the fix. */
+static bool       s_focus_darken = false;
+
+/* How far the selection highlight tints the accent (toward white or black). Kept
+ * modest so it doesn't blow out on light accent colors. */
+#define FOCUS_TINT LV_OPA_30
+
 /**********************
  *      MACROS
  **********************/
@@ -338,12 +353,23 @@ static void style_init(my_theme_t * theme)
     lv_style_set_outline_opa(&theme->styles.outline_secondary, LV_OPA_50);
 
     style_init_reset(&theme->styles.focus_key_bg);
-    /* Selected/focused item highlight. Themed: a translucent wash of the accent
-     * (so the item's own text stays readable) instead of the old opaque grey. */
-    lv_style_set_bg_color(&theme->styles.focus_key_bg,
-                          s_palette.valid ? s_palette.accent : lv_color_hex(0xAAAAAA));
+    /* Selected/focused item highlight. Color is theme-driven; the fill style
+     * (wash vs solid) and tint direction (brighten vs darken) are global user
+     * prefs. A button's own fill IS the accent, so a raw-accent highlight would be
+     * invisible on it (accent-over-accent). Instead we TINT the accent — lighter
+     * or darker by a modest amount — so the selection stands out without washing
+     * out. The factory default keeps its neutral grey. */
+    lv_color_t focus_col;
+    if(s_palette.valid) {
+        focus_col = s_focus_darken ? lv_color_darken(s_palette.accent, FOCUS_TINT)
+                                   : lv_color_lighten(s_palette.accent, FOCUS_TINT);
+    }
+    else {
+        focus_col = lv_color_hex(0xAAAAAA);
+    }
+    lv_style_set_bg_color(&theme->styles.focus_key_bg, focus_col);
     lv_style_set_bg_opa(&theme->styles.focus_key_bg,
-                        s_palette.valid ? LV_OPA_50 : LV_OPA_COVER);
+                        s_focus_solid ? LV_OPA_COVER : LV_OPA_50);
 
     style_init_reset(&theme->styles.btn);
     lv_style_set_radius(&theme->styles.btn, RADIUS_MESHPUNK);
@@ -779,6 +805,30 @@ void lv_theme_meshpunk_set_palette(uint32_t scr, uint32_t card, uint32_t text,
     s_palette = p;
     theme->base.flags = dark ? MODE_DARK : 0;
     style_init(theme);
+    lv_obj_report_style_change(NULL);
+}
+
+void lv_theme_meshpunk_set_focus_solid(bool solid)
+{
+    /* Store unconditionally so style_init() reads the right value even if this is
+     * pushed before the theme is fully inited (e.g. at boot, before the first
+     * palette apply). Only re-cascade when the value actually changed and there
+     * are live widgets to update. */
+    if(s_focus_solid == solid && lv_theme_meshpunk_is_inited()) return;
+    s_focus_solid = solid;
+    if(!lv_theme_meshpunk_is_inited()) return;
+    style_init(theme_def);
+    lv_obj_report_style_change(NULL);
+}
+
+void lv_theme_meshpunk_set_focus_darken(bool darken)
+{
+    /* Same store-then-cascade pattern as set_focus_solid, so it works whether
+     * pushed before or after the theme is inited. */
+    if(s_focus_darken == darken && lv_theme_meshpunk_is_inited()) return;
+    s_focus_darken = darken;
+    if(!lv_theme_meshpunk_is_inited()) return;
+    style_init(theme_def);
     lv_obj_report_style_change(NULL);
 }
 

@@ -57,6 +57,20 @@ void lv_theme_meshpunk_set_palette(uint32_t scr, uint32_t card, uint32_t text,
                                    bool dark);
 
 /**
+ * Set the selection/focus highlight fill style, a global preference applied to
+ * every theme. Re-cascades to every live widget.
+ * @param solid true = opaque solid fill; false = translucent "highlighted fill".
+ */
+void lv_theme_meshpunk_set_focus_solid(bool solid);
+
+/**
+ * Set the selection/focus highlight tint direction, a global preference applied
+ * to every theme. Re-cascades to every live widget.
+ * @param darken true = darken the selected item; false = brighten it.
+ */
+void lv_theme_meshpunk_set_focus_darken(bool darken);
+
+/**
  * Get meshpunk theme
  * @return a pointer to meshpunk theme, or NULL if this is not initialized
  */
