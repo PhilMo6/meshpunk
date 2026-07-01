@@ -23,10 +23,12 @@ def git_version(project_dir):
 # All release artifacts land here.
 RELEASES_DIR_NAME = "releases"
 
-# Launcher build (bmorcelli/Launcher): the full 12 MB data image won't fit
-# alongside the resident Launcher on a 16 MB device, so the Launcher gets a
-# smaller, purpose-built filesystem image from the same data/ folder.
-LAUNCHER_FS_SIZE = 6 * 1024 * 1024          # 6 MB (multiple of block size)
+# Launcher build (bmorcelli/Launcher): the standalone 12 MB image won't fit
+# alongside the resident Launcher, so its merged image carries a LittleFS payload
+# sized to the current data/ contents plus a small margin (estimate_littlefs_size).
+LAUNCHER_FS_MARGIN =  512 * 1024            # small extra headroom over content
+LAUNCHER_FS_MIN    = 1024 * 1024            # never smaller than 1 MB
+LAUNCHER_FS_MAX    = 12 * 1024 * 1024       # cap / retry ceiling (full partition)
 # LittleFS geometry for ESP32 - must match what PlatformIO bakes the normal
 # image with, or the firmware's LittleFS.begin() won't mount it.
 LITTLEFS_PAGE  = 256
@@ -41,6 +43,22 @@ def mklittlefs_path(env):
         if os.path.isfile(cand):
             return cand
     return None
+
+def estimate_littlefs_size(data_dir, block=LITTLEFS_BLOCK):
+    # Rough LittleFS footprint of data_dir: each file rounds up to a block plus a
+    # metadata block, each directory a couple of metadata blocks. Deliberately
+    # conservative so mklittlefs rarely runs short; the build retries larger if so.
+    used = block  # superblock / root
+    for root, dirs, files in os.walk(data_dir):
+        used += 2 * block
+        for name in files:
+            try:
+                sz = os.path.getsize(os.path.join(root, name))
+            except OSError:
+                sz = 0
+            used += ((sz + block - 1) // block + 1) * block
+    size = max(used + LAUNCHER_FS_MARGIN, LAUNCHER_FS_MIN)
+    return ((size + block - 1) // block) * block
 
 def merge_bin(source, target, env):
     build_dir   = env.subst("$BUILD_DIR")
@@ -103,25 +121,37 @@ def merge_bin(source, target, env):
     # An app-only binary has no table -> Launcher makes no filesystem ("no
     # filesystem" warning); a bare fs image gets mistaken for an app and errors.
     # The normal 12 MB image is too big to sit beside the resident Launcher, so we
-    # emit a second merged image carrying a 6 MB LittleFS payload. The embedded
-    # table still declares the 12 MB spiffs (label "spiffs"), which exceeds
-    # Launcher's 5 MB threshold, so Launcher sizes the real partition to the free
-    # space, copies our 6 MB payload, and patches the LittleFS superblock to fit.
+    # emit a second merged image whose LittleFS payload is sized to the current
+    # data/ contents plus a small margin. The embedded table still declares the
+    # 12 MB spiffs (label "spiffs"), which exceeds Launcher's 5 MB threshold, so on
+    # install Launcher grows the real partition to the free space and patches the
+    # LittleFS superblock -- this payload is just the seed content.
     data_dir   = os.path.join(project_dir, "data")
     mklittlefs = mklittlefs_path(env)
     if mklittlefs and os.path.isdir(data_dir):
         launcher_fs = os.path.join(build_dir, "littlefs_launcher.bin")
-        fs_cmd = [
-            mklittlefs,
-            "-c", data_dir,
-            "-p", str(LITTLEFS_PAGE),
-            "-b", str(LITTLEFS_BLOCK),
-            "-s", str(LAUNCHER_FS_SIZE),
-            launcher_fs,
-        ]
-        print("merge_bin: building %d MB Launcher fs payload"
-              % (LAUNCHER_FS_SIZE // (1024 * 1024)))
-        subprocess.check_call(fs_cmd)
+        fs_size = estimate_littlefs_size(data_dir)
+        while True:
+            fs_cmd = [
+                mklittlefs,
+                "-c", data_dir,
+                "-p", str(LITTLEFS_PAGE),
+                "-b", str(LITTLEFS_BLOCK),
+                "-s", str(fs_size),
+                launcher_fs,
+            ]
+            print("merge_bin: building Launcher fs payload (%.1f MB)"
+                  % (fs_size / (1024.0 * 1024.0)))
+            try:
+                subprocess.check_call(fs_cmd)
+                break
+            except subprocess.CalledProcessError:
+                if fs_size >= LAUNCHER_FS_MAX:
+                    print("merge_bin: data/ too large for Launcher fs image")
+                    raise
+                fs_size = min(fs_size + 1024 * 1024, LAUNCHER_FS_MAX)
+                print("merge_bin: fs image too small, retrying at %.1f MB"
+                      % (fs_size / (1024.0 * 1024.0)))
 
         launcher_img = os.path.join(releases_dir, "meshpunk-%s-launcher.bin" % version)
         launcher_cmd = [
