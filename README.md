@@ -19,7 +19,7 @@
 - Elf file loader
 - Doom! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
 - Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts. (thanks to https://github.com/mintylinux)
-- Themes! make Meshpunk look the way you want. 10 themes are included!
+- Themes! make Meshpunk look the way you want. 14 themes are included!
 
 ## Installation 
 
