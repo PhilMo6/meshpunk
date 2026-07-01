@@ -131,11 +131,13 @@
 /*Default cache size in bytes.
  *Used by image decoders such as `lv_lodepng` to keep the decoded image in the memory.
  *With PSRAM available we can cache decoded images to avoid re-decoding each frame.
- *Lowered 3MB->2MB (2026-06-19): the Map app's decoded working set is the 4x4 tile
- *grid (16 * 128KB = 2MB), so 2MB hard-bounds it without thrashing the visible
- *tiles, while freeing ~1MB of PSRAM ceiling (LVGL + Lua share the PSRAM heap, and
- *a full pool null-crashes lv_draw_add_task).*/
-#define LV_CACHE_DEF_SIZE       (2048 * 1024)
+ *Lowered 3MB->2MB (2026-06-19), then 2MB->256KB (tile-pool refactor): the Map app
+ *no longer routes tiles through this cache — it draws them from a fixed contiguous
+ *2MB pool (in-memory RGB565 descriptors, used_directly, no cache buffers). So this
+ *cache now only holds small UI icons; 256KB hard-bounds it and frees ~1.75MB of the
+ *PSRAM ceiling (LVGL + Lua share the PSRAM heap, and a full pool null-crashes
+ *lv_draw_add_task).*/
+#define LV_CACHE_DEF_SIZE       (256 * 1024)
 
 #define LV_IMAGE_HEADER_CACHE_DEF_CNT 32
 #define LV_GRADIENT_MAX_STOPS   2

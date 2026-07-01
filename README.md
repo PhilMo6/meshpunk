@@ -66,6 +66,7 @@ The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. T
 | `i` / `-` | Zoom out |
 | `Space` | Stop scrolling |
 | `Enter` | Select contact at center / stop scrolling |
+| `c` | Cycle archived-contact page (when archived contacts are shown) |
 | Trackball | Pan the map |
 
 - Pre-cache Downloads

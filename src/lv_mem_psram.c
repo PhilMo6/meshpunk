@@ -46,12 +46,14 @@ void lv_mem_remove_pool(lv_mem_pool_t pool)
 
 void * lv_malloc_core(size_t size)
 {
-    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void * p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p;
 }
 
 void * lv_realloc_core(void * p, size_t new_size)
 {
-    return heap_caps_realloc(p, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void * np = heap_caps_realloc(p, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return np;
 }
 
 void lv_free_core(void * p)

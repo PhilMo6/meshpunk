@@ -76,17 +76,15 @@ static int luavgl_group_delete(lua_State *L)
 
   g->deleted = true;
 
-#if 0
-  /* delete group if it's lua created. */
+  /* MESHPUNK: only delete groups created from Lua. The default group is created
+   * C-side in setupLvgl() and the keyboard indev is permanently bound to it, so
+   * freeing it (e.g. on lua_close during an ELF teardown) would dangle that
+   * binding. get_default() marks its wrapper lua_created=false; create() marks
+   * it true. Matches obj.c's lua_created semantics. (Upstream deleted anyway.) */
   if (g->lua_created) {
     lv_group_del(g->group);
     g->group = NULL;
   }
-#else
-  /* delete the group anyway */
-  lv_group_del(g->group);
-  g->group = NULL;
-#endif
 
   LV_LOG_INFO("delete group:%p", g);
   return 0;
@@ -270,17 +268,14 @@ static int luavgl_group_gc(lua_State *L)
     return 0;
   }
 
-#if 0
-  /* delete group if it's lua created. */
+  /* MESHPUNK: only delete Lua-created groups. The C-owned default group (wrapped
+   * via get_default with lua_created=false) must survive lua_close so the
+   * keyboard indev's group binding from setupLvgl() stays valid across Lua
+   * teardown/recreate cycles. (Upstream deleted the group unconditionally.) */
   if (g->lua_created) {
     lv_group_del(g->group);
     g->group = NULL;
   }
-#else
-  /* delete the group anyway */
-  lv_group_del(g->group);
-  g->group = NULL;
-#endif
 
   LV_LOG_INFO("gc group: %p", g);
   return 0;

@@ -477,20 +477,10 @@ create_main_screen = function()
                 args[#args + 1] = km
                 args[#args + 1] = "-trkball"
                 args[#args + 1] = build_trkball_string()
-                local ok, result = _launch_elf(table.unpack(args))
-                if not ok then
-                    status:set{ text = "ELF load failed" }
-                elseif result == 0 then
-                    status:set{ text = "Ready to launch" }
-                elseif result == -2 then
-                    status:set{ text = "Failed to start (low RAM?)" }
-                elseif result == -1 then
-                    status:set{ text = "Doom crashed (not enough RAM?)" }
-                elseif result == 1 then
-                    status:set{ text = "Doom error (bad WAD?)" }
-                else
-                    status:set{ text = "Exit code: " .. tostring(result) }
-                end
+                -- Deferred launch: the firmware tears Lua down, runs Doom, then
+                -- recreates Lua and returns to the launcher home. _launch_elf only
+                -- queues the request, so there's no result to handle here.
+                _launch_elf(table.unpack(args))
             end
         }
     end)

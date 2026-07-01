@@ -7,6 +7,15 @@ struct lua_State;
 // Register the _launch_elf() Lua binding.
 void elf_host_register_lua(lua_State* L);
 
+// Deferred ELF launch (Core 0 / loop). _launch_elf() only stashes the request;
+// the main loop drives the teardown→run→recreate cycle around these:
+//   if (elf_host_pending_take()) { luaTearDown(); elf_host_run_pending(); luaBringUp(); }
+// elf_host_pending_take(): true (and marks running) if a launch was requested.
+// elf_host_run_pending():  loads+runs the stashed module to completion. MUST be
+//   called only after Lua is torn down — it never touches lua_State.
+bool elf_host_pending_take(void);
+int  elf_host_run_pending(void);
+
 // ---------------------------------------------------------------------------
 // Host functions exported to loaded ELF modules.
 // These are resolved by name via the elf_loader symbol table.

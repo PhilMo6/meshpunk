@@ -10,6 +10,7 @@
 #include <Wire.h>
 #include <esp_heap_caps.h> // DMA-capable buffer allocation for LVGL
 #include <mbedtls/platform.h> // runtime override of mbedTLS allocator (TLS -> PSRAM)
+#include "multi_heap.h" // ESP-IDF arena allocator for the Lua PSRAM arena
 #include <lvgl.h>
 #include "theme/lv_theme_meshpunk.h"
 #include "emoji_font.h"
@@ -49,27 +50,41 @@ extern "C" {
 #include <lualib.h>
 #include <luavgl.h>
 
+// Streaming Lua chunk reader: feeds an open file to lua_load() in fixed 512-byte
+// blocks so we never hold an entire source file in one contiguous RAM buffer.
+// (Used by both luaL_loadfilex below and the require() searcher.) Slurping the
+// whole file into one malloc'd buffer was ~169KB for the Map app; freed after
+// compile, but in a post-meshprint heap that hole couldn't coalesce and became
+// the contiguous-block "wall" that starved Doom's zone after a Map session.
+struct LuaFileChunkReader {
+  fs::File file;
+  char buf[512];
+};
+
+static const char *lua_file_chunk_reader(lua_State *L, void *ud, size_t *size) {
+  (void)L;
+  LuaFileChunkReader *st = (LuaFileChunkReader *)ud;
+  size_t n = st->file.read((uint8_t *)st->buf, sizeof(st->buf));
+  if (n == 0) {
+    *size = 0;
+    return NULL;
+  }
+  *size = n;
+  return st->buf;
+}
+
 int luaL_loadfilex(lua_State *L, const char *filename, const char *mode) {
-    File file = LittleFS.open(filename, "r");
-    if (!file || file.isDirectory()) {
+    LuaFileChunkReader rdr;
+    rdr.file = LittleFS.open(filename, "r");
+    if (!rdr.file || rdr.file.isDirectory()) {
+      if (rdr.file) rdr.file.close();
       lua_pushfstring(L, "cannot open %s", filename);
       return LUA_ERRFILE;
     }
-
-    size_t size = file.size();
-    char* buffer = (char*)malloc(size + 1);
-    if (!buffer) {
-      file.close();
-      lua_pushliteral(L, "out of memory");
-      return LUA_ERRMEM;
-    }
-
-    file.readBytes(buffer, size);
-    buffer[size] = '\0';
-    file.close();
-
-    int status = luaL_loadbufferx(L, buffer, size, filename, mode);
-    free(buffer);
+    // Stream to lua_load() in 512-byte blocks (no whole-file buffer). `mode` is
+    // passed through; the require() searcher does the same lua_load call.
+    int status = lua_load(L, lua_file_chunk_reader, &rdr, filename, mode);
+    rdr.file.close();
     return status;
   }
 }
@@ -840,27 +855,8 @@ String readFile(const char *filename) {
   return content;
 }
 
-// Streaming Lua chunk reader: feeds an open file to lua_load() in fixed blocks
-// so we never hold an entire source file in one contiguous RAM buffer. Building
-// the whole file into an Arduino String (as readFile does) fails for large
-// modules once internal heap is fragmented -- the String build truncates and
-// the parser then chokes with a bogus "unexpected symbol". Used by require().
-struct LuaFileChunkReader {
-  fs::File file;
-  char buf[512];
-};
-
-static const char *lua_file_chunk_reader(lua_State *L, void *ud, size_t *size) {
-  (void)L;
-  LuaFileChunkReader *st = (LuaFileChunkReader *)ud;
-  size_t n = st->file.read((uint8_t *)st->buf, sizeof(st->buf));
-  if (n == 0) {
-    *size = 0;
-    return NULL;
-  }
-  *size = n;
-  return st->buf;
-}
+// (LuaFileChunkReader + lua_file_chunk_reader moved up near luaL_loadfilex so
+// both the loadfile override and the require() searcher share the streaming path.)
 
 // -- Replaced by safe_open version that parses L:/S: prefix
 // static int lua_io_open(lua_State *L) {
@@ -2342,6 +2338,32 @@ static int lua_mesh_get_contacts(lua_State *L) {
   return 1;
 }
 
+// _mesh_drop_contacts_cache(): release the cached contact master tables (live-only
+// + live+archived). They're pinned in the Lua registry via luaL_ref, so they
+// survive app teardown and GC — ~388KB for 500 contacts, parked mid-heap. Only the
+// Map and Messenger consume them, so the launcher drops them on app launch to give
+// a heavy app (Doom/PICO-8) the contiguous PSRAM back. The next _mesh_get_contacts
+// call rebuilds from scratch (the generation/TTL logic is unchanged — clearing the
+// refs just forces a fresh build). Lua-state only (Core 0), so no MESH_LOCK needed.
+static int lua_mesh_drop_contacts_cache(lua_State *L) {
+  if (s_contacts_ref != LUA_NOREF) {
+    luaL_unref(L, LUA_REGISTRYINDEX, s_contacts_ref);
+    s_contacts_ref = LUA_NOREF;
+    s_contacts_count = 0;
+    s_contacts_gen = 0;
+    s_contacts_built_ms = 0;
+  }
+  if (s_union_ref != LUA_NOREF) {
+    luaL_unref(L, LUA_REGISTRYINDEX, s_union_ref);
+    s_union_ref = LUA_NOREF;
+    s_union_count = 0;
+    s_union_gen = 0;
+    s_union_arch_gen = 0;
+    s_union_built_ms = 0;
+  }
+  return 0;
+}
+
 // _mesh_archive_read(offset, max) -> contacts_table, next_offset, done
 // One batch of archived contacts from the disk log, for the Map's progressive
 // "show archived" loader. Stateless (byte-offset based) so the mesh task keeps
@@ -2391,6 +2413,95 @@ static int lua_mesh_archive_read(lua_State *L) {
   lua_pushinteger(L, (lua_Integer)next_offset);
   lua_pushboolean(L, done);
   return 3;
+}
+
+// Helper for _mesh_search_contact_names: ASCII-lowercase `name`, and if it
+// contains `q` (already lowercased) and isn't a name we've already collected,
+// append the ORIGINAL-case name to the result table (at the top of the Lua stack)
+// and record its lowercased form in `seen`. Returns the new match count.
+static int search_try_add_name(lua_State *L, const char *name, const char *q,
+                               char seen[][32], int count, int max) {
+  if (count >= max) return count;
+  char low[32];
+  int ln = 0;
+  for (const char *p = name; *p && ln < 31; p++) {
+    char ch = *p;
+    if (ch >= 'A' && ch <= 'Z') ch += 32;   // ASCII lower (matches Lua :lower())
+    low[ln++] = ch;
+  }
+  low[ln] = '\0';
+  if (!strstr(low, q)) return count;                 // no substring match
+  for (int j = 0; j < count; j++)
+    if (strcmp(seen[j], low) == 0) return count;     // name already collected
+  strncpy(seen[count], low, 31);
+  seen[count][31] = '\0';
+  lua_pushstring(L, name);                            // original-case name
+  lua_rawseti(L, -2, count + 1);                      // result[count+1] = name
+  return count + 1;
+}
+
+// _mesh_search_contact_names(query, include_archived, max) -> { name, ... }
+// Case-insensitive (ASCII) substring search over contact names, returning ONLY
+// the matching names (deduped by name, <= max). Replaces the Map search's old
+// _mesh_get_contacts(true) + Lua filter, which materialized the entire ~1500-
+// entry union table (~1MB — the worst single PSRAM fragmenter) just to pull out
+// a few names. Live names matched under MESH_LOCK; archived streamed from the
+// disk log in batches (no lock — archive file only, sd_spi serialized inside).
+static int lua_mesh_search_contact_names(lua_State *L) {
+  const char *query = luaL_checkstring(L, 1);
+  bool inc_arch = lua_toboolean(L, 2);
+  int max = (int)luaL_optinteger(L, 3, 40);
+  if (max < 1) max = 1;
+  if (max > 64) max = 64;          // bounds the on-stack dedup table
+
+  char q[48];
+  int qn = 0;
+  for (const char *p = query; *p && qn < (int)sizeof(q) - 1; p++) {
+    char ch = *p;
+    if (ch >= 'A' && ch <= 'Z') ch += 32;
+    q[qn++] = ch;
+  }
+  q[qn] = '\0';
+
+  lua_newtable(L);                 // result array — stays at the stack top
+  if (qn == 0 || !the_mesh) return 1;
+
+  char seen[64][32];               // lowercased collected names (dedup)
+  int count = 0;
+
+  // Live contacts.
+  MESH_LOCK();
+  ContactInfo c;
+  int nlive = the_mesh->getNumContacts();
+  for (int i = 0; i < nlive && count < max; i++) {
+    if (the_mesh->getContactByIdx(i, c)) {
+      count = search_try_add_name(L, c.name, q, seen, count, max);
+    }
+  }
+  MESH_UNLOCK();
+
+  // Archived contacts (streamed from disk; raw lines, name-deduped above so a
+  // re-archived/duplicate pubkey can't show the same name twice).
+  if (inc_arch && count < max) {
+    const int BATCH = 48;
+    ContactInfo *abuf = (ContactInfo *)heap_caps_malloc(
+        sizeof(ContactInfo) * BATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (abuf) {
+      uint32_t off = 0;
+      bool done = false;
+      while (!done && count < max) {
+        uint32_t next = off;
+        int n = the_mesh->readArchiveBatch(off, BATCH, abuf, &next, &done);
+        for (int i = 0; i < n && count < max; i++) {
+          count = search_try_add_name(L, abuf[i].name, q, seen, count, max);
+        }
+        if (n <= 0 || next == off) break;   // no progress -> stop
+        off = next;
+      }
+      heap_caps_free(abuf);
+    }
+  }
+  return 1;
 }
 
 // _mesh_readd_contact(pubkey_hex) -> bool
@@ -3823,6 +3934,7 @@ static const uint32_t TILE_PNG_BUF_SIZE = 256 * 1024;
 // _wifi_download_file's client stays on Core 0). Closed after 10s of queue
 // idle to free the TLS buffers (~45KB internal RAM).
 static HTTPClient *s_tile_http = nullptr;
+static volatile bool s_tile_http_close_req = false;  // UI asked to drop TLS now (Map close)
 
 static void tile_http_close() {
   if (!s_tile_http) return;
@@ -3945,12 +4057,30 @@ static void tile_fetch_task(void *param) {
   SLog.printf("[TASK] tile_fetch starting on core=%d\n", xPortGetCoreID());
   for (;;) {
     TileFetchReq req;
-    if (xQueueReceive(s_tile_req_q, &req, pdMS_TO_TICKS(10000)) != pdTRUE) {
-      // 10s with no work — drop the keep-alive socket (frees the TLS
-      // buffers), then block indefinitely until the next request.
+    bool got = (xQueueReceive(s_tile_req_q, &req, pdMS_TO_TICKS(10000)) == pdTRUE);
+
+    // Teardown requested by the UI (Map close): close the keep-alive TLS session
+    // AND free THIS task's 16KB INTERNAL stack — the dominant reason a heavy app
+    // (Doom) launched right after the Map can't get its task stack. That 16KB is
+    // carved from the largest internal block, dropping it from ~48KB to ~32KB,
+    // one notch under Doom's need. _tile_fetch_start recreates the worker on the
+    // next fetch; the shared request queue preserves any pending work for it.
+    // Signalled via a flag + an empty-url sentinel that just wakes an idle worker.
+    if (s_tile_http_close_req) {
+      s_tile_http_close_req = false;
       tile_http_close();
-      xQueueReceive(s_tile_req_q, &req, portMAX_DELAY);
+      s_tile_task_handle = nullptr;
+      vTaskDelete(NULL);   // frees our stack; never returns
     }
+
+    if (!got) {
+      // 10s with no work — drop the keep-alive socket (frees the TLS buffers).
+      // The decode arena stays put: it's one contiguous 1MB block, so it doesn't
+      // itself fragment anything, and it's freed on teardown below. Loop back.
+      tile_http_close();
+      continue;
+    }
+    if (req.url[0] == '\0') continue;   // bare wake sentinel — no work to do
 
     TileFetchRes res;
     memset(&res, 0, sizeof(res));
@@ -4004,6 +4134,24 @@ static int lua_tile_fetch_start(lua_State *L) {
   return 1;
 }
 
+// _tile_fetch_close(): tear the Core-1 tile worker all the way down — close its
+// keep-alive HTTPS/TLS client AND let the task delete itself, freeing its 16KB
+// INTERNAL stack (the block that otherwise leaves <32KB contiguous internal, so
+// an ELF module like Doom can't create its task). Both the client and the task
+// are worker-owned — never touch them from Core 0 — so we set a flag and post an
+// empty-url sentinel to wake an idle worker; it runs the teardown on its own
+// thread and is recreated by _tile_fetch_start on the next fetch. No-op before
+// the worker exists. Called by the Map on shutdown so the next heavy app fits.
+static int lua_tile_fetch_close(lua_State *L) {
+  s_tile_http_close_req = true;
+  if (s_tile_req_q) {
+    TileFetchReq req;
+    memset(&req, 0, sizeof(req));  // url[0] == '\0' = wake/close sentinel
+    xQueueSend(s_tile_req_q, &req, 0);
+  }
+  return 0;
+}
+
 // _tile_fetch_poll() -> key, ok, stage | nil
 // Pop one completed fetch; call in a loop until nil. stage is "" on success.
 static int lua_tile_fetch_poll(lua_State *L) {
@@ -4036,6 +4184,109 @@ static int lua_lvgl_image_cache_drop(lua_State *L) {
     lv_image_cache_drop(src);
   }
   return 0;
+}
+
+// ── Map tile pool (contiguous, fixed) ───────────────────────────────────────
+// The map shows a 4x4 = 16 grid. Instead of 16 LVGL Image widgets each loading a
+// .bin FILE (which LVGL decodes into a SCATTERED 128KB image-cache buffer per
+// tile — the prime PSRAM fragmenter), we keep ONE contiguous 16x128KB block and
+// display each tile via an in-memory RGB565 lv_image_dsc that LVGL draws DIRECTLY
+// (use_directly path, lv_bin_decoder.c — no copy, no cache buffer). The 16 grid
+// widgets map 1:1 to slots (slot = grid index). Allocated when the map opens,
+// freed on close (lua_tile_pool_free) once the widgets are hidden.
+#define TILE_POOL_SLOTS      16
+#define TILE_POOL_SLOT_BYTES (256 * 256 * 2)   // 131072 (RGB565)
+static uint8_t *s_tile_pool = nullptr;
+static lv_image_dsc_t s_tile_dsc[TILE_POOL_SLOTS];
+
+// _tile_pool_alloc() -> bool. One contiguous 2MB block; cache-drop + retry once
+// on failure (the canvas-alloc pattern) so it lands even on a tightish heap.
+static int lua_tile_pool_alloc(lua_State *L) {
+  if (!s_tile_pool) {
+    size_t need = (size_t)TILE_POOL_SLOTS * TILE_POOL_SLOT_BYTES;
+    SLog.printf("[tile_pool] pre-alloc: psram free=%uKB largest=%uKB (need %uKB)\n",
+                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+                (unsigned)(need / 1024));
+    s_tile_pool = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_tile_pool) {
+      lv_image_cache_drop(NULL);
+      s_tile_pool = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_tile_pool) { SLog.println("[tile_pool] alloc FAILED"); lua_pushboolean(L, 0); return 1; }
+    lv_memzero(s_tile_dsc, sizeof(s_tile_dsc));
+    SLog.printf("[tile_pool] allocated %uKB; psram now free=%uKB largest=%uKB\n",
+                (unsigned)(need / 1024),
+                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// _tile_pool_free(). Caller MUST hide/clear the tile widgets first so nothing
+// draws from pool memory after it's freed. Drops the image cache (in case a
+// descriptor was cached pointing at pool data) then frees the block.
+static int lua_tile_pool_free(lua_State *L) {
+  if (s_tile_pool) {
+    lv_image_cache_drop(NULL);
+    heap_caps_free(s_tile_pool);
+    s_tile_pool = nullptr;
+    lv_memzero(s_tile_dsc, sizeof(s_tile_dsc));
+  }
+  return 0;
+}
+
+// _tile_show(widget, slot1based, sd_bin_path) -> bool. Reads the .bin (header +
+// RGB565 data) into the slot's buffer and points the widget's image src at the
+// in-memory descriptor for that slot. Chunked SD read releasing the SPI bus
+// between chunks (like png2bin's write) so it never stalls the flush/radio.
+static int lua_tile_show(lua_State *L) {
+  luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+  if (!lobj || !lobj->obj) { lua_pushboolean(L, 0); return 1; }
+  lv_obj_t *img = lobj->obj;
+  int slot = (int)luaL_checkinteger(L, 2) - 1;     // 1-based Lua -> 0-based
+  const char *path = luaL_checkstring(L, 3);
+  if (!s_tile_pool || slot < 0 || slot >= TILE_POOL_SLOTS) { lua_pushboolean(L, 0); return 1; }
+
+  uint8_t *dst = s_tile_pool + (size_t)slot * TILE_POOL_SLOT_BYTES;
+  lv_image_header_t hdr;
+
+  sd_spi_take();
+  File f = SD.open(path, "r");
+  bool ok = f && (f.read((uint8_t *)&hdr, sizeof(hdr)) == (int)sizeof(hdr));
+  sd_spi_release();
+  if (!f) { lua_pushboolean(L, 0); return 1; }
+
+  if (ok && (hdr.magic != LV_IMAGE_HEADER_MAGIC || hdr.cf != LV_COLOR_FORMAT_RGB565)) ok = false;
+  uint32_t data_size = ok ? (uint32_t)hdr.stride * hdr.h : 0;
+  if (data_size == 0 || data_size > TILE_POOL_SLOT_BYTES) ok = false;
+
+  uint32_t off = 0;
+  while (ok && off < data_size) {
+    uint32_t n = (data_size - off < 32768u) ? (data_size - off) : 32768u;
+    sd_spi_take();
+    int rd = f.read(dst + off, n);
+    sd_spi_release();
+    if (rd != (int)n) ok = false;
+    off += n;
+  }
+  sd_spi_take(); f.close(); sd_spi_release();
+  if (!ok) { lua_pushboolean(L, 0); return 1; }
+
+  lv_image_dsc_t *d = &s_tile_dsc[slot];
+  d->header    = hdr;
+  d->data      = dst;
+  d->data_size = data_size;
+
+  // Re-point the widget at this slot's (just-updated) descriptor and force a
+  // redraw. set_src to the same pointer is a no-op, so clear first; the
+  // descriptor is used directly (no decode copy), so this is cheap.
+  lv_image_set_src(img, NULL);
+  lv_image_set_src(img, d);
+  lv_obj_invalidate(img);
+  lua_pushboolean(L, 1);
+  return 1;
 }
 
 // Load and execute a Lua file from the SD card
@@ -4103,13 +4354,99 @@ static int lua_dofile_sd(lua_State *L) {
   return lua_gettop(L); // return whatever the script returned
 }
 
-// PSRAM allocator for Lua – keeps internal SRAM free for DMA (AES, etc.)
+// ── Lua PSRAM arena (ELF-launch fragmentation fix) ──────────────────────────
+// Lua lives in its OWN multi_heap arena (not the shared PSRAM heap), placed above a
+// deliberate free GAP. The gap is a sacrificial low region: ESP-IDF's TLSF heap
+// serves a small request from the smallest-size-class free block (the gap), so the
+// mesh / tile-decode / ESP-IDF churn we can't redirect carves from the gap instead
+// of fragmenting the big block a heavy ELF needs. The arena is freed wholesale at
+// ELF launch (luaTearDown), coalescing up into one large clean block for the module.
+// lua_psram_alloc runs only on Core 0 (Lua is single-threaded) -> no lock needed.
+#define LUA_GAP_BYTES      (1024u * 1024u)        // sacrificial: mesh + tile-decode + emoji churn
+#define MAIN_HEAP_RESERVE  (3584u * 1024u)        // kept free for the Map (tile pool + canvases) + slack
+#define LUA_ARENA_MIN      (1536u * 1024u)        // floor if PSRAM is tight (overflow spills to the gap)
+#define LUA_ARENA_MAX      (3u * 1024u * 1024u)   // ceiling: Lua won't need more; don't starve the Map
+static multi_heap_handle_t s_lua_heap = NULL;
+static uintptr_t s_lua_arena_base = 0;
+static size_t    s_lua_arena_size = 0;
+
+static inline bool lua_in_arena(void *p) {
+  return s_lua_arena_base && (uintptr_t)p >= s_lua_arena_base &&
+         (uintptr_t)p < s_lua_arena_base + s_lua_arena_size;
+}
+
+// Create the arena above a free gap (spacer trick — heap_caps_malloc can't take an
+// address). Sized dynamically: grab as much as Lua can use, leaving MAIN_HEAP_RESERVE
+// free for the Map's big buffers. Call at boot + each bring-up, BEFORE lua_newstate.
+static void lua_arena_create() {
+  if (s_lua_heap) return;
+  void *spacer = heap_caps_malloc(LUA_GAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  size_t avail = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);  // block ABOVE the spacer
+  size_t want  = (avail > MAIN_HEAP_RESERVE + LUA_ARENA_MIN) ? (avail - MAIN_HEAP_RESERVE)
+                                                             : LUA_ARENA_MIN;
+  if (want > LUA_ARENA_MAX) want = LUA_ARENA_MAX;
+  void *blk = heap_caps_malloc(want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (spacer) heap_caps_free(spacer);   // leave the GAP free below the arena
+  if (!blk) {
+    SLog.printf("[lua_arena] create FAILED (want %uKB, avail %uKB) -> Lua uses main heap\n",
+                (unsigned)(want / 1024), (unsigned)(avail / 1024));
+    return;
+  }
+  s_lua_heap = multi_heap_register(blk, want);
+  if (!s_lua_heap) { heap_caps_free(blk); return; }
+  s_lua_arena_base = (uintptr_t)blk;
+  s_lua_arena_size = want;
+  SLog.printf("[lua_arena] %uKB @0x%08X (gap %uKB reserve %uKB avail %uKB); psram largest now %uKB\n",
+              (unsigned)(want / 1024), (unsigned)(uintptr_t)blk,
+              (unsigned)(LUA_GAP_BYTES / 1024), (unsigned)(MAIN_HEAP_RESERVE / 1024),
+              (unsigned)(avail / 1024),
+              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+}
+
+// Free the whole arena back to the main heap. Call AFTER lua_close (so every arena
+// object is already freed); the block coalesces up into the big region for the ELF.
+static void lua_arena_destroy() {
+  if (!s_lua_heap) return;
+  void *blk = (void *)s_lua_arena_base;
+  s_lua_heap = NULL;
+  s_lua_arena_base = 0;
+  s_lua_arena_size = 0;
+  heap_caps_free(blk);
+  SLog.printf("[lua_arena] freed; psram largest now %uKB\n",
+              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+}
+
+// PSRAM allocator for Lua. Routes through the arena (multi_heap) when it exists,
+// falling back to the shared PSRAM heap (small Lua objects -> TLSF puts them in the
+// gap). osize is Lua's valid old size (only when ptr != NULL) for cross-heap memcpy.
 static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
-    (void)ud; (void)osize;
-    if (nsize == 0) {
-        heap_caps_free(ptr);
+    (void)ud;
+    if (nsize == 0) {                       // free
+        if (ptr) {
+            if (lua_in_arena(ptr)) multi_heap_free(s_lua_heap, ptr);
+            else                   heap_caps_free(ptr);
+        }
         return NULL;
     }
+    if (s_lua_heap) {
+        bool was_in = lua_in_arena(ptr);    // ptr==NULL -> false
+        void *p = multi_heap_realloc(s_lua_heap, was_in ? ptr : NULL, nsize);
+        if (p) {
+            if (ptr && !was_in) {           // pulled a prior fallback obj into the arena
+                memcpy(p, ptr, osize < nsize ? osize : nsize);
+                heap_caps_free(ptr);
+            }
+            return p;
+        }
+        // Arena full -> fall back to the shared heap (small objs land in the gap).
+        void *q = heap_caps_realloc(was_in ? NULL : ptr, nsize, MALLOC_CAP_SPIRAM);
+        if (q && was_in) {                  // moved an arena obj out -> copy + free old
+            memcpy(q, ptr, osize < nsize ? osize : nsize);
+            multi_heap_free(s_lua_heap, ptr);
+        }
+        return q;
+    }
+    // No arena (pre-create / create failed): plain shared-heap realloc.
     return heap_caps_realloc(ptr, nsize, MALLOC_CAP_SPIRAM);
 }
 
@@ -4154,6 +4491,8 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_send_direct", lua_mesh_send_direct);
   lua_register(L, "_mesh_get_node_info", lua_mesh_get_node_info);
   lua_register(L, "_mesh_get_contacts", lua_mesh_get_contacts);
+  lua_register(L, "_mesh_drop_contacts_cache", lua_mesh_drop_contacts_cache);
+  lua_register(L, "_mesh_search_contact_names", lua_mesh_search_contact_names);
   lua_register(L, "_mesh_send_advert", lua_mesh_send_advert);
   lua_register(L, "_mesh_get_num_contacts", lua_mesh_get_num_contacts);
   lua_register(L, "_mesh_set_config", lua_mesh_set_config);
@@ -4319,6 +4658,7 @@ void setupLuaVGL() {
     lua_pushinteger(L, (lua_Integer)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return 4;
   });
+
 
   // RTC epoch seconds (seeded from GPS once at boot, then free-running)
   lua_register(L, "_rtc_time", [](lua_State *L) -> int {
@@ -4684,6 +5024,19 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // Top bar transparency: true = the themed wallpaper shows through the status
+  // bar, false = a solid (themed card) background. Persisted. Applied live to the
+  // running bar by lib/topbar.apply_transparency().
+  lua_register(L, "_topbar_transparant_set", [](lua_State* L) -> int {
+    topbar_transparant = lua_toboolean(L, 1);
+    firmware_prefs_save();
+    return 0;
+  });
+  lua_register(L, "_topbar_transparant_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, topbar_transparant ? 1 : 0);
+    return 1;
+  });
+
   // QR code: create an lv_qrcode child inside a Lua object, encoding `text`.
   // Usage: local ok = _qr_create(parent_obj, "meshcore://...", size_px)
   // The QR is centered in the parent; deleting the parent removes it.
@@ -4949,7 +5302,11 @@ void setupLuaVGL() {
   lua_register(L, "_png_to_bin", lua_png_to_bin);
   lua_register(L, "_tile_fetch_start", lua_tile_fetch_start);
   lua_register(L, "_tile_fetch_poll", lua_tile_fetch_poll);
+  lua_register(L, "_tile_fetch_close", lua_tile_fetch_close);
   lua_register(L, "_lvgl_image_cache_drop", lua_lvgl_image_cache_drop);
+  lua_register(L, "_tile_pool_alloc", lua_tile_pool_alloc);
+  lua_register(L, "_tile_pool_free", lua_tile_pool_free);
+  lua_register(L, "_tile_show", lua_tile_show);
   lua_register(L, "_dofile_sd", lua_dofile_sd);
   lua_register(L, "_list_all", lua_list_all);
   lua_register(L, "_list_all_sd", lua_list_all_sd);
@@ -5208,6 +5565,48 @@ void setupLuaVGL() {
   return;
 }
 
+// ── Lua teardown / bring-up (ELF-launch fragmentation fix) ──────────────────
+// Heavy ELF modules (Doom, PICO-8) need a large CONTIGUOUS PSRAM block, which a
+// prior Map+meshprint session fragments by churning small Lua objects through
+// the shared heap. Lua never executes while an ELF runs, so we fully shut Lua
+// down on launch: lua_close() frees every Lua object back to the heap, the holes
+// coalesce, and the ELF loader gets a clean block. Lua + the launcher are
+// recreated on ELF exit. See the plan in lua_arena_plan / meshprint_strt_frag.
+
+// Tear the whole Lua world down. Safe preconditions (audited):
+//  - The sole C->Lua bridge, drain_rx_events(), is guarded by `!L`; the mesh
+//    task (Core 1) only enqueues RxEvents and never calls Lua.
+//  - Message persistence is C-side (appendDM/ChannelMessage), so traffic during
+//    teardown is saved to disk and reloaded by messages:loadPersisted() later.
+//  - lua_close() runs luavgl __gc -> lv_obj_del on the whole widget tree, so
+//    LVGL MUST stay initialized here. We do NOT touch LVGL core or buf1/buf2.
+//    luavgl's group gc was patched to spare the C-owned default group.
+void luaTearDown() {
+  if (!L) return;
+  lua_State *dead = L;
+  L = NULL;                                   // drain_rx_events() now bails
+  if (the_mesh) the_mesh->lua_runtime = NULL; // drop the stale-state handle
+  lua_close(dead);                            // GCs luavgl widgets -> lv_obj_del
+  // Free the non-Lua global caches that survive lua_close and otherwise leave a
+  // persistent mid-heap cluster capping the largest contiguous block:
+  //  - emoji glyph cache: per-glyph PSRAM pixel+descriptor allocs, never freed —
+  //    CONFIRMED as the ~33KB wall splitting PSRAM after a Map session (the Map's
+  //    emoji contact names decode a burst of glyphs). This is the actual fix.
+  //  - LVGL image/draw-buf cache: belt-and-suspenders (decoded icons/markers).
+  // Both re-populate on demand when the launcher re-renders. Core-0 only.
+  emoji_font_cache_clear();
+  lv_image_cache_drop(NULL);
+  lua_arena_destroy();   // free the now-empty Lua arena -> coalesces up for the ELF
+}
+
+// Recreate Lua + the launcher (boot path and post-ELF-exit path are identical).
+// lua_arena_create() MUST run before setupLuaVGL() (which calls lua_newstate ->
+// lua_psram_alloc); setupLuaVGL() then builds the state, registers every binding,
+// installs the require searcher, and loads the launcher main.lua at its tail.
+void luaBringUp() {
+  lua_arena_create();
+  setupLuaVGL();
+}
 
 volatile bool lora_packet_ready = false;
 
@@ -5224,6 +5623,21 @@ volatile bool lora_packet_ready = false;
 // frees the internal headroom those DMA allocs need.
 static void *mbedtls_psram_calloc(size_t n, size_t size) {
   return heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+// Boot-time PSRAM/internal accounting. Prints free + largest-contiguous after each
+// init stage so the baseline consumption can be attributed to specific subsystems:
+// the DROP in `free` between two consecutive lines is that stage's cost. `lua=` is
+// the Lua heap (lua_gc COUNT, PSRAM-routed) — the prime unknown; 0 until the Lua
+// state exists, then it jumps when createUI() loads the launcher + libraries.
+static void log_boot_mem(const char* stage) {
+  unsigned lua_kb = L ? (unsigned)lua_gc(L, LUA_GCCOUNT, 0) : 0;
+  SLog.printf("[boot][mem] %-20s psram free=%uKB largest=%uKB | int free=%uKB | lua=%uKB\n",
+              stage,
+              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+              lua_kb);
 }
 
 void setup() {
@@ -5247,6 +5661,25 @@ void setup() {
   // macros no-op when the handle is null (not needed — this runs first —
   // but defensive).
   meshpunk_sync_init();
+
+  // Allocate the map tile worker's scratch buffers HERE, at boot, while the PSRAM
+  // heap is clean — so they land at stable low addresses instead of dropping into
+  // a mid-heap hole on first tile use and fragmenting the heap. They are never
+  // freed (Core-1 worker lifetime). The lazy `if (!s_x)` checks at the use sites
+  // stay as a fallback in case a boot alloc returns null.
+  s_dl_buf       = (uint8_t  *)heap_caps_malloc(DL_BUF_SIZE,       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  s_rgb565_buf   = (uint16_t *)heap_caps_malloc(RGB565_BUF_SIZE,   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  s_tile_png_buf = (uint8_t  *)heap_caps_malloc(TILE_PNG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  SLog.printf("[boot] tile scratch: dl=%p rgb565=%p png=%p\n",
+              (void*)s_dl_buf, (void*)s_rgb565_buf, (void*)s_tile_png_buf);
+  // PSRAM ceiling at boot (before LVGL/Lua/mesh init consume it). total tells us
+  // how much we actually have to work with; everything below is carved from this.
+  SLog.printf("[boot][mem] psram total=%uKB free=%uKB largest=%uKB | int free=%uKB largest=%uKB\n",
+              (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
+              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
 
   // Connect trackball / home button
   pinMode(TDECK_TRACKBALL_CLICK, INPUT_PULLUP);
@@ -5360,6 +5793,7 @@ void setup() {
   void* mesh_mem = heap_caps_malloc(sizeof(PunkMesh), MALLOC_CAP_SPIRAM);
   the_mesh = new (mesh_mem) PunkMesh(radio_driver, fast_rng, *new VolatileRTCClock(), tables);
   SLog.printf("[MESH] PunkMesh allocated in PSRAM (%u bytes)\n", sizeof(PunkMesh));
+  log_boot_mem("after mesh alloc");
 
 #if BLE_COMPANION_ENABLED
   if (ble_enabled_pref) {
@@ -5368,6 +5802,7 @@ void setup() {
     SLog.println("[BLE] Disabled by user preference");
   }
 #endif
+  log_boot_mem("after BLE early");
 
   // Decide which storage to use (use_sd_pref loaded by firmware_prefs_load)
   if (sd_mounted && use_sd_pref) {
@@ -5396,6 +5831,7 @@ void setup() {
     WiFi.mode(WIFI_OFF);
     SLog.println("WiFi disabled by preference");
   }
+  log_boot_mem("after wifi");
 
   // Set touch int input
   pinMode(BOARD_TOUCH_INT, INPUT);
@@ -5449,6 +5885,7 @@ void setup() {
   sound_init(audio, firmware_prefs_save);
   audio->setVolume(sound_get_muted() ? 0 : sound_get_volume());
   SLog.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
+  log_boot_mem("after audio");
 
   tft.fillScreen(TFT_GREEN);
 
@@ -5517,6 +5954,7 @@ void setup() {
   char pk_hex[PUB_KEY_SIZE * 2 + 1];
   mesh::Utils::toHex(pk_hex, the_mesh->self_id.pub_key, PUB_KEY_SIZE);
   SLog.printf("[MESH] Pub key: %s\n", pk_hex);
+  log_boot_mem("after mesh begin");
 
   //Initialize the disply only after all other spi bus setup is finished
   SLog.println("Initialize display");
@@ -5531,6 +5969,7 @@ void setup() {
 
   // Initialize LVGL
   setupLvgl();
+  log_boot_mem("after setupLvgl");
 
   // Set LVGL screen to opaque dark background
   // Without this, LVGL objects are transparent and the raw TFT fill color shows through
@@ -5539,13 +5978,17 @@ void setup() {
 
   SLog.println("===== LUA INIT =====");
 
-  // Initialize LuaVGL
-  setupLuaVGL();
+  // Initialize LuaVGL. luaBringUp() creates the Lua PSRAM arena (+ offset gap) and
+  // then setupLuaVGL() — same path used to recreate Lua after an ELF exits.
+  luaBringUp();
 
-  SLog.println("[LUA] setupLuaVGL() returned");
+  SLog.println("[LUA] luaBringUp() returned");
+  log_boot_mem("after setupLuaVGL");
 
   // Create UI
   createUI();
+  log_boot_mem("after createUI");
+
 
   // Adjust backlight
   pinMode(BOARD_BL_PIN, OUTPUT);
@@ -5559,6 +6002,7 @@ void setup() {
     ble_companion_start(*the_mesh);
   }
 #endif
+  log_boot_mem("after BLE start");
 
   // Hand off mesh + radio to Core 1 now that the_mesh, Lua, LVGL, and the
   // RX queue are all up. Must happen AFTER createUI / setupLuaVGL so that
@@ -5567,6 +6011,7 @@ void setup() {
                 xPortGetCoreID());
   meshpunk_spawn_mesh_task();
   meshpunk_spawn_gps_task();
+  log_boot_mem("setup done");
 }
 
 // Forward decls for the Lua dispatchers that live in punkmesh.cpp.
@@ -5604,6 +6049,18 @@ static void drain_rx_events() {
 void loop() {
   // Core 0 (UI domain) — LVGL + Lua + input. The mesh dispatcher runs on
   // Core 1 via mesh_task (see meshpunk_tasks.cpp).
+
+  // Deferred ELF launch: a Lua game called _launch_elf (which only stashed the
+  // request — Lua can't close itself from its own C stack). Tear Lua all the way
+  // down so the fragmented Lua heap is freed and the module gets a clean
+  // contiguous PSRAM block, run the module to completion (this blocks the loop),
+  // then recreate Lua + the launcher. The user lands on the launcher home.
+  if (elf_host_pending_take()) {
+    luaTearDown();              // frees Lua + its arena (logs [lua_arena] freed)
+    elf_host_run_pending();     // runs the module to completion (elf_host logs PSRAM)
+    luaBringUp();               // recreate Lua + arena + launcher (logs [lua_arena])
+    return;   // skip the rest of this tick; the fresh launcher runs next tick
+  }
 
   // Handle LVGL tasks
   lv_timer_handler();

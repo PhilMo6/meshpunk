@@ -336,22 +336,12 @@ create_main_screen = function()
                 t:delete()
                 local c = found_carts[selected_cart]
                 local vfs_cart = to_vfs_path(c.path)
-                local ok, result = _launch_elf(ELF_PATH, vfs_cart,
+                -- Deferred launch: the firmware tears Lua down, runs the cart,
+                -- then recreates Lua and returns to the launcher home. _launch_elf
+                -- only queues the request, so there's no result to handle here.
+                _launch_elf(ELF_PATH, vfs_cart,
                     "-keymap", km,
                     "-trkball", build_trkball_string())
-                if not ok then
-                    status:set{ text = "ELF load failed" }
-                elseif result == 0 then
-                    status:set{ text = "Ready to play" }
-                elseif result == -2 then
-                    status:set{ text = "Failed to start (low RAM?)" }
-                elseif result == -1 then
-                    status:set{ text = "Crashed (not enough RAM?)" }
-                elseif result == 1 then
-                    status:set{ text = "Cart load error" }
-                else
-                    status:set{ text = "Exit code: " .. tostring(result) }
-                end
             end
         }
     end)

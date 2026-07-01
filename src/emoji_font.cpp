@@ -331,6 +331,21 @@ extern "C" bool emoji_preload(uint32_t codepoint)
     return true;
 }
 
+extern "C" void emoji_font_cache_clear()
+{
+    if (!s_cache_inited) return;
+    for (auto & e : s_cache) {
+        // Free heap-backed glyphs only; s_blank_dsc and its pixel are static.
+        if (e.dsc && e.dsc != &s_blank_dsc) {
+            heap_caps_free(const_cast<void *>(static_cast<const void *>(e.dsc->data)));
+            heap_caps_free(e.dsc);
+        }
+        e.codepoint = EMOJI_CACHE_EMPTY;
+        e.dsc = nullptr;
+    }
+    s_cache_count = 0;
+}
+
 extern "C" lv_font_t * emoji_font_create(uint16_t height, const lv_font_t * fallback)
 {
     lv_font_t * f = lv_imgfont_create(height, emoji_path_cb, nullptr);

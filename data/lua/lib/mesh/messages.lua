@@ -101,6 +101,24 @@ function M:loadPersisted()
     end
 end
 
+-- Drop the in-RAM message history loaded by loadPersisted (the per-channel and
+-- per-DM lists — the big consumer: ~1.7MB on a busy mesh). Only the Messenger
+-- needs it; it's freed when the Messenger closes so it isn't resident while the
+-- heavy apps run. Safe because:
+--   * C++ has every message persisted on disk → loadPersisted() rebuilds it
+--     verbatim on the next Messenger open (and _loaded is reset so it re-runs).
+--   * The unread COUNTERS are left intact (the topbar badge is counter-based),
+--     so closing the Messenger never wrongly clears unread state.
+--   * Live __dispatch after this just rebuilds the small per-session buckets
+--     until the next loadPersisted replaces them with the full disk history.
+function M:freePersisted()
+    M.__channel_history = {}
+    M.__dm_threads = {}
+    M.__ack_index = {}          -- held refs into the freed history; drop them too
+    M._loaded = false
+    collectgarbage("collect")
+end
+
 -- Register priority callback (fires before onMessage, used by topbar)
 function M:onMessageFirst(cb)
     M.__onMessageFirst = cb

@@ -849,10 +849,14 @@ String PunkMesh::dmMsgPath(const char* peer) {
 
 static void ensure_messages_dir(fs::FS* fs, const String& prefix) {
     if (!fs) return;
+    // Cache by FS pointer so the common path (every message append) skips the
+    // exists() stat. setStorage() switching backend (SD<->LittleFS) flips the
+    // pointer, so the new backend re-creates its dir on first use.
+    static fs::FS* ready_for = nullptr;
+    if (fs == ready_for) return;
     String dir = messages_dir(prefix);
-    if (!fs->exists(dir.c_str())) {
-        fs->mkdir(dir.c_str());
-    }
+    if (!fs->exists(dir.c_str())) fs->mkdir(dir.c_str());
+    ready_for = fs;
 }
 
 static void fill_stored_msg(StoredMsg& m, int channel_idx, const char* from,
@@ -915,42 +919,75 @@ static void push_path_table(lua_State* L, uint16_t path_len, const uint8_t* path
 // Each record is a block of key=value lines terminated by "---".
 // Unknown keys are ignored on load (forward-compatible).
 
-static bool is_old_binary_file(fs::FS* storage, const String& path) {
-    File f = storage->open(path.c_str(), "r");
-    if (!f || f.size() == 0) { if (f) f.close(); return false; }
-    uint8_t first;
-    f.read(&first, 1);
-    f.close();
-    return !(first >= 0x20 && first <= 0x7E) && first != '\n' && first != '\r';
-}
-
-static void write_path_field(File& f, uint16_t path_len, const uint8_t* path) {
+// Write path hashes as "aa,bb,cc" (no key, no newline). Shared by the path=
+// field, the inline rpath= line, and the .paths sidecar.
+static void write_path_hex(File& f, uint16_t path_len, const uint8_t* path) {
     uint8_t hash_size = (path_len >> 6) + 1;
     uint8_t hash_count = path_len & 63;
-    if (hash_count == 0) return;
-    f.print("path=");
     char hex[9];  // up to 4-byte hashes
     for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
         if (j > 0) f.print(",");
         mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
         f.print(hex);
     }
+}
+
+// The per-conversation path sidecar beside a message log: ch_X.log -> ch_X.paths.
+// Append-only "<hash_hex> <pathhex>;snr;rssi;direct" records, joined back to
+// messages by hash on read (see read_msg_text_file). Keeps extra-path
+// persistence O(1) instead of rewriting the whole message log per repeat heard.
+static String paths_sidecar_for(const String& msg_log_path) {
+    if (msg_log_path.endsWith(".log"))
+        return msg_log_path.substring(0, msg_log_path.length() - 4) + ".paths";
+    return msg_log_path + ".paths";
+}
+
+static void write_path_field(File& f, uint16_t path_len, const uint8_t* path) {
+    if ((path_len & 63) == 0) return;
+    f.print("path=");
+    write_path_hex(f, path_len, path);
     f.print("\n");
 }
 
 static void write_rpath_line(File& f, uint16_t path_len, const uint8_t* path,
                              float snr, float rssi, bool is_direct) {
-    uint8_t hash_size = (path_len >> 6) + 1;
-    uint8_t hash_count = path_len & 63;
     f.print("rpath=");
-    char hex[9];  // up to 4-byte hashes
-    for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
-        if (j > 0) f.print(",");
-        mesh::Utils::toHex(hex, &path[j * hash_size], hash_size);
-        f.print(hex);
-    }
+    write_path_hex(f, path_len, path);
     f.printf(";%.2f;%.2f;%d\n", snr, rssi, is_direct ? 1 : 0);
 }
+
+// Buffered line reader: pulls a File in 512-byte blocks instead of one byte at a
+// time. Per-byte fs::File::read() carries heavy virtual-call overhead that makes
+// scanning a large log take seconds; block reads cut that by ~100x. next() fills
+// `out` with the next line (NUL-terminated, trailing CR/LF stripped, chars past
+// outsz-1 dropped) and returns its length, or -1 at end of file. The SD lock may
+// be released between next() calls (the pending bytes live in RAM); the actual
+// file read only happens inside next(), under the caller's lock.
+struct BlockLineReader {
+    File*   f;
+    uint8_t buf[512];
+    int     len = 0;   // valid bytes in buf
+    int     pos = 0;   // next byte to consume
+    explicit BlockLineReader(File* file) : f(file) {}
+    int next(char* out, int outsz) {
+        int n = 0;
+        bool saw = false;
+        for (;;) {
+            if (pos >= len) {
+                len = f->read(buf, sizeof(buf));
+                pos = 0;
+                if (len <= 0) break;            // EOF (or read error)
+            }
+            saw = true;
+            char c = (char)buf[pos++];
+            if (c == '\n') { out[n] = '\0'; return n; }
+            if (c == '\r') continue;
+            if (n < outsz - 1) out[n++] = c;     // overflow chars dropped
+        }
+        out[n] = '\0';
+        return (saw || n > 0) ? n : -1;          // last line, or -1 at true EOF
+    }
+};
 
 static int count_text_records(File& f) {
     f.seek(0);
@@ -1028,11 +1065,9 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
     if (is_sd) sd_spi_take();
     ensure_messages_dir(storage, prefix);
 
-    if (storage->exists(fpath.c_str()) && is_old_binary_file(storage, fpath)) {
-        storage->remove(fpath.c_str());
-        SLog.printf("[STORAGE] Cleared old binary log: %s\n", fpath.c_str());
-    }
-
+    // open("a", true) creates on demand — no separate exists() probe. (The old
+    // pre-text binary-format detection is long obsolete and was removed.)
+    size_t fsize = 0;
     File f = storage->open(fpath.c_str(), "a", true);
     if (f) {
         f.printf("ts=%u\n", m.timestamp);          // authoritative (our RX/send clock)
@@ -1064,9 +1099,68 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
             f.printf("lon=%.6f\n", m.lon);
         }
         f.print("---\n");
+        fsize = f.size();
         f.close();
     }
-    trim_msg_text_file(storage, fpath, cap);
+    // Size-gated backstop, measured from the append handle so the common path
+    // needs no extra open. Retention by days is handled separately (pruneStep).
+    if (fsize >= MSG_FILE_SAFETY_BYTES) trim_msg_text_file(storage, fpath, cap);
+    if (is_sd) sd_spi_release();
+}
+
+// ── Per-message extra-path sidecar (append-only) ────────────────────────────
+// When a stored message is heard again via a NEW route, record that path here.
+// One append is O(1); the old approach rewrote the whole message log per repeat,
+// churning large PSRAM blocks and fragmenting the heap. Joined to messages by
+// hash on read (read_msg_text_file).
+static const size_t PATHS_FILE_SAFETY_BYTES = 256 * 1024;  // sidecar size backstop
+
+// Keep only the most-recent tail of an oversized sidecar. Streamed in fixed
+// chunks (no whole-file buffer). Caller holds the SD lock.
+static void trim_paths_sidecar(fs::FS* storage, const String& spath) {
+    File f = storage->open(spath.c_str(), "r");
+    if (!f) return;
+    size_t sz = f.size();
+    if (sz < PATHS_FILE_SAFETY_BYTES) { f.close(); return; }
+    f.seek(sz - PATHS_FILE_SAFETY_BYTES / 2);            // drop the oldest half
+    while (f.available()) { if (f.read() == '\n') break; }  // align to a record start
+    String tmp = spath + ".tmp";
+    File wf = storage->open(tmp.c_str(), "w", true);
+    if (!wf) { f.close(); return; }
+    uint8_t chunk[512];
+    while (f.available()) {
+        int n = f.read(chunk, sizeof(chunk));
+        if (n <= 0) break;
+        wf.write(chunk, n);
+    }
+    wf.close();
+    f.close();
+    storage->remove(spath.c_str());
+    if (!storage->rename(tmp.c_str(), spath.c_str()))
+        SLog.printf("[STORAGE] paths sidecar trim rename failed: %s\n", spath.c_str());
+}
+
+// Append one observed path for `hash` to the conversation's .paths sidecar.
+// Self-locks the SD bus; the size backstop is measured from the append handle.
+static void append_path_record(fs::FS* storage, const String& msg_log_path,
+                               const uint8_t* hash, const ObservedPath& op) {
+    if (!storage) return;
+    bool is_sd = (storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+    String spath = paths_sidecar_for(msg_log_path);
+    size_t sz = 0;
+    File f = storage->open(spath.c_str(), "a", true);
+    if (f) {
+        char hash_hex[MAX_HASH_SIZE * 2 + 1];
+        mesh::Utils::toHex(hash_hex, hash, MAX_HASH_SIZE);
+        f.print(hash_hex);
+        f.print(" ");
+        write_path_hex(f, op.path_len, op.path);
+        f.printf(";%.2f;%.2f;%d\n", op.snr, op.rssi, op.is_direct ? 1 : 0);
+        sz = f.size();
+        f.close();
+    }
+    if (sz >= PATHS_FILE_SAFETY_BYTES) trim_paths_sidecar(storage, spath);
     if (is_sd) sd_spi_release();
 }
 
@@ -1559,6 +1653,19 @@ void PunkMesh::appendDMMessage(const char* peer, const char* from, const char* t
                     m, _max_messages);
 }
 
+// Push one {path, hops, direct, snr, rssi} table for an observed route of a
+// message. Leaves the table on the stack. Shared by push_stored_msg_table (for
+// inline rpaths) and the .paths-sidecar join in read_msg_text_file.
+static void push_one_rpath_entry(lua_State* L, const ObservedPath& rp) {
+    lua_newtable(L);
+    push_path_table(L, rp.path_len, rp.path);
+    lua_setfield(L, -2, "path");
+    lua_pushinteger(L, rp.path_len & 63); lua_setfield(L, -2, "hops");
+    lua_pushboolean(L, rp.is_direct);     lua_setfield(L, -2, "direct");
+    lua_pushnumber(L, rp.snr);            lua_setfield(L, -2, "snr");
+    lua_pushnumber(L, rp.rssi);           lua_setfield(L, -2, "rssi");
+}
+
 static void push_stored_msg_table(lua_State* L, const StoredMsg& m) {
     lua_newtable(L);
     lua_pushstring(L, m.from);      lua_setfield(L, -2, "from");
@@ -1587,19 +1694,7 @@ static void push_stored_msg_table(lua_State* L, const StoredMsg& m) {
     if (m.rpath_count > 0) {
         lua_newtable(L);
         for (int i = 0; i < m.rpath_count; i++) {
-            const ObservedPath& rp = m.rpaths[i];
-            lua_newtable(L);
-            push_path_table(L, rp.path_len, rp.path);
-            lua_setfield(L, -2, "path");
-            uint8_t hc = rp.path_len & 63;
-            lua_pushinteger(L, hc);
-            lua_setfield(L, -2, "hops");
-            lua_pushboolean(L, rp.is_direct);
-            lua_setfield(L, -2, "direct");
-            lua_pushnumber(L, rp.snr);
-            lua_setfield(L, -2, "snr");
-            lua_pushnumber(L, rp.rssi);
-            lua_setfield(L, -2, "rssi");
+            push_one_rpath_entry(L, m.rpaths[i]);
             lua_rawseti(L, -2, i + 1);
         }
         lua_setfield(L, -2, "rpaths");
@@ -1632,8 +1727,36 @@ static uint16_t parse_path_field(const char* val, uint8_t* path_out) {
     return ((hash_size - 1) << 6) | count;
 }
 
+// Parse a "<pathhex>;snr;rssi;direct" value (mutates the buffer) into rp.
+// Returns false if there's no field separator. Shared by the inline rpath= key
+// and the .paths sidecar.
+static bool parse_rpath_value(char* val, ObservedPath& rp) {
+    char* semi1 = strchr(val, ';');
+    if (!semi1) return false;
+    *semi1 = '\0';
+    memset(&rp, 0, sizeof(rp));
+    rp.path_len = parse_path_field(val, rp.path);
+    char* semi2 = strchr(semi1 + 1, ';');
+    if (semi2) {
+        *semi2 = '\0';
+        rp.snr = atof(semi1 + 1);
+        char* semi3 = strchr(semi2 + 1, ';');
+        if (semi3) {
+            *semi3 = '\0';
+            rp.rssi = atof(semi2 + 1);
+            rp.is_direct = atoi(semi3 + 1) != 0;
+        } else {
+            rp.rssi = atof(semi2 + 1);
+        }
+    } else {
+        rp.snr = atof(semi1 + 1);
+    }
+    return true;
+}
+
 static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath) {
     lua_newtable(L);
+    int msgs_idx = lua_gettop(L);
     if (!storage) return 1;
     bool is_sd = (storage != &LittleFS);
     if (is_sd) sd_spi_take();
@@ -1647,23 +1770,29 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
         return 1;
     }
 
+    // Only build the hash-hex -> message lookup (used to join the .paths sidecar
+    // of extra routes back to each message) when a sidecar actually exists — most
+    // conversations have none, so skip both the table and the per-record insert.
+    String spath = paths_sidecar_for(fpath);
+    bool have_sidecar = storage->exists(spath.c_str());
+    int lookup_idx = 0;
+    if (have_sidecar) {
+        lua_newtable(L);
+        lookup_idx = lua_gettop(L);
+    }
+
     int idx = 1;
     int line_count = 0;
     StoredMsg m;
     memset(&m, 0, sizeof(m));
     char line[256];
 
-    while (f.available()) {
-        int len = 0;
-        while (f.available() && len < (int)sizeof(line) - 1) {
-            char ch = f.read();
-            if (ch == '\n' || ch == '\r') break;
-            line[len++] = ch;
-        }
-        line[len] = '\0';
+    BlockLineReader lr(&f);
+    int len;
+    while ((len = lr.next(line, sizeof(line))) >= 0) {
         if (len == 0) continue;
 
-        // Yield every 100 lines to prevent task watchdog timeout on large log files
+        // Yield every 100 lines so a large log can't trip the task watchdog.
         if (is_sd && ++line_count % 100 == 0) {
             sd_spi_release();
             vTaskDelay(1);
@@ -1671,8 +1800,14 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
         }
 
         if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
-            push_stored_msg_table(L, m);
-            lua_rawseti(L, -2, idx++);
+            push_stored_msg_table(L, m);                 // msgtbl on top
+            if (have_sidecar && m.has_hash) {
+                char hx[MAX_HASH_SIZE * 2 + 1];
+                mesh::Utils::toHex(hx, m.pkt_hash, MAX_HASH_SIZE);
+                lua_pushvalue(L, -1);                    // dup msgtbl
+                lua_setfield(L, lookup_idx, hx);         // lookup[hx] = msgtbl
+            }
+            lua_rawseti(L, msgs_idx, idx++);             // msgs[idx] = msgtbl
             memset(&m, 0, sizeof(m));
             continue;
         }
@@ -1708,37 +1843,60 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
         else if (strcmp(key, "lat") == 0) { m.lat = atof(val); m.has_loc = true; }
         else if (strcmp(key, "lon") == 0) { m.lon = atof(val); m.has_loc = true; }
         else if (strcmp(key, "rpath") == 0 && m.rpath_count < MAX_PATHS_PER_MSG) {
-            // Format: hop_hashes;snr;rssi;direct
+            // Inline (legacy) extra path: "hop_hashes;snr;rssi;direct"
             char rval[256];
             strncpy(rval, val, sizeof(rval) - 1);
             rval[sizeof(rval) - 1] = '\0';
-            char* semi1 = strchr(rval, ';');
-            if (semi1) {
-                *semi1 = '\0';
-                ObservedPath& rp = m.rpaths[m.rpath_count];
-                memset(&rp, 0, sizeof(rp));
-                rp.path_len = parse_path_field(rval, rp.path);
-                char* semi2 = strchr(semi1 + 1, ';');
-                if (semi2) {
-                    *semi2 = '\0';
-                    rp.snr = atof(semi1 + 1);
-                    char* semi3 = strchr(semi2 + 1, ';');
-                    if (semi3) {
-                        *semi3 = '\0';
-                        rp.rssi = atof(semi2 + 1);
-                        rp.is_direct = atoi(semi3 + 1) != 0;
-                    } else {
-                        rp.rssi = atof(semi2 + 1);
-                    }
-                } else {
-                    rp.snr = atof(semi1 + 1);
-                }
-                m.rpath_count++;
-            }
+            if (parse_rpath_value(rval, m.rpaths[m.rpath_count])) m.rpath_count++;
         }
     }
     f.close();
+
+    // Join the .paths sidecar: each "<hash_hex> <pathhex>;snr;rssi;direct" line
+    // appends one observed route to the matching message's rpaths.
+    if (have_sidecar) {
+        File sf = storage->open(spath.c_str(), "r");
+        if (sf) {
+            int slc = 0;
+            char sline[256];
+            BlockLineReader slr(&sf);
+            int slen;
+            while ((slen = slr.next(sline, sizeof(sline))) >= 0) {
+                if (slen == 0) continue;
+                if (is_sd && ++slc % 100 == 0) {
+                    sd_spi_release(); vTaskDelay(1); sd_spi_take();
+                }
+                char* sp = strchr(sline, ' ');
+                if (!sp) continue;
+                *sp = '\0';
+                if (strlen(sline) != MAX_HASH_SIZE * 2) continue;   // sline = hash hex
+                lua_getfield(L, lookup_idx, sline);                 // msgtbl | nil
+                if (lua_istable(L, -1)) {
+                    ObservedPath rp;
+                    if (parse_rpath_value(sp + 1, rp)) {
+                        lua_getfield(L, -1, "rpaths");              // msgtbl, rpaths|nil
+                        if (!lua_istable(L, -1)) {
+                            lua_pop(L, 1);
+                            lua_newtable(L);                        // msgtbl, rpaths
+                            lua_pushvalue(L, -1);
+                            lua_setfield(L, -3, "rpaths");          // msgtbl.rpaths = rpaths
+                        }
+                        int n = (int)lua_rawlen(L, -1);
+                        if (n < MAX_PATHS_PER_MSG) {
+                            push_one_rpath_entry(L, rp);            // msgtbl, rpaths, entry
+                            lua_rawseti(L, -2, n + 1);
+                        }
+                        lua_pop(L, 1);                              // pop rpaths
+                    }
+                }
+                lua_pop(L, 1);                                      // pop msgtbl|nil
+            }
+            sf.close();
+        }
+    }
+
     if (is_sd) sd_spi_release();
+    if (have_sidecar) lua_remove(L, lookup_idx);   // drop lookup; leaves msgs on top
     return 1;
 }
 
@@ -1990,76 +2148,74 @@ int PunkMesh::lookupPersistedPaths(lua_State* L, const char* hash_hex,
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
-    File f = _storage->open(fpath.c_str(), "r");
-    if (!f) { if (is_sd) sd_spi_release(); return 1; }
-
-    // Build target line to match
-    char target[6 + MAX_HASH_SIZE * 2 + 1];
-    snprintf(target, sizeof(target), "hash=%s", hash_hex);
-
-    char line[256];
-    bool found_hash = false;
     int rpath_idx = 1;
 
-    while (f.available()) {
-        int len = 0;
-        while (f.available() && len < (int)sizeof(line) - 1) {
-            char ch = f.read();
-            if (ch == '\n' || ch == '\r') break;
-            line[len++] = ch;
-        }
-        line[len] = '\0';
-        if (len == 0) continue;
-
-        if (found_hash) {
-            if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-')
-                break;  // end of matching record
-            if (strncmp(line, "rpath=", 6) == 0) {
-                char rval[256];
-                strncpy(rval, line + 6, sizeof(rval) - 1);
-                rval[sizeof(rval) - 1] = '\0';
-                char* semi1 = strchr(rval, ';');
-                if (semi1) {
-                    *semi1 = '\0';
-                    uint8_t path_buf[MAX_PATH_SIZE];
-                    uint16_t path_len_enc = parse_path_field(rval, path_buf);
-                    float snr = 0, rssi = 0;
-                    bool is_direct = false;
-                    char* semi2 = strchr(semi1 + 1, ';');
-                    if (semi2) {
-                        *semi2 = '\0';
-                        snr = atof(semi1 + 1);
-                        char* semi3 = strchr(semi2 + 1, ';');
-                        if (semi3) {
-                            *semi3 = '\0';
-                            rssi = atof(semi2 + 1);
-                            is_direct = atoi(semi3 + 1) != 0;
-                        } else {
-                            rssi = atof(semi2 + 1);
-                        }
-                    } else {
-                        snr = atof(semi1 + 1);
+    // 1) The inline first route: scan the message log for this hash's record and
+    //    read its rpath= line. Block-buffered (BlockLineReader) and yields every
+    //    100 lines, so even a large log scanned to its end can't starve the UI
+    //    thread's watchdog.
+    File f = _storage->open(fpath.c_str(), "r");
+    if (f) {
+        char target[6 + MAX_HASH_SIZE * 2 + 1];
+        snprintf(target, sizeof(target), "hash=%s", hash_hex);
+        BlockLineReader lr(&f);
+        char line[256];
+        bool found_hash = false;
+        int line_count = 0, len;
+        while ((len = lr.next(line, sizeof(line))) >= 0) {
+            if (len == 0) continue;
+            if (is_sd && ++line_count % 100 == 0) {
+                sd_spi_release(); vTaskDelay(1); sd_spi_take();
+            }
+            if (found_hash) {
+                if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-')
+                    break;  // end of matching record
+                if (strncmp(line, "rpath=", 6) == 0) {
+                    ObservedPath rp;
+                    char rval[256];
+                    strncpy(rval, line + 6, sizeof(rval) - 1);
+                    rval[sizeof(rval) - 1] = '\0';
+                    if (parse_rpath_value(rval, rp)) {
+                        push_one_rpath_entry(L, rp);
+                        lua_rawseti(L, -2, rpath_idx++);
                     }
-                    lua_newtable(L);
-                    push_path_table(L, path_len_enc, path_buf);
-                    lua_setfield(L, -2, "path");
-                    lua_pushinteger(L, path_len_enc & 63);
-                    lua_setfield(L, -2, "hops");
-                    lua_pushboolean(L, is_direct);
-                    lua_setfield(L, -2, "direct");
-                    lua_pushnumber(L, snr);
-                    lua_setfield(L, -2, "snr");
-                    lua_pushnumber(L, rssi);
-                    lua_setfield(L, -2, "rssi");
+                }
+            } else if (strcmp(line, target) == 0) {
+                found_hash = true;
+            }
+        }
+        f.close();
+    }
+
+    // 2) Extra routes from the .paths sidecar (where repeats heard via new routes
+    //    are now recorded). Each line is "<hash_hex> <pathhex>;snr;rssi;direct";
+    //    pick the ones keyed by this hash. Yields on the same cadence.
+    String spath = paths_sidecar_for(fpath);
+    if (_storage->exists(spath.c_str())) {
+        File sf = _storage->open(spath.c_str(), "r");
+        if (sf) {
+            size_t hlen = strlen(hash_hex);
+            BlockLineReader lr(&sf);
+            char sline[256];
+            int slc = 0, slen;
+            while ((slen = lr.next(sline, sizeof(sline))) >= 0) {
+                if (slen == 0) continue;
+                if (is_sd && ++slc % 100 == 0) {
+                    sd_spi_release(); vTaskDelay(1); sd_spi_take();
+                }
+                // Match "<hash_hex> ..." (our hash, then a single space).
+                if ((size_t)slen <= hlen || sline[hlen] != ' ') continue;
+                if (strncmp(sline, hash_hex, hlen) != 0) continue;
+                ObservedPath rp;
+                if (parse_rpath_value(sline + hlen + 1, rp)) {
+                    push_one_rpath_entry(L, rp);
                     lua_rawseti(L, -2, rpath_idx++);
                 }
             }
-        } else if (strcmp(line, target) == 0) {
-            found_hash = true;
+            sf.close();
         }
     }
 
-    f.close();
     if (is_sd) sd_spi_release();
     return 1;
 }
@@ -2723,93 +2879,20 @@ void PunkMesh::persistExtraPath(const uint8_t* hash, const ObservedPath& op) {
     if (!entry || !entry->is_message) return;
 
     String fpath;
-    if (entry->is_dm)
+    if (entry->is_dm) {
+        if (entry->peer[0] == '\0') return;            // no peer — no DM log to attach to
         fpath = dm_msg_path(_storage_prefix, entry->peer);
-    else {
+    } else {
+        if (entry->channel_idx < 0) return;            // unknown channel — no log exists
         String ch_name = channel_name_for_idx(*this, entry->channel_idx);
         fpath = channel_msg_path(_storage_prefix, ch_name.c_str());
     }
 
-    char hash_hex[MAX_HASH_SIZE * 2 + 1];
-    mesh::Utils::toHex(hash_hex, hash, MAX_HASH_SIZE);
-    String hash_line = String("hash=") + hash_hex;
-
-    bool is_sd = (_storage != &LittleFS);
-    if (is_sd) sd_spi_take();
-
-    File f = _storage->open(fpath.c_str(), "r");
-    if (!f) { if (is_sd) sd_spi_release(); return; }
-
-    size_t fsize = f.size();
-    uint8_t* buf = (uint8_t*)malloc(fsize);
-    if (!buf) { f.close(); if (is_sd) sd_spi_release(); return; }
-    f.read(buf, fsize);
-    f.close();
-
-    // Scan for the hash= line, then find its following --- delimiter
-    const char* data = (const char*)buf;
-    const char* found_hash = nullptr;
-    const char* p = data;
-    while (p < data + fsize) {
-        const char* eol = (const char*)memchr(p, '\n', fsize - (p - data));
-        if (!eol) eol = data + fsize;
-        size_t line_len = eol - p;
-        if (line_len == hash_line.length() &&
-            memcmp(p, hash_line.c_str(), line_len) == 0) {
-            found_hash = p;
-            break;
-        }
-        p = eol + 1;
-    }
-
-    if (!found_hash) { free(buf); if (is_sd) sd_spi_release(); return; }
-
-    // Find the --- after the hash line
-    p = found_hash;
-    const char* insert_pos = nullptr;
-    while (p < data + fsize) {
-        const char* eol = (const char*)memchr(p, '\n', fsize - (p - data));
-        if (!eol) eol = data + fsize;
-        size_t line_len = eol - p;
-        if (line_len == 3 && p[0] == '-' && p[1] == '-' && p[2] == '-') {
-            insert_pos = p;
-            break;
-        }
-        p = eol + 1;
-    }
-
-    if (!insert_pos) { free(buf); if (is_sd) sd_spi_release(); return; }
-
-    // Build the rpath line to insert
-    char rpath_buf[256];
-    int rlen = 0;
-    rlen += snprintf(rpath_buf + rlen, sizeof(rpath_buf) - rlen, "rpath=");
-    uint8_t hs = (op.path_len >> 6) + 1;
-    uint8_t hc = op.path_len & 63;
-    if (hs > 4) hc = 0;  // invalid encoding — write no hops
-    char hex[9];  // up to 4-byte hashes (8 hex chars + NUL)
-    for (int j = 0; j < hc && (j + 1) * hs <= MAX_PATH_SIZE; j++) {
-        // leave room for this token plus the ;snr;rssi;d\n tail
-        if (rlen + (int)hs * 2 + 32 >= (int)sizeof(rpath_buf)) break;
-        if (j > 0) rpath_buf[rlen++] = ',';
-        mesh::Utils::toHex(hex, &op.path[j * hs], hs);
-        memcpy(rpath_buf + rlen, hex, hs * 2);
-        rlen += hs * 2;
-    }
-    rlen += snprintf(rpath_buf + rlen, sizeof(rpath_buf) - rlen,
-                     ";%.2f;%.2f;%d\n", op.snr, op.rssi, op.is_direct ? 1 : 0);
-
-    // Rewrite file: before insert_pos + rpath line + from insert_pos onward
-    File wf = _storage->open(fpath.c_str(), "w", true);
-    if (wf) {
-        size_t before = insert_pos - data;
-        wf.write(buf, before);
-        wf.write((const uint8_t*)rpath_buf, rlen);
-        wf.write(buf + before, fsize - before);
-        wf.close();
-    }
-    free(buf);
-    if (is_sd) sd_spi_release();
+    // O(1) append to the per-conversation .paths sidecar, joined back to this
+    // message by hash on read. Replaces the old whole-file read+rewrite, which
+    // malloc'd the entire (growing) message log per repeat heard — the source of
+    // the PSRAM fragmentation that starved large allocations over uptime.
+    append_path_record(_storage, fpath, hash, op);
 }
 
 void PunkMesh::preRegisterSentHash(const uint8_t* hash, bool is_dm,

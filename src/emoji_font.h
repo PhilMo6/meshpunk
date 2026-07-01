@@ -25,6 +25,15 @@ void emoji_font_destroy(lv_font_t * font);
  *  Returns true if the glyph loaded successfully, false if missing/failed. */
 bool emoji_preload(uint32_t codepoint);
 
+/** Free every cached emoji glyph (the per-glyph PSRAM pixel buffer + descriptor)
+ *  and reset the cache; glyphs re-load on demand on the next render. This cache
+ *  is global C state that is never otherwise freed, so a session that renders
+ *  many emoji (e.g. the Map's contact names) leaves a persistent mid-heap cluster
+ *  that caps the largest contiguous PSRAM block. Called before launching a heavy
+ *  ELF module so it gets a clean block. The open blob file + codepoint index are
+ *  kept (cheap, needed for re-load). */
+void emoji_font_cache_clear(void);
+
 #ifdef __cplusplus
 }
 #endif

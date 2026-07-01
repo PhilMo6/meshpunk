@@ -1259,20 +1259,65 @@ static void elf_run_task(void* param) {
 }
 
 // ---------------------------------------------------------------------------
-// _launch_elf(path [, arg1, arg2, ...])
-// Lua binding: suspends LVGL, loads+runs ELF, resumes LVGL.
+// _launch_elf(path [, arg1, arg2, ...])  — DEFERRED launch.
+//
+// The binding is called from a Lua game, so we cannot tear Lua down here (Lua is
+// on the C stack). It deep-copies the args — the Lua strings will NOT survive the
+// lua_close — sets s_elf_pending, and returns. The main loop (Core 0) then sees
+// the flag, calls luaTearDown() (freeing the whole fragmented Lua heap so the
+// module gets a clean contiguous PSRAM block), runs the module via
+// elf_host_run_pending(), and recreates Lua + the launcher. Because Lua is gone
+// before the module runs, _launch_elf returns no meaningful result — the user
+// lands on the launcher home when the module exits.
 // ---------------------------------------------------------------------------
+#define ELF_MAX_ARGS 16
+#define ELF_ARG_MAX  256
+static volatile bool s_elf_pending = false;
+static volatile bool s_elf_running = false;
+static int  s_elf_argc = 0;
+static char s_elf_args[ELF_MAX_ARGS][ELF_ARG_MAX];
 
 static int lua_launch_elf(lua_State* L) {
-    const char* path = luaL_checkstring(L, 1);
-
-    // Collect extra string args for the module
-    int nargs = lua_gettop(L);
-    int argc = nargs; // first arg is the elf path, rest are forwarded
-    char** argv = (char**)malloc(sizeof(char*) * (argc + 1));
-    for (int i = 0; i < argc; i++) {
-        argv[i] = (char*)lua_tostring(L, i + 1);
+    if (s_elf_pending || s_elf_running) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "launch already in progress");
+        return 2;
     }
+    int nargs = lua_gettop(L);
+    if (nargs < 1) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "no ELF path");
+        return 2;
+    }
+    if (nargs > ELF_MAX_ARGS) nargs = ELF_MAX_ARGS;
+    s_elf_argc = nargs;
+    for (int i = 0; i < nargs; i++) {
+        const char* a = lua_tostring(L, i + 1);
+        strlcpy(s_elf_args[i], a ? a : "", ELF_ARG_MAX);
+    }
+    s_elf_pending = true;
+    lua_pushboolean(L, 1);   // queued; the real load happens after teardown
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+// Called from loop() (Core 0): true if a launch was requested; marks it running
+// so a second tap is ignored until the module exits.
+bool elf_host_pending_take(void) {
+    if (!s_elf_pending) return false;
+    s_elf_pending = false;
+    s_elf_running = true;
+    return true;
+}
+
+// Run the stashed module to completion. MUST be called only after luaTearDown()
+// — Lua is down and this never touches lua_State. The caller recreates Lua after
+// it returns. Returns the module result (negative on load/spawn failure).
+int elf_host_run_pending(void) {
+    const char* path = s_elf_args[0];
+    int argc = s_elf_argc;
+    char* argv[ELF_MAX_ARGS + 1];
+    for (int i = 0; i < argc; i++) argv[i] = s_elf_args[i];
     argv[argc] = NULL;
 
     SLog.printf("[elf_host] loading %s\n", path);
@@ -1284,10 +1329,9 @@ static int lua_launch_elf(lua_State* L) {
     uint32_t elf_size = 0;
     void* elf_data = host_read_file(path, &elf_size);
     if (!elf_data) {
-        free(argv);
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, "failed to read ELF file");
-        return 2;
+        SLog.printf("[elf_host] failed to read ELF file: %s\n", path);
+        s_elf_running = false;
+        return -3;
     }
     SLog.printf("[elf_host] read %u bytes\n", elf_size);
 
@@ -1440,8 +1484,6 @@ static int lua_launch_elf(lua_State* L) {
         SLog.println("[elf_host] elf_load failed");
     }
 
-    free(argv);
-
     // Close any file descriptors the module left open
     mod_close_tracked_files();
 
@@ -1475,9 +1517,10 @@ static int lua_launch_elf(lua_State* L) {
     // Force full redraw — LVGL doesn't know the display was wiped
     lv_obj_invalidate(lv_screen_active());
 
-    lua_pushboolean(L, mod != NULL);
-    lua_pushinteger(L, result);
-    return 2;
+    SLog.printf("[elf_host] module session done (loaded=%d result=%d)\n",
+                mod != NULL, result);
+    s_elf_running = false;
+    return result;
 }
 
 void elf_host_register_lua(lua_State* L) {

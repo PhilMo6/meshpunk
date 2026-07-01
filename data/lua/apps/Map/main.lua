@@ -149,7 +149,6 @@ end
 local bin_cache = {}  -- in-memory set of tiles known to have .bin on SD
 local bin_cache_n = 0           -- approx entry count (bounds memory growth)
 local BIN_CACHE_CAP = 4000      -- panning a wide area would otherwise grow forever
-local loaded_srcs = {}  -- src paths currently decoded in the LVGL image cache
 
 local function tile_bin_path(z, tx, ty)
     return CACHE_ROOT .. "/" .. z .. "/" .. tx .. "/" .. ty .. ".bin"
@@ -273,19 +272,18 @@ local hide_precache_screen  -- forward-declare; defined after UI setup
 
 local function set_tile_widget(idx, z, tx, ty)
     if not tile_imgs[idx] then return false end
-    local src = tile_img_src(z, tx, ty)
+    local src = tile_img_src(z, tx, ty)   -- string key for per-widget dedup
     if tile_srcs[idx] == src then
         tile_imgs[idx]:clear_flag(lvgl.FLAG.HIDDEN)
-        loaded_srcs[src] = true
         return true
     end
-    local ok, err = pcall(function()
-        tile_imgs[idx]:set_src(src)
+    -- Load the .bin into the fixed tile pool slot `idx` and point the widget at
+    -- that slot's in-memory RGB565 descriptor (LVGL draws it directly). No LVGL
+    -- image cache, so no scattered 128KB decode buffers fragmenting PSRAM.
+    local ok, shown = pcall(_tile_show, tile_imgs[idx], idx, tile_bin_path(z, tx, ty))
+    if ok and shown then
         tile_imgs[idx]:clear_flag(lvgl.FLAG.HIDDEN)
-    end)
-    if ok then
         tile_srcs[idx] = src
-        loaded_srcs[src] = true  -- track for off-screen eviction
         return true
     end
     tile_imgs[idx]:add_flag(lvgl.FLAG.HIDDEN)
@@ -439,66 +437,100 @@ local MCANVAS_H = H + 2 * MARKER_PAD
 local marker_canvas, anim_canvas  -- created by create_base_canvases()
 local function create_base_canvases()
     if marker_canvas and anim_canvas then return end
+    -- Reclaim freed PSRAM (a meshprint frees ~1.8MB) before the ~1.2MB marker+anim
+    -- re-alloc, so it lands in contiguous space and leaves headroom for the draw
+    -- descriptors the first repaint needs. Runs only when actually (re)creating.
+    collectgarbage("collect")
     local function mk(w, h, x, y)
-        local okc, cv = pcall(function()
-            return root:Canvas({ w = w, h = h, cf = lvgl.COLOR_FORMAT.ARGB8888, x = x, y = y })
-        end)
-        return okc and cv or nil
+        local function try()
+            local okc, cv = pcall(function()
+                return root:Canvas({ w = w, h = h, cf = lvgl.COLOR_FORMAT.ARGB8888, x = x, y = y })
+            end)
+            return okc and cv or nil
+        end
+        local cv = try()
+        if not cv then
+            -- A big ARGB canvas (the ~915KB oversized marker layer especially) needs
+            -- a large CONTIGUOUS block. The LVGL tile image cache fragments PSRAM
+            -- below that — more so now that tiles download during a meshprint, which
+            -- fills the cache (it's global, survives the app closing). Drop it (tiles
+            -- transparently re-decode from their .bin) + GC, then retry once.
+            pcall(_lvgl_image_cache_drop)
+            collectgarbage("collect")
+            cv = try()
+        end
+        return cv
     end
-    local mc = mk(MCANVAS_W, MCANVAS_H, -MARKER_PAD, -MARKER_PAD)  -- oversized
-    local ac = mk(W, H, 0, 0)                                     -- screen-sized
-    if not mc or not ac then
-        print("[Map] base canvas alloc FAILED m=" .. tostring(mc ~= nil) .. " a=" .. tostring(ac ~= nil))
-        if mc then mc:delete() end
-        if ac then ac:delete() end
-        return  -- both stay nil; nil-guards keep the app alive (markers hidden)
+    -- Each canvas is (re)created independently: a meshprint frees ONLY the marker
+    -- canvas (the anim canvas is reused as the meshprint dot layer and stays alive),
+    -- so we must not clobber a surviving anim_canvas. nil-guards in the redraw paths
+    -- keep the app alive if either alloc fails.
+    if not marker_canvas then
+        local mc = mk(MCANVAS_W, MCANVAS_H, -MARKER_PAD, -MARKER_PAD)  -- oversized
+        if mc then
+            marker_canvas = mc
+            marker_canvas:fill_bg("#000000", 0)
+            marker_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
+            marker_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
+        else
+            print("[Map] marker canvas alloc FAILED")
+        end
     end
-    marker_canvas = mc
-    marker_canvas:fill_bg("#000000", 0)
-    marker_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
-    marker_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-    anim_canvas = ac
-    anim_canvas:fill_bg("#000000", 0)
-    anim_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
-    anim_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
-    anim_canvas:add_flag(lvgl.FLAG.HIDDEN)  -- hidden = skipped by renderer
+    if not anim_canvas then
+        local ac = mk(W, H, 0, 0)  -- screen-sized; doubles as the meshprint dot layer
+        if ac then
+            anim_canvas = ac
+            anim_canvas:fill_bg("#000000", 0)
+            anim_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
+            anim_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
+            anim_canvas:add_flag(lvgl.FLAG.HIDDEN)  -- hidden = skipped by renderer
+        else
+            print("[Map] anim canvas alloc FAILED")
+        end
+    end
 
     -- tile_layer (bottom) < marker_canvas < anim_canvas < everything above.
-    pcall(_obj_move_background, anim_canvas)
-    pcall(_obj_move_background, marker_canvas)
+    if anim_canvas then pcall(_obj_move_background, anim_canvas) end
+    if marker_canvas then pcall(_obj_move_background, marker_canvas) end
     pcall(_obj_move_background, tile_layer)
 end
-local function free_base_canvases()
-    if anim_canvas then anim_canvas:delete(); anim_canvas = nil end
-    if marker_canvas then marker_canvas:delete(); marker_canvas = nil end
+-- A meshprint HIDES (never frees) the marker canvas. The marker canvas is the big
+-- ~915KB oversized layer; freeing it and re-allocating after a meshprint is exactly
+-- the trap that fails — tiles/TLS/in-flight fetches move into the freed hole and a
+-- clean 915KB block is no longer there. Kept allocated at its app-start address it
+-- never has to move. Tiles still decode during a meshprint (they coexist with the
+-- marker on first open, using OTHER free PSRAM, not the marker's block).
+local function hide_marker_layer()
+    if marker_canvas then pcall(function() marker_canvas:add_flag(lvgl.FLAG.HIDDEN) end) end
+end
+-- Show the marker canvas again after a meshprint. It stayed allocated, so this is
+-- just clearing HIDDEN; only re-create if the app-start alloc had failed.
+local function show_marker_layer()
+    if marker_canvas then
+        pcall(function() marker_canvas:clear_flag(lvgl.FLAG.HIDDEN) end)
+    else
+        create_base_canvases()
+    end
+end
+
+-- Allocate the contiguous tile pool (one 2MB block, 16 fixed slots) FIRST, before
+-- the canvases, while the heap is cleanest — the biggest contiguous request gets
+-- first pick. Tiles draw from this pool instead of LVGL's scattered image cache.
+collectgarbage("collect")
+if not _tile_pool_alloc() then
+    print("[Map] tile pool alloc FAILED - tiles will not display this session")
 end
 create_base_canvases()
-
--- Meshprint canvas: sender-triangulation markers on their own layer. SCREEN-
--- SIZED (W×H ~307KB) and REDRAWN on pan/zoom like the anim canvas (few dots).
--- Allocated LAZILY when a meshprint runs (ensure_meshprint_canvas) and freed in
--- clear_meshprint, so steady state stays at 2 canvases. Created on top of the
--- HUD; harmless since it's transparent except for small dots and input-
--- transparent (CLICKABLE/SCROLLABLE cleared), so taps/pans pass through.
-local meshprint_canvas = nil
-local function ensure_meshprint_canvas()
-    if meshprint_canvas then return true end
-    local ok, cv = pcall(function()
-        return root:Canvas({
-            w = W, h = H,
-            cf = lvgl.COLOR_FORMAT.ARGB8888,
-            x = 0, y = 0,
-        })
-    end)
-    if not ok or not cv then
-        return false
+-- Meshprint sender-triangulation dots are drawn onto the ANIM canvas (reused
+-- while a meshprint is open — animation is stopped then), so a meshprint never
+-- allocates a separate ~307KB layer into a fragmented heap. hide_meshprint_layer
+-- clears + hides those dots from the anim canvas (on clear, or when a scan finds
+-- nothing); animation re-shows/redraws the canvas on its own when it resumes.
+local function hide_meshprint_layer()
+    if anim_canvas then
+        pcall(function() anim_canvas:fill_bg("#000000", 0) end)
+        pcall(function() anim_canvas:add_flag(lvgl.FLAG.HIDDEN) end)
     end
-    meshprint_canvas = cv
-    meshprint_canvas:fill_bg("#000000", 0)
-    meshprint_canvas:clear_flag(lvgl.FLAG.CLICKABLE)
-    meshprint_canvas:clear_flag(lvgl.FLAG.SCROLLABLE)
-    return true
 end
 
 -- Moving packet dot for the path animation (above both canvases, below
@@ -524,6 +556,7 @@ local mp_clear_btn = root:Button({ w = 80, h = 28, x = W - 86, y = 24 })
 mp_clear_btn:Label({ text = "Clear MP", align = lvgl.ALIGN.CENTER })
 mp_clear_btn:add_flag(lvgl.FLAG.HIDDEN)
 mp_clear_btn:clear_flag(lvgl.FLAG.SCROLLABLE)
+mp_clear_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)  -- tap-only, like the other overlay buttons (don't trap gridnav focus)
 mp_clear_btn:onClicked(function() if clear_meshprint then clear_meshprint() end end)
 
 -- On-map archive cycle button (top-right, just below the status bar): visible
@@ -536,6 +569,7 @@ local arch_cycle_btn = root:Button({ w = 92, h = 28, x = W - 98, y = 24 })
 local arch_cycle_lbl = arch_cycle_btn:Label({ text = "Arch 1", align = lvgl.ALIGN.CENTER })
 arch_cycle_btn:add_flag(lvgl.FLAG.HIDDEN)
 arch_cycle_btn:clear_flag(lvgl.FLAG.SCROLLABLE)
+arch_cycle_btn:clear_flag(lvgl.FLAG.CLICK_FOCUSABLE)  -- tap-only, like the other overlay buttons (don't trap gridnav focus)
 arch_cycle_btn:onClicked(function() if arch_cycle then arch_cycle() end end)
 
 -- Replay info popup (top-left corner under the status bar): who the
@@ -664,40 +698,12 @@ map.tooltip = tooltip
 -- Tile rendering
 -- ---------------------------------------------------------------------------
 
--- Evict from the LVGL image cache every tile we've decoded that is no longer in
--- the on-screen grid. Decoded tiles are ~131KB each; left to LVGL's LRU they
--- accumulate to the 3MB cap (old zoom levels, far-scrolled tiles) and fragment
--- PSRAM so the 256KB PNG decode buffer can't be allocated. Bounding the cache to
--- the visible set keeps a large contiguous region free. Zoom changes are handled
--- for free: old-zoom tiles have different paths, so none match the new grid.
+-- Vestigial. Tiles no longer go through LVGL's image cache: they are loaded into
+-- the fixed contiguous tile pool (16 slots, 1:1 with the grid widgets) and drawn
+-- from in-memory RGB565 descriptors. A tile that scrolls off-screen simply has its
+-- slot overwritten by the next on-screen tile, so there is nothing to evict and no
+-- per-frame cache churn to compact. Kept as a no-op so existing callers are unchanged.
 local function evict_offscreen_tiles()
-    if not map.base_tx or not map.canvas_zoom then return end
-    local max_tile = 2 ^ map.canvas_zoom - 1
-    local visible = {}
-    for r = 0, GRID - 1 do
-        for c = 0, GRID - 1 do
-            local tx = map.base_tx + c
-            local ty = map.base_ty + r
-            if tx >= 0 and ty >= 0 and tx <= max_tile and ty <= max_tile then
-                visible[tile_img_src(map.canvas_zoom, tx, ty)] = true
-            end
-        end
-    end
-    local dropped = false
-    for src in pairs(loaded_srcs) do
-        if not visible[src] then
-            pcall(_lvgl_image_cache_drop, src)
-            loaded_srcs[src] = nil
-            dropped = true
-        end
-    end
-    -- We just freed decoded-tile buffers (~128KB each). Compact the (shared)
-    -- PSRAM heap so that memory becomes a contiguous block again — but only when
-    -- the view has settled, so a full GC can't hitch an active fling (during a
-    -- fling no downloads run anyway, so there's nothing to make room for yet).
-    if dropped and map.vx == 0 and map.vy == 0 then
-        collectgarbage("collect")
-    end
 end
 
 local redraw_markers      -- forward declaration (defined after refresh_tiles)
@@ -852,6 +858,25 @@ end
 -- Markers (drawn onto canvas — 1 widget vs 262)
 -- ---------------------------------------------------------------------------
 
+-- Largest-free-block floor for a single canvas repaint. Each draw_rect/line/label
+-- allocates a transient LVGL draw descriptor; if that malloc returns NULL (PSRAM
+-- starved) the draw path writes to address 0 and hard-faults (StoreProhibited).
+-- A meshprint frees+restores ~1.8MB, so the frames just after one can land tight.
+-- Returns false -> skip this repaint (the layer keeps its last contents and
+-- repaints once memory frees). Smaller than ARCH_MIN_FREE: this is one frame's
+-- descriptors, not a 300-record batch. GCs once before giving up (the Lua heap
+-- IS PSRAM and its incremental GC lags on churn, so a low reading is often just
+-- uncollected garbage).
+local DRAW_MIN_FREE = 128 * 1024
+local function draw_heap_ok()
+    local okh, _, largest = pcall(_heap_info)
+    if okh and largest and largest < DRAW_MIN_FREE then
+        collectgarbage("collect")
+        okh, _, largest = pcall(_heap_info)
+    end
+    return (not okh) or (not largest) or largest >= DRAW_MIN_FREE
+end
+
 -- Draw the active packet path polyline onto the ANIMATION canvas, positioned
 -- against the current view (screen-sized canvas; redrawn on pan/zoom).
 -- Segments touching a synthesized waypoint (repeater with unknown position)
@@ -942,6 +967,7 @@ redraw_anim_canvas = function()
         anim_canvas:add_flag(lvgl.FLAG.HIDDEN)  -- zero render cost while idle
         return
     end
+    if not draw_heap_ok() then return end  -- low PSRAM: keep last frame, don't risk a draw-descriptor NULL
     anim_canvas:clear_flag(lvgl.FLAG.HIDDEN)
     anim_canvas:set({ x = 0, y = 0 })
     anim_canvas:fill_bg("#000000", 0)
@@ -950,7 +976,9 @@ end
 
 redraw_markers = function()
     if not map.running then return end
-    if not marker_canvas then return end  -- freed while a meshprint is active
+    if meshprint.active then return end   -- marker layer is hidden during a meshprint
+    if not marker_canvas then return end
+    if not draw_heap_ok() then return end  -- low PSRAM: keep last frame, don't risk a draw-descriptor NULL
 
     local view_left = map.cx - math.floor(W / 2)
     local view_top  = map.cy - math.floor(H / 2)
@@ -1212,14 +1240,12 @@ end
 -- every pan/zoom; cheap since it's only a handful of dots. Hidden when idle.
 redraw_meshprint_canvas = function()
     if not map.running then return end
-    if not meshprint.active then
-        if meshprint_canvas then meshprint_canvas:add_flag(lvgl.FLAG.HIDDEN) end
-        return
-    end
-    if not meshprint_canvas then return end
-    meshprint_canvas:clear_flag(lvgl.FLAG.HIDDEN)
-    meshprint_canvas:set({ x = 0, y = 0 })
-    meshprint_canvas:fill_bg("#000000", 0)
+    if not meshprint.active then return end  -- not our layer now; clear/scan hides it
+    if not anim_canvas then return end        -- anim canvas alloc failed at startup
+    if not draw_heap_ok() then return end  -- low PSRAM: keep last frame, don't risk a draw-descriptor NULL
+    anim_canvas:clear_flag(lvgl.FLAG.HIDDEN)
+    anim_canvas:set({ x = 0, y = 0 })
+    anim_canvas:fill_bg("#000000", 0)
 
     local view_left = map.cx - math.floor(W / 2)
     local view_top  = map.cy - math.floor(H / 2)
@@ -1229,7 +1255,7 @@ redraw_meshprint_canvas = function()
         local cx = px - view_left
         local cy = py - view_top
         if cx >= -size and cx < W + size and cy >= -size and cy < H + size then
-            meshprint_canvas:draw_rect({
+            anim_canvas:draw_rect({
                 x1 = cx - size, y1 = cy - size, x2 = cx + size - 1, y2 = cy + size - 1,
                 bg_color = color, bg_opa = 255, radius = size,
                 border_color = "#ffffff", border_width = border, border_opa = 255,
@@ -1721,52 +1747,89 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
     if not ok or not contacts then
         if on_done then on_done(0) end return
     end
-
     if meshprint.scan_timer then meshprint.scan_timer:delete(); meshprint.scan_timer = nil end
     collectgarbage("collect")  -- maximize free heap before building the LUT
 
-    -- Free the marker + animation canvases (~1.8MB) for the whole meshprint:
-    -- gives the scan and the meshprint canvas plenty of room, and the map shows
-    -- tiles + meshprint dots only (markers/anim restored in clear_meshprint, or
-    -- on the failure paths below). Stop any animation first (it owns anim_canvas).
+    -- Free the big marker canvas (~915KB) for scan headroom; the map then shows
+    -- tiles + meshprint dots only (the marker canvas is restored in clear_meshprint
+    -- or on the failure paths below). The anim canvas is NOT freed — it's reused as
+    -- the meshprint dot layer. Allocated at app start in a clean heap, it sits at a
+    -- stable address, so reusing it avoids a fresh ~307KB alloc fragmenting PSRAM
+    -- and starving tile decodes. Stop any animation first so the layer is free.
     if anim.active then anim_stop() end
     anim.queue = {}
     arch_load_stop()  -- suspend archived-contact loader to free PSRAM for the scan
-    free_base_canvases()
+    -- HIDE (don't free) the marker canvas. Freeing the 915KB layer and re-allocating
+    -- it after a meshprint is the trap that fails; kept resident it never has to move
+    -- and the scan/tiles use the rest of free PSRAM (marker + tiles coexist already).
+    hide_marker_layer()
+    -- Drop any previous run's dots so a stale layer doesn't show during this scan
+    -- (the anim canvas is live now, unlike the old separate lazily-allocated layer).
+    meshprint.reps1, meshprint.reps2, meshprint.tri = {}, {}, nil
     -- Mark active now (before the scan) so anim_tick early-returns for the whole
-    -- run and never touches the freed anim canvas. Cleared again on any failure.
+    -- run (the meshprint owns the anim canvas). Cleared again on any failure.
     meshprint.active = true
     update_arch_button()  -- hide the archive cycle button while the MP owns the layer
     collectgarbage("collect")
 
-    -- prefix -> { positioned candidate contacts at this hash size }. Keeps
-    -- colliding contacts so the cull can pick between them. Sizes 1-4 bytes =
-    -- 2/4/6/8 hex chars. Buckets reference the existing contact subtables (no
+    -- Integer value of the first n hex chars of s, read via string.byte so NO
+    -- substring is interned. The LUT used to key on pk:sub(1,hlen) strings, which
+    -- interned ~1800 short strings for 500 contacts and overflowed Lua's global
+    -- string table; its bucket array then realloc'd mid-heap and pinned there (in
+    -- place on later shrink) — the PSRAM wall that halved the largest free block
+    -- and starved Doom's zone. Integer keys never touch the string table.
+    -- Case-insensitive; a non-hex byte (or past end of s) counts as 0.
+    local function hex_prefix_val(s, n)
+        local v = 0
+        for i = 1, n do
+            local b = s:byte(i)
+            local d = 0
+            if b then
+                if     b >= 48 and b <= 57  then d = b - 48   -- '0'-'9'
+                elseif b >= 97 and b <= 102 then d = b - 87   -- 'a'-'f'
+                elseif b >= 65 and b <= 70  then d = b - 55   -- 'A'-'F'
+                end
+            end
+            v = v * 16 + d
+        end
+        return v
+    end
+
+    -- prefix value -> { positioned candidate contacts }, nested by hash length
+    -- (1-4 bytes = 2/4/6/8 hex chars). INTEGER keys (see hex_prefix_val) so the
+    -- build doesn't grow the string table. Keeps colliding contacts so the cull
+    -- can pick between them. Buckets reference the existing contact subtables (no
     -- copies — Lua keeps them alive; the C cache won't free them under us).
-    local prefix_lut = {}
+    local prefix_lut = { [2] = {}, [4] = {}, [6] = {}, [8] = {} }
     for _, c in ipairs(contacts) do
         if c.pubkey and c.lat and c.lon and (c.lat ~= 0 or c.lon ~= 0) then
-            local pk = c.pubkey:lower()
+            local pk = c.pubkey
             for _, hlen in ipairs({2, 4, 6, 8}) do
                 if #pk >= hlen then
-                    local prefix = pk:sub(1, hlen)
-                    local bucket = prefix_lut[prefix]
-                    if not bucket then bucket = {}; prefix_lut[prefix] = bucket end
+                    local v = hex_prefix_val(pk, hlen)
+                    local sub = prefix_lut[hlen]
+                    local bucket = sub[v]
+                    if not bucket then bucket = {}; sub[v] = bucket end
                     bucket[#bucket + 1] = c
                 end
             end
         end
     end
 
-    -- Repeater-preferred candidate set for a hash (repeaters if any match,
-    -- else all matches). Cached per hash; cached arrays are read-only/shared.
-    local cand_cache = {}
+    -- Repeater-preferred candidate set for a path-hop hash (repeaters if any
+    -- match, else all matches). Keyed by integer prefix value nested per hash
+    -- length — no interned hash strings. Cached arrays are read-only/shared.
+    local cand_cache = { [2] = {}, [4] = {}, [6] = {}, [8] = {} }
     local function cands_for(hash)
-        local key = hash:lower()
-        local cached = cand_cache[key]
+        local hlen = #hash
+        local sub = prefix_lut[hlen]
+        if not sub then return nil end          -- hop hash not a 1-4 byte prefix
+        local v = hex_prefix_val(hash, hlen)
+        local ccache = cand_cache[hlen]
+        local cached = ccache[v]
         if cached ~= nil then return cached or nil end
-        local bucket = prefix_lut[key]
-        if not bucket then cand_cache[key] = false; return nil end
+        local bucket = sub[v]
+        if not bucket then ccache[v] = false; return nil end
         local reps = nil
         for _, c in ipairs(bucket) do
             if c.type_name and c.type_name:lower():find("repeater", 1, true) then
@@ -1774,7 +1837,7 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
             end
         end
         local result = reps or bucket
-        cand_cache[key] = result
+        ccache[v] = result
         return result
     end
 
@@ -1856,10 +1919,10 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
             t:delete(); meshprint.scan_timer = nil
             if #reps1 == 0 then
                 all_msgs = nil; prefix_lut = nil; cand_cache = nil; contacts = nil
-                if meshprint_canvas then meshprint_canvas:delete(); meshprint_canvas = nil end
                 meshprint.active = false
+                hide_meshprint_layer()  -- clear/hide the anim-canvas dot layer
                 collectgarbage("collect")
-                create_base_canvases()  -- nothing to show; restore markers/anim
+                show_marker_layer()     -- un-hide the (still-allocated) marker canvas
                 invalidate_markers()
                 redraw_markers()
                 if show_archived then arch_load_start() end
@@ -1875,15 +1938,9 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
             cand_cache = nil
             contacts = nil
             collectgarbage("collect")
-            if not ensure_meshprint_canvas() then
-                meshprint.active = false
-                create_base_canvases()  -- restore markers/anim since MP failed
-                invalidate_markers()
-                redraw_markers()
-                if show_archived then arch_load_start() end
-                if on_done then on_done(-1) end
-                return
-            end
+            -- The meshprint dots are drawn onto the (already-alive) anim canvas, so
+            -- there's no separate layer to allocate here; redraw_meshprint_canvas
+            -- nil-guards a missing anim canvas.
             -- Final cull: remove outliers (bad hash resolutions) before triangulating.
             -- The culled sets also feed the displayed markers, so a node judged bogus
             -- doesn't show as a repeater either. 1st and 2nd hops are culled SEPARATELY
@@ -1900,20 +1957,23 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
             meshprint.active = true
             redraw_meshprint_canvas()
             mp_clear_btn:clear_flag(lvgl.FLAG.HIDDEN)
+            -- Collect the scan's transient interned strings before reporting done.
+            collectgarbage("collect")
             if on_done then on_done(#reps1) end
         end
     end })
     end  -- start_scan
 
     -- Fold one lean archived contact into the prefix LUT under each hash size
-    -- (same shape the live-contacts loop builds above).
+    -- (same integer-keyed shape the live-contacts loop builds above).
     local function fold_into_lut(c)
-        local pk = c.pubkey:lower()
+        local pk = c.pubkey
         for _, hlen in ipairs({2, 4, 6, 8}) do
             if #pk >= hlen then
-                local prefix = pk:sub(1, hlen)
-                local bucket = prefix_lut[prefix]
-                if not bucket then bucket = {}; prefix_lut[prefix] = bucket end
+                local v = hex_prefix_val(pk, hlen)
+                local sub = prefix_lut[hlen]
+                local bucket = sub[v]
+                if not bucket then bucket = {}; sub[v] = bucket end
                 bucket[#bucket + 1] = c
             end
         end
@@ -1971,14 +2031,10 @@ clear_meshprint = function()
     if meshprint.scan_timer then meshprint.scan_timer:delete(); meshprint.scan_timer = nil end
     meshprint.active = false
     meshprint.reps1, meshprint.reps2, meshprint.tri = {}, {}, nil
-    -- Free the ~307KB layer; it's re-allocated on the next meshprint run.
-    if meshprint_canvas then
-        meshprint_canvas:delete()
-        meshprint_canvas = nil
-    end
-    -- Restore the marker + animation canvases that were freed for the meshprint,
-    -- and repaint the contact markers for the current view.
-    create_base_canvases()
+    -- Clear + hide the meshprint dots from the (reused) anim canvas, un-hide the
+    -- (still-allocated) marker canvas, and repaint the markers.
+    hide_meshprint_layer()
+    show_marker_layer()
     invalidate_markers()  -- contacts may have changed during the meshprint
     redraw_markers()
     if show_archived then arch_load_start() end
@@ -3033,22 +3089,21 @@ show_meshprint_screen = function()
             render_results({}, "Type a name, then Find")
             return
         end
-        -- Known contacts first.
+        -- Matching contact names (live + archived) come back from C already
+        -- filtered + deduped, so the full ~1500-entry union table is never built
+        -- in Lua (that build was the worst single PSRAM fragmenter on a busy mesh).
+        local cap = scan_msgs and 60 or 12
         local names, seen = {}, {}
-        local ok, contacts = pcall(_mesh_get_contacts, show_archived)
-        if ok and contacts then
-            for _, c in ipairs(contacts) do
-                if c.name then
-                    local lk = c.name:lower()
-                    if not seen[lk] and lk:find(q, 1, true) then
-                        seen[lk] = true
-                        names[#names + 1] = c.name
-                        if #names >= 12 and not scan_msgs then break end
-                    end
+        local ok, matches = pcall(_mesh_search_contact_names, q, show_archived, cap)
+        if ok and type(matches) == "table" then
+            for _, nm in ipairs(matches) do
+                local lk = nm:lower()
+                if not seen[lk] then
+                    seen[lk] = true
+                    names[#names + 1] = nm
                 end
             end
-        end
-        table.sort(names, function(a, b) return a:lower() < b:lower() end)
+        end        table.sort(names, function(a, b) return a:lower() < b:lower() end)
         if scan_msgs then
             render_results(names, "Scanning messages...")
             scan_message_senders(q, names, seen)
@@ -3293,6 +3348,78 @@ end
 -- ---------------------------------------------------------------------------
 -- Settings screen
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- Controls / help screen (text mirrors the README's "Map App" section)
+-- ---------------------------------------------------------------------------
+local help_overlay = nil
+
+local function close_map_help()
+    if help_overlay then
+        _nav_clear()  -- remove gridnav before delete (avoids use-after-free)
+        help_overlay:delete()
+        help_overlay = nil
+        lvgl.group.focus_obj(root)
+    end
+end
+
+local function show_map_help()
+    if help_overlay then return end
+
+    help_overlay = root:Object({
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#1a1a2e", bg_opa = 255,
+        pad_all = 8, border_width = 0,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    })
+
+    -- Close first so gridnav focuses it at the top (the screen opens scrolled
+    -- to the top); the help text below scrolls with touch.
+    local back_btn = help_overlay:Button({ w = W - 16, h = 30 })
+    back_btn:Label({ text = "Close", align = lvgl.ALIGN.CENTER })
+    back_btn:onClicked(function() close_map_help() end)
+
+    help_overlay:Label({
+        text = "Map Controls", text_color = "#FFFFFF", w = lvgl.PCT(100), h = 22,
+    })
+
+    local function section(title, body)
+        help_overlay:Label({ text = title, text_color = "#88AAFF", w = lvgl.PCT(100) })
+        help_overlay:Label({ text = body, text_color = "#CCCCCC", w = lvgl.PCT(100) })
+    end
+
+    section("Keys",
+        "h  -  center on home (own GPS)\n" ..
+        "o / +  -  zoom in\n" ..
+        "i / -  -  zoom out\n" ..
+        "Space  -  stop scrolling\n" ..
+        "Enter  -  select contact / stop scrolling\n" ..
+        "c  -  cycle archived-contact page\n" ..
+        "q  -  quit (closes a popup first)\n" ..
+        "Trackball  -  pan the map")
+
+    section("Contacts",
+        "Long-press a marker (touch), or center the trackball on it and " ..
+        "press Enter, to see its name, type, distance, hop count and last seen.")
+
+    section("Meshprint",
+        "Run a meshprint on a message's sender to capture its 1st/2nd-hop " ..
+        "repeaters and triangulate the sender's rough location. The more mesh " ..
+        "data you have, the better the result.")
+
+    section("Offline tiles",
+        "In Settings, download map tiles for offline use - pick an area size " ..
+        "and zoom range. Tiles are cached to the SD card.")
+
+    -- 'q' / ESC closes the help. While this overlay is the gridnav scope, root
+    -- (which owns the map's key handler) isn't focused — so handle the key on
+    -- the scope itself, the same idiom the messenger's nav.list uses.
+    help_overlay:onevent(lvgl.EVENT.KEY, function()
+        local k = lvgl.indev.get_act():get_key()
+        if k == 113 or k == 27 then close_map_help() end
+    end)
+    _nav_setup(help_overlay, GRIDNAV_ROLLOVER)
+end
+
 local settings_overlay = nil
 
 local function close_settings_screen()
@@ -3389,11 +3516,25 @@ local function show_settings_screen()
         show_precache_screen()
     end)
 
+    -- Controls / help (info mirrors the README)
+    local help_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    help_btn:Label({ text = "Controls / help...", align = lvgl.ALIGN.LEFT_MID })
+    help_btn:onClicked(function()
+        close_settings_screen()
+        show_map_help()
+    end)
+
     -- Back to map
     local back_btn = settings_overlay:Button({ w = W - 16, h = 32 })
     back_btn:Label({ text = "Close", align = lvgl.ALIGN.CENTER })
     back_btn:onClicked(function() close_settings_screen() end)
 
+    -- 'q' / ESC closes the menu (the gridnav scope owns the keys while it's
+    -- open, so root's key handler can't see them).
+    settings_overlay:onevent(lvgl.EVENT.KEY, function()
+        local k = lvgl.indev.get_act():get_key()
+        if k == 113 or k == 27 then close_settings_screen() end
+    end)
     _nav_setup(settings_overlay, GRIDNAV_ROLLOVER)
 end
 
@@ -3436,7 +3577,7 @@ local function reposition_tiles()
     end
     -- anim/meshprint are screen-sized (few elements): redraw against the new view.
     if anim.active and anim_canvas then redraw_anim_canvas() end
-    if meshprint.active and meshprint_canvas then redraw_meshprint_canvas() end
+    if meshprint.active and anim_canvas then redraw_meshprint_canvas() end
 end
 
 -- Momentum constants (shared by trackball and touch)
@@ -3497,6 +3638,23 @@ local function shutdown()
         meshprint.scan_timer = nil
     end
     pcall(function() messages:onAnyMessage(nil) end)  -- release the hub slot
+    -- Free the contiguous 2MB tile pool. HIDE the tile widgets first so nothing
+    -- draws from the pool memory between the free and go_home's (deferred) widget
+    -- deletion. _tile_pool_free also drops the image cache (icons re-decode).
+    for _, img in ipairs(tile_imgs) do
+        pcall(function() img:add_flag(lvgl.FLAG.HIDDEN) end)
+    end
+    pcall(_tile_pool_free)
+    -- Release the cached 500-contact Lua table (~388KB, pinned in the registry by
+    -- _mesh_get_contacts). The Map is one of only two consumers; dropping it on
+    -- close stops it lingering and fragmenting the heap for the next heavy app.
+    -- go_home's collectgarbage reclaims it. Rebuilt on demand next time it's used.
+    pcall(_mesh_drop_contacts_cache)
+    -- Tear down the Core-1 tile worker: close its keep-alive TLS session AND free
+    -- its 16KB INTERNAL stack (the task self-deletes). That 16KB is what drops the
+    -- largest contiguous internal block below what a heavy app (Doom) needs for
+    -- its own task stack right after the Map. Recreated on the next tile fetch.
+    pcall(_tile_fetch_close)
     apps.go_home()   -- manager: _nav_clear, delete tracked timers, then the root
 end
 
@@ -3527,7 +3685,9 @@ root:onevent(lvgl.EVENT.KEY, function()
             end
         end
     elseif key == lvgl.KEY.ESC or key == 27 or key == 113 then -- ESC / q
-        if replay_overlay then
+        if help_overlay then
+            close_map_help()
+        elseif replay_overlay then
             close_replay_screen()
         elseif settings_overlay then
             close_settings_screen()
@@ -3546,6 +3706,8 @@ root:onevent(lvgl.EVENT.KEY, function()
         set_zoom(map.zoom - 1)
     elseif key == 104 then -- h
         center_on_self()
+    elseif key == 99 then -- c: cycle the archive page (same as the on-map button)
+        if show_archived and not meshprint.active and arch_cycle then arch_cycle() end
     elseif key == 32 then -- space
         brake()
     end
