@@ -1,7 +1,6 @@
 local lvgl = require("lvgl")
 local clock_fmt = require("lib/clock_fmt")
 local messages = require("lib/mesh/messages")
-local sound = require("lib/sound")
 
 local M = {}
 
@@ -89,35 +88,10 @@ local sat_tick_max = 150
 local sat_tick = sat_tick_max - 15 --we want gps to update the first time after the gps has a fix
 local unread = 0
 local unread_label
-local blink_timer = nil
-local notify_melody = nil
 
-local function kbd_blink_notify()
-    if not _notify_kbd_get() then return end
-    if blink_timer then return end
-    local timed_out = _kbd_is_timed_out and _kbd_is_timed_out()
-    local saved = timed_out and 0 or _kbd_get_brightness()
-    local step = 0
-    blink_timer = lvgl.Timer{
-        period = 150,
-        cb = function(t)
-            step = step + 1
-            if step > 6 then
-                pcall(_kbd_set_brightness_temp, saved)
-                t:delete()
-                blink_timer = nil
-                return
-            end
-            local val = (step % 2 == 1) and 255 or 0
-            pcall(_kbd_set_brightness_temp, val)
-        end,
-    }
-end
-
-local function sound_notify()
-    if not _notify_sound_get() then return end
-    notify_melody:play()
-end
+-- DM / @mention alerts (melody + keyboard blink) are C-side now (notify.cpp,
+-- triggered from the mesh RX handlers) so they fire even while Lua is torn
+-- down for an ELF run. The topbar only owns the unread badge.
 
 function M.updateUnread()
     unread = messages:countUnread()  -- O(threads) sum of the unread counters
@@ -134,13 +108,6 @@ function M.create()
     -- Messenger app is the only consumer of the history and calls loadPersisted()
     -- itself on open; C++ persists every message before dispatch, so deferring the
     -- load loses nothing (and the unread badge is unaffected — it's counter-based).
-
-    notify_melody = sound.generateMelody({
-        {freq=523, ms=150}, {freq=0, ms=30},
-        {freq=659, ms=150}, {freq=0, ms=30},
-        {freq=784, ms=150}, {freq=0, ms=30},
-        {freq=1047, ms=300},
-    }, { attack = 5, decay = 30, sustain = 0.6, release = 30 })
 
     bar = lvgl.Object({
         flex = { flex_direction = "row", flex_wrap = "nowrap", justify_content = "space-between" },
@@ -170,16 +137,8 @@ function M.create()
 
     messages:onDirectMessageFirst(function(msg)
         M.updateUnread()
-        kbd_blink_notify()
-        sound_notify()
     end)
 
-    messages:onMessageMentionFirst(function(msg)
-        kbd_blink_notify()
-        sound_notify()
-    end)
-
-    
     updateTimer = lvgl.Timer{
         period = 1000,
         cb = function(t)

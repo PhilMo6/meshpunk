@@ -324,8 +324,11 @@ static void poll_input(bool kb_only = false) {
 //
 // I2C safety: _launch_elf blocks loopTask for the whole module run, so the
 // firmware's own keyboard scanning (the loop() path — untouched) is dormant;
-// this task is the sole I2C keyboard user between elf_input_start/stop, and
-// stop() returns only once it has fully exited, before loopTask resumes.
+// this task is the only keyboard-matrix READER between elf_input_start/stop,
+// and stop() returns only once it has fully exited, before loopTask resumes.
+// The notification blink (notify.cpp, mesh task) may WRITE the backlight
+// brightness concurrently — Wire's per-transaction HAL lock serializes it
+// against the matrix reads here.
 //
 // The keyboard is read every tick (100Hz); the trackball's momentum model is
 // integrated only every 3rd tick (~33Hz) so its tuned feel is unchanged by
@@ -1437,9 +1440,12 @@ int elf_host_run_pending(void) {
         elf_input_start();
 
         // Run the module on a dedicated large-stack task pinned to Core 0
-        // (the UI core; LVGL is suspended and mesh is paused, so Core 0 is
-        // free). This loopTask blocks until the module returns — IDLE0 still
-        // runs between the module's per-frame yields, feeding the watchdog.
+        // (the UI core; LVGL is idle and Lua is torn down, so Core 0 is
+        // free). The mesh task keeps running on Core 1 the whole time —
+        // messages still arrive, persist, and raise the C-side notification
+        // alert (notify.cpp). This loopTask blocks until the module returns —
+        // IDLE0 still runs between the module's per-frame yields, feeding the
+        // watchdog.
         // Try progressively smaller stacks until one fits in available RAM.
         SemaphoreHandle_t done = xSemaphoreCreateBinary();
         elf_run_ctx ctx = { mod, argc, argv, -1, done };

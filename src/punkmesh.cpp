@@ -5,6 +5,7 @@
 #include <SHA256.h>
 #include "meshpunk_sync.h"
 #include "ble_companion.h"
+#include "notify.h"
 
 // Shared-SPI-bus lock pair (defined in main.cpp).
 // sd_spi_take()    — acquire spi_bus_mutex before any SD operation.
@@ -697,6 +698,116 @@ void PunkMesh::saveChannels()
     }
 
     if (is_sd) sd_spi_release();
+}
+
+// ── Per-channel notification modes ──────────────────────────────────────────
+// Stored by channel NAME in /channel_notify ("name \t mode" lines). Only
+// non-default modes are written; a missing entry means NOTIFY_CHAN_MENTION
+// (the pre-existing behavior). See the member comment in punkmesh.h.
+
+void PunkMesh::loadChannelNotify()
+{
+    _chan_notify_count = 0;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/channel_notify");
+    if (_storage->exists(path.c_str()))
+    {
+        File file = _storage->open(path.c_str());
+        if (file)
+        {
+            char line[64];
+            while (file.available() && _chan_notify_count < MAX_CHANNEL_NOTIFY_PREFS)
+            {
+                int len = 0;
+                while (file.available() && len < (int)sizeof(line) - 1) {
+                    char ch = file.read();
+                    if (ch == '\n' || ch == '\r') break;
+                    line[len++] = ch;
+                }
+                line[len] = '\0';
+                if (len == 0) continue;
+
+                // Format: name \t mode
+                char* tab = strchr(line, '\t');
+                if (!tab) continue;
+                *tab = '\0';
+                int mode = atoi(tab + 1);
+                if (line[0] == '\0' || mode < 0 || mode > NOTIFY_CHAN_ALL) continue;
+                if (mode == NOTIFY_CHAN_MENTION) continue;  // default needs no entry
+
+                ChannelNotifyPref& p = _chan_notify[_chan_notify_count++];
+                memset(&p, 0, sizeof(p));
+                strncpy(p.name, line, sizeof(p.name) - 1);
+                p.mode = (uint8_t)mode;
+            }
+            file.close();
+        }
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+void PunkMesh::saveChannelNotify()
+{
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/channel_notify");
+    File file = _storage->open(path.c_str(), "w", true);
+    if (file)
+    {
+        for (int i = 0; i < _chan_notify_count; i++)
+            file.printf("%s\t%d\n", _chan_notify[i].name, _chan_notify[i].mode);
+        file.close();
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+uint8_t PunkMesh::getChannelNotifyMode(const char* name)
+{
+    if (!name || !name[0]) return NOTIFY_CHAN_MENTION;
+    for (int i = 0; i < _chan_notify_count; i++) {
+        if (strcmp(_chan_notify[i].name, name) == 0) return _chan_notify[i].mode;
+    }
+    return NOTIFY_CHAN_MENTION;
+}
+
+void PunkMesh::setChannelNotifyMode(const char* name, uint8_t mode)
+{
+    if (!name || !name[0]) return;
+    if (mode > NOTIFY_CHAN_ALL) mode = NOTIFY_CHAN_MENTION;
+
+    int found = -1;
+    for (int i = 0; i < _chan_notify_count; i++) {
+        if (strcmp(_chan_notify[i].name, name) == 0) { found = i; break; }
+    }
+
+    if (mode == NOTIFY_CHAN_MENTION) {
+        // Default mode = no entry; drop an existing one.
+        if (found >= 0) {
+            _chan_notify[found] = _chan_notify[_chan_notify_count - 1];
+            _chan_notify_count--;
+            saveChannelNotify();
+        }
+        return;
+    }
+
+    if (found >= 0) {
+        if (_chan_notify[found].mode == mode) return;   // no change, skip the write
+    } else {
+        if (_chan_notify_count >= MAX_CHANNEL_NOTIFY_PREFS) {
+            SLog.println("[NOTIFY] channel-notify table full, pref not saved");
+            return;
+        }
+        found = _chan_notify_count++;
+        memset(&_chan_notify[found], 0, sizeof(_chan_notify[found]));
+        strncpy(_chan_notify[found].name, name, sizeof(_chan_notify[found].name) - 1);
+    }
+    _chan_notify[found].mode = mode;
+    saveChannelNotify();
 }
 
 // Slot of the channel named "Public", or -1 if there isn't one. Public is treated
@@ -2521,6 +2632,10 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
         }
     }
 
+    // C-side alert (melody + kbd blink). Fires from this mesh-task context so
+    // DMs still notify while Lua is torn down for an ELF run.
+    notify_message_alert();
+
 #if BLE_COMPANION_ENABLED
     if (ble_companion) ble_companion->queueReceivedDM(from, pkt, sender_timestamp, text);
 #endif
@@ -2602,6 +2717,21 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
         if (xQueueSend(rx_event_queue, &ev, 0) != pdTRUE) {
             SLog.println("[MESH RX] WARNING: rx_event_queue full, dropping channel msg");
         }
+    }
+
+    // C-side alert, gated by the channel's notify mode. The mode is keyed by
+    // NAME — the slot is only a transient handle to resolve the live name at
+    // this instant. Unknown channels surface under Public in the UI, so they
+    // follow Public's mode. Own echoes never alert.
+    if (strcmp(sender_name, _prefs.node_name) != 0) {
+        const char* notify_name = "Public";
+        ChannelDetails ncd;
+        if (channel_idx >= 0 && getChannel(channel_idx, ncd) && ncd.name[0] != '\0')
+            notify_name = ncd.name;
+        uint8_t nmode = getChannelNotifyMode(notify_name);
+        if (nmode == NOTIFY_CHAN_ALL ||
+            (nmode == NOTIFY_CHAN_MENTION && contains_mention(norm_msg, _prefs.node_name)))
+            notify_message_alert();
     }
 
 #if BLE_COMPANION_ENABLED
@@ -3274,6 +3404,7 @@ void PunkMesh::begin()
     // Restore saved channels (slots 1-7) FIRST — this also sets _public_deleted
     // from the channels-file "pubdel" marker, so we know whether to recreate Public.
     loadChannels();
+    loadChannelNotify();
 
     if (!_public_deleted) {
         ChannelDetails* pub = addChannel("Public", PUBLIC_GROUP_PSK);

@@ -63,6 +63,31 @@ btn_snd:onClicked(function()
     status.text = "Sound: " .. (snd_enabled and "ON" or "OFF")
 end)
 
+-- ── Per-channel mode ────────────────────────────────────────────────────────
+-- 0 = Off, 1 = Mentions only (default), 2 = All messages. Stored C-side by
+-- channel NAME (slots shift when channels are added/removed). DMs always alert.
+content:Label { text = "-- Channels --", w = lvgl.PCT(100), h = 16 }
+
+local MODE_NAMES = { [0] = "Off", [1] = "Mentions", [2] = "All" }
+
+local channels = _mesh_get_channels()
+if #channels == 0 then
+    content:Label { text = "(no channels)", w = lvgl.PCT(100), h = 16 }
+end
+for _, ch in ipairs(channels) do
+    content:Label { text = ch.name, w = lvgl.PCT(45), h = 30 }
+    local btn = content:Button { w = lvgl.PCT(50), h = 30 }
+    local lbl = btn:Label { align = lvgl.ALIGN.CENTER }
+    local mode = _notify_channel_get(ch.name)
+    lbl.text = MODE_NAMES[mode] or "Mentions"
+    btn:onClicked(function()
+        mode = (mode + 1) % 3
+        _notify_channel_set(ch.name, mode)
+        lbl.text = MODE_NAMES[mode]
+        status.text = ch.name .. ": " .. MODE_NAMES[mode]
+    end)
+end
+
 -- ── Back ────────────────────────────────────────────────────────────────────
 back_btn:onClicked(function()
     apps.go_home()

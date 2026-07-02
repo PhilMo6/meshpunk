@@ -42,6 +42,12 @@ struct ToneParams {
     float        fm_index      = 0.0f;
 };
 
+// One melody note for the C-array renderer. freq_hz == 0 is a rest.
+struct MelodyNote {
+    uint16_t freq_hz;
+    uint16_t ms;
+};
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void sound_init(Audio* audio_ptr, void (*prefs_save_fn)());
@@ -50,6 +56,7 @@ int  sound_create_tone(const ToneParams& p);
 int  sound_create_tone(uint16_t freq_hz, uint16_t duration_ms);
 int  sound_create_chord(const uint16_t* freqs, int freq_count, const ToneParams& base);
 int  sound_create_melody(lua_State* L);
+int  sound_create_melody_notes(const MelodyNote* notes, int count, const ToneParams& base);
 int  sound_load_file(lua_State* L);
 void sound_play(int id);
 void sound_stop(int id);

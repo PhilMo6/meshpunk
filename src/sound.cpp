@@ -437,65 +437,17 @@ int sound_create_chord(const uint16_t* freqs, int freq_count, const ToneParams& 
 
 // ── Melody generation ─────────────────────────────────────────────────────────
 
-int sound_create_melody(lua_State* L) {
-    if (!lua_istable(L, 1)) return -1;
-    int note_count = (int)lua_rawlen(L, 1);
-    if (note_count <= 0 || note_count > 256) return -1;
-
-    // Parse shared opts from arg 2
-    ToneParams base{};
-    if (lua_istable(L, 2)) {
-        lua_getfield(L, 2, "waveform");
-        if (lua_isstring(L, -1)) {
-            const char* w = lua_tostring(L, -1);
-            if      (strcmp(w, "square")   == 0) base.waveform = WAVE_SQUARE;
-            else if (strcmp(w, "saw")      == 0) base.waveform = WAVE_SAW;
-            else if (strcmp(w, "triangle") == 0) base.waveform = WAVE_TRIANGLE;
-            else if (strcmp(w, "noise")    == 0) base.waveform = WAVE_NOISE;
-        }
-        lua_pop(L, 1);
-
-        lua_getfield(L, 2, "attack");
-        if (lua_isnumber(L, -1)) base.attack_ms = (uint16_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, 2, "decay");
-        if (lua_isnumber(L, -1)) base.decay_ms = (uint16_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, 2, "sustain");
-        if (lua_isnumber(L, -1)) {
-            base.sustain_level = (float)lua_tonumber(L, -1);
-            if (base.sustain_level < 0.0f) base.sustain_level = 0.0f;
-            if (base.sustain_level > 1.0f) base.sustain_level = 1.0f;
-        }
-        lua_pop(L, 1);
-        lua_getfield(L, 2, "release");
-        if (lua_isnumber(L, -1)) base.release_ms = (uint16_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 2, "fm_ratio");
-        if (lua_isnumber(L, -1)) {
-            base.fm_ratio = (float)lua_tonumber(L, -1);
-            if (base.fm_ratio < 0.0f) base.fm_ratio = 0.0f;
-            if (base.fm_ratio > 32.0f) base.fm_ratio = 32.0f;
-        }
-        lua_pop(L, 1);
-        lua_getfield(L, 2, "fm_index");
-        if (lua_isnumber(L, -1)) {
-            base.fm_index = (float)lua_tonumber(L, -1);
-            if (base.fm_index < 0.0f) base.fm_index = 0.0f;
-            if (base.fm_index > 20.0f) base.fm_index = 20.0f;
-        }
-        lua_pop(L, 1);
-    }
+// C-array renderer — the synth core shared by the Lua binding below and C
+// callers (the boot-time notification melody in notify.cpp, which must not
+// depend on a lua_State). Renders all notes into one PSRAM PCM buffer.
+int sound_create_melody_notes(const MelodyNote* notes, int count, const ToneParams& base) {
+    if (!notes || count <= 0 || count > 256) return -1;
 
     // First pass: compute total frames
     const uint32_t SR = TONE_SR;
     uint32_t total_frames = 0;
-    for (int n = 1; n <= note_count; n++) {
-        lua_rawgeti(L, 1, n);
-        lua_getfield(L, -1, "ms");
-        int ms = lua_isnumber(L, -1) ? (int)lua_tointeger(L, -1) : 200;
-        lua_pop(L, 2);
+    for (int n = 0; n < count; n++) {
+        int ms = notes[n].ms;
         if (ms < 1) ms = 1;
         if (ms > 10000) ms = 10000;
         total_frames += (SR * ms) / 1000;
@@ -507,18 +459,9 @@ int sound_create_melody(lua_State* L) {
 
     // Second pass: render each note
     uint32_t write_pos = 0;
-    for (int n = 1; n <= note_count; n++) {
-        lua_rawgeti(L, 1, n);
-
-        lua_getfield(L, -1, "freq");
-        int freq = lua_isnumber(L, -1) ? (int)lua_tointeger(L, -1) : 0;
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "ms");
-        int ms = lua_isnumber(L, -1) ? (int)lua_tointeger(L, -1) : 200;
-        lua_pop(L, 1);
-
-        lua_pop(L, 1); // pop note table
+    for (int n = 0; n < count; n++) {
+        int freq = notes[n].freq_hz;
+        int ms   = notes[n].ms;
 
         if (ms < 1) ms = 1;
         if (ms > 10000) ms = 10000;
@@ -630,6 +573,83 @@ int sound_create_melody(lua_State* L) {
     obj->tone_loop    = false;
     sound_obj_add(obj);
     return obj->id;
+}
+
+// Lua-facing wrapper: parses the note tables + shared opts into plain arrays,
+// then delegates to the C renderer above.
+int sound_create_melody(lua_State* L) {
+    if (!lua_istable(L, 1)) return -1;
+    int note_count = (int)lua_rawlen(L, 1);
+    if (note_count <= 0 || note_count > 256) return -1;
+
+    // Parse shared opts from arg 2
+    ToneParams base{};
+    if (lua_istable(L, 2)) {
+        lua_getfield(L, 2, "waveform");
+        if (lua_isstring(L, -1)) {
+            const char* w = lua_tostring(L, -1);
+            if      (strcmp(w, "square")   == 0) base.waveform = WAVE_SQUARE;
+            else if (strcmp(w, "saw")      == 0) base.waveform = WAVE_SAW;
+            else if (strcmp(w, "triangle") == 0) base.waveform = WAVE_TRIANGLE;
+            else if (strcmp(w, "noise")    == 0) base.waveform = WAVE_NOISE;
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "attack");
+        if (lua_isnumber(L, -1)) base.attack_ms = (uint16_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "decay");
+        if (lua_isnumber(L, -1)) base.decay_ms = (uint16_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "sustain");
+        if (lua_isnumber(L, -1)) {
+            base.sustain_level = (float)lua_tonumber(L, -1);
+            if (base.sustain_level < 0.0f) base.sustain_level = 0.0f;
+            if (base.sustain_level > 1.0f) base.sustain_level = 1.0f;
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "release");
+        if (lua_isnumber(L, -1)) base.release_ms = (uint16_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "fm_ratio");
+        if (lua_isnumber(L, -1)) {
+            base.fm_ratio = (float)lua_tonumber(L, -1);
+            if (base.fm_ratio < 0.0f) base.fm_ratio = 0.0f;
+            if (base.fm_ratio > 32.0f) base.fm_ratio = 32.0f;
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "fm_index");
+        if (lua_isnumber(L, -1)) {
+            base.fm_index = (float)lua_tonumber(L, -1);
+            if (base.fm_index < 0.0f) base.fm_index = 0.0f;
+            if (base.fm_index > 20.0f) base.fm_index = 20.0f;
+        }
+        lua_pop(L, 1);
+    }
+
+    // Copy the note tables into a plain array for the renderer.
+    MelodyNote notes[256];
+    for (int n = 1; n <= note_count; n++) {
+        lua_rawgeti(L, 1, n);
+
+        lua_getfield(L, -1, "freq");
+        int freq = lua_isnumber(L, -1) ? (int)lua_tointeger(L, -1) : 0;
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "ms");
+        int ms = lua_isnumber(L, -1) ? (int)lua_tointeger(L, -1) : 200;
+        lua_pop(L, 2);   // ms value + note table
+
+        if (freq < 0) freq = 0;
+        if (freq > 20000) freq = 20000;
+        if (ms < 0) ms = 0;
+        if (ms > 10000) ms = 10000;
+        notes[n - 1].freq_hz = (uint16_t)freq;
+        notes[n - 1].ms      = (uint16_t)ms;
+    }
+
+    return sound_create_melody_notes(notes, note_count, base);
 }
 
 // ── File loading ──────────────────────────────────────────────────────────────

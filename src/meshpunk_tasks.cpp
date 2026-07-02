@@ -18,6 +18,7 @@
 #include "meshpunk_sync.h"
 #include "punkmesh.h"
 #include "ble_companion.h"
+#include "notify.h"
 #include <esp_heap_caps.h>
 
 extern PunkMesh* the_mesh;
@@ -29,6 +30,11 @@ static void mesh_task_body(void *param) {
   SLog.printf("[TASK] mesh_task starting on core=%d\n", xPortGetCoreID());
 
   for (;;) {
+    // Keyboard-blink notification state machine. Single-task by construction:
+    // armed by notify_message_alert() inside the RX handlers below, stepped
+    // here. Runs before the paused check so an in-flight blink still finishes.
+    notify_tick();
+
     // When paused (e.g. during ELF module execution), skip all work
     // but keep yielding so the watchdog is fed.
     if (mesh_task_paused) {

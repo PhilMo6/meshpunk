@@ -250,6 +250,21 @@ public:
   bool isPublicDeleted() const { return _public_deleted; }
   int  publicChannelIdx();   // slot of the channel named "Public", or -1 if none
 
+  // ── Per-channel notification mode ───────────────────────────
+  // NotifyChannelMode (notify.h), keyed by channel NAME — slots shift when
+  // channels are added/removed, so a slot-keyed pref could silently attach to
+  // the wrong channel. Missing entry = NOTIFY_CHAN_MENTION (the default).
+  // Entries persist for deleted channels on purpose: re-adding a channel
+  // under the same name restores its preference.
+  struct ChannelNotifyPref { char name[32]; uint8_t mode; };
+  static const int MAX_CHANNEL_NOTIFY_PREFS = 40;
+  ChannelNotifyPref _chan_notify[MAX_CHANNEL_NOTIFY_PREFS];
+  int _chan_notify_count = 0;
+  void    loadChannelNotify();
+  void    saveChannelNotify();
+  uint8_t getChannelNotifyMode(const char* name);
+  void    setChannelNotifyMode(const char* name, uint8_t mode);
+
   // ── Unified send + persist helpers ──────────────────────────
   struct SendResult {
     int code;              // MSG_SEND_FAILED / MSG_SEND_SENT_FLOOD / MSG_SEND_SENT_DIRECT

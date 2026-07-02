@@ -18,6 +18,7 @@
 #include "meshpunk_sync.h"
 #include "Audio.h"
 #include "sound.h"
+#include "notify.h"
 #include "ble_companion.h"
 #include "elf_host.h"
 #include "meshpunk_fs.h"
@@ -170,6 +171,14 @@ static bool     kbd_timed_out        = false;
 // ── Notification Preferences ─────────────────────────────────────────────
 static bool     notify_kbd_enabled   = true;   // keyboard blink on DM / @mention
 static bool     notify_sound_enabled = true;   // melody on DM / @mention
+
+// Accessors for notify.cpp (the C-side alert path) — these globals are
+// file-static, and the alert fires from the mesh task, so it reads the live
+// values through here rather than snapshotting them.
+bool    firmware_notify_kbd_enabled()   { return notify_kbd_enabled; }
+bool    firmware_notify_sound_enabled() { return notify_sound_enabled; }
+uint8_t firmware_kbd_brightness()       { return kbd_brightness; }
+bool    firmware_kbd_timed_out()        { return kbd_timed_out; }
 
 // ── Topbar Preferences ─────────────────────────────────────────────
 static bool     topbar_transparant = false;   // can you see the background though the topbar
@@ -5206,6 +5215,31 @@ void setupLuaVGL() {
     lua_pushboolean(L, notify_sound_enabled);
     return 1;
   });
+  // Per-channel notification mode, keyed by channel NAME (see notify.h):
+  // 0 = off, 1 = mention-only (default), 2 = every message.
+  lua_register(L, "_notify_channel_get", [](lua_State* L) -> int {
+    const char* name = luaL_checkstring(L, 1);
+    uint8_t mode = NOTIFY_CHAN_MENTION;
+    if (the_mesh) {
+      MESH_LOCK();
+      mode = the_mesh->getChannelNotifyMode(name);
+      MESH_UNLOCK();
+    }
+    lua_pushinteger(L, mode);
+    return 1;
+  });
+  lua_register(L, "_notify_channel_set", [](lua_State* L) -> int {
+    const char* name = luaL_checkstring(L, 1);
+    int mode = (int)luaL_checkinteger(L, 2);
+    if (mode < 0 || mode > NOTIFY_CHAN_ALL) mode = NOTIFY_CHAN_MENTION;
+    if (the_mesh) {
+      MESH_LOCK();
+      the_mesh->setChannelNotifyMode(name, (uint8_t)mode);
+      MESH_UNLOCK();
+    }
+    lua_pushinteger(L, mode);
+    return 1;
+  });
 
   // ── BLE companion ──────────────────────────────────────────────────────────
 #if BLE_COMPANION_ENABLED
@@ -6228,6 +6262,7 @@ void setup() {
   audio = new Audio();
   audio->setPinout(TDECK_I2S_BCK, TDECK_I2S_WS, TDECK_I2S_DOUT);
   sound_init(audio, firmware_prefs_save);
+  notify_init();   // pre-render the notification melody (C-owned, survives lua_close)
   audio->setVolume(sound_get_muted() ? 0 : sound_get_volume());
   SLog.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
   log_boot_mem("after audio");

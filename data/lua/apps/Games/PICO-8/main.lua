@@ -198,7 +198,7 @@ local function load_config()
     f:close()
     if not text then return false end
     for line in text:gmatch("[^\r\n]+") do
-        local id, k1s, k2s = line:match("^(%w+)=(%S+),(%S+)$")
+        local id, k1s, k2s = line:match("^([%w_]+)=(%S+),(%S+)$")
         if id and bindings[id] then
             bindings[id].key1 = (k1s ~= "--") and tonumber(k1s, 16) or nil
             bindings[id].key2 = (k2s ~= "--") and tonumber(k2s, 16) or nil
