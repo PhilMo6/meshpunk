@@ -24,8 +24,8 @@
 ## Installation 
 
 1. Download the release file you want to install from the release page.
-- If a first time install or you want to update your filesystem then download the -merged.bin file
-- If you just want to update the MeshPunk firmware and leave the filesystem then download the -firmware.bin
+- For a first-time install download the -merged.bin file
+- For updates download the -firmware.bin: it updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept)
 2. Go to https://meshcore.io/flasher scroll to bottom and click on Custom Firmware
 3. Select the firmware release you downloaded. If it is the merged firmware it will erase your filesystem to replace it with the Meshpunk one! The flasher will give you a warning about this.
 4. Flash the firmware and wait.
@@ -42,14 +42,15 @@ Pico8 carts go onto the sd card in either /p8carts or /meshpunk/apps/Games/PICO-
 MeshPunk can also be installed through [bmorcelli's Launcher](https://github.com/bmorcelli/Launcher) — a multi-firmware boot menu that lets you keep several firmwares on one device and choose which to boot. If you run the Launcher, install the **`-launcher.bin`** release, not the other files.
 
 1. Download `meshpunk-<version>-launcher.bin` from the releases page.
-2. Copy it to a FAT32-formatted SD card (or upload it through the Launcher's WebUI).
-3. In the Launcher, choose to install firmware from the SD card (or WebUI) and select the `-launcher.bin` file.
-4. The Launcher reads the embedded partition table, creates the app and filesystem partitions, copies both in, and boots MeshPunk with its filesystem ready.
+2. Install it through the Launcher: from a FAT32 SD card, through the WebUI, or as a direct download URL / OTA.
+3. On the first boot MeshPunk sets up its filesystem and unpacks its bundled files (about a minute). After that it boots normally.
 
 Notes:
 
-- Install **only** the `-launcher.bin` build through the Launcher. The `-merged.bin` is a full-flash image, and `-firmware.bin` / `-littlefs.bin` are app- or filesystem-only — none of those install correctly through the Launcher.
-- The Launcher build ships a 6 MB filesystem (the standalone builds use 12 MB) so it fits alongside the Launcher and any other firmwares. The Launcher sizes the actual filesystem partition to the free space available on your device.
+- The MeshPunk app carries its own files and populates its filesystem by itself, so no SPIFFS copy options or extra steps are needed in the Launcher.
+- `-firmware.bin` (the bare app) also installs through the Launcher — MeshPunk creates its own data partition if none exists. `-launcher.bin` is preferred since it declares the partition layout up front.
+- Don't install the `-merged.bin` through the Launcher; that one is a full-flash image for the web flasher.
+- Works with Launcher 2.7.2 and newer.
 - This path is only for devices running the Launcher. For a normal install, use the flasher steps above.
 
 ## Map App
@@ -115,6 +116,14 @@ The more data you have the better your results will be!
    ```
    pio run --target uploadfs
    ```
+7. To build release artifacts (written to `releases/`): the release env embeds
+   the `data/` tree into the app so the published binaries are self-contained
+   ```
+   pio run -e meshpunk_release
+   ```
+   If it reports missing littlefs, run `pio run -t buildfs` first; if the
+   firmware was already up to date, force the artifact step with
+   `pio run -e meshpunk_release -t mergebin`.
 
 ## VSCode hints
 

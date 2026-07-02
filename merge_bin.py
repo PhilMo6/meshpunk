@@ -1,14 +1,17 @@
+import hashlib
 import os
 import shutil
+import struct
 import subprocess
 import sys
 Import("env")
 
+# Flash offsets - MUST stay in lockstep with meshpunk_custom_16Mb.csv.
 OFFSETS = {
     "bootloader": "0x0000",
     "partitions": "0x8000",
     "firmware":   "0x10000",
-    "littlefs":   "0x410000",
+    "littlefs":   "0x590000",
 }
 
 def git_version(project_dir):
@@ -23,42 +26,34 @@ def git_version(project_dir):
 # All release artifacts land here.
 RELEASES_DIR_NAME = "releases"
 
-# Launcher build (bmorcelli/Launcher): the standalone 12 MB image won't fit
-# alongside the resident Launcher, so its merged image carries a LittleFS payload
-# sized to the current data/ contents plus a small margin (estimate_littlefs_size).
-LAUNCHER_FS_MARGIN =  512 * 1024            # small extra headroom over content
-LAUNCHER_FS_MIN    = 1024 * 1024            # never smaller than 1 MB
-LAUNCHER_FS_MAX    = 12 * 1024 * 1024       # cap / retry ceiling (full partition)
-# LittleFS geometry for ESP32 - must match what PlatformIO bakes the normal
-# image with, or the firmware's LittleFS.begin() won't mount it.
-LITTLEFS_PAGE  = 256
-LITTLEFS_BLOCK = 4096
+# Launcher build (bmorcelli/Launcher): a merged image of bootloader + table +
+# the RELEASE app only. The release app embeds the data/ tree (MESHPUNK_EMBED_PACK)
+# and extracts it into LittleFS on first boot, so no filesystem payload ships in
+# the image. The table still declares the data partition so the Launcher creates
+# it: the entry's offset lies beyond the end of the file, which every Launcher
+# version treats as "create the partition, copy nothing". Launcher <=2.7.2
+# ignores the label and creates "spiffs" (declared > 5 MB -> fill-remaining;
+# <= 5 MB would get a 1 MB partition, too small for extraction - keep the csv
+# spiffs partition above 5 MB). Launcher >2.7.2 honors the "assets" label and
+# creates it at the exact declared size. The firmware mounts "spiffs" first,
+# then falls back to "assets", covering both generations.
+LAUNCHER_FS_THRESHOLD = 0x500000  # Launcher's LAUNCHER_DEFAULT_SPIFFS_THRESHOLD
 
-def mklittlefs_path(env):
-    pkg = env.PioPlatform().get_package_dir("tool-mklittlefs")
-    if not pkg:
-        return None
-    for name in ("mklittlefs.exe", "mklittlefs"):
-        cand = os.path.join(pkg, name)
-        if os.path.isfile(cand):
-            return cand
-    return None
-
-def estimate_littlefs_size(data_dir, block=LITTLEFS_BLOCK):
-    # Rough LittleFS footprint of data_dir: each file rounds up to a block plus a
-    # metadata block, each directory a couple of metadata blocks. Deliberately
-    # conservative so mklittlefs rarely runs short; the build retries larger if so.
-    used = block  # superblock / root
-    for root, dirs, files in os.walk(data_dir):
-        used += 2 * block
-        for name in files:
-            try:
-                sz = os.path.getsize(os.path.join(root, name))
-            except OSError:
-                sz = 0
-            used += ((sz + block - 1) // block + 1) * block
-    size = max(used + LAUNCHER_FS_MARGIN, LAUNCHER_FS_MIN)
-    return ((size + block - 1) // block) * block
+def build_launcher_partition_table(fs_size):
+    # ESP32 partition table: 32-byte entries (magic 0x50AA, type, subtype,
+    # offset, size, 16-byte label, flags), MD5 entry, 0xFF padding to 0xC00.
+    # Offsets/sizes MUST stay in lockstep with meshpunk_custom_16Mb.csv.
+    entries = [
+        (0x01, 0x02, 0x9000,   0x5000,   b"nvs"),
+        (0x00, 0x00, 0x10000,  0x580000, b"app0"),
+        (0x01, 0x82, 0x590000, fs_size,  b"assets"),
+    ]
+    blob = b""
+    for ptype, subtype, offset, size, label in entries:
+        blob += struct.pack("<HBBII16sI", 0x50AA, ptype, subtype, offset, size,
+                            label.ljust(16, b"\x00"), 0)
+    blob += b"\xEB\xEB" + b"\xFF" * 14 + hashlib.md5(blob).digest()
+    return blob + b"\xFF" * (0xC00 - len(blob))
 
 def merge_bin(source, target, env):
     build_dir   = env.subst("$BUILD_DIR")
@@ -76,6 +71,15 @@ def merge_bin(source, target, env):
         "firmware":   os.path.join(build_dir, "firmware.bin"),
         "littlefs":   os.path.join(build_dir, "littlefs.bin"),
     }
+
+    # The littlefs image is identical across envs (same data/ + partition csv),
+    # so if this env hasn't run buildfs, reuse the dev env's image instead of
+    # requiring a second buildfs run.
+    if not os.path.isfile(bins["littlefs"]):
+        alt = os.path.join(os.path.dirname(build_dir), "meshpunk", "littlefs.bin")
+        if os.path.isfile(alt):
+            print("merge_bin: using littlefs.bin from dev env")
+            bins["littlefs"] = alt
 
     for name, path in bins.items():
         if not os.path.isfile(path):
@@ -104,75 +108,60 @@ def merge_bin(source, target, env):
     print("merge_bin: creating %s" % output)
     subprocess.check_call(cmd)
 
-    # App-only binary: the application image, flashed at the app offset (0x10000).
-    firmware_out = os.path.join(releases_dir, "meshpunk-%s-firmware.bin" % version)
-    shutil.copy2(bins["firmware"], firmware_out)
-    print("merge_bin: copied firmware (app) binary to %s" % firmware_out)
-
-    # Full filesystem image (the build's 12 MB littlefs, for flashing the FS alone).
+    # Full filesystem image (the build's littlefs, for flashing the FS alone).
     littlefs_out = os.path.join(releases_dir, "meshpunk-%s-littlefs.bin" % version)
     shutil.copy2(bins["littlefs"], littlefs_out)
     print("merge_bin: copied full littlefs image to %s" % littlefs_out)
 
-    # ---- Launcher build (bmorcelli/Launcher) ----------------------------------
-    # Launcher installs a MERGED image, NOT an app-only bin. updateFromSD() reads
-    # the partition table at offset 0x8000, creates the app + spiffs partitions it
-    # declares, and copies the app and the embedded filesystem payload into them.
-    # An app-only binary has no table -> Launcher makes no filesystem ("no
-    # filesystem" warning); a bare fs image gets mistaken for an app and errors.
-    # The normal 12 MB image is too big to sit beside the resident Launcher, so we
-    # emit a second merged image whose LittleFS payload is sized to the current
-    # data/ contents plus a small margin. The embedded table still declares the
-    # 12 MB spiffs (label "spiffs"), which exceeds Launcher's 5 MB threshold, so on
-    # install Launcher grows the real partition to the free space and patches the
-    # LittleFS superblock -- this payload is just the seed content.
-    data_dir   = os.path.join(project_dir, "data")
-    mklittlefs = mklittlefs_path(env)
-    if mklittlefs and os.path.isdir(data_dir):
-        launcher_fs = os.path.join(build_dir, "littlefs_launcher.bin")
-        fs_size = estimate_littlefs_size(data_dir)
-        while True:
-            fs_cmd = [
-                mklittlefs,
-                "-c", data_dir,
-                "-p", str(LITTLEFS_PAGE),
-                "-b", str(LITTLEFS_BLOCK),
-                "-s", str(fs_size),
-                launcher_fs,
-            ]
-            print("merge_bin: building Launcher fs payload (%.1f MB)"
-                  % (fs_size / (1024.0 * 1024.0)))
-            try:
-                subprocess.check_call(fs_cmd)
-                break
-            except subprocess.CalledProcessError:
-                if fs_size >= LAUNCHER_FS_MAX:
-                    print("merge_bin: data/ too large for Launcher fs image")
-                    raise
-                fs_size = min(fs_size + 1024 * 1024, LAUNCHER_FS_MAX)
-                print("merge_bin: fs image too small, retrying at %.1f MB"
-                      % (fs_size / (1024.0 * 1024.0)))
+    # Distribution artifacts below require the release env: its app embeds the
+    # data pack (MESHPUNK_EMBED_PACK) and is self-contained. A dev app has no
+    # pack, so publishing it as firmware.bin/launcher.bin would install with an
+    # empty filesystem.
+    if env["PIOENV"] != "meshpunk_release":
+        print("merge_bin: dev env - skipping firmware/launcher artifacts"
+              " (use 'pio run -e meshpunk_release' for release builds)")
+        print("merge_bin: done")
+        return
 
-        launcher_img = os.path.join(releases_dir, "meshpunk-%s-launcher.bin" % version)
-        launcher_cmd = [
-            sys.executable, esptool,
-            "--chip", "esp32s3",
-            "merge_bin",
-            "--target-offset", "0x0000",
-            "--output", launcher_img,
-            "--flash_mode", "keep",
-            "--flash_freq", "keep",
-            "--flash_size", "keep",
-            OFFSETS["bootloader"], bins["bootloader"],
-            OFFSETS["partitions"], bins["partitions"],
-            OFFSETS["firmware"],   bins["firmware"],
-            OFFSETS["littlefs"],   launcher_fs,
-        ]
-        print("merge_bin: creating Launcher image %s" % launcher_img)
-        subprocess.check_call(launcher_cmd)
-        print("merge_bin: Launcher image done (users install THIS file via Launcher)")
-    else:
-        print("merge_bin: skipped Launcher image (mklittlefs or data/ not found)")
+    # Self-contained app binary: THE universal file. Flash at the app offset
+    # (0x10000) via any flasher, or install through the Launcher; it populates
+    # its own filesystem on first boot.
+    firmware_out = os.path.join(releases_dir, "meshpunk-%s-firmware.bin" % version)
+    shutil.copy2(bins["firmware"], firmware_out)
+    print("merge_bin: copied firmware (app) binary to %s" % firmware_out)
+
+    # ---- Launcher build (bmorcelli/Launcher) ----------------------------------
+    # Launcher installs a MERGED image, NOT an app-only bin: it reads the
+    # partition table at file offset 0x8000, creates the partitions it declares,
+    # and copies the payloads that exist in the file. No filesystem payload here
+    # -- see the note at the constants above.
+    fs_size = os.path.getsize(bins["littlefs"])
+    if fs_size <= LAUNCHER_FS_THRESHOLD:
+        print("merge_bin: WARNING: declared fs %.1f MB is <= 5 MB; Launcher"
+              " <=2.7.2 would create a 1 MB partition, too small for the pack"
+              % (fs_size / (1024.0 * 1024.0)))
+
+    launcher_table = os.path.join(build_dir, "partitions_launcher.bin")
+    with open(launcher_table, "wb") as f:
+        f.write(build_launcher_partition_table(fs_size))
+
+    launcher_img = os.path.join(releases_dir, "meshpunk-%s-launcher.bin" % version)
+    launcher_cmd = [
+        sys.executable, esptool,
+        "--chip", "esp32s3",
+        "merge_bin",
+        "--target-offset", "0x0000",
+        "--output", launcher_img,
+        "--flash_mode", "keep",
+        "--flash_freq", "keep",
+        "--flash_size", "keep",
+        OFFSETS["bootloader"], bins["bootloader"],
+        OFFSETS["partitions"], launcher_table,
+        OFFSETS["firmware"],   bins["firmware"],
+    ]
+    print("merge_bin: creating Launcher image %s" % launcher_img)
+    subprocess.check_call(launcher_cmd)
+    print("merge_bin: Launcher image done (users install THIS file via Launcher)")
 
     print("merge_bin: done")
 

@@ -3382,6 +3382,300 @@ static bool copyFile(fs::FS &srcFS, const char* srcPath, fs::FS &dstFS, const ch
   return true;
 }
 
+#ifdef MESHPUNK_EMBED_PACK
+// ==== Self-contained release build ==========================================
+// pack/data_pack.bin (built by make_data_pack.py, linked in via
+// board_build.embed_files) carries the whole data/ tree. On first boot with an
+// empty filesystem the firmware extracts it into LittleFS, so the app binary
+// alone is a complete install: no littlefs payload has to survive a Launcher
+// or web-flasher install. Pack format: "MPK1" | u32 version | u32 count |
+// u32 index_size, then count entries (u16 path_len | u16 flags | u32 raw_size
+// | u32 stored_size | u32 offset | path). flags bit0 = raw DEFLATE, inflated
+// with the ESP32-S3 ROM's tinfl; the pack is read in place from mapped flash.
+#include "esp_flash.h"
+#include "esp_partition.h"
+#include "rom/miniz.h"
+#include "rom/md5_hash.h"
+
+// Symbol names come from objcopy mangling the project-relative source path
+// ("pack/data_pack.bin"), directories included - verified with nm on the
+// generated .txt.o. If the pack file moves, these must change with it.
+extern const uint8_t data_pack_start[] asm("_binary_pack_data_pack_bin_start");
+extern const uint8_t data_pack_end[]   asm("_binary_pack_data_pack_bin_end");
+
+static bool pack_inflate_to_file(const uint8_t *src, size_t stored, File &out, uint32_t raw_size) {
+  tinfl_decompressor *inf =
+      (tinfl_decompressor *)heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM);
+  uint8_t *dict = (uint8_t *)heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_SPIRAM);
+  if (!inf || !dict) {
+    free(inf);
+    free(dict);
+    return false;
+  }
+  tinfl_init(inf);
+  size_t in_pos = 0, dict_pos = 0;
+  uint32_t written = 0;
+  bool ok = true;
+  while (true) {
+    size_t in_bytes = stored - in_pos;
+    size_t out_bytes = TINFL_LZ_DICT_SIZE - dict_pos;
+    // Raw deflate, all input present, 32K wrapping output dictionary.
+    tinfl_status st = tinfl_decompress(inf, src + in_pos, &in_bytes, dict, dict + dict_pos, &out_bytes, 0);
+    in_pos += in_bytes;
+    if (out_bytes) {
+      if (out.write(dict + dict_pos, out_bytes) != out_bytes) { ok = false; break; }
+      written += out_bytes;
+      dict_pos = (dict_pos + out_bytes) & (TINFL_LZ_DICT_SIZE - 1);
+    }
+    if (st == TINFL_STATUS_DONE) break;
+    if (st < TINFL_STATUS_DONE) { ok = false; break; }
+    if (st == TINFL_STATUS_NEEDS_MORE_INPUT && in_pos >= stored) { ok = false; break; }
+  }
+  free(inf);
+  free(dict);
+  return ok && written == raw_size;
+}
+
+static void pack_mkdirs(const String &path) {
+  for (int i = 1; i < (int)path.length(); i++) {
+    if (path[i] == '/') LittleFS.mkdir(path.substring(0, i));
+  }
+}
+
+static bool pack_write_file(const String &path, const uint8_t *stored, uint32_t stored_size,
+                            uint32_t raw_size, uint16_t flags) {
+  pack_mkdirs(path);
+  File out = LittleFS.open(path, "w", true);
+  if (!out) {
+    SLog.printf("[PACK] open failed: %s\n", path.c_str());
+    return false;
+  }
+  bool ok = true;
+  if (flags & 1) {
+    ok = pack_inflate_to_file(stored, stored_size, out, raw_size);
+  } else {
+    uint32_t w = 0;
+    while (w < stored_size) {
+      uint32_t n = stored_size - w;
+      if (n > 4096) n = 4096;
+      if (out.write(stored + w, n) != n) { ok = false; break; }
+      w += n;
+    }
+  }
+  out.close();
+  if (!ok) {
+    SLog.printf("[PACK] write failed: %s\n", path.c_str());
+    LittleFS.remove(path);
+  }
+  return ok;
+}
+
+// Extract the embedded pack into LittleFS. The /.pack_version marker (git
+// version, injected by make_data_pack.py) is written last and only after a
+// clean pass: pack_needs_extract() compares it against the pack's copy, so an
+// interrupted extraction retries on the next boot and a firmware update with
+// new bundled files re-extracts automatically. Existing files are overwritten;
+// runtime-created files (prefs, messages) are not in the pack and survive.
+static bool extract_data_pack() {
+  const uint8_t *p = data_pack_start;
+  const size_t pack_len = (size_t)(data_pack_end - data_pack_start);
+  if (pack_len < 16 || memcmp(p, "MPK1", 4) != 0) {
+    SLog.println("[PACK] bad magic");
+    return false;
+  }
+  uint32_t version, count, index_size;
+  memcpy(&version, p + 4, 4);
+  memcpy(&count, p + 8, 4);
+  memcpy(&index_size, p + 12, 4);
+  if (version != 1 || 16 + (size_t)index_size > pack_len) {
+    SLog.println("[PACK] bad header");
+    return false;
+  }
+  SLog.printf("[PACK] extracting %u files to LittleFS...\n", (unsigned)count);
+  uint32_t t0 = millis();
+  const uint8_t *idx = p + 16;
+  const uint8_t *idx_end = idx + index_size;
+  uint32_t marker_raw = 0, marker_stored = 0, marker_off = 0;
+  uint16_t marker_flags = 0;
+  bool have_marker = false, ok = true;
+  int done = 0;
+  for (uint32_t i = 0; i < count && ok; i++) {
+    if (idx + 16 > idx_end) { ok = false; break; }
+    uint16_t path_len, flags;
+    uint32_t raw_size, stored_size, off;
+    memcpy(&path_len, idx, 2);
+    memcpy(&flags, idx + 2, 2);
+    memcpy(&raw_size, idx + 4, 4);
+    memcpy(&stored_size, idx + 8, 4);
+    memcpy(&off, idx + 12, 4);
+    idx += 16;
+    if (idx + path_len > idx_end || (size_t)off + stored_size > pack_len) { ok = false; break; }
+    String path;
+    path.reserve(path_len);
+    for (uint16_t c = 0; c < path_len; c++) path += (char)idx[c];
+    idx += path_len;
+    if (path == "/.pack_version") {  // marker: written last, see above
+      marker_raw = raw_size;
+      marker_stored = stored_size;
+      marker_off = off;
+      marker_flags = flags;
+      have_marker = true;
+      continue;
+    }
+    if (!pack_write_file(path, p + off, stored_size, raw_size, flags)) { ok = false; break; }
+    done++;
+  }
+  if (ok && have_marker) {
+    ok = pack_write_file("/.pack_version", p + marker_off, marker_stored, marker_raw, marker_flags);
+    if (ok) done++;
+  }
+  SLog.printf("[PACK] %s: %d/%u files in %lus\n", ok ? "done" : "FAILED", done, (unsigned)count,
+              (unsigned long)((millis() - t0) / 1000));
+  return ok;
+}
+
+// True when the pack should be unpacked: fresh/wiped filesystem, an
+// interrupted extraction, or a firmware update whose bundled files differ
+// (marker mismatch). Cheap when up to date: one index scan + small file read.
+static bool pack_needs_extract() {
+  const uint8_t *p = data_pack_start;
+  const size_t pack_len = (size_t)(data_pack_end - data_pack_start);
+  if (pack_len < 16 || memcmp(p, "MPK1", 4) != 0) return false;
+  uint32_t count, index_size;
+  memcpy(&count, p + 8, 4);
+  memcpy(&index_size, p + 12, 4);
+  if (16 + (size_t)index_size > pack_len) return false;
+  const uint8_t *idx = p + 16;
+  const uint8_t *idx_end = idx + index_size;
+  for (uint32_t i = 0; i < count; i++) {
+    if (idx + 16 > idx_end) return false;
+    uint16_t path_len, flags;
+    uint32_t stored_size, off;
+    memcpy(&path_len, idx, 2);
+    memcpy(&flags, idx + 2, 2);
+    memcpy(&stored_size, idx + 8, 4);
+    memcpy(&off, idx + 12, 4);
+    idx += 16;
+    if (idx + path_len > idx_end) return false;
+    if (path_len == 14 && memcmp(idx, "/.pack_version", 14) == 0) {
+      if ((flags & 1) || (size_t)off + stored_size > pack_len) return true;
+      File f = LittleFS.open("/.pack_version", "r");
+      if (!f) return true;
+      bool match = ((uint32_t)f.size() == stored_size);
+      uint32_t pos = 0;
+      while (match && pos < stored_size) {
+        uint8_t buf[64];
+        int n = f.read(buf, sizeof(buf));
+        if (n <= 0 || memcmp(buf, p + off + pos, n) != 0) { match = false; break; }
+        pos += n;
+      }
+      f.close();
+      return !match;
+    }
+    idx += path_len;
+  }
+  // Pack has no marker (shouldn't happen): fall back to the coarse check so a
+  // populated filesystem doesn't re-extract every boot.
+  return !LittleFS.exists("/lua/main.lua");
+}
+
+// Create a data partition when the table has none. Launcher 2.7.2 OTA installs
+// copy only the app, leaving the device without any spiffs partition; without
+// one there is nowhere to extract the pack. This appends a "spiffs" entry into
+// the free flash after the last used partition (same 0x8000 table write the
+// Launcher itself performs), fixes up the table's MD5 entry, and reboots so the
+// bootloader and esp_partition see the new table. Hard guards: only runs when
+// NO spiffs/littlefs data partition exists, never moves or resizes existing
+// entries, and aborts on anything unexpected.
+static void ensure_data_partition() {
+  if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL))
+    return;
+  if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x83, NULL))
+    return;  // littlefs subtype used by some tools
+
+  uint8_t table[0xC00];
+  if (esp_flash_read(NULL, table, 0x8000, sizeof(table)) != ESP_OK) {
+    SLog.println("[PART] table read failed");
+    return;
+  }
+  if (table[0] != 0xAA || table[1] != 0x50) {
+    SLog.println("[PART] bad table magic");
+    return;
+  }
+  uint32_t flash_size = 0;
+  if (esp_flash_get_size(NULL, &flash_size) != ESP_OK || flash_size < 0x800000) {
+    SLog.println("[PART] flash size unavailable");
+    return;
+  }
+
+  int md5_at = -1;
+  int end_at = -1;
+  uint32_t max_end = 0x10000;
+  for (int n = 0; n < (int)sizeof(table); n += 32) {
+    uint8_t *e = table + n;
+    if (e[0] == 0xEB && e[1] == 0xEB) { md5_at = n; break; }
+    if (e[0] == 0xFF && e[1] == 0xFF) { end_at = n; break; }
+    if (e[0] != 0xAA || e[1] != 0x50) {
+      SLog.println("[PART] unexpected entry, aborting");
+      return;
+    }
+    uint32_t off, sz;
+    memcpy(&off, e + 4, 4);
+    memcpy(&sz, e + 8, 4);
+    if (off + sz > max_end) max_end = off + sz;
+  }
+  int insert_at = (md5_at >= 0) ? md5_at : end_at;
+  if (insert_at < 0 || insert_at + 64 > (int)sizeof(table)) {
+    SLog.println("[PART] no room in table");
+    return;
+  }
+
+  uint32_t part_off = (max_end + 0xFFFF) & ~0xFFFFu;  // 64 KB align
+  if (part_off + 0x400000 > flash_size) {             // need >= 4 MB for the data
+    SLog.println("[PART] not enough free flash for data partition");
+    return;
+  }
+  uint32_t part_size = flash_size - part_off;
+  if (part_size > 0x600000) part_size = 0x600000;  // match normal builds
+
+  if (md5_at >= 0) memmove(table + insert_at + 32, table + insert_at, 32);
+  uint8_t *ne = table + insert_at;
+  memset(ne, 0, 32);
+  ne[0] = 0xAA;
+  ne[1] = 0x50;
+  ne[2] = 0x01;  // type: data
+  ne[3] = 0x82;  // subtype: spiffs
+  memcpy(ne + 4, &part_off, 4);
+  memcpy(ne + 8, &part_size, 4);
+  memcpy(ne + 12, "spiffs", 6);
+
+  if (md5_at >= 0) {
+    int md5_new = insert_at + 32;
+    struct MD5Context md5ctx;
+    MD5Init(&md5ctx);
+    MD5Update(&md5ctx, table, md5_new);
+    uint8_t *m = table + md5_new;
+    memset(m, 0xFF, 32);
+    m[0] = 0xEB;
+    m[1] = 0xEB;
+    MD5Final(m + 16, &md5ctx);
+  }
+
+  SLog.printf("[PART] adding spiffs partition at 0x%06X size 0x%06X, rebooting\n",
+              (unsigned)part_off, (unsigned)part_size);
+  if (esp_flash_erase_region(NULL, 0x8000, 0x1000) != ESP_OK) {
+    SLog.println("[PART] table erase failed");
+    return;
+  }
+  if (esp_flash_write(NULL, table, 0x8000, sizeof(table)) != ESP_OK) {
+    SLog.println("[PART] table write failed");
+    return;
+  }
+  delay(100);
+  esp_restart();
+}
+#endif  // MESHPUNK_EMBED_PACK
+
 // Set whether to use SD card for mesh data storage
 // Usage: _storage_set_use_sd(true)  -- switch to SD
 //        _storage_set_use_sd(false) -- switch to LittleFS
@@ -5754,10 +6048,22 @@ void setup() {
 
   SLog.println("Initializing display");
 
-  // Initialize filesystem
-  if (LittleFS.begin(true)) {
+  // Initialize filesystem. Normal builds use the partition labeled "spiffs"
+  // (the begin() default); installs via bmorcelli's Launcher create the data
+  // partition labeled "assets" (its exact-size install path), so fall back.
+#ifdef MESHPUNK_EMBED_PACK
+  ensure_data_partition();  // reboots if it had to create one
+#endif
+  bool fs_on_spiffs = LittleFS.begin(true);
+  if (!fs_on_spiffs) SLog.println("LittleFS: no \"spiffs\" partition, trying \"assets\" (Launcher install)");
+  if (fs_on_spiffs || LittleFS.begin(true, "/littlefs", 10, "assets")) {
     fs_mounted = true;
-    SLog.println("LittleFS mounted successfully");
+    SLog.printf("LittleFS mounted successfully (label: %s)\n", fs_on_spiffs ? "spiffs" : "assets");
+#ifdef MESHPUNK_EMBED_PACK
+    // Fresh/wiped filesystem or a firmware update with new bundled files:
+    // populate it from the pack embedded in this binary.
+    if (pack_needs_extract()) extract_data_pack();
+#endif
 
     SLog.println("LittleFS contents:");
     listDir(LittleFS, "/lua");
