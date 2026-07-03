@@ -3329,6 +3329,15 @@ static int lua_mesh_get_dm_threads(lua_State *L) {
   return n;
 }
 
+// One summary entry per stored conversation for the Messenger inbox:
+// { kind="channel", idx, name, count, last } / { kind="dm", name, count, last }.
+// Usage: local sums = _mesh_get_msg_summaries()
+// No MESH_LOCK here — pushMsgSummariesToLua takes it internally just for the
+// channel-table snapshot and does all file I/O outside it.
+static int lua_mesh_get_msg_summaries(lua_State *L) {
+  return the_mesh->pushMsgSummariesToLua(L);
+}
+
 // Configure the max records retained per message log file.
 // Usage: _mesh_set_max_messages(100)
 static int lua_mesh_set_max_messages(lua_State *L) {
@@ -4683,6 +4692,13 @@ static multi_heap_handle_t s_lua_heap = NULL;
 static uintptr_t s_lua_arena_base = 0;
 static size_t    s_lua_arena_size = 0;
 
+// Lua allocations that missed the arena and fell back to the shared PSRAM heap
+// (cumulative since boot). A growing number means Lua's live set exceeds the
+// arena — exactly the fragmentation the arena exists to prevent — so it's
+// surfaced in the mesh task's periodic [HEAP] line rather than failing silently.
+// Written on Core 0 (Lua alloc), read on Core 1 (log); aligned 32-bit, no lock.
+volatile uint32_t g_lua_arena_spill_count = 0;
+
 static inline bool lua_in_arena(void *p) {
   return s_lua_arena_base && (uintptr_t)p >= s_lua_arena_base &&
          (uintptr_t)p < s_lua_arena_base + s_lua_arena_size;
@@ -4752,6 +4768,7 @@ static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
             return p;
         }
         // Arena full -> fall back to the shared heap (small objs land in the gap).
+        g_lua_arena_spill_count++;
         void *q = heap_caps_realloc(was_in ? NULL : ptr, nsize, MALLOC_CAP_SPIRAM);
         if (q && was_in) {                  // moved an arena obj out -> copy + free old
             memcpy(q, ptr, osize < nsize ? osize : nsize);
@@ -4895,6 +4912,7 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_routing_senders", lua_mesh_routing_senders);
   lua_register(L, "_mesh_get_dm_messages", lua_mesh_get_dm_messages);
   lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
+  lua_register(L, "_mesh_get_msg_summaries", lua_mesh_get_msg_summaries);
   lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
 
   // Identity management

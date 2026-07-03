@@ -22,6 +22,7 @@
 #include <esp_heap_caps.h>
 
 extern PunkMesh* the_mesh;
+extern volatile uint32_t g_lua_arena_spill_count;   // main.cpp: Lua allocs that missed the arena
 
 static TaskHandle_t s_mesh_task_handle = nullptr;
 volatile bool mesh_task_paused = false;
@@ -57,11 +58,12 @@ static void mesh_task_body(void *param) {
     uint32_t now = millis();
     if (now - last_heap_log > 60000) {
       last_heap_log = now;
-      SLog.printf("[HEAP] internal: %u free, %u largest block | PSRAM: %u free | min ever: %u\n",
+      SLog.printf("[HEAP] internal: %u free, %u largest block | PSRAM: %u free | min ever: %u | lua_spill: %u\n",
           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
           heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
           heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-          esp_get_minimum_free_heap_size());
+          esp_get_minimum_free_heap_size(),
+          (unsigned)g_lua_arena_spill_count);
     }
 
     // Yield so lower priority tasks (IDLE, watchdog) can run.

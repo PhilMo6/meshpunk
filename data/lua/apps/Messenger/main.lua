@@ -16,9 +16,13 @@ local theme = require("lib/theme")
 -- root or /meshpunk on SD), so any app can access the same message history.
 -- The per-file cap is owned by the firmware (_max_messages, default 400) — we
 -- deliberately don't shrink it here, so the full stored history is available.
--- The chat view only renders the most recent slice and pages older messages
--- in on demand, so a large history stays cheap to display.
-messages:loadPersisted()
+-- Only SUMMARIES load here (one {count, last} entry per conversation, built by
+-- a C-side scan): the inbox never needs more, and materializing every history
+-- (~1.7MB on a busy mesh) overflowed the Lua arena into the shared PSRAM heap,
+-- fragmenting the big region the Map/ELF apps need. A conversation's full
+-- history loads when its chat opens (openThread) and is dropped on the way
+-- out (clear_view -> closeThread), so at most one is ever resident.
+messages:loadSummaries()
 
 local W = lvgl.HOR_RES()
 local H = lvgl.VER_RES()
@@ -93,6 +97,9 @@ end
 -- ── Helpers ─────────────────────────────────────────────────────
 local function clear_view()
     nav.reset()   -- drop every nav scope (any open popup's too) before the swap
+    -- Drop the open chat's history bucket (the chat view is the only view that
+    -- loads one, and every way out of it comes through here).
+    messages:closeThread()
     -- current_view can hold hundreds of rows (contacts/inbox); a synchronous
     -- delete of that many objects starves Core 0 and trips the watchdog, so tear
     -- it down in the background. The input bar is always small — delete it inline.
@@ -370,28 +377,37 @@ apps.add_timer {
 }
 
 -- ── Conversation model (shared by inbox) ────────────────────────
+-- Rows come from the conversation SUMMARIES (count + last message each), not
+-- from loaded histories — the inbox never materializes a thread.
 local function build_conversations()
     local convos = {}
+    local have_ch0 = false
     local ok_ch, channels = pcall(_mesh_get_channels)
     if ok_ch and channels then
         for _, ch in ipairs(channels) do
-            local hist = messages:getChannelHistory(ch.idx)
-            if #hist == 0 and ch.idx == 0 then hist = messages:all() end
-            local last = hist[#hist]
+            if ch.idx == 0 then have_ch0 = true end
+            local sum = messages:getChannelSummary(ch.idx)
+            local last = sum and sum.last or nil
             convos[#convos + 1] = {
                 kind = "channel", idx = ch.idx, name = ch.name,
                 last = last, ts = last and last.timestamp or 0,
-                unread = messages:unreadInChannel(ch.idx), count = #hist,
+                unread = messages:unreadInChannel(ch.idx),
+                count = sum and sum.count or 0,
             }
         end
     end
-    if (not ok_ch or not channels or #channels == 0) and #messages:all() > 0 then
-        local last = messages:all()[#messages:all()]
-        convos[#convos + 1] = {
-            kind = "channel", idx = 0, name = "Public",
-            last = last, ts = last and last.timestamp or 0,
-            unread = messages:unreadInChannel(0), count = #messages:all(),
-        }
+    -- Unknown-channel traffic surfaces under Public (idx 0). When no channel
+    -- occupies slot 0 (e.g. Public deleted), a live summary entry for it still
+    -- gets a row so those messages aren't invisible.
+    if not have_ch0 then
+        local sum = messages:getChannelSummary(0)
+        if sum and sum.last then
+            convos[#convos + 1] = {
+                kind = "channel", idx = 0, name = "Public",
+                last = sum.last, ts = sum.last.timestamp or 0,
+                unread = messages:unreadInChannel(0), count = sum.count or 0,
+            }
+        end
     end
     for _, t in ipairs(messages:getDMThreadNames()) do
         convos[#convos + 1] = {
@@ -433,11 +449,9 @@ show_inbox = function()
         messages:onDirectMessage(nil)
         messages:onContactUpdate(nil)
         messages:onAck(nil)
-        -- Drop the in-RAM message history we loaded on open (~1.7MB on a busy
-        -- mesh). The Messenger is its only consumer; freeing it here returns that
-        -- PSRAM (and un-fragments the heap) for the heavy apps. Reloaded verbatim
-        -- from disk via loadPersisted() the next time the Messenger opens. The
-        -- unread badge is counter-based, so it's unaffected.
+        -- Drop everything this session loaded: the summaries and any open
+        -- chat's history bucket. Rebuilt from disk on the next Messenger open.
+        -- The unread badge is counter-based, so it's unaffected.
         messages:freePersisted()
         -- Also drop the cached 500-contact Lua table (~388KB, pinned in the
         -- registry by _mesh_get_contacts) — the Messenger is its other consumer.
@@ -568,6 +582,10 @@ show_chat = function(target)
     current_mode = "chat"
     chat_target = target
 
+    -- Load THIS conversation's history from disk — the only bucket resident.
+    -- clear_view -> closeThread drops it again on the way out of the chat.
+    messages:openThread(target)
+
     -- Clear unread for this thread now that it's open.
     if target.type == "channel" then
         messages:markChannelSeen(target.idx)
@@ -608,7 +626,7 @@ show_chat = function(target)
 
     -- Message scroll area (full width).
     local MSG_H = H - HEADER_H - 20 - 34 - 24
-    msg_list = body:Object {
+    local msg_list = body:Object {
         w = lvgl.PCT(100), h = MSG_H,
         border_width = 0, pad_all = 2, bg_opa = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
@@ -745,11 +763,10 @@ show_chat = function(target)
         return bubble
     end
 
-    -- Load existing messages
+    -- Existing messages: the bucket openThread just loaded (rooms stay empty).
     local history = {}
     if target.type == "channel" then
         history = messages:getChannelHistory(target.idx)
-        if #history == 0 and target.idx == 0 then history = messages:all() end
     elseif target.type == "dm" then
         history = messages:getDMThread(target.name)
     end

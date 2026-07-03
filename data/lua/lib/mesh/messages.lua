@@ -2,10 +2,16 @@
 -- Bridges C++ MeshCore <-> Lua UI
 -- Enhanced for full MeshCore integration: multi-channel, DMs, rooms, contacts
 --
--- Message persistence lives on the C++ PunkMesh side now, so any app can
--- access the same history. This module is a thin in-memory cache that:
---   * receives live dispatch from C++ (__dispatch / __dispatch_dm)
---   * pulls the persisted history once at app start via _mesh_get_* APIs
+-- Message persistence lives on the C++ PunkMesh side, so any app can access
+-- the same history. This module keeps Lua's RESIDENT footprint tiny — the Lua
+-- heap is a fixed PSRAM arena, and overflowing it spills objects into the
+-- shared heap, re-fragmenting the big region the arena exists to protect:
+--   * loadSummaries() pulls one {count, last} entry per conversation for the
+--     inbox (a C-side file scan — no histories materialize in Lua)
+--   * openThread()/closeThread() load ONE conversation's full history while
+--     its chat view is open, and drop it again on the way out
+--   * live dispatch from C++ (__dispatch / __dispatch_dm) appends only to an
+--     open bucket, keeps the summaries fresh, and bumps the unread counters
 --   * fires onMessage / onDirectMessage / onAnyMessage callbacks
 
 local M = {
@@ -21,21 +27,20 @@ local M = {
     __ack_index = {},      -- [expected_ack_crc] = sent msg (latest send only)
     __dm_threads = {},     -- grouped by contact name: {[name] = {msg, msg, ...}}
     __channel_history = {}, -- grouped by channel idx: {[idx] = {msg, msg, ...}}
-    -- The two grouped tables above are the SINGLE in-RAM source. The old flat
-    -- __history / __dm_history duplicates were removed: __history only existed
-    -- for the topbar's O(N) countUnread scan (now O(1) via the counters below)
-    -- and the Public fallback (now reads __channel_history[0]); __dm_history was
-    -- never read at all. Each list is capped (trim_list) so a busy mesh can't
-    -- grow them unbounded — they share the PSRAM heap with LVGL's draw allocator
-    -- and were starving it. loadPersisted seeds them from disk once at startup.
+    -- The two grouped tables above hold ONLY the open conversation's history
+    -- (openThread loads it from disk for the chat view; closeThread drops it).
+    -- They are windows, not stores: C++ persists every message before dispatch
+    -- and the inbox runs on __summaries, so a busy mesh never accumulates
+    -- megabytes of message tables in the Lua arena.
+    __summaries = nil,     -- {channels={[idx]=e}, dms={[name]=e}} where e =
+                           -- {kind, idx|name, count, last}; nil until
+                           -- loadSummaries() (i.e. while the Messenger is closed)
+    __open_thread = nil,   -- {kind="channel"|"dm", key=idx|name}: the loaded bucket
     -- Incremental unread counters so badges never rescan history. Bumped only by
     -- live dispatch (own echoes don't count); reset when the thread's chat opens.
     __channel_unread = {}, -- [idx]  = count
     __dm_unread = {},      -- [name] = count
 }
-
--- Avoid double-loading if an app calls loadPersisted() more than once
-M._loaded = false
 
 -- Device RTC epoch (UTC). os.time() is NOT synced to the RTC on this firmware, so
 -- never use it for message timestamps — the C side persists our sent messages with
@@ -69,54 +74,99 @@ function M:setMaxMessages(n)
     end
 end
 
--- Pull persisted history from C++ into the in-memory tables. Safe to call
--- multiple times; only the first call hits the C API.
-function M:loadPersisted()
-    if M._loaded then return end
-    M._loaded = true
-
-    -- Channel histories (slots 0..7; C++ ignores unknown slots gracefully)
-    if _mesh_get_channel_messages then
-        for i = 0, 7 do
-            local ok, list = pcall(_mesh_get_channel_messages, i)
-            if ok and type(list) == "table" and #list > 0 then
-                M.__channel_history[i] = list
-                trim_list(M.__channel_history[i])  -- days-retained files can exceed
-            end                                    -- HIST_CAP; keep RAM bounded
+-- ── Conversation summaries (the inbox model) ────────────────────────────────
+-- One tiny entry per stored conversation ({count, last message}) built C-side
+-- by _mesh_get_msg_summaries — a whole busy mesh is a few KB, where the old
+-- loadPersisted materialized EVERY history (~1.7MB) and overflowed the Lua
+-- arena into the shared PSRAM heap. Kept fresh by live dispatch below.
+function M:loadSummaries()
+    local sums = { channels = {}, dms = {} }
+    local ok, list = pcall(_mesh_get_msg_summaries)
+    if ok and type(list) == "table" then
+        for _, e in ipairs(list) do
+            if e.kind == "channel" then sums.channels[e.idx] = e
+            elseif e.kind == "dm" then sums.dms[e.name] = e end
         end
     end
+    M.__summaries = sums
+end
 
-    -- DM threads
-    if _mesh_get_dm_threads and _mesh_get_dm_messages then
-        local ok, names = pcall(_mesh_get_dm_threads)
-        if ok and type(names) == "table" then
-            for _, name in ipairs(names) do
-                local ok2, list = pcall(_mesh_get_dm_messages, name)
-                if ok2 and type(list) == "table" and #list > 0 then
-                    M.__dm_threads[name] = list
-                    trim_list(M.__dm_threads[name])  -- bound RAM (see above)
-                end
-            end
+-- Channel summary entry ({count, last}) or nil — inbox preview data.
+function M:getChannelSummary(ch_idx)
+    local s = M.__summaries
+    return s and s.channels[ch_idx] or nil
+end
+
+-- Load ONE conversation's full history from disk into its bucket (the chat
+-- view is its only consumer; trim_list bounds the RAM). Any previously open
+-- thread is dropped first, so at most one history is ever resident. Room
+-- chats keep their historical no-bucket behavior (live view only).
+function M:openThread(target)
+    M:closeThread()
+    if target.type == "channel" then
+        local ok, list = pcall(_mesh_get_channel_messages, target.idx)
+        if ok and type(list) == "table" then
+            trim_list(list)   -- days-retained files can exceed HIST_CAP
+            M.__channel_history[target.idx] = list
         end
+        M.__open_thread = { kind = "channel", key = target.idx }
+    elseif target.type == "dm" then
+        local ok, list = pcall(_mesh_get_dm_messages, target.name)
+        if ok and type(list) == "table" then
+            trim_list(list)
+            M.__dm_threads[target.name] = list
+        end
+        M.__open_thread = { kind = "dm", key = target.name }
     end
 end
 
--- Drop the in-RAM message history loaded by loadPersisted (the per-channel and
--- per-DM lists — the big consumer: ~1.7MB on a busy mesh). Only the Messenger
--- needs it; it's freed when the Messenger closes so it isn't resident while the
--- heavy apps run. Safe because:
---   * C++ has every message persisted on disk → loadPersisted() rebuilds it
---     verbatim on the next Messenger open (and _loaded is reset so it re-runs).
---   * The unread COUNTERS are left intact (the topbar badge is counter-based),
---     so closing the Messenger never wrongly clears unread state.
---   * Live __dispatch after this just rebuilds the small per-session buckets
---     until the next loadPersisted replaces them with the full disk history.
+function M:closeThread()
+    local t = M.__open_thread
+    if not t then return end
+    if t.kind == "channel" then M.__channel_history[t.key] = nil
+    else M.__dm_threads[t.key] = nil end
+    M.__open_thread = nil
+end
+
+-- Drop everything a Messenger session loaded: the open bucket, the summaries
+-- and the ack ref. Called on Messenger exit so nothing big stays resident in
+-- the Lua arena; it all rebuilds from disk on the next open. The unread
+-- COUNTERS are left intact (the topbar badge is counter-based), so closing
+-- the Messenger never wrongly clears unread state.
 function M:freePersisted()
     M.__channel_history = {}
     M.__dm_threads = {}
-    M.__ack_index = {}          -- held refs into the freed history; drop them too
-    M._loaded = false
+    M.__ack_index = {}
+    M.__summaries = nil
+    M.__open_thread = nil
     collectgarbage("collect")
+end
+
+-- Keep the loaded summaries in step with live traffic / local echoes so the
+-- inbox stays current without reloading from disk. No-ops while summaries
+-- aren't loaded (Messenger closed) — they rebuild from disk on the next open.
+local function summary_touch_channel(idx, msg)
+    local s = M.__summaries
+    if not s then return end
+    local e = s.channels[idx]
+    if not e then
+        e = { kind = "channel", idx = idx, count = 0 }
+        s.channels[idx] = e
+    end
+    e.count = (e.count or 0) + 1
+    e.last = msg
+end
+
+local function summary_touch_dm(name, msg)
+    local s = M.__summaries
+    if not s then return end
+    local e = s.dms[name]
+    if not e then
+        e = { kind = "dm", name = name, count = 0 }
+        s.dms[name] = e
+    end
+    e.count = (e.count or 0) + 1
+    e.last = msg
 end
 
 -- Register priority callback (fires before onMessage, used by topbar)
@@ -186,9 +236,14 @@ function M:broadcast(text)
         rssi = 0,
         hash = hash_hex
     }
-    if not M.__channel_history[0] then M.__channel_history[0] = {} end
-    table.insert(M.__channel_history[0], msg)
-    trim_list(M.__channel_history[0])
+    -- Echo into the bucket only when Public's chat is open (the bucket is the
+    -- chat view's window); the summary keeps the inbox preview current.
+    local list = M.__channel_history[0]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
+    end
+    summary_touch_channel(0, msg)
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
@@ -222,11 +277,15 @@ function M:sendDirect(name_prefix, text)
         ack = ack,
         status = "sent",
     }
-    if not M.__dm_threads[name_prefix] then
-        M.__dm_threads[name_prefix] = {}
+    -- Echo into the bucket only when this DM's chat is open; the summary
+    -- keeps the inbox preview current. (Room sends land here too — rooms have
+    -- no bucket, matching their no-history chat view.)
+    local list = M.__dm_threads[name_prefix]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
     end
-    table.insert(M.__dm_threads[name_prefix], msg)
-    trim_list(M.__dm_threads[name_prefix])
+    summary_touch_dm(name_prefix, msg)
     -- Firmware tracks one outstanding ack, so only the latest send can be
     -- confirmed; index just this one (bounded, no stale build-up).
     M.__ack_index = {}
@@ -260,11 +319,12 @@ function M:sendToChannel(ch_idx, text)
         rssi = 0,
         hash = hash_hex
     }
-    if not M.__channel_history[ch_idx] then
-        M.__channel_history[ch_idx] = {}
+    local list = M.__channel_history[ch_idx]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
     end
-    table.insert(M.__channel_history[ch_idx], msg)
-    trim_list(M.__channel_history[ch_idx])
+    summary_touch_channel(ch_idx, msg)
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
     if M.__onMessage then M.__onMessage(msg) end
     if M.__onAnyMessage then M.__onAnyMessage(msg) end
@@ -353,14 +413,17 @@ function M.__dispatch(from, text, timestamp, direct, hops, snr, rssi, channel_id
         hash = hash
     }
 
-    -- File into the per-channel bucket. Unknown-channel (-1) messages surface
-    -- under Public (idx 0), both for display and the unread badge.
+    -- Unknown-channel (-1) messages surface under Public (idx 0), both for
+    -- display and the unread badge. Append to the bucket only when that
+    -- conversation's chat is open (openThread loaded it) — the bucket is a
+    -- window, not a store; disk + the summaries carry everything else.
     local bucket = channel_idx >= 0 and channel_idx or 0
-    if not M.__channel_history[bucket] then
-        M.__channel_history[bucket] = {}
+    local list = M.__channel_history[bucket]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
     end
-    table.insert(M.__channel_history[bucket], msg)
-    trim_list(M.__channel_history[bucket])
+    summary_touch_channel(bucket, msg)
     M.__channel_unread[bucket] = (M.__channel_unread[bucket] or 0) + 1
 
     if M.__onMessageFirst then M.__onMessageFirst(msg) end
@@ -391,13 +454,15 @@ function M.__dispatch_dm(from, text, timestamp, direct, hops, snr, rssi, path, h
         hash = hash
     }
 
-    -- Group into thread by sender name
+    -- Thread key is the sender name. Append to the bucket only when this DM's
+    -- chat is open; the summary keeps the inbox row current.
     local key = msg.from
-    if not M.__dm_threads[key] then
-        M.__dm_threads[key] = {}
+    local list = M.__dm_threads[key]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
     end
-    table.insert(M.__dm_threads[key], msg)
-    trim_list(M.__dm_threads[key])
+    summary_touch_dm(key, msg)
     M.__dm_unread[key] = (M.__dm_unread[key] or 0) + 1
 
     if M.__onDirectMessageFirst then M.__onDirectMessageFirst(msg) end
@@ -476,17 +541,21 @@ function M:getDMThread(contact_name)
     return self.__dm_threads[contact_name] or {}
 end
 
--- Get all DM thread names (contacts with active conversations)
+-- All DM threads for the inbox ({name, count, unread, last_msg} per thread),
+-- most recent first. Built from the summaries — no histories needed.
 function M:getDMThreadNames()
     local names = {}
-    for name, thread in pairs(self.__dm_threads) do
-        if #thread > 0 then
-            table.insert(names, {
-                name = name,
-                count = #thread,
-                unread = self.__dm_unread[name] or 0,
-                last_msg = thread[#thread]
-            })
+    local s = M.__summaries
+    if s then
+        for name, e in pairs(s.dms) do
+            if (e.count or 0) > 0 and e.last then
+                table.insert(names, {
+                    name = name,
+                    count = e.count,
+                    unread = self.__dm_unread[name] or 0,
+                    last_msg = e.last
+                })
+            end
         end
     end
     -- Sort by most recent message

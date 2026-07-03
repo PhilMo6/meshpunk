@@ -1865,6 +1865,50 @@ static bool parse_rpath_value(char* val, ObservedPath& rp) {
     return true;
 }
 
+// Parse one "key=value" record line into m. Mutates `line` (the '=' is cut).
+// Lines without '=' are ignored; the "---" record terminator is handled by the
+// callers. Shared by the full-file reader (read_msg_text_file) and the
+// summary scanner (scan_msg_records).
+static void parse_msg_line(char* line, StoredMsg& m) {
+    char* eq = strchr(line, '=');
+    if (!eq) return;
+    *eq = '\0';
+    const char* key = line;
+    const char* val = eq + 1;
+
+    if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
+    else if (strcmp(key, "sender_ts") == 0) m.sender_ts = strtoul(val, nullptr, 10);
+    else if (strcmp(key, "from") == 0) strncpy(m.from, val, sizeof(m.from) - 1);
+    else if (strcmp(key, "peer") == 0) strncpy(m.peer, val, sizeof(m.peer) - 1);
+    else if (strcmp(key, "text") == 0) strncpy(m.text, val, sizeof(m.text) - 1);
+    else if (strcmp(key, "ch") == 0) m.channel_idx = (int8_t)atoi(val);
+    else if (strcmp(key, "hops") == 0) m.hops = (uint8_t)atoi(val);
+    else if (strcmp(key, "snr") == 0) m.snr = atof(val);
+    else if (strcmp(key, "rssi") == 0) m.rssi = atof(val);
+    else if (strcmp(key, "direct") == 0) { if (atoi(val)) m.flags |= 0x01; }
+    else if (strcmp(key, "dm") == 0) { if (atoi(val)) m.flags |= 0x02; }
+    else if (strcmp(key, "path") == 0) m.path_len = parse_path_field(val, m.path);
+    else if (strcmp(key, "hash") == 0) {
+        if (strlen(val) == MAX_HASH_SIZE * 2) {
+            mesh::Utils::fromHex(m.pkt_hash, MAX_HASH_SIZE, val);
+            m.has_hash = true;
+        }
+    }
+    else if (strcmp(key, "pubkey") == 0 && strlen(val) == 12) {
+        mesh::Utils::fromHex(m.sender_pub_key, 6, val);
+        m.has_pub_key = true;
+    }
+    else if (strcmp(key, "lat") == 0) { m.lat = atof(val); m.has_loc = true; }
+    else if (strcmp(key, "lon") == 0) { m.lon = atof(val); m.has_loc = true; }
+    else if (strcmp(key, "rpath") == 0 && m.rpath_count < MAX_PATHS_PER_MSG) {
+        // Inline (legacy) extra path: "hop_hashes;snr;rssi;direct"
+        char rval[256];
+        strncpy(rval, val, sizeof(rval) - 1);
+        rval[sizeof(rval) - 1] = '\0';
+        if (parse_rpath_value(rval, m.rpaths[m.rpath_count])) m.rpath_count++;
+    }
+}
+
 static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath) {
     lua_newtable(L);
     int msgs_idx = lua_gettop(L);
@@ -1923,43 +1967,7 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
             continue;
         }
 
-        char* eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        const char* key = line;
-        const char* val = eq + 1;
-
-        if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
-        else if (strcmp(key, "sender_ts") == 0) m.sender_ts = strtoul(val, nullptr, 10);
-        else if (strcmp(key, "from") == 0) strncpy(m.from, val, sizeof(m.from) - 1);
-        else if (strcmp(key, "peer") == 0) strncpy(m.peer, val, sizeof(m.peer) - 1);
-        else if (strcmp(key, "text") == 0) strncpy(m.text, val, sizeof(m.text) - 1);
-        else if (strcmp(key, "ch") == 0) m.channel_idx = (int8_t)atoi(val);
-        else if (strcmp(key, "hops") == 0) m.hops = (uint8_t)atoi(val);
-        else if (strcmp(key, "snr") == 0) m.snr = atof(val);
-        else if (strcmp(key, "rssi") == 0) m.rssi = atof(val);
-        else if (strcmp(key, "direct") == 0) { if (atoi(val)) m.flags |= 0x01; }
-        else if (strcmp(key, "dm") == 0) { if (atoi(val)) m.flags |= 0x02; }
-        else if (strcmp(key, "path") == 0) m.path_len = parse_path_field(val, m.path);
-        else if (strcmp(key, "hash") == 0) {
-            if (strlen(val) == MAX_HASH_SIZE * 2) {
-                mesh::Utils::fromHex(m.pkt_hash, MAX_HASH_SIZE, val);
-                m.has_hash = true;
-            }
-        }
-        else if (strcmp(key, "pubkey") == 0 && strlen(val) == 12) {
-            mesh::Utils::fromHex(m.sender_pub_key, 6, val);
-            m.has_pub_key = true;
-        }
-        else if (strcmp(key, "lat") == 0) { m.lat = atof(val); m.has_loc = true; }
-        else if (strcmp(key, "lon") == 0) { m.lon = atof(val); m.has_loc = true; }
-        else if (strcmp(key, "rpath") == 0 && m.rpath_count < MAX_PATHS_PER_MSG) {
-            // Inline (legacy) extra path: "hop_hashes;snr;rssi;direct"
-            char rval[256];
-            strncpy(rval, val, sizeof(rval) - 1);
-            rval[sizeof(rval) - 1] = '\0';
-            if (parse_rpath_value(rval, m.rpaths[m.rpath_count])) m.rpath_count++;
-        }
+        parse_msg_line(line, m);
     }
     f.close();
 
@@ -2081,6 +2089,140 @@ int PunkMesh::pushDMThreadNamesToLua(lua_State* L) {
         entry = root.openNextFile();
     }
     root.close();
+    if (is_sd) sd_spi_release();
+    return 1;
+}
+
+// Single-pass summary scan of one open message log: record count + a copy of
+// the LAST record. peer_out (nullable) receives the thread's real peer name —
+// the first non-empty peer= field seen (DM filenames are sanitized, so the
+// name must come from the records). Shares parse_msg_line with the full
+// reader but allocates nothing in Lua, so the inbox can list every
+// conversation without materializing histories. Caller holds the SD lock when
+// the file is on SD; like the full reader, it's released/retaken every 100
+// lines so a big log can't starve the bus or trip the watchdog.
+// Returns true when the file held at least one complete record.
+static bool scan_msg_records(File& f, bool is_sd, StoredMsg& last, int& count,
+                             char* peer_out, size_t peer_sz) {
+    count = 0;
+    if (peer_out && peer_sz) peer_out[0] = '\0';
+
+    StoredMsg m;
+    memset(&m, 0, sizeof(m));
+    char line[256];
+    int line_count = 0;
+
+    BlockLineReader lr(&f);
+    int len;
+    while ((len = lr.next(line, sizeof(line))) >= 0) {
+        if (len == 0) continue;
+        if (is_sd && ++line_count % 100 == 0) {
+            sd_spi_release();
+            vTaskDelay(1);
+            sd_spi_take();
+        }
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+            if (peer_out && peer_sz && peer_out[0] == '\0' && m.peer[0] != '\0') {
+                strncpy(peer_out, m.peer, peer_sz - 1);
+                peer_out[peer_sz - 1] = '\0';
+            }
+            last = m;   // struct copy; cheaper than re-seeking the tail
+            count++;
+            memset(&m, 0, sizeof(m));
+            continue;
+        }
+        parse_msg_line(line, m);
+    }
+    return count > 0;
+}
+
+// One lightweight summary entry per stored conversation, for the Messenger
+// inbox:
+//   { kind="channel", idx=N, name=..., count=N, last=<msg table> }
+//   { kind="dm",      name=peer,       count=N, last=<msg table> }
+// Only count + last record are read per log (scan_msg_records) instead of
+// materializing whole histories in Lua; the full history of ONE conversation
+// loads on demand when its chat opens (pushChannel/DMMessagesToLua). MESH_LOCK
+// is held only for the channel-table snapshot — all file I/O runs outside it
+// (SD lock only), unlike the full readers.
+int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
+    lua_newtable(L);
+    if (!_storage) return 1;
+    int out_idx = 1;
+
+    struct { int idx; char name[32]; } chans[MAX_GROUP_CHANNELS];
+    int nch = 0;
+    MESH_LOCK();
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+        ChannelDetails cd;
+        if (getChannel(i, cd) && cd.name[0] != '\0') {
+            chans[nch].idx = i;
+            strncpy(chans[nch].name, cd.name, sizeof(chans[nch].name) - 1);
+            chans[nch].name[sizeof(chans[nch].name) - 1] = '\0';
+            nch++;
+        }
+    }
+    MESH_UNLOCK();
+
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    StoredMsg last;
+    int count;
+    for (int c = 0; c < nch; c++) {
+        String path = channel_msg_path(_storage_prefix, chans[c].name);
+        if (!_storage->exists(path.c_str())) continue;
+        File f = _storage->open(path.c_str(), "r");
+        if (!f) continue;
+        bool ok = scan_msg_records(f, is_sd, last, count, nullptr, 0);
+        f.close();
+        if (!ok) continue;
+        lua_newtable(L);
+        lua_pushstring(L, "channel");      lua_setfield(L, -2, "kind");
+        lua_pushinteger(L, chans[c].idx);  lua_setfield(L, -2, "idx");
+        lua_pushstring(L, chans[c].name);  lua_setfield(L, -2, "name");
+        lua_pushinteger(L, count);         lua_setfield(L, -2, "count");
+        push_stored_msg_table(L, last);    lua_setfield(L, -2, "last");
+        lua_rawseti(L, -2, out_idx++);
+    }
+
+    // DM logs: directory pass (same shape as pushDMThreadNamesToLua), scanning
+    // each iterated entry handle directly — no re-open by path.
+    String dir = messages_dir(_storage_prefix);
+    File root = _storage->open(dir.c_str());
+    if (root && root.isDirectory()) {
+        int iter = 0;
+        File entry = root.openNextFile();
+        while (entry) {
+            if (!entry.isDirectory()) {
+                String name = entry.name();
+                int slash = name.lastIndexOf('/');
+                String base = (slash >= 0) ? name.substring(slash + 1) : name;
+                if (base.startsWith("dm_") && base.endsWith(".log")) {
+                    char peer[32];
+                    if (scan_msg_records(entry, is_sd, last, count,
+                                         peer, sizeof(peer)) && peer[0] != '\0') {
+                        lua_newtable(L);
+                        lua_pushstring(L, "dm");        lua_setfield(L, -2, "kind");
+                        lua_pushstring(L, peer);        lua_setfield(L, -2, "name");
+                        lua_pushinteger(L, count);      lua_setfield(L, -2, "count");
+                        push_stored_msg_table(L, last); lua_setfield(L, -2, "last");
+                        lua_rawseti(L, -2, out_idx++);
+                    }
+                }
+            }
+            if (is_sd && ++iter % 10 == 0) {
+                sd_spi_release();
+                vTaskDelay(1);
+                sd_spi_take();
+            }
+            entry = root.openNextFile();
+        }
+        root.close();
+    } else if (root) {
+        root.close();
+    }
+
     if (is_sd) sd_spi_release();
     return 1;
 }

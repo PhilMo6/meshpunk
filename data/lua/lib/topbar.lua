@@ -99,15 +99,14 @@ function M.updateUnread()
 end
 
 function M.create()
-    -- Do NOT loadPersisted() here. The topbar only needs the live unread COUNTERS
-    -- (countUnread sums __channel_unread/__dm_unread, bumped by live __dispatch) —
-    -- it never reads the message history. loadPersisted pulls EVERY channel + DM
-    -- thread from disk into Lua tables (~1.7MB with a busy mesh); called at boot
-    -- that baseline sat resident in the Lua heap forever, fragmenting PSRAM so the
-    -- heavy apps (Doom/Map/PICO-8) couldn't get a big contiguous block. The
-    -- Messenger app is the only consumer of the history and calls loadPersisted()
-    -- itself on open; C++ persists every message before dispatch, so deferring the
-    -- load loses nothing (and the unread badge is unaffected — it's counter-based).
+    -- The topbar only needs the live unread COUNTERS (countUnread sums
+    -- __channel_unread/__dm_unread, bumped by live __dispatch) — it never reads
+    -- message history. Histories don't sit in Lua at all anymore: the Messenger
+    -- runs its inbox on C-side summaries (messages:loadSummaries) and loads a
+    -- single conversation only while its chat view is open (openThread), so the
+    -- Lua arena stays small and the heavy apps (Doom/Map/PICO-8) keep their big
+    -- contiguous PSRAM block. C++ persists every message before dispatch, so
+    -- none of this loses data (and the unread badge is counter-based anyway).
 
     bar = lvgl.Object({
         flex = { flex_direction = "row", flex_wrap = "nowrap", justify_content = "space-between" },

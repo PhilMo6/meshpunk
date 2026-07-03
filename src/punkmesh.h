@@ -351,6 +351,10 @@ public:
   int pushChannelMessagesToLua(lua_State* L, int channel_idx);
   int pushDMMessagesToLua(lua_State* L, const char* peer);
   int pushDMThreadNamesToLua(lua_State* L);
+  // One {kind, idx/name, count, last} summary entry per stored conversation
+  // (count + last record only — no full histories). Takes MESH_LOCK internally
+  // just for the channel-table snapshot; call it WITHOUT the lock held.
+  int pushMsgSummariesToLua(lua_State* L);
   // Routing store (Phase 3): pushes {from,timestamp,lat,lon,path} records for a
   // sender (empty/null = all) within [since_ts, until_ts] (0 = open bound).
   int pushRoutingQuery(lua_State* L, const char* sender, uint32_t since_ts, uint32_t until_ts);
