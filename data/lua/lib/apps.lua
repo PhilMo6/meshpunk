@@ -398,8 +398,13 @@ function M.launch(name_or_record)
         if step == 1 then
             print("[apps] launching: " .. rec.name)
             if rec.source == "sd" and type(_dofile_sd) == "function" then
-                local ok, err = pcall(_dofile_sd, rec.entrypoint, rec.dir)
-                if not ok then finish_err(err); return true end
+                local ok, result = pcall(_dofile_sd, rec.entrypoint, rec.dir)
+                if not ok then finish_err(result); return true end
+                -- Deferred-init apps (the ELF launchers) return a phased init
+                -- function; hand it to the same stepper the internal path uses.
+                -- Dropping it left the app as an empty black root (SD black
+                -- screen on Doom/PICO-8/GameBoy).
+                if type(result) == "function" then deferred_init = result; return false end
                 finish_ok(); return true
             else
                 local chunk, lerr = loadfile(rec.entrypoint)

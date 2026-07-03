@@ -874,7 +874,11 @@ void* psram_calloc(size_t nmemb, size_t size) {
 void* psram_realloc(void* ptr, size_t size) {
     mod_untrack(ptr);
     void* p = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    mod_track(p);
+    if (p) mod_track(p);
+    // Failed grow: the old block is still live and the module keeps using it —
+    // re-track it or it escapes the leak sweep if the module exits via longjmp.
+    // (size == 0 means realloc freed the block; it must stay untracked.)
+    else if (ptr && size) mod_track(ptr);
     return p;
 }
 

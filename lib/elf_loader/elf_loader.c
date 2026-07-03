@@ -278,7 +278,14 @@ static int process_rela_section(elf_module_t* mod, void* load_base,
                     LOG_E("unresolved symbol: %s", name);
                     return -1;
                 }
-                *target = (uint32_t)addr;
+                // The Xtensa linker emits GLOB_DAT with non-zero addends for
+                // literals addressing members of a global object (e.g. gnuboy's
+                // &GB.ioregs = GB+8). Dropping the addend aliases every such
+                // literal to the base symbol — gnuboy's gb_hw_reset then
+                // memset()s over its own struct and crashes on the nulled
+                // pointers. JMP_SLOT addends are 0 in practice; adding is a
+                // no-op there and correct per RELA semantics.
+                *target = (uint32_t)addr + rela[i].r_addend;
                 break;
             }
 
