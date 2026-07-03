@@ -2434,6 +2434,31 @@ static int lua_mesh_archive_read(lua_State *L) {
   return 3;
 }
 
+// _mesh_archive_compact() -> before, after (record counts) | nil, errcode
+// Streaming dedup rewrite of the archive log (one record per pubkey, newest
+// wins, live contacts dropped) + index rebuild. No MESH_LOCK here —
+// compactArchive manages its own bounded lock windows so the radio never
+// stalls for the whole rewrite. Nothing crosses into Lua but two integers.
+static int lua_mesh_archive_compact(lua_State *L) {
+  uint32_t before = 0, after = 0;
+  int rc = the_mesh->compactArchive(&before, &after);
+  if (rc != 0) {
+    lua_pushnil(L);
+    lua_pushinteger(L, rc);
+    return 2;
+  }
+  lua_pushinteger(L, (lua_Integer)before);
+  lua_pushinteger(L, (lua_Integer)after);
+  return 2;
+}
+
+// _mesh_archive_count() -> records currently in the log (duplicates included).
+// One file stat — no scan, no lock beyond the SD bus.
+static int lua_mesh_archive_count(lua_State *L) {
+  lua_pushinteger(L, (lua_Integer)the_mesh->archiveRecordCount());
+  return 1;
+}
+
 // Helper for _mesh_search_contact_names: ASCII-lowercase `name`, and if it
 // contains `q` (already lowercased) and isn't a name we've already collected,
 // append the ORIGINAL-case name to the result table (at the top of the Lua stack)
@@ -4837,6 +4862,8 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_remove_contact", lua_mesh_remove_contact);
   lua_register(L, "_mesh_readd_contact", lua_mesh_readd_contact);
   lua_register(L, "_mesh_archive_read", lua_mesh_archive_read);
+  lua_register(L, "_mesh_archive_compact", lua_mesh_archive_compact);
+  lua_register(L, "_mesh_archive_count", lua_mesh_archive_count);
   lua_register(L, "_mesh_clear_contacts", lua_mesh_clear_contacts);
   lua_register(L, "_mesh_reset_path", lua_mesh_reset_path);
   lua_register(L, "_mesh_export_contact", lua_mesh_export_contact);

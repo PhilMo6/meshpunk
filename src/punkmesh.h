@@ -191,19 +191,31 @@ public:
 
   // ── Contact archive ────────────────────────────────────────────
   // Contacts that fall out of the live table (overwritten when it is full,
-  // or removed by the user) are preserved in <storage>/contacts_arch so they
-  // can still be shown on the map and re-added later — mirrors the MeshCore
-  // Android app's contact history. DISK-ONLY (2026-06-19): the archive lives
-  // ONLY in the append-only log on disk — there is NO in-RAM array and NO cap,
-  // so it is permanent and costs ZERO PSRAM unless the user opens "show
-  // archived", which reads it on demand. The hot path just appends one line;
-  // duplicates are resolved newest-wins when read (re-adds rely on the union
-  // skipping live contacts, so a re-added contact's stale line is harmless).
+  // or removed by the user) are preserved in <storage>/contacts_arch.bin so
+  // they can still be shown on the map and re-added later — mirrors the
+  // MeshCore Android app's contact history. DISK-ONLY records (2026-06-19):
+  // the record data lives only in the fixed-stride log on disk, read on
+  // demand. Since 2026-07-02 the hot path is an UPSERT: an in-RAM pubkey→
+  // offset hash index (192KB, allocated once at boot low in PSRAM — see the
+  // dedup-index section in punkmesh.cpp) lets a re-archived contact overwrite
+  // its existing record in place, so the log no longer grows without bound on
+  // a large mesh. compactArchive() rewrites the log to one record per pubkey
+  // (newest wins, live contacts dropped) and rebuilds the index — also the
+  // recovery path for a pre-index runaway log, which is too big to index at
+  // boot and falls back to plain appends until compacted.
   volatile uint32_t archive_generation = 0;  // bumps on every archive change
 
   void appendArchiveEntry(const ContactInfo& c);
   void archiveContact(const ContactInfo& c);
   bool readdArchivedContact(const uint8_t* pub_key);
+  // Allocate (once) + rebuild the dedup index from this backend's log.
+  // Called by setStorage(); safe to call again (idempotent allocation).
+  void archiveIndexInit();
+  // Streaming dedup rewrite of the log (see punkmesh.cpp for the pass/locking
+  // design). Returns 0 with record counts in the out params, negative on error.
+  int compactArchive(uint32_t* before_out, uint32_t* after_out);
+  // Records currently in the log, duplicates included (file size / stride).
+  uint32_t archiveRecordCount();
   // Read the archive log into `out` (deduped, newest line per pubkey wins),
   // up to max_out entries; returns the count. Used by the "show archived" map
   // union. Caller owns the (transient) buffer; disk keeps everything regardless

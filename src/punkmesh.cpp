@@ -51,6 +51,10 @@ void PunkMesh::setStorage(fs::FS* fs, const char* prefix) {
     SLog.printf("[STORAGE] Set to %s, prefix=\"%s\"\n",
         (fs == &LittleFS) ? "LittleFS" : "SD", prefix);
     recover_tmp_files(_storage, messages_dir(_storage_prefix));
+    // (Re)build the archive dedup index for this backend's log. At boot this
+    // is also what allocates it — setStorage runs early in setup(), so the
+    // 192KB block lands low in PSRAM, before the Lua arena/gap form.
+    archiveIndexInit();
 }
 
 // Helper to build a full path with storage prefix
@@ -441,9 +445,152 @@ void PunkMesh::saveOneContact(const ContactInfo& c)
 }
 
 // ── Contact archive ──────────────────────────────────────────────────
-// DISK-ONLY: the archive lives only in the <storage>/contacts_arch append-only
-// log — no RAM array, no cap. See punkmesh.h. Read on demand (transient) for
-// the "show archived" map union and re-add.
+// DISK-ONLY records: the archive lives in the <storage>/contacts_arch.bin
+// fixed-stride log (CONTACT_REC bytes/record). See punkmesh.h. Read on demand
+// (transient) for the "show archived" map union and re-add.
+//
+// ── Archive dedup index ──
+// Open-addressed hash (linear probe) mapping every archived pubkey → byte
+// offset of its newest record. It turns archiveContact into an UPSERT (an
+// in-place record rewrite instead of a blind append), which is what stops the
+// log growing without bound on a large mesh: with thousands of contacts on
+// multi-day advert cycles and ~500 live slots, nearly every eviction re-archives
+// a pubkey that is already in the log.
+//   - keys are the FIRST 8 PUBKEY BYTES (ed25519 keys are uniform; collision
+//     odds across 10k contacts ~1e-12, and the worst case is one archive
+//     record superseding another — self-heals on that contact's next eviction)
+//   - one 192KB PSRAM block allocated ONCE from setStorage() at boot, so it
+//     lands low among the boot residents, below the Lua arena/gap — a fixed
+//     resident, not mid-heap churn (see the meshprint fragmentation work)
+//   - offset sentinel UINT32_MAX = empty slot (0 is a valid record offset)
+//   - concurrency: every index reader/writer holds MESH_LOCK (all
+//     archiveContact callers do; compactArchive's index-mutating phases do).
+//     compactArchive's unlocked streaming passes set s_arch_compacting, which
+//     routes the hot path to plain appends so it never touches the index.
+#define ARCH_IDX_SLOTS     16384u             // power of two; ~11k keys @ 0.7 load
+#define ARCH_IDX_MAX_USED  (ARCH_IDX_SLOTS * 7u / 10u)
+#define ARCH_IDX_BUILD_MAX (1024u * 1024u)    // boot-scan cap: a legacy runaway log
+                                              // stays unindexed until compacted
+static uint64_t*     s_arch_key = nullptr;    // [ARCH_IDX_SLOTS] pubkey prefixes
+static uint32_t*     s_arch_off = nullptr;    // [ARCH_IDX_SLOTS] record offsets
+static uint32_t      s_arch_used = 0;
+static bool          s_arch_built = false;    // false → appendArchiveEntry appends blindly
+static volatile bool s_arch_compacting = false;
+
+static inline uint64_t arch_key_of(const uint8_t* pub_key_or_rec) {
+    uint64_t k;
+    memcpy(&k, pub_key_or_rec, 8);   // records start with the pubkey, so a raw
+    return k;                        // record pointer works here too
+}
+
+static inline uint32_t arch_idx_home(uint64_t key) {
+    return (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 32) & (ARCH_IDX_SLOTS - 1);
+}
+
+// Slot holding `key`, or -1 when absent.
+static int arch_idx_find(uint64_t key) {
+    if (!s_arch_key) return -1;
+    uint32_t i = arch_idx_home(key);
+    for (uint32_t probes = 0; probes < ARCH_IDX_SLOTS; probes++) {
+        if (s_arch_off[i] == UINT32_MAX) return -1;
+        if (s_arch_key[i] == key) return (int)i;
+        i = (i + 1) & (ARCH_IDX_SLOTS - 1);
+    }
+    return -1;
+}
+
+// Insert or update key → off. Returns false at the load cap (caller reverts to
+// append-only mode; a later compaction dedups and rebuilds).
+static bool arch_idx_upsert(uint64_t key, uint32_t off) {
+    if (!s_arch_key) return false;
+    uint32_t i = arch_idx_home(key);
+    for (uint32_t probes = 0; probes < ARCH_IDX_SLOTS; probes++) {
+        if (s_arch_off[i] == UINT32_MAX) {
+            if (s_arch_used >= ARCH_IDX_MAX_USED) return false;
+            s_arch_key[i] = key;
+            s_arch_off[i] = off;
+            s_arch_used++;
+            return true;
+        }
+        if (s_arch_key[i] == key) { s_arch_off[i] = off; return true; }
+        i = (i + 1) & (ARCH_IDX_SLOTS - 1);
+    }
+    return false;
+}
+
+static void arch_idx_reset() {
+    if (!s_arch_off) return;
+    for (uint32_t i = 0; i < ARCH_IDX_SLOTS; i++) s_arch_off[i] = UINT32_MAX;
+    s_arch_used = 0;
+}
+
+// Allocate (once) and (re)build the archive index by streaming the log.
+// Called from setStorage() — at boot (lands low in PSRAM, before the Lua
+// arena/gap form) and again on a runtime backend switch (the other backend has
+// its own log). A file over ARCH_IDX_BUILD_MAX is left unindexed — appends
+// behave exactly as before this index existed — until compactArchive() shrinks
+// it and rebuilds; scanning a multi-MB runaway log on every boot helps nobody.
+void PunkMesh::archiveIndexInit()
+{
+    if (!s_arch_key) {
+        void* blk = heap_caps_malloc(ARCH_IDX_SLOTS * 12, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!blk) {
+            SLog.println("[ARCH] index alloc failed - archive stays append-only");
+            return;
+        }
+        s_arch_key = (uint64_t*)blk;
+        s_arch_off = (uint32_t*)((uint8_t*)blk + ARCH_IDX_SLOTS * 8);
+    }
+    arch_idx_reset();
+    s_arch_built = false;
+    if (!_storage) return;
+
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    String tmp  = path + ".tmp";
+    // Compaction crash recovery: interrupted between remove and rename leaves
+    // only the finished .tmp — adopt it. Any other leftover .tmp is half
+    // written garbage — drop it.
+    if (!_storage->exists(path.c_str()) && _storage->exists(tmp.c_str()))
+        _storage->rename(tmp.c_str(), path.c_str());
+    else if (_storage->exists(tmp.c_str()))
+        _storage->remove(tmp.c_str());
+
+    bool too_big = false, overflow = false;
+    if (_storage->exists(path.c_str())) {
+        File f = _storage->open(path.c_str());
+        if (f) {
+            if ((uint32_t)f.size() > ARCH_IDX_BUILD_MAX) {
+                too_big = true;
+                SLog.printf("[ARCH] %uKB archive too large to index - run compaction\n",
+                            (unsigned)(f.size() / 1024));
+            } else {
+                uint8_t rec[CONTACT_REC];
+                uint32_t off = 0;
+                int cnt = 0;
+                while (f.available() >= CONTACT_REC) {
+                    if (f.read(rec, CONTACT_REC) != CONTACT_REC) break;
+                    if (!arch_idx_upsert(arch_key_of(rec), off)) { overflow = true; break; }
+                    off += CONTACT_REC;
+                    if (is_sd && ++cnt % 200 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+                }
+            }
+            f.close();
+        }
+    }
+
+    if (overflow) {
+        arch_idx_reset();
+        SLog.println("[ARCH] too many distinct archived contacts for the index - append-only");
+    } else if (!too_big) {
+        s_arch_built = true;   // empty/missing file = trivially indexed
+        SLog.printf("[ARCH] index built: %u archived contacts\n", (unsigned)s_arch_used);
+    }
+
+    if (is_sd) sd_spi_release();
+}
 
 // Read the log into `out` (deduped — the newest line per pubkey wins, since the
 // file is append-order), up to max_out entries; returns the count. The whole
@@ -523,10 +670,12 @@ int PunkMesh::readArchiveBatch(uint32_t offset, int max_count, ContactInfo* out,
     return n;
 }
 
-// Hot-path persistence: append ONE binary contact record (CONTACT_REC bytes).
-// Keeping the archive append-only (vs rewriting) is what keeps eviction during
-// advert storms cheap on the shared SD/TFT SPI bus. Duplicates (re-archived
-// pubkeys) are resolved newest-wins when the log is read.
+// Hot-path persistence, now an UPSERT: when the index knows this pubkey, its
+// record is overwritten in place (fixed CONTACT_REC stride makes that a single
+// seek+write) — the log only grows for pubkeys never archived before. Index
+// miss / unbuilt / compaction-in-progress fall back to the old blind append,
+// so nothing is ever dropped. Callers hold MESH_LOCK (evict/discard run in the
+// mesh loop; the Lua remove binding locks), which serializes the index.
 void PunkMesh::appendArchiveEntry(const ContactInfo& c)
 {
     archive_generation++;  // invalidate the Lua-side union cache
@@ -534,12 +683,38 @@ void PunkMesh::appendArchiveEntry(const ContactInfo& c)
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    uint8_t rec[CONTACT_REC];
+    serialize_contact(c, rec);
+
+    if (s_arch_built && !s_arch_compacting) {
+        int slot = arch_idx_find(arch_key_of(c.id.pub_key));
+        if (slot >= 0) {
+            File f = _storage->open(path.c_str(), "r+");
+            if (f) {
+                uint32_t off = s_arch_off[slot];
+                if (off + CONTACT_REC <= (uint32_t)f.size() && f.seek(off)) {
+                    f.write(rec, CONTACT_REC);
+                    f.close();
+                    if (is_sd) sd_spi_release();
+                    return;
+                }
+                f.close();
+            }
+            // "r+" unsupported or a stale offset: append below instead (never
+            // drop the record); the index is re-pointed at the fresh copy.
+        }
+    }
+
     File file = _storage->open(path.c_str(), "a", true);
     if (file) {
-        uint8_t rec[CONTACT_REC];
-        serialize_contact(c, rec);
+        uint32_t off = (uint32_t)file.size();   // append position = record offset
         file.write(rec, CONTACT_REC);
         file.close();
+        if (s_arch_built && !s_arch_compacting &&
+            !arch_idx_upsert(arch_key_of(c.id.pub_key), off)) {
+            s_arch_built = false;   // load cap hit: back to append-only
+            SLog.println("[ARCH] index full - append-only until next compaction");
+        }
     }
 
     if (is_sd) sd_spi_release();
@@ -548,22 +723,52 @@ void PunkMesh::appendArchiveEntry(const ContactInfo& c)
 void PunkMesh::archiveContact(const ContactInfo& c)
 {
     if (!_prefs.archive_contacts) return;  // archiving disabled by setting
-    // Disk-only: just append. A re-archived pubkey gets a fresh line that
-    // supersedes the old one on read (newest-wins) — no RAM lookup, no cap.
+    // Upsert: a re-archived pubkey overwrites its existing record in place via
+    // the dedup index; only never-archived pubkeys append (see appendArchiveEntry).
     appendArchiveEntry(c);
     SLog.printf("[ARCH] Archived contact: %s\n", c.name);
 }
 
 bool PunkMesh::readdArchivedContact(const uint8_t* pub_key)
 {
-    // Scan the binary log for this pubkey's newest record (fixed stride, no parse).
     ContactInfo found;
     bool have = false;
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/contacts_arch.bin");
-    if (_storage->exists(path.c_str()))
+
+    // Index fast path (caller holds MESH_LOCK): one seek instead of a full
+    // scan. The full-pubkey compare guards the astronomical prefix-collision
+    // case — on mismatch we fall back to the scan rather than trust the slot.
+    if (s_arch_built && !s_arch_compacting) {
+        int slot = arch_idx_find(arch_key_of(pub_key));
+        if (slot >= 0 && _storage->exists(path.c_str())) {
+            File f = _storage->open(path.c_str());
+            if (f) {
+                uint8_t rec[CONTACT_REC];
+                if (s_arch_off[slot] + CONTACT_REC <= (uint32_t)f.size() &&
+                    f.seek(s_arch_off[slot]) &&
+                    f.read(rec, CONTACT_REC) == CONTACT_REC) {
+                    ContactInfo entry;
+                    deserialize_contact(rec, entry);
+                    if (memcmp(entry.id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+                        found = entry;
+                        have = true;
+                    }
+                }
+                f.close();
+            }
+        }
+        if (!have && slot < 0) {
+            // Index is authoritative when built: not indexed = not archived.
+            if (is_sd) sd_spi_release();
+            return false;
+        }
+    }
+
+    // Scan the binary log for this pubkey's newest record (fixed stride, no parse).
+    if (!have && _storage->exists(path.c_str()))
     {
         File file = _storage->open(path.c_str());
         if (file)
@@ -616,6 +821,206 @@ void PunkMesh::onContactOverwrite(const uint8_t* pub_key)
         SLog.printf("[ARCH] Live table full — archiving evicted contact: %s\n", c->name);
         archiveContact(*c);
     }
+}
+
+// Records currently in the archive log (including duplicates) — one stat, no scan.
+uint32_t PunkMesh::archiveRecordCount()
+{
+    uint32_t n = 0;
+    if (!_storage) return 0;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    if (_storage->exists(path.c_str())) {
+        File f = _storage->open(path.c_str());
+        if (f) { n = (uint32_t)f.size() / CONTACT_REC; f.close(); }
+    }
+    if (is_sd) sd_spi_release();
+    return n;
+}
+
+// Rewrite contacts_arch.bin down to ONE record per pubkey (newest wins),
+// dropping records whose contact is back in the live table (documented as
+// stale/superseded — they re-archive fresh if evicted again). Streaming: two
+// sequential passes plus a bounded tail merge; the archive never materializes
+// in RAM. The index arrays double as the pass-1 scratch (old offsets) and are
+// re-pointed to the new offsets during pass 2, so a finished compaction leaves
+// the index built and exact as a byproduct. User-triggered from the Messenger.
+//
+// Locking: pass 0 snapshots the live table under MESH_LOCK and raises
+// s_arch_compacting (concurrent evictions take the plain-append path and land
+// past the size snapshot). Passes 1-2 stream WITHOUT the mesh lock. The finish
+// phase takes MESH_LOCK *then* the SD lock (same order as the mesh task) to
+// fold in the tail, swap the files and mark the index live — bounded work, so
+// the radio is never stalled for the whole rewrite.
+//
+// The pass-2 "newest" test stays valid as offsets are re-pointed because the
+// newest record is the LAST occurrence of its key in [0,S): earlier duplicates
+// compare against the (not-yet-re-pointed) old offset and miss; once the last
+// occurrence matches and the slot is re-pointed, that key never recurs.
+//
+// Returns 0 on success (record counts in *before_out/*after_out), else:
+//   -1 no storage or no archive file, -2 index memory missing (boot alloc
+//   failed), -3 too many distinct pubkeys for the index, -4 file I/O error.
+int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
+{
+    *before_out = 0;
+    *after_out = 0;
+    if (!_storage) return -1;
+    if (!s_arch_key) return -2;
+
+    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
+    String tmp  = path + ".tmp";
+    bool is_sd = (_storage != &LittleFS);
+
+    // ── Pass 0: live-table pubkey prefixes + enter append-only mode ──
+    // Transient heap block (4KB @ MAX_CONTACTS=500), not stack — the binding
+    // runs on loopTask whose 16KB also carries the Lua C stack.
+    uint64_t* live = (uint64_t*)heap_caps_malloc(
+        sizeof(uint64_t) * MAX_CONTACTS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int nlive = 0;
+    MESH_LOCK();
+    s_arch_compacting = true;
+    s_arch_built = false;
+    arch_idx_reset();
+    if (live) {
+        int n = getNumContacts();
+        ContactInfo ci;
+        for (int i = 0; i < n && nlive < MAX_CONTACTS; i++) {
+            if (!getContactByIdx(i, ci)) break;
+            live[nlive++] = arch_key_of(ci.id.pub_key);
+        }
+    }
+    // live == NULL -> nlive stays 0: live contacts keep their archive records
+    // this round (harmless, documented as superseded) instead of failing.
+    MESH_UNLOCK();
+
+    int rc = 0;
+    uint32_t S = 0;      // size snapshot: passes cover [0,S), the tail merge covers the rest
+    uint32_t kept = 0;
+    uint32_t woff = 0;   // write offset in .tmp
+    uint8_t rec[CONTACT_REC];
+
+    // ── Passes 1-2: stream without the mesh lock ──
+    if (is_sd) sd_spi_take();
+    do {
+        if (!_storage->exists(path.c_str())) { rc = -1; break; }
+
+        // Pass 1: newest offset per non-live pubkey into the index arrays.
+        File f = _storage->open(path.c_str());
+        if (!f) { rc = -4; break; }
+        S = ((uint32_t)f.size() / CONTACT_REC) * CONTACT_REC;
+        uint32_t off = 0;
+        int cnt = 0;
+        bool idx_ok = true;
+        while (off + CONTACT_REC <= S) {
+            if (f.read(rec, CONTACT_REC) != CONTACT_REC) { rc = -4; break; }
+            uint64_t key = arch_key_of(rec);
+            bool is_live = false;
+            for (int i = 0; i < nlive; i++) {
+                if (live[i] == key) { is_live = true; break; }
+            }
+            if (!is_live && !arch_idx_upsert(key, off)) { idx_ok = false; break; }
+            off += CONTACT_REC;
+            if (is_sd && ++cnt % 200 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+        }
+        f.close();
+        if (rc) break;
+        if (!idx_ok) { rc = -3; break; }
+
+        // Pass 2: write each key's newest record to .tmp, re-pointing its
+        // index slot at the record's new offset as it lands.
+        File in = _storage->open(path.c_str());
+        File out = _storage->open(tmp.c_str(), "w", true);
+        if (!in || !out) {
+            if (in) in.close();
+            if (out) out.close();
+            rc = -4;
+            break;
+        }
+        uint32_t off2 = 0;
+        cnt = 0;
+        while (off2 + CONTACT_REC <= S) {
+            if (in.read(rec, CONTACT_REC) != CONTACT_REC) { rc = -4; break; }
+            int slot = arch_idx_find(arch_key_of(rec));
+            if (slot >= 0 && s_arch_off[slot] == off2) {
+                if (out.write(rec, CONTACT_REC) != CONTACT_REC) { rc = -4; break; }
+                s_arch_off[slot] = woff;
+                woff += CONTACT_REC;
+                kept++;
+            }
+            off2 += CONTACT_REC;
+            if (is_sd && ++cnt % 200 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+        }
+        in.close();
+        out.close();
+    } while (0);
+    if (is_sd) sd_spi_release();
+
+    if (rc == 0) {
+        // ── Finish: tail merge + swap, MESH_LOCK then SD lock ──
+        MESH_LOCK();
+        if (is_sd) sd_spi_take();
+
+        File src = _storage->open(path.c_str());
+        File dst = _storage->open(tmp.c_str(), "a");
+        bool ok = (src && dst);
+        if (ok) {
+            // Records archived while we streamed (append-only mode put them
+            // past S). Copied verbatim + indexed; a duplicate this creates is
+            // superseded newest-wins and cleaned by the next compaction.
+            uint32_t end = ((uint32_t)src.size() / CONTACT_REC) * CONTACT_REC;
+            *before_out = end / CONTACT_REC;
+            uint32_t o = S;
+            if (o < end && !src.seek(o)) ok = false;
+            while (ok && o + CONTACT_REC <= end) {
+                if (src.read(rec, CONTACT_REC) != CONTACT_REC) { ok = false; break; }
+                if (dst.write(rec, CONTACT_REC) != CONTACT_REC) { ok = false; break; }
+                arch_idx_upsert(arch_key_of(rec), woff);
+                woff += CONTACT_REC;
+                kept++;
+                o += CONTACT_REC;
+            }
+        }
+        if (src) src.close();
+        if (dst) dst.close();
+
+        if (ok) {
+            _storage->remove(path.c_str());
+            ok = _storage->rename(tmp.c_str(), path.c_str());
+            // A crash between remove and rename is recovered by
+            // archiveIndexInit (adopts a lone .tmp) on next boot.
+        }
+        if (ok) {
+            s_arch_built = true;
+            *after_out = kept;
+        } else {
+            _storage->remove(tmp.c_str());
+            arch_idx_reset();      // offsets are unreliable now
+            rc = -4;
+        }
+        s_arch_compacting = false;
+        archive_generation++;      // Map union cache + pager windows are stale
+
+        if (is_sd) sd_spi_release();
+        MESH_UNLOCK();
+    } else {
+        // Failed mid-pass: original untouched, drop the .tmp, stay append-only
+        // (the safe state) until the next successful compaction or reboot.
+        if (is_sd) sd_spi_take();
+        if (_storage->exists(tmp.c_str())) _storage->remove(tmp.c_str());
+        if (is_sd) sd_spi_release();
+        MESH_LOCK();
+        arch_idx_reset();
+        s_arch_built = false;
+        s_arch_compacting = false;
+        MESH_UNLOCK();
+    }
+
+    if (live) heap_caps_free(live);
+    SLog.printf("[ARCH] compact rc=%d: %u -> %u records\n",
+                rc, (unsigned)*before_out, (unsigned)*after_out);
+    return rc;
 }
 
 void PunkMesh::loadChannels()

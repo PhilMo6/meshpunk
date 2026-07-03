@@ -1246,6 +1246,33 @@ show_contact_settings = function()
         function(v) archive_on = v
             pcall(_mesh_set_config, "archive_contacts", v and "1" or "0") end)
 
+    -- Compact the on-disk archive: C-side streaming rewrite down to one record
+    -- per contact (newest wins, live contacts dropped). Nothing loads into Lua
+    -- but the two record counts shown on the button.
+    local arch_n = 0
+    local ok_an, an = pcall(_mesh_archive_count)
+    if ok_an and type(an) == "number" then arch_n = an end
+    local compact_btn = box:Button { w = lvgl.PCT(100), h = 28 }
+    local compact_lbl = compact_btn:Label {
+        text = "Compact archive (" .. arch_n .. ")", align = lvgl.ALIGN.CENTER }
+    local compacting = false
+    compact_btn:onevent(lvgl.EVENT.RELEASED, function()
+        if compacting then return end
+        compacting = true
+        compact_lbl.text = "Compacting..."
+        -- One tick later so the label paints before the blocking C call.
+        apps.add_timer { period = 50, cb = function(t)
+            t:delete()
+            local ok_c, before, after = pcall(_mesh_archive_compact)
+            if ok_c and before then
+                compact_lbl.text = "Compacted: " .. before .. " -> " .. after
+            else
+                compact_lbl.text = "Compact failed (" .. tostring(after or before) .. ")"
+            end
+            compacting = false
+        end }
+    end)
+
     local add_btn = box:Button { w = lvgl.PCT(100), h = 28 }
     add_btn:Label { text = "Add Contact", align = lvgl.ALIGN.CENTER }
     add_btn:onevent(lvgl.EVENT.RELEASED, function()
