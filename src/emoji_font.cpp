@@ -8,6 +8,7 @@
 
 #include "../lib/lvgl/src/others/imgfont/lv_imgfont.h"
 #include "../lib/lvgl/src/misc/lv_fs.h"
+#include "../lib/lvgl/lvgl.h"   // lv_timer / lv_image_cache_drop / lv_obj_invalidate
 
 namespace {
 
@@ -105,6 +106,36 @@ bool cache_insert(uint32_t cp, lv_image_dsc_t * dsc)
         }
     }
     return false;
+}
+
+// ---- Cache-full recycling --------------------------------------------------
+// The cache has no per-slot eviction: a returned dsc pointer lands in DEFERRED
+// draw tasks (imgfont stores it in the glyph dsc; the image draw executes later
+// in the refresh cycle) and may sit in LVGL's decoder cache, so freeing a
+// published glyph synchronously risks use-after-free. Instead, when the cache
+// fills we schedule a FULL clear from an lv_timer: timers run strictly outside
+// the display-refresh timer (LV_USE_OS 0 — all draw tasks complete inside it),
+// so at that point nothing in the pipeline references any glyph. Visible emoji
+// reload lazily after the invalidate; the triggering glyph is blank one frame.
+
+bool s_clear_scheduled = false;
+
+void cache_clear_timer_cb(lv_timer_t * t)
+{
+    LV_UNUSED(t);   // repeat_count 1: LVGL deletes the timer after this call
+    emoji_font_cache_clear();
+    lv_image_cache_drop(NULL);   // decoder entries may point at freed dscs
+    lv_obj_invalidate(lv_screen_active());
+    s_clear_scheduled = false;
+}
+
+void schedule_cache_clear()
+{
+    if (s_clear_scheduled) return;
+    lv_timer_t * t = lv_timer_create(cache_clear_timer_cb, 20, nullptr);
+    if (!t) return;   // OOM: stay full, blank-render until a later attempt lands
+    lv_timer_set_repeat_count(t, 1);
+    s_clear_scheduled = true;
 }
 
 // ---- Helpers --------------------------------------------------------------
@@ -303,6 +334,15 @@ const void * emoji_path_cb(const lv_font_t * font,
     // The in-RAM binary search is ~11 compares — cheap enough per glyph.
     if (!blob_init_once() || blob_find(unicode) < 0) return nullptr;
 
+    // Cache full: don't load a glyph we can't keep — pre-fix, the fresh glyph
+    // was returned uncached and orphaned PER DRAW once 256 distinct emoji had
+    // been seen (the audit's one real leak). Blank this frame, recycle the
+    // cache at the next safe point, render normally from the next frame on.
+    if (s_cache_count >= EMOJI_CACHE_CAP) {
+        schedule_cache_clear();
+        return &s_blank_dsc;
+    }
+
     auto * fresh = load_emoji_from_blob(unicode);
     // In the index but failed to load (OOM/decode) — cache the blank so we
     // never retry this codepoint every frame.
@@ -311,7 +351,14 @@ const void * emoji_path_cb(const lv_font_t * font,
         return &s_blank_dsc;
     }
 
-    (void)cache_insert(unicode, fresh);
+    if (!cache_insert(unicode, fresh)) {
+        // Unreachable with the cap guard above, but never orphan a glyph:
+        // `fresh` was never handed to LVGL, so freeing it here is safe.
+        heap_caps_free(const_cast<void *>(static_cast<const void *>(fresh->data)));
+        heap_caps_free(fresh);
+        schedule_cache_clear();
+        return &s_blank_dsc;
+    }
     return fresh;
 }
 
@@ -322,12 +369,21 @@ extern "C" bool emoji_preload(uint32_t codepoint)
     cache_init_once();
     if (auto *cached = cache_lookup(codepoint))
         return cached != &s_blank_dsc;
+    if (s_cache_count >= EMOJI_CACHE_CAP) {   // full: same recycle as the render path
+        schedule_cache_clear();
+        return false;
+    }
     auto *fresh = load_emoji_from_blob(codepoint);
     if (!fresh) {
         cache_insert(codepoint, &s_blank_dsc);
         return false;
     }
-    cache_insert(codepoint, fresh);
+    if (!cache_insert(codepoint, fresh)) {
+        heap_caps_free(const_cast<void *>(static_cast<const void *>(fresh->data)));
+        heap_caps_free(fresh);
+        schedule_cache_clear();
+        return false;
+    }
     return true;
 }
 

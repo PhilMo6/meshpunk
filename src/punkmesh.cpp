@@ -965,6 +965,7 @@ int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
         File src = _storage->open(path.c_str());
         File dst = _storage->open(tmp.c_str(), "a");
         bool ok = (src && dst);
+        bool idx_ok = true;
         if (ok) {
             // Records archived while we streamed (append-only mode put them
             // past S). Copied verbatim + indexed; a duplicate this creates is
@@ -976,7 +977,10 @@ int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
             while (ok && o + CONTACT_REC <= end) {
                 if (src.read(rec, CONTACT_REC) != CONTACT_REC) { ok = false; break; }
                 if (dst.write(rec, CONTACT_REC) != CONTACT_REC) { ok = false; break; }
-                arch_idx_upsert(arch_key_of(rec), woff);
+                // Cap hit: the record is safely in the file but NOT indexed. A
+                // built index is authoritative for re-add, so it must not go
+                // live missing keys — finish the swap, then stay unbuilt.
+                if (!arch_idx_upsert(arch_key_of(rec), woff)) idx_ok = false;
                 woff += CONTACT_REC;
                 kept++;
                 o += CONTACT_REC;
@@ -992,7 +996,11 @@ int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
             // archiveIndexInit (adopts a lone .tmp) on next boot.
         }
         if (ok) {
-            s_arch_built = true;
+            s_arch_built = idx_ok;
+            if (!idx_ok) {
+                arch_idx_reset();
+                SLog.println("[ARCH] index overflow during tail merge - append-only until next compaction");
+            }
             *after_out = kept;
         } else {
             _storage->remove(tmp.c_str());
@@ -2050,9 +2058,15 @@ int PunkMesh::pushRoutingQuery(lua_State* L, const char* sender,
 // opening the next; only the bounded distinct-name set is held. Returns a Lua array
 // of up to `max` original-case names. .idx files are tiny, so the whole sweep is a
 // quick bounded read (no per-record yield needed).
+//
+// The Lua pushes happen AFTER the walk, with the SD lock released and the dir
+// handle closed — a lua_pushstring longjmp on true OOM must not strand the SPI
+// lock (mesh-task deadlock). The name buffer leaking on that path is accepted.
 int PunkMesh::pushRoutingSenders(lua_State* L, const char* query, int max) {
-    lua_newtable(L);
-    if (!_storage) return 1;
+    if (!_storage) {
+        lua_newtable(L);
+        return 1;
+    }
     bool is_sd = (_storage != &LittleFS);
 
     char want[32] = {0};
@@ -2061,9 +2075,15 @@ int PunkMesh::pushRoutingSenders(lua_State* L, const char* query, int max) {
 
     if (max <= 0 || max > 128) max = 64;
     const int NAMESZ = 32;
-    char* seen = (char*)malloc((size_t)max * NAMESZ);   // distinct-name set (lowercased)
-    if (!seen) return 1;
-    int nseen = 0, out_idx = 1;
+    // One block, two halves: [0..max) lowercased dedup set, [max..2*max)
+    // original-case names for the deferred push phase.
+    char* seen = (char*)malloc((size_t)max * NAMESZ * 2);
+    if (!seen) {
+        lua_newtable(L);
+        return 1;
+    }
+    char* orig = seen + (size_t)max * NAMESZ;
+    int nseen = 0;
 
     if (is_sd) sd_spi_take();
     String dir = route_dir(_storage_prefix);
@@ -2072,6 +2092,7 @@ int PunkMesh::pushRoutingSenders(lua_State* L, const char* query, int max) {
         if (root) root.close();
         if (is_sd) sd_spi_release();
         free(seen);
+        lua_newtable(L);
         return 1;
     }
 
@@ -2104,9 +2125,9 @@ int PunkMesh::pushRoutingSenders(lua_State* L, const char* query, int max) {
                     if (dup) continue;
                     strncpy(seen + (size_t)nseen * NAMESZ, lc, NAMESZ - 1);
                     seen[(size_t)nseen * NAMESZ + NAMESZ - 1] = '\0';
+                    strncpy(orig + (size_t)nseen * NAMESZ, fn, NAMESZ - 1);
+                    orig[(size_t)nseen * NAMESZ + NAMESZ - 1] = '\0';
                     nseen++;
-                    lua_pushstring(L, fn);            // original case for display
-                    lua_rawseti(L, -2, out_idx++);
                 }
             }
         }
@@ -2114,6 +2135,12 @@ int PunkMesh::pushRoutingSenders(lua_State* L, const char* query, int max) {
     }
     root.close();
     if (is_sd) sd_spi_release();
+
+    lua_newtable(L);
+    for (int i = 0; i < nseen; i++) {
+        lua_pushstring(L, orig + (size_t)i * NAMESZ);   // original case for display
+        lua_rawseti(L, -2, i + 1);
+    }
     free(seen);
     return 1;
 }
@@ -2547,13 +2574,35 @@ static bool scan_msg_records(File& f, bool is_sd, StoredMsg& last, int& count,
 //   { kind="dm",      name=peer,       count=N, last=<msg table> }
 // Only count + last record are read per log (scan_msg_records) instead of
 // materializing whole histories in Lua; the full history of ONE conversation
-// loads on demand when its chat opens (pushChannel/DMMessagesToLua). MESH_LOCK
-// is held only for the channel-table snapshot — all file I/O runs outside it
-// (SD lock only), unlike the full readers.
+// loads on demand when its chat opens (pushChannel/DMMessagesToLua).
+//
+// Two-phase: phase A gathers every summary into a transient PSRAM array with
+// the SD lock held (MESH_LOCK only for the channel-table snapshot); phase B
+// builds the Lua tables holding NO locks. lua_push* can longjmp on a true OOM,
+// and an escape with the SPI lock held would stall the mesh task forever — the
+// transient array leaking on that path is the acceptable trade.
 int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
-    lua_newtable(L);
-    if (!_storage) return 1;
-    int out_idx = 1;
+    if (!_storage) {
+        lua_newtable(L);
+        return 1;
+    }
+
+    struct SumRec {
+        bool is_dm;
+        int idx;
+        char name[32];
+        int count;
+        StoredMsg last;
+    };
+    // MAX_GROUP_CHANNELS + a generous DM-thread cap; ~1KB/record, transient.
+    const int SUM_MAX = 96;
+    SumRec* recs = (SumRec*)heap_caps_malloc(sizeof(SumRec) * SUM_MAX,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!recs) {
+        lua_newtable(L);
+        return 1;
+    }
+    int nrec = 0;
 
     struct { int idx; char name[32]; } chans[MAX_GROUP_CHANNELS];
     int nch = 0;
@@ -2569,12 +2618,13 @@ int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
     }
     MESH_UNLOCK();
 
+    // ── Phase A: file I/O only, no Lua calls ──
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
 
     StoredMsg last;
     int count;
-    for (int c = 0; c < nch; c++) {
+    for (int c = 0; c < nch && nrec < SUM_MAX; c++) {
         String path = channel_msg_path(_storage_prefix, chans[c].name);
         if (!_storage->exists(path.c_str())) continue;
         File f = _storage->open(path.c_str(), "r");
@@ -2582,13 +2632,13 @@ int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
         bool ok = scan_msg_records(f, is_sd, last, count, nullptr, 0);
         f.close();
         if (!ok) continue;
-        lua_newtable(L);
-        lua_pushstring(L, "channel");      lua_setfield(L, -2, "kind");
-        lua_pushinteger(L, chans[c].idx);  lua_setfield(L, -2, "idx");
-        lua_pushstring(L, chans[c].name);  lua_setfield(L, -2, "name");
-        lua_pushinteger(L, count);         lua_setfield(L, -2, "count");
-        push_stored_msg_table(L, last);    lua_setfield(L, -2, "last");
-        lua_rawseti(L, -2, out_idx++);
+        SumRec& r = recs[nrec++];
+        r.is_dm = false;
+        r.idx = chans[c].idx;
+        strncpy(r.name, chans[c].name, sizeof(r.name) - 1);
+        r.name[sizeof(r.name) - 1] = '\0';
+        r.count = count;
+        r.last = last;
     }
 
     // DM logs: directory pass (same shape as pushDMThreadNamesToLua), scanning
@@ -2599,6 +2649,10 @@ int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
         int iter = 0;
         File entry = root.openNextFile();
         while (entry) {
+            if (nrec >= SUM_MAX) {
+                SLog.printf("[MSG] summary cap (%d) hit - remaining DM threads skipped\n", SUM_MAX);
+                break;
+            }
             if (!entry.isDirectory()) {
                 String name = entry.name();
                 int slash = name.lastIndexOf('/');
@@ -2607,12 +2661,13 @@ int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
                     char peer[32];
                     if (scan_msg_records(entry, is_sd, last, count,
                                          peer, sizeof(peer)) && peer[0] != '\0') {
-                        lua_newtable(L);
-                        lua_pushstring(L, "dm");        lua_setfield(L, -2, "kind");
-                        lua_pushstring(L, peer);        lua_setfield(L, -2, "name");
-                        lua_pushinteger(L, count);      lua_setfield(L, -2, "count");
-                        push_stored_msg_table(L, last); lua_setfield(L, -2, "last");
-                        lua_rawseti(L, -2, out_idx++);
+                        SumRec& r = recs[nrec++];
+                        r.is_dm = true;
+                        r.idx = -1;
+                        strncpy(r.name, peer, sizeof(r.name) - 1);
+                        r.name[sizeof(r.name) - 1] = '\0';
+                        r.count = count;
+                        r.last = last;
                     }
                 }
             }
@@ -2629,6 +2684,22 @@ int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
     }
 
     if (is_sd) sd_spi_release();
+
+    // ── Phase B: build the Lua array, nothing held ──
+    lua_newtable(L);
+    for (int i = 0; i < nrec; i++) {
+        const SumRec& r = recs[i];
+        lua_newtable(L);
+        lua_pushstring(L, r.is_dm ? "dm" : "channel"); lua_setfield(L, -2, "kind");
+        if (!r.is_dm) {
+            lua_pushinteger(L, r.idx);                 lua_setfield(L, -2, "idx");
+        }
+        lua_pushstring(L, r.name);                     lua_setfield(L, -2, "name");
+        lua_pushinteger(L, r.count);                   lua_setfield(L, -2, "count");
+        push_stored_msg_table(L, r.last);              lua_setfield(L, -2, "last");
+        lua_rawseti(L, -2, i + 1);
+    }
+    heap_caps_free(recs);
     return 1;
 }
 

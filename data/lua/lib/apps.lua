@@ -42,6 +42,7 @@ M.current = nil       -- name of the running app, nil = launcher
 M._screen = nil       -- root object of the current screen owner (app or launcher page)
 M._timers = {}        -- timers registered since the last set_root
 M._busy = false       -- re-entrancy guard for launch / go_home
+M._sound_mark = nil   -- _sound_mark() watermark: sound ids owned by the current app
 
 function M.set_current(name)
     M.current = name
@@ -318,6 +319,13 @@ function M.go_home()
     lvgl.Timer({ period = 1, cb = function(t)
         t:delete()
         destroy(scr, timers)
+        -- Sweep the closed app's C-side sound objects. The Lua handles are
+        -- plain int wrappers with no __gc — anything the app didn't delete()
+        -- on this exit path would leak its PCM buffers permanently.
+        if M._sound_mark and _sound_sweep then
+            _sound_sweep(M._sound_mark)
+            M._sound_mark = nil
+        end
         -- Drop the captured refs and force a full GC before building the
         -- launcher: luavgl frees a deleted timer's memory only at __gc (delete()
         -- just pauses it), and the closed app's closures/wrappers are now
@@ -349,13 +357,26 @@ function M.launch(name_or_record)
     local prev_screen, prev_timers = M._screen, M._timers
     M._screen, M._timers = nil, {}
 
+    -- Sound watermark: every sound id created from here on (the target's chunk
+    -- runs in the steps below) belongs to the app being launched. On success
+    -- the PREVIOUS app's range [old mark, this mark) is swept — bounded, so
+    -- the new app's own sounds survive an app-to-app launch.
+    local sound_mark = _sound_mark and _sound_mark() or nil
+
     local function finish_ok()
         M.set_current(rec.name)
         destroy(prev_screen, prev_timers)   -- target already _nav_setup'd; no _nav_clear here
+        if M._sound_mark and sound_mark and _sound_sweep then
+            _sound_sweep(M._sound_mark, sound_mark)
+        end
+        M._sound_mark = sound_mark
         M._busy = false
     end
     local function finish_err(msg)
         print("[apps] launch error: " .. tostring(msg))
+        -- Sweep the failed app's partial sounds (nothing newer exists);
+        -- the restored app's mark stays in force.
+        if sound_mark and _sound_sweep then _sound_sweep(sound_mark) end
         M._screen, M._timers = prev_screen, prev_timers   -- restore; keep current screen
         -- We stay on the launcher, so put back the chrome we tore down for the
         -- launch attempt: resume the topbar and redraw the freed wallpaper.

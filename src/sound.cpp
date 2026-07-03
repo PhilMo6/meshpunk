@@ -31,6 +31,10 @@ static int           next_sound_id      = 1;
 static uint8_t sound_volume    = 10;
 static bool    sound_muted     = false;
 static bool    active_file_is_sd = false;
+// Id of the AUDIO_FILE object currently connected to the mixer, or -1. Lets
+// sound_obj_remove/sound_sweep stopSong() before closing a File the streamer
+// is still reading (deleting a playing file object was a latent use-after-free).
+static int     s_active_file_id  = -1;
 
 static const uint32_t TONE_SR = 44100;
 static bool tone_sr_set = false;
@@ -162,15 +166,23 @@ bool sound_is_playing() {
 
 // ── Object registry ───────────────────────────────────────────────────────────
 
-static void sound_obj_add(SoundObject* obj) {
+// False when growing the registry failed — the caller still owns obj and must
+// free it (the old array stays valid; nothing was registered).
+static bool sound_obj_add(SoundObject* obj) {
     xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
     if (sound_obj_count >= sound_obj_capacity) {
         int new_cap = sound_obj_capacity == 0 ? 8 : sound_obj_capacity * 2;
-        sound_objects = (SoundObject**)realloc(sound_objects, new_cap * sizeof(SoundObject*));
+        SoundObject** grown = (SoundObject**)realloc(sound_objects, new_cap * sizeof(SoundObject*));
+        if (!grown) {
+            xSemaphoreGive(s_sound_mutex);
+            return false;
+        }
+        sound_objects = grown;
         sound_obj_capacity = new_cap;
     }
     sound_objects[sound_obj_count++] = obj;
     xSemaphoreGive(s_sound_mutex);
+    return true;
 }
 
 static SoundObject* sound_obj_find(int id) {
@@ -189,6 +201,13 @@ static void sound_obj_remove(int id) {
         sound_objects[i] = sound_objects[--sound_obj_count];
         break;
     }
+    // Removing the file the mixer is streaming from: disconnect BEFORE the
+    // File is closed below, or the streamer keeps reading a dead handle.
+    if (obj && obj->type == SoundObject::AUDIO_FILE && obj->id == s_active_file_id) {
+        s_audio->stopSong();
+        active_file_is_sd = false;
+        s_active_file_id  = -1;
+    }
     xSemaphoreGive(s_sound_mutex);
     if (!obj) return;
     if (obj->type == SoundObject::TONE && obj->pcm_buffer)
@@ -198,6 +217,43 @@ static void sound_obj_remove(int id) {
         delete obj->file;
     }
     delete obj;
+}
+
+// ── Id-watermark sweep ────────────────────────────────────────────────────────
+// Sound handles on the Lua side are plain integer wrappers with no __gc, so an
+// app that exits without delete()ing leaks its PCM renders into this registry
+// forever (100s of KB of PSRAM per abandoned session). Ids are monotonic:
+// everything created at-or-after a mark belongs to that app session. The
+// launcher marks at app launch and sweeps on app exit (lib/apps.lua);
+// luaTearDown sweeps from the boot mark as the ELF-launch safety net. C-owned
+// sounds (the notify melody) predate every mark and survive.
+
+int sound_mark(void) {
+    return next_sound_id;
+}
+
+// Sweep ids in [from_id, to_id); to_id == 0 means no upper bound. The bound
+// matters for app→app launches: the NEW app's chunk runs before the old one is
+// torn down, so its fresh sounds sit above the old app's range and must survive.
+int sound_sweep(int from_id, int to_id) {
+    int swept = 0;
+    for (;;) {
+        // Find one victim under the mutex, remove it outside the scan so the
+        // swap-with-last removal can't skip entries mid-iteration.
+        int victim = -1;
+        xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
+        for (int i = 0; i < sound_obj_count; i++) {
+            int oid = sound_objects[i]->id;
+            if (oid >= from_id && (to_id == 0 || oid < to_id)) { victim = oid; break; }
+        }
+        xSemaphoreGive(s_sound_mutex);
+        if (victim < 0) break;
+        sound_obj_remove(victim);   // handles mixer/file disconnect safety
+        swept++;
+    }
+    if (swept > 0)
+        SLog.printf("[SOUND] swept %d leaked object(s) (id %d..%d)\n", swept, from_id, to_id);
+    return swept;
 }
 
 // ── Tone generation ───────────────────────────────────────────────────────────
@@ -308,7 +364,11 @@ int sound_create_tone(const ToneParams& p) {
     obj->tone_playing = false;
     obj->tone_paused  = false;
     obj->tone_loop    = false;
-    sound_obj_add(obj);
+    if (!sound_obj_add(obj)) {   // registry realloc failed: don't leak the render
+        free(obj->pcm_buffer);
+        delete obj;
+        return -1;
+    }
     return obj->id;
 }
 
@@ -431,7 +491,11 @@ int sound_create_chord(const uint16_t* freqs, int freq_count, const ToneParams& 
     obj->tone_playing = false;
     obj->tone_paused  = false;
     obj->tone_loop    = false;
-    sound_obj_add(obj);
+    if (!sound_obj_add(obj)) {   // registry realloc failed: don't leak the render
+        free(obj->pcm_buffer);
+        delete obj;
+        return -1;
+    }
     return obj->id;
 }
 
@@ -571,7 +635,11 @@ int sound_create_melody_notes(const MelodyNote* notes, int count, const TonePara
     obj->tone_playing = false;
     obj->tone_paused  = false;
     obj->tone_loop    = false;
-    sound_obj_add(obj);
+    if (!sound_obj_add(obj)) {   // registry realloc failed: don't leak the render
+        free(obj->pcm_buffer);
+        delete obj;
+        return -1;
+    }
     return obj->id;
 }
 
@@ -667,7 +735,13 @@ int sound_load_file(lua_State* L) {
     obj->file_is_sd  = fh->is_sd;
     obj->file_paused = false;
     fh->file = nullptr;
-    sound_obj_add(obj);
+    if (!sound_obj_add(obj)) {   // registry realloc failed: we own the File now
+        obj->file->close();
+        delete obj->file;
+        delete obj;
+        lua_pushinteger(L, -1);
+        return 1;
+    }
     lua_pushinteger(L, obj->id);
     return 1;
 }
@@ -690,6 +764,7 @@ void sound_play(int id) {
         obj->file_paused = false;
         s_audio->connectToFile(*obj->file);
         active_file_is_sd = obj->file_is_sd;
+        s_active_file_id  = obj->id;
     }
     xSemaphoreGive(s_sound_mutex);
     if (is_tone && s_sound_task) xTaskNotifyGive(s_sound_task);
@@ -706,6 +781,7 @@ void sound_stop(int id) {
         s_audio->stopSong();
         active_file_is_sd = false;
         obj->file_paused  = false;
+        s_active_file_id  = -1;
     }
     xSemaphoreGive(s_sound_mutex);
 }
@@ -1103,6 +1179,18 @@ void sound_register_lua(lua_State* L) {
     lua_register(L, "_sound_set_loop", [](lua_State* L) -> int {
         sound_set_loop((int)luaL_checkinteger(L, 1), lua_toboolean(L, 2));
         return 0;
+    });
+    // Id-watermark ownership for the launcher (lib/apps.lua): mark before an
+    // app's chunk runs, sweep everything >= mark when the app exits — apps
+    // can no longer leak PCM renders by skipping delete() on an exit path.
+    lua_register(L, "_sound_mark", [](lua_State* L) -> int {
+        lua_pushinteger(L, sound_mark());
+        return 1;
+    });
+    lua_register(L, "_sound_sweep", [](lua_State* L) -> int {
+        lua_pushinteger(L, sound_sweep((int)luaL_checkinteger(L, 1),
+                                       (int)luaL_optinteger(L, 2, 0)));
+        return 1;
     });
 
     lua_register(L, "_sound_save_wav", [](lua_State* L) -> int {

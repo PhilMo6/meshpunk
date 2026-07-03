@@ -64,6 +64,17 @@ void sound_pause(int id);
 void sound_delete(int id);
 void sound_set_loop(int id, bool loop);
 
+// Id-watermark ownership sweep. Ids are monotonic, so everything created
+// at-or-after a mark belongs to that "session": the launcher marks before an
+// app's chunk runs and sweeps that range on app exit (Lua handles have no
+// __gc — an app skipping delete() on any exit path would otherwise leak its
+// PCM renders permanently); luaTearDown sweeps from the boot mark on ELF
+// launch. C-owned sounds (notify melody) predate every mark and survive.
+// sound_sweep removes ids in [from_id, to_id), to_id == 0 = unbounded;
+// returns the count swept.
+int  sound_mark(void);
+int  sound_sweep(int from_id, int to_id);
+
 void sound_tone_tick();
 void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S);
 

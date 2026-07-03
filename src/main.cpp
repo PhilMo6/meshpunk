@@ -2274,90 +2274,138 @@ static uint32_t s_union_arch_gen = 0;
 static uint32_t s_union_built_ms = 0;
 static int s_union_count = 0;
 
+// Copy the live contact table into a transient PSRAM snapshot under MESH_LOCK.
+// Returns the buffer (caller frees) or NULL; *out_n = contacts copied. Exists
+// so the Lua pushes below run with NO locks held: lua_push* can longjmp on a
+// true OOM, and an escape while MESH_LOCK is held would deadlock the mesh task
+// permanently — strictly worse than the OOM itself. Bonus: the lock is now held
+// only for a memcpy loop, not table pushes + archive-file I/O.
+static ContactInfo* snapshot_live_contacts(int* out_n) {
+  *out_n = 0;
+  MESH_LOCK();
+  int n = the_mesh->getNumContacts();
+  ContactInfo* live = (ContactInfo*)heap_caps_malloc(
+      sizeof(ContactInfo) * (n > 0 ? n : 1), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (live) {
+    ContactInfo c;
+    int nlive = 0;
+    for (int i = 0; i < n; i++) {
+      if (the_mesh->getContactByIdx(i, c)) live[nlive++] = c;
+    }
+    *out_n = nlive;
+  }
+  MESH_UNLOCK();
+  return live;
+}
+
 static int lua_mesh_get_contacts(lua_State *L) {
   bool include_archived = lua_toboolean(L, 1);
 
   int ref;
   int count;
 
-  MESH_LOCK();
   if (!include_archived) {
+    MESH_LOCK();
     uint32_t gen = the_mesh->contacts_generation;
+    MESH_UNLOCK();
     bool fresh = (s_contacts_ref != LUA_NOREF) && (gen == s_contacts_gen) &&
                  (millis() - s_contacts_built_ms < 10000);
     if (!fresh) {
-      lua_newtable(L);
-
-      ContactInfo c;
-      int idx = 1;
-      for (int i = 0; i < the_mesh->getNumContacts(); i++) {
-        if (the_mesh->getContactByIdx(i, c)) {
-          push_contact_table(L, c, false);
-          lua_rawseti(L, -2, idx++);
+      int nlive = 0;
+      ContactInfo* live = snapshot_live_contacts(&nlive);
+      if (!live) {
+        // No snapshot memory: serve the stale cache if one exists, else empty.
+        if (s_contacts_ref == LUA_NOREF) {
+          lua_newtable(L);
+          return 1;
         }
-      }
+      } else {
+        lua_newtable(L);
+        for (int i = 0; i < nlive; i++) {
+          push_contact_table(L, live[i], false);
+          lua_rawseti(L, -2, i + 1);
+        }
+        heap_caps_free(live);
 
-      if (s_contacts_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, s_contacts_ref);
+        if (s_contacts_ref != LUA_NOREF) {
+          luaL_unref(L, LUA_REGISTRYINDEX, s_contacts_ref);
+        }
+        s_contacts_count = nlive;
+        s_contacts_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // pops the master
+        s_contacts_gen = gen;
+        s_contacts_built_ms = millis();
       }
-      s_contacts_count = idx - 1;
-      s_contacts_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // pops the master
-      s_contacts_gen = gen;
-      s_contacts_built_ms = millis();
     }
     ref = s_contacts_ref;
     count = s_contacts_count;
   } else {
+    MESH_LOCK();
     uint32_t gen = the_mesh->contacts_generation;
     uint32_t agen = the_mesh->archive_generation;
+    MESH_UNLOCK();
     bool fresh = (s_union_ref != LUA_NOREF) && (gen == s_union_gen) &&
                  (agen == s_union_arch_gen) &&
                  (millis() - s_union_built_ms < 10000);
     if (!fresh) {
-      lua_newtable(L);
+      int nlive = 0;
+      ContactInfo* live = snapshot_live_contacts(&nlive);
+      if (!live) {
+        if (s_union_ref == LUA_NOREF) {
+          lua_newtable(L);
+          return 1;
+        }
+      } else {
+        // Archived contacts live on disk only. Read a transient, deduped view
+        // here (freed immediately after) so the archive costs ZERO steady-state
+        // PSRAM — this whole branch only runs when the user has "show archived"
+        // on, and is cached for 10s. The on-map display is bounded; the disk
+        // archive keeps everything (re-add can still pull back any contact).
+        // readArchivedDeduped does its own SPI locking — no MESH_LOCK needed.
+        const int ARCH_DISPLAY_MAX = 1000;
+        ContactInfo* abuf = (ContactInfo*)heap_caps_malloc(
+            sizeof(ContactInfo) * ARCH_DISPLAY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        int na = 0;
+        if (abuf) na = the_mesh->readArchivedDeduped(abuf, ARCH_DISPLAY_MAX);
 
-      ContactInfo c;
-      int idx = 1;
-      for (int i = 0; i < the_mesh->getNumContacts(); i++) {
-        if (the_mesh->getContactByIdx(i, c)) {
-          push_contact_table(L, c, false);
+        lua_newtable(L);
+        int idx = 1;
+        for (int i = 0; i < nlive; i++) {
+          push_contact_table(L, live[i], false);
           lua_rawseti(L, -2, idx++);
         }
-      }
-      // Archived contacts live on disk only. Read a transient, deduped view
-      // here (freed immediately after) so the archive costs ZERO steady-state
-      // PSRAM — this whole branch only runs when the user has "show archived"
-      // on, and is cached for 10s. The on-map display is bounded; the disk
-      // archive keeps everything (re-add can still pull back any contact).
-      const int ARCH_DISPLAY_MAX = 1000;
-      ContactInfo* abuf = (ContactInfo*)heap_caps_malloc(
-          sizeof(ContactInfo) * ARCH_DISPLAY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-      if (abuf) {
-        int na = the_mesh->readArchivedDeduped(abuf, ARCH_DISPLAY_MAX);
-        for (int i = 0; i < na; i++) {
-          // Live wins by pubkey — also self-heals entries left behind when a
-          // contact re-adverted back in.
-          if (!the_mesh->lookupContactByPubKey(abuf[i].id.pub_key, PUB_KEY_SIZE)) {
-            push_contact_table(L, abuf[i], true);
-            lua_rawseti(L, -2, idx++);
+        if (abuf) {
+          for (int i = 0; i < na; i++) {
+            // Live wins by pubkey (checked against the snapshot) — also
+            // self-heals entries left behind when a contact re-adverted in.
+            bool is_live = false;
+            for (int j = 0; j < nlive; j++) {
+              if (memcmp(live[j].id.pub_key, abuf[i].id.pub_key, PUB_KEY_SIZE) == 0) {
+                is_live = true;
+                break;
+              }
+            }
+            if (!is_live) {
+              push_contact_table(L, abuf[i], true);
+              lua_rawseti(L, -2, idx++);
+            }
           }
+          heap_caps_free(abuf);
         }
-        heap_caps_free(abuf);
-      }
+        heap_caps_free(live);
 
-      if (s_union_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, s_union_ref);
+        if (s_union_ref != LUA_NOREF) {
+          luaL_unref(L, LUA_REGISTRYINDEX, s_union_ref);
+        }
+        s_union_count = idx - 1;
+        s_union_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // pops the master
+        s_union_gen = gen;
+        s_union_arch_gen = agen;
+        s_union_built_ms = millis();
       }
-      s_union_count = idx - 1;
-      s_union_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // pops the master
-      s_union_gen = gen;
-      s_union_arch_gen = agen;
-      s_union_built_ms = millis();
     }
     ref = s_union_ref;
     count = s_union_count;
   }
-  MESH_UNLOCK();
 
   // Hand out a fresh outer array sharing the cached per-contact tables.
   lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
@@ -4649,9 +4697,35 @@ static int lua_tile_show(lua_State *L) {
   return 1;
 }
 
+// Streaming chunk reader for SD sources: same pattern as lua_file_chunk_reader
+// (top of this file), but takes the SPI bus only INSIDE each read — the
+// parser's own Lua allocations between chunks never hold the bus, and the
+// mesh task gets radio time throughout a large compile.
+struct LuaSDChunkReader {
+  File file;
+  char buf[1024];
+};
+
+static const char *lua_sd_chunk_reader(lua_State *L, void *ud, size_t *size) {
+  (void)L;
+  LuaSDChunkReader *st = (LuaSDChunkReader *)ud;
+  sd_spi_take();
+  size_t n = st->file.read((uint8_t *)st->buf, sizeof(st->buf));
+  sd_spi_release();
+  if (n == 0) {
+    *size = 0;
+    return NULL;
+  }
+  *size = n;
+  return st->buf;
+}
+
 // Load and execute a Lua file from the SD card
 // Usage: _dofile_sd("/meshpunk/apps/myapp/main.lua")
-// This is needed because dofile/loadfile only read from LittleFS
+// This is needed because dofile/loadfile only read from LittleFS.
+// Streams the source to lua_load() in 1KB blocks — the old whole-file malloc
+// held the entire source contiguously (the same slurp pattern the require()
+// searcher dropped in the "lua large file bug" fix, d20dcb3).
 static int lua_dofile_sd(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
 
@@ -4661,30 +4735,17 @@ static int lua_dofile_sd(lua_State *L) {
     return 2;
   }
 
+  LuaSDChunkReader rdr;
   sd_spi_take();
-  File file = SD.open(path);
-  if (!file || file.isDirectory()) {
+  rdr.file = SD.open(path);
+  if (!rdr.file || rdr.file.isDirectory()) {
+    if (rdr.file) rdr.file.close();
     sd_spi_release();
     lua_pushnil(L);
     lua_pushfstring(L, "Cannot open SD file: %s", path);
     return 2;
   }
-
-  size_t size = file.size();
-  char* buffer = (char*)malloc(size + 1);
-  if (!buffer) {
-    file.close();
-    sd_spi_release();
-    lua_pushnil(L);
-    lua_pushstring(L, "Out of memory reading SD file");
-    return 2;
-  }
-
-  file.readBytes(buffer, size);
-  buffer[size] = '\0';
-  file.close();
-
-  // Release SD bus back to display BEFORE executing the Lua chunk
+  size_t size = rdr.file.size();
   sd_spi_release();
 
   SLog.printf("[FS] _dofile_sd: loading %s (%d bytes)\n", path, (int)size);
@@ -4692,8 +4753,11 @@ static int lua_dofile_sd(lua_State *L) {
   // Count extra args (everything after the path on the stack)
   int nargs = lua_gettop(L) - 1;
 
-  int status = luaL_loadbuffer(L, buffer, size, path);
-  free(buffer);
+  // lua_load returns a status instead of raising, so the file always closes.
+  int status = lua_load(L, lua_sd_chunk_reader, &rdr, path, NULL);
+  sd_spi_take();
+  rdr.file.close();
+  sd_spi_release();
 
   if (status != LUA_OK) {
     SLog.printf("[FS] _dofile_sd: load error: %s\n", lua_tostring(L, -1));
@@ -5786,7 +5850,12 @@ void setupLuaVGL() {
 
   lua_newtable(L);
 
-  // file:read([mode]) — read(n) for n bytes (binary-safe), read("*a")/read() for all
+  // file:read([mode]) — read(n) for n bytes (binary-safe), read("*a")/read() for all.
+  // Both paths read straight into Lua-managed memory (luaL_buffinitsize): one
+  // copy total, no malloc bounce buffer, no Arduino String (readString() grew
+  // byte-wise — O(n^2) reallocs — and silently TRUNCATED big files; a too-big
+  // read now raises a catchable Lua memory error instead). Every Lua call that
+  // can longjmp runs while no lock or C allocation is held.
   lua_pushcfunction(L, [](lua_State *L) -> int {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
 
@@ -5794,24 +5863,38 @@ void setupLuaVGL() {
     if (lua_isnumber(L, 2)) {
       int n = (int)lua_tointeger(L, 2);
       if (n <= 0) { lua_pushstring(L, ""); return 1; }
-      uint8_t *buf = (uint8_t *)malloc(n);
-      if (!buf) { lua_pushnil(L); return 1; }
+      luaL_Buffer b;
+      char *p = luaL_buffinitsize(L, &b, (size_t)n);
       if (ud->is_sd) sd_spi_take();
-      int got = ud->file->read(buf, n);
+      int got = ud->file->read((uint8_t *)p, n);
       if (ud->is_sd) sd_spi_release();
-      if (got > 0)
-        lua_pushlstring(L, (const char *)buf, got);
-      else
-        lua_pushnil(L);
-      free(buf);
+      if (got <= 0) { lua_pushnil(L); return 1; }  // buffer box is GC'd harmlessly
+      luaL_pushresultsize(&b, (size_t)got);
       return 1;
     }
 
-    // f:read("*a") or f:read() — read entire file
+    // f:read("*a") or f:read() — read from the current position to EOF
     if (ud->is_sd) sd_spi_take();
-    String content = ud->file->readString();
+    size_t fsize = ud->file->size();
+    size_t fpos  = ud->file->position();
     if (ud->is_sd) sd_spi_release();
-    lua_pushstring(L, content.c_str());
+    size_t remaining = (fsize > fpos) ? fsize - fpos : 0;
+
+    luaL_Buffer b;
+    char *p = luaL_buffinitsize(L, &b, remaining);
+    size_t off = 0;
+    while (off < remaining) {
+      // Chunked SPI take/release (like _fs_copy) so a multi-MB SD read never
+      // stalls the mesh task for the whole file.
+      size_t chunk = remaining - off;
+      if (chunk > 32768) chunk = 32768;
+      if (ud->is_sd) sd_spi_take();
+      int got = ud->file->read((uint8_t *)p + off, chunk);
+      if (ud->is_sd) sd_spi_release();
+      if (got <= 0) break;  // EOF / IO error: return what we have
+      off += (size_t)got;
+    }
+    luaL_pushresultsize(&b, off);
     return 1;
   });
   lua_setfield(L, -2, "read");
@@ -5822,7 +5905,8 @@ void setupLuaVGL() {
     size_t len;
     const char *str = luaL_checklstring(L, 2, &len);
     if (ud->is_sd) sd_spi_take();
-    size_t written = ud->file->print(str);
+    // write(buf, len), not print(str): binary-safe past embedded NULs
+    size_t written = ud->file->write((const uint8_t *)str, len);
     if (ud->is_sd) sd_spi_release();
     lua_pushinteger(L, written);
     return 1;
@@ -6004,6 +6088,12 @@ void setupLuaVGL() {
 //  - lua_close() runs luavgl __gc -> lv_obj_del on the whole widget tree, so
 //    LVGL MUST stay initialized here. We do NOT touch LVGL core or buf1/buf2.
 //    luavgl's group gc was patched to spare the C-owned default group.
+
+// sound_mark() taken in setup() right after notify_init(): ids below it are
+// C-owned residents (the notify melody); ids at/above it were created via the
+// Lua bindings and are swept here when Lua dies.
+static int s_boot_sound_mark = 0;
+
 void luaTearDown() {
   if (!L) return;
   lua_State *dead = L;
@@ -6019,6 +6109,10 @@ void luaTearDown() {
   // Both re-populate on demand when the launcher re-renders. Core-0 only.
   emoji_font_cache_clear();
   lv_image_cache_drop(NULL);
+  // Sweep every Lua-created sound object: the handles died with lua_close, and
+  // the heavy module wants the contiguous PSRAM their PCM renders occupy. The
+  // notify melody sits below the boot mark and survives (alerts during Doom).
+  sound_sweep(s_boot_sound_mark, 0);
   lua_arena_destroy();   // free the now-empty Lua arena -> coalesces up for the ELF
 }
 
@@ -6323,6 +6417,10 @@ void setup() {
   audio->setPinout(TDECK_I2S_BCK, TDECK_I2S_WS, TDECK_I2S_DOUT);
   sound_init(audio, firmware_prefs_save);
   notify_init();   // pre-render the notification melody (C-owned, survives lua_close)
+  // Boot watermark: every sound id below this is C-owned (the notify melody)
+  // and survives every sweep; everything at/above it is Lua-created and gets
+  // swept by luaTearDown on ELF launch (Lua handles die with lua_close anyway).
+  s_boot_sound_mark = sound_mark();
   audio->setVolume(sound_get_muted() ? 0 : sound_get_volume());
   SLog.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
   log_boot_mem("after audio");
