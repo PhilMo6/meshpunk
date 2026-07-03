@@ -37,3 +37,9 @@ void* meshpunk_read_all(const char* path, uint32_t* out_size, bool default_sd = 
 // a file name and not created). Same prefix routing as meshpunk_open().
 // Returns true if the parents exist on return.
 bool meshpunk_mkdirs(const char* path, bool default_sd = false);
+
+// Strip an S:/L: drive prefix from `path`, setting *use_sd accordingly
+// (no prefix -> *use_sd = default_sd). Returns a pointer INTO `path` at the
+// first character after the prefix. Shared by fs_bridge.cpp so every binding
+// resolves drives identically.
+const char* meshpunk_parse_prefix(const char* path, bool* use_sd, bool default_sd);

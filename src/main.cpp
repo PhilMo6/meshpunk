@@ -22,6 +22,7 @@
 #include "ble_companion.h"
 #include "elf_host.h"
 #include "meshpunk_fs.h"
+#include "fs_bridge.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -935,6 +936,16 @@ static int lua_io_open(lua_State *L) {
     return 2;
   }
 
+  // Create the userdata BEFORE opening the file: lua_newuserdata can longjmp
+  // on OOM, and a longjmp skips C++ destructors — an already-open File (and
+  // its held SPI lock) would leak. With the userdata first, a failed open just
+  // leaves a dead wrapper for GC (__gc sees file == nullptr, a no-op).
+  LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
+  ud->file = nullptr;
+  ud->is_sd = false;
+  luaL_getmetatable(L, "esp32_file");
+  lua_setmetatable(L, -2);
+
   // Lua io.open defaults to LittleFS (L:) when no prefix given
   MeshpunkFile mf = meshpunk_open(filename, mode, /*default_sd=*/false);
   if (!mf.valid) {
@@ -949,13 +960,15 @@ static int lua_io_open(lua_State *L) {
   // Release the SPI lock now — Lua file ops re-acquire per-call.
   if (mf.is_sd) sd_spi_release();
 
-  fs::File *file = new fs::File(mf.file);
-  LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
+  fs::File *file = new (std::nothrow) fs::File(mf.file);
+  if (!file) {
+    mf.file.close();
+    lua_pushnil(L);
+    lua_pushstring(L, "Out of memory");
+    return 2;
+  }
   ud->file = file;
   ud->is_sd = mf.is_sd;
-
-  luaL_getmetatable(L, "esp32_file");
-  lua_setmetatable(L, -2);
   return 1;
 }
 
@@ -4996,6 +5009,8 @@ void setupLuaVGL() {
 
   // Register Filesystem bridge functions
   lua_register(L, "_list_dir", lua_list_dir);
+  // Unified drive-aware _fs_* family (fs_bridge.cpp) — used by lib/fileman.lua
+  fs_bridge_register(L);
 
   // System
   lua_register(L, "_system_reboot", [](lua_State *L) -> int {

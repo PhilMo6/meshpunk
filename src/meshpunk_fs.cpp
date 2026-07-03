@@ -13,7 +13,7 @@ extern void sd_spi_release();
 // If no prefix, *use_sd = default_sd.
 // Also strips leading /sd/ when targeting SD, since SD.open() already
 // operates relative to the SD mount point.
-static const char* parse_prefix(const char* path, bool* use_sd, bool default_sd) {
+const char* meshpunk_parse_prefix(const char* path, bool* use_sd, bool default_sd) {
     *use_sd = default_sd;
     if (path[0] != '\0' && path[1] == ':') {
         if (path[0] == 'S' || path[0] == 's') {
@@ -35,7 +35,7 @@ MeshpunkFile meshpunk_open(const char* path, const char* mode, bool default_sd) 
     MeshpunkFile mf = { {}, false, false };
 
     bool use_sd;
-    const char* actual = parse_prefix(path, &use_sd, default_sd);
+    const char* actual = meshpunk_parse_prefix(path, &use_sd, default_sd);
     mf.is_sd = use_sd;
 
     if (use_sd) {
@@ -64,7 +64,7 @@ void meshpunk_close(MeshpunkFile& mf) {
 
 bool meshpunk_mkdirs(const char* path, bool default_sd) {
     bool use_sd;
-    const char* actual = parse_prefix(path, &use_sd, default_sd);
+    const char* actual = meshpunk_parse_prefix(path, &use_sd, default_sd);
     if (use_sd && !sd_mounted) return false;
 
     char buf[160];
