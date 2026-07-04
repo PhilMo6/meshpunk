@@ -154,6 +154,18 @@ static bool kb_sym_latched = false;
 static bool kb_sym_phys_prev = false;
 static bool kb_sym_used_while_held = false;
 
+// ── Keyboard alt emoji layer ────────────────────────────────────────────────
+// alt+key types an emoji while a textarea is focused (the layer is inert
+// outside text fields, so a latched alt never hijacks WASD nav). Same
+// tap-toggle latch machinery as sym above, behind its own persisted pref.
+// The per-key map is keyed by the key's normal-layer char and persisted to
+// /emoji_keymap on LittleFS (kb_emoji_map_load/save below the matrices).
+static bool kb_alt_toggle_pref = false;
+static bool kb_alt_latched = false;
+static bool kb_alt_phys_prev = false;
+static bool kb_alt_used_while_held = false;
+static bool kb_alt_layer_active = false;
+
 // ── Display Backlight ──────────────────────────────────────────────────────
 static uint8_t display_brightness = 16;  // 0–16, persisted
 
@@ -236,6 +248,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("trackball_sens=%d\n", trackball_sensitivity_ms);
   f.printf("trackball_roll=%d\n", trackball_roll_ms);
   f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
+  f.printf("alt_toggle=%d\n", kb_alt_toggle_pref ? 1 : 0);
   f.printf("theme=%s\n", theme_pref_str.c_str());
   f.printf("topbar_transparant=%d\n", topbar_transparant ? 1 : 0);
   f.printf("sel_solid=%d\n", theme_focus_solid ? 1 : 0);
@@ -373,6 +386,8 @@ static void firmware_prefs_load() {
       if (v >= 0 && v <= 500) trackball_roll_ms = (uint16_t)v;
     } else if (strcmp(key, "sym_toggle") == 0) {
       kb_sym_toggle_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "alt_toggle") == 0) {
+      kb_alt_toggle_pref = (atoi(val) == 1);
     } else if (strcmp(key, "theme") == 0) {
       theme_pref_str = String(val);
       theme_pref_str.trim();
@@ -788,6 +803,85 @@ static const char kb_matrix_symbol[KB_COLS][KB_ROWS] = {
   {'_',':',')',  0, '!',',',';'},
   {'+','"','-',  0,   0, '.','\''},
 };
+
+// ── Alt emoji layer map ─────────────────────────────────────────────────────
+// Default emoji per key (normal-layer char -> Unicode codepoint), roughly the
+// most-used emojis with a few mnemonics (z=sleep, $=money, h=haha). Space is
+// deliberately absent so latched emoji runs can still be space-separated.
+// Sequence emojis are assignable too: the picker stores their PUA codepoint
+// and the send path decomposes it to real Unicode (see prepare_outgoing_text).
+struct KbEmojiDefault { char key; uint32_t cp; };
+static const KbEmojiDefault kb_emoji_defaults[] = {
+  {'q',0x1F923},{'w',0x1F609},{'e',0x1F60D},{'r',0x1F917},{'t',0x1F44D},
+  {'y',0x1F642},{'u',0x1F937},{'i',0x1F60A},{'o',0x1F618},{'p',0x1F970},
+  {'a',0x2764}, {'s',0x263A}, {'d',0x1F62D},{'f',0x1F525},{'g',0x1F601},
+  {'h',0x1F602},{'j',0x1F605},{'k',0x1F64F},{'l',0x1F606},
+  {'z',0x1F634},{'x',0x1F926},{'c',0x1F97A},{'v',0x1F495},{'b',0x1F382},
+  {'n',0x1F644},{'m',0x1F914},{'$',0x1F4B0},
+};
+
+// Active map, indexed by the key's normal-layer char. 0 = no emoji (the key
+// falls through to its normal char under alt).
+static uint32_t kb_emoji_map[128] = {0};
+
+static void kb_emoji_apply_defaults() {
+  memset(kb_emoji_map, 0, sizeof(kb_emoji_map));
+  for (auto &d : kb_emoji_defaults) kb_emoji_map[(uint8_t)d.key] = d.cp;
+}
+
+// /emoji_keymap on LittleFS: one "c=1F602" line per key (hex codepoint; 0
+// clears the key). Defaults apply first, then the file overrides — so a
+// missing file or a key the file doesn't mention means the compiled default.
+static void kb_emoji_map_load() {
+  kb_emoji_apply_defaults();
+  File f = LittleFS.open("/emoji_keymap", "r");
+  if (!f) return;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() < 3 || line[1] != '=') continue;
+    uint8_t c = (uint8_t)line[0];
+    if (c >= 128) continue;
+    kb_emoji_map[c] = (uint32_t)strtoul(line.c_str() + 2, nullptr, 16);
+  }
+  f.close();
+}
+
+static void kb_emoji_map_save() {
+  File f = LittleFS.open("/emoji_keymap", "w", true);
+  if (!f) { SLog.println("[KB_EMOJI] cannot write /emoji_keymap"); return; }
+  for (int c = 32; c < 128; c++) {
+    bool is_default_key = false;
+    for (auto &d : kb_emoji_defaults) {
+      if ((uint8_t)d.key == c) { is_default_key = true; break; }
+    }
+    // Write every assigned key, plus explicit "=0" lines for cleared default
+    // keys so a cleared key doesn't resurrect its default on the next boot.
+    if (kb_emoji_map[c] || is_default_key)
+      f.printf("%c=%lX\n", (char)c, (unsigned long)kb_emoji_map[c]);
+  }
+  f.close();
+}
+
+// Pack a codepoint's UTF-8 bytes into a uint32 with the FIRST byte in the
+// LOW byte (U+1F602 = F0 9F 98 82 -> 0x82989FF0). lv_textarea_add_char()
+// reinterprets the uint32's memory as the char sequence
+// (letter_buf = (char *)&u32_buf), and the ESP32-S3 is little-endian, so
+// memory order = low byte first.
+static uint32_t utf8_pack_key(uint32_t cp) {
+  if (cp < 0x80u) return cp;
+  if (cp < 0x800u)
+    return  (0xC0u | (cp >> 6)) |
+           ((0x80u | (cp & 0x3Fu)) << 8);
+  if (cp < 0x10000u)
+    return  (0xE0u | (cp >> 12)) |
+           ((0x80u | ((cp >> 6) & 0x3Fu)) << 8) |
+           ((0x80u | (cp & 0x3Fu)) << 16);
+  return  (0xF0u | (cp >> 18)) |
+         ((0x80u | ((cp >> 12) & 0x3Fu)) << 8) |
+         ((0x80u | ((cp >> 6) & 0x3Fu)) << 16) |
+         ((0x80u | (cp & 0x3Fu)) << 24);
+}
 
 // Data directory paths
 #define LUA_PATH "/lua/"
@@ -1231,7 +1325,25 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   kb_lshift_active = cur_matrix[KB_MOD_LSHIFT_COL] & (1 << KB_MOD_LSHIFT_ROW);
   kb_rshift_active = cur_matrix[KB_MOD_RSHIFT_COL] & (1 << KB_MOD_RSHIFT_ROW);
   kb_shift_active = kb_lshift_active || kb_rshift_active;
-  kb_alt_active = cur_matrix[KB_MOD_ALT_COL] & (1 << KB_MOD_ALT_ROW);
+
+  // alt: same tap-toggle latch as sym below, behind its own pref. The emoji
+  // layer it drives only substitutes while typing in a textarea (see the
+  // substitution block after the resolver), so a latched alt never pauses
+  // WASD nav the way a latched sym does.
+  bool alt_phys = cur_matrix[KB_MOD_ALT_COL] & (1 << KB_MOD_ALT_ROW);
+  kb_alt_active = alt_phys;
+  if (kb_alt_toggle_pref) {
+    if (alt_phys && !kb_alt_phys_prev) {
+      kb_alt_used_while_held = false;             // new hold begins
+    } else if (!alt_phys && kb_alt_phys_prev && !kb_alt_used_while_held) {
+      kb_alt_latched = !kb_alt_latched;           // clean tap — toggle latch
+    }
+    kb_alt_layer_active = alt_phys || kb_alt_latched;
+  } else {
+    kb_alt_layer_active = alt_phys;
+    kb_alt_latched = false;
+  }
+  kb_alt_phys_prev = alt_phys;
 
   // sym: plain hold by default. In toggle mode a clean tap (press + release
   // with nothing typed during the hold) latches the symbol layer until the
@@ -1285,6 +1397,7 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
         kb_key_press_time[ch] = millis();
       }
       if (sym_phys) kb_sym_used_while_held = true;  // hold was used — not a tap
+      if (alt_phys) kb_alt_used_while_held = true;
 
       if (resolved_key == 0) {
         if (ch == 0x0D) resolved_key = LV_KEY_ENTER;
@@ -1300,6 +1413,25 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   uint32_t wasd_dir = 0;
   lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
   bool typing = focused && lv_obj_is_valid(focused) && lv_obj_check_type(focused, &lv_textarea_class);
+
+  // ── Alt emoji layer — substitute AFTER resolution, only while typing ──
+  // kb_key_state[] above stays indexed by the base char (it's a 128-slot
+  // array); outside a textarea the layer is inert. Sym wins when both are
+  // active, shift is ignored (alt+shift+A = same emoji as alt+a), and an
+  // unmapped key falls through to its normal char. The key value carries the
+  // emoji's UTF-8 bytes packed low-byte-first (see utf8_pack_key).
+  if (typing && kb_alt_layer_active && !kb_sym_active &&
+      resolved_key >= 0x20 && resolved_key < 0x80) {
+    uint32_t base = resolved_key;
+    if (base >= 'A' && base <= 'Z') base += 32;
+    uint32_t cp = kb_emoji_map[base];
+    // emoji_preload gates on the ACTIVE blob: a mapped emoji the current set
+    // can't render (e.g. a sequence PUA after the SD extended set was
+    // removed) falls through to the plain char instead of emitting a
+    // codepoint that would draw tofu here and on the receiving device.
+    if (cp && emoji_preload(cp)) resolved_key = utf8_pack_key(cp);
+  }
+
   if (!typing) {
     if      (resolved_key == 'w') wasd_dir = LV_KEY_UP;
     else if (resolved_key == 'a') wasd_dir = LV_KEY_LEFT;
@@ -1850,8 +1982,17 @@ static int lua_wifi_download_file(lua_State *L) {
     return 1;
   }
 
+  // meshpunk_open returns HOLDING the SPI lock for SD paths (meshpunk_close
+  // releases it) — fine for quick writes, but holding the shared bus across a
+  // whole multi-MB body (e.g. the 3.7MB extended emoji blob) starves the
+  // radio and freezes TFT flushes. Yield it between chunks instead — keeping
+  // the File open across release/retake is the fs_bridge copy-loop pattern.
+  if (mf.is_sd) sd_spi_release();
+
   int total = 0;
-  uint32_t deadline = millis() + 20000;  // hard stop for stalled transfers
+  // Stall detector, not a total-time cap: big files legitimately take longer
+  // than any fixed budget, so the deadline resets on every received chunk.
+  uint32_t deadline = millis() + 20000;
   while (len > 0 || len == -1) {
     if ((int32_t)(millis() - deadline) >= 0) break;
     int avail = stream->available();
@@ -1863,11 +2004,15 @@ static int lua_wifi_download_file(lua_State *L) {
     int toRead = (avail < (int)DL_BUF_SIZE) ? avail : (int)DL_BUF_SIZE;
     int rd = stream->readBytes(s_dl_buf, toRead);
     if (rd <= 0) break;
+    if (mf.is_sd) sd_spi_take();
     mf.file.write(s_dl_buf, rd);
+    if (mf.is_sd) sd_spi_release();
     total += rd;
     if (len > 0) len -= rd;
+    deadline = millis() + 20000;   // progress made — reset the stall clock
   }
 
+  if (mf.is_sd) sd_spi_take();   // rebalance for meshpunk_close's release
   meshpunk_close(mf);
 
   if (len > 0) {
@@ -1992,6 +2137,30 @@ static int lua_wifi_auto_connect(lua_State *L) {
 
 // ── Mesh bridge: Lua → C++ ──────────────────────────────────────
 
+// Prepare outgoing message text for the wire: expand composed PUA emoji back
+// to their real Unicode sequences (peers must receive standard emoji — the
+// PUA form only exists in this device's UI space), then normalize smart
+// quotes into the fixed wire buffer. Finally trim any multi-byte codepoint
+// split by the byte-wise 160-cap truncation so the wire text stays valid
+// UTF-8 (decompose expansion makes hitting the cap likelier).
+static void prepare_outgoing_text(const char *raw, char *out, size_t outlen) {
+  char *expanded = emoji_decompose(raw);
+  normalize_smart_quotes(expanded ? expanded : raw, out, outlen);
+  if (expanded) free(expanded);
+
+  size_t w = strlen(out);
+  if (w == 0) return;
+  size_t lead = w;
+  while (lead > 0 && ((unsigned char)out[lead - 1] & 0xC0) == 0x80) lead--;
+  if (lead == 0) return;                      // all continuation bytes — leave it
+  unsigned char lb = (unsigned char)out[lead - 1];
+  size_t need = (lb & 0x80) == 0    ? 1 :
+                (lb & 0xE0) == 0xC0 ? 2 :
+                (lb & 0xF0) == 0xE0 ? 3 :
+                (lb & 0xF8) == 0xF0 ? 4 : 1;
+  if (lead - 1 + need > w) out[lead - 1] = '\0';   // drop the partial tail
+}
+
 // Send a public/group channel message from Lua
 // Usage from Lua: _mesh_send_public("Hello mesh!")
 static int lua_mesh_send_public(lua_State *L) {
@@ -1999,7 +2168,7 @@ static int lua_mesh_send_public(lua_State *L) {
   // Normalize smart quotes so both the wire message and the local echo
   // render cleanly on receivers whose base font lacks U+2018-U+201D.
   char text[160];
-  normalize_smart_quotes(raw, text, sizeof(text));
+  prepare_outgoing_text(raw, text, sizeof(text));
 
   SLog.printf("[MESH TX] lua_mesh_send_public called, text=\"%s\"\n", text);
 
@@ -2035,7 +2204,7 @@ static int lua_mesh_send_direct(lua_State *L) {
   const char *name_prefix = luaL_checkstring(L, 1);
   const char *raw = luaL_checkstring(L, 2);
   char text[160];
-  normalize_smart_quotes(raw, text, sizeof(text));
+  prepare_outgoing_text(raw, text, sizeof(text));
 
   MESH_LOCK();
   ContactInfo *recipient = the_mesh->searchContactsByPrefix(name_prefix);
@@ -3014,7 +3183,7 @@ static int lua_mesh_send_channel(lua_State *L) {
   int ch_idx = luaL_checkinteger(L, 1);
   const char *raw = luaL_checkstring(L, 2);
   char text[160];
-  normalize_smart_quotes(raw, text, sizeof(text));
+  prepare_outgoing_text(raw, text, sizeof(text));
 
   MESH_LOCK();
   uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
@@ -3514,6 +3683,63 @@ static int lua_storage_get_info(lua_State *L) {
 static int lua_emoji_preload(lua_State *L) {
   uint32_t cp = (uint32_t)luaL_checkinteger(L, 1);
   lua_pushboolean(L, emoji_preload(cp));
+  return 1;
+}
+
+// _emoji_compose(str) -> str: replace known emoji sequences with their PUA
+// codepoints (the form the UI renders as one glyph). Returns the input
+// unchanged when nothing matched.
+static int lua_emoji_compose(lua_State *L) {
+  const char *in = luaL_checkstring(L, 1);
+  char *out = emoji_compose(in);
+  if (out) { lua_pushstring(L, out); free(out); }
+  else     { lua_pushvalue(L, 1); }
+  return 1;
+}
+
+// _emoji_decompose(str) -> str: expand PUA codepoints back to the real
+// Unicode sequences (the wire/disk form). Lua uses this to measure the true
+// on-wire byte length of composed text before sending.
+static int lua_emoji_decompose(lua_State *L) {
+  const char *in = luaL_checkstring(L, 1);
+  char *out = emoji_decompose(in);
+  if (out) { lua_pushstring(L, out); free(out); }
+  else     { lua_pushvalue(L, 1); }
+  return 1;
+}
+
+// _emoji_blob_count() -> int: glyphs in the emoji blob (0 = blob unavailable).
+static int lua_emoji_blob_count(lua_State *L) {
+  lua_pushinteger(L, (lua_Integer)emoji_blob_count());
+  return 1;
+}
+
+// _emoji_font_reload([close_only]) -> int: re-open the blob (SD extended set
+// preferred) after a download/removal; returns the new glyph count.
+// _emoji_font_reload(true) only RELEASES the blob (returns 0) so the caller
+// can remove/rename the file on disk, then calls _emoji_font_reload() again.
+static int lua_emoji_font_reload(lua_State *L) {
+  bool close_only = lua_toboolean(L, 1);
+  lua_pushinteger(L, (lua_Integer)emoji_font_reload(close_only));
+  return 1;
+}
+
+// _emoji_blob_list(start, count) -> array of codepoints (1-based start into
+// the blob's sorted index). For the Settings emoji picker's paged grid.
+static int lua_emoji_blob_list(lua_State *L) {
+  uint32_t total = emoji_blob_count();
+  lua_Integer start = luaL_checkinteger(L, 1);
+  lua_Integer count = luaL_checkinteger(L, 2);
+  if (start < 1) start = 1;
+  if (count < 0) count = 0;
+  lua_newtable(L);
+  int n = 0;
+  for (lua_Integer i = 0; i < count; i++) {
+    uint32_t idx = (uint32_t)(start - 1 + i);
+    if (idx >= total) break;
+    lua_pushinteger(L, (lua_Integer)emoji_blob_cp_at(idx));
+    lua_rawseti(L, -2, ++n);
+  }
   return 1;
 }
 
@@ -5128,6 +5354,11 @@ void setupLuaVGL() {
   });
 
   lua_register(L, "_emoji_preload", lua_emoji_preload);
+  lua_register(L, "_emoji_compose", lua_emoji_compose);
+  lua_register(L, "_emoji_decompose", lua_emoji_decompose);
+  lua_register(L, "_emoji_blob_count", lua_emoji_blob_count);
+  lua_register(L, "_emoji_blob_list", lua_emoji_blob_list);
+  lua_register(L, "_emoji_font_reload", lua_emoji_font_reload);
 
   // Register Filesystem bridge functions
   lua_register(L, "_list_dir", lua_list_dir);
@@ -5542,6 +5773,43 @@ void setupLuaVGL() {
   lua_register(L, "_kb_sym_toggle_get", [](lua_State* L) -> int {
     lua_pushboolean(L, kb_sym_toggle_pref ? 1 : 0);
     return 1;
+  });
+
+  // Alt key behavior: false = hold modifier (default), true = tap toggles
+  // the emoji layer (hold still works as momentary). Persisted.
+  lua_register(L, "_kb_alt_toggle_set", [](lua_State* L) -> int {
+    kb_alt_toggle_pref = lua_toboolean(L, 1);
+    if (!kb_alt_toggle_pref) kb_alt_latched = false;
+    firmware_prefs_save();
+    return 0;
+  });
+  lua_register(L, "_kb_alt_toggle_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, kb_alt_toggle_pref ? 1 : 0);
+    return 1;
+  });
+
+  // Alt emoji layer keymap. Keys are identified by their normal-layer char
+  // ("a".."z", "$"); codepoints may be blob singles OR sequence PUAs.
+  lua_register(L, "_kb_emoji_get", [](lua_State* L) -> int {
+    const char *k = luaL_checkstring(L, 1);
+    uint8_t c = (uint8_t)k[0];
+    lua_pushinteger(L, (c && c < 128) ? (lua_Integer)kb_emoji_map[c] : 0);
+    return 1;
+  });
+  lua_register(L, "_kb_emoji_set", [](lua_State* L) -> int {
+    const char *k = luaL_checkstring(L, 1);
+    uint32_t cp = (uint32_t)luaL_checkinteger(L, 2);   // 0 clears the key
+    uint8_t c = (uint8_t)k[0];
+    if (!c || c >= 128) { lua_pushboolean(L, 0); return 1; }
+    kb_emoji_map[c] = cp;
+    kb_emoji_map_save();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+  lua_register(L, "_kb_emoji_reset", [](lua_State* L) -> int {
+    kb_emoji_apply_defaults();
+    LittleFS.remove("/emoji_keymap");
+    return 0;
   });
 
   // Top bar transparency: true = the themed wallpaper shows through the status
@@ -6316,6 +6584,8 @@ void setup() {
 
     // Load firmware preferences (tz, use_sd, clock_fmt)
     firmware_prefs_load();
+    // Alt emoji layer per-key map (defaults + /emoji_keymap overrides)
+    kb_emoji_map_load();
     // Push the selection-highlight preferences into the live theme (the theme is
     // already inited; Lua applies the palette later and re-reads these).
     lv_theme_meshpunk_set_focus_solid(theme_focus_solid);

@@ -229,6 +229,26 @@ sym_btn:onClicked(function()
                                 or "Sym: hold to use symbols"
 end)
 
+-- Alt key: hold modifier (default) vs tap-to-toggle the emoji layer (mirrors
+-- the sym toggle above; per-key emoji live in Settings > Emoji). Guarded so
+-- the page still loads on firmware without the emoji-layer bindings.
+if _kb_alt_toggle_get then
+    local alt_toggle_on = _kb_alt_toggle_get()
+    local function alt_toggle_text()
+        return (alt_toggle_on and "[x]" or "[ ]") .. " Alt key tap toggles emoji"
+    end
+    local alt_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+    local alt_lbl = alt_btn:Label { text = alt_toggle_text(), align = lvgl.ALIGN.LEFT_MID }
+
+    alt_btn:onClicked(function()
+        alt_toggle_on = not alt_toggle_on
+        _kb_alt_toggle_set(alt_toggle_on)
+        alt_lbl:set({ text = alt_toggle_text() })
+        status.text = alt_toggle_on and "Alt: tap toggles emoji layer"
+                                    or "Alt: hold to type emoji"
+    end)
+end
+
 -- ── Trackball Sensitivity ────────────────────────────────────────────────────
 content:Label { text = "-- Trackball --", w = lvgl.PCT(100), h = 16 }
 

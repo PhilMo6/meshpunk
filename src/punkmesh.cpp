@@ -14,6 +14,12 @@
 extern void sd_spi_release();
 extern PunkMesh* the_mesh;
 
+// emoji_font.cpp — multi-codepoint emoji sequences <-> PUA codepoints.
+// Rule: wire + disk carry real Unicode; text pushed up to Lua is composed so
+// a ZWJ sequence renders as ONE glyph. Both return a malloc'd string or NULL
+// when nothing changed (caller keeps the original); free() the result.
+extern "C" char * emoji_compose(const char * in);
+
 // Forward declaration — defined further down with the other path helpers.
 static String messages_dir(const String& prefix);
 
@@ -138,7 +144,11 @@ void lua_mesh_push_channel_message(lua_State* L, const char* sender_name, uint8_
     }
 
     lua_pushstring(L, sender_name);             // arg1: from
-    lua_pushstring(L, text);                    // arg2: text
+    {                                           // arg2: text (composed for UI)
+        char * comp = emoji_compose(text);
+        lua_pushstring(L, comp ? comp : text);
+        if (comp) free(comp);
+    }
     lua_pushinteger(L, timestamp);              // arg3: timestamp
     lua_pushboolean(L, direct);                 // arg4: direct
     lua_pushinteger(L, hops);                   // arg5: hops
@@ -181,7 +191,11 @@ void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t
     }
 
     lua_pushstring(L, sender_name);             // arg1: from
-    lua_pushstring(L, text);                    // arg2: text
+    {                                           // arg2: text (composed for UI)
+        char * comp = emoji_compose(text);
+        lua_pushstring(L, comp ? comp : text);
+        if (comp) free(comp);
+    }
     lua_pushinteger(L, timestamp);              // arg3: timestamp
     lua_pushboolean(L, direct);                 // arg4: direct
     lua_pushinteger(L, hops);                   // arg5: hops
@@ -2275,7 +2289,12 @@ static void push_stored_msg_table(lua_State* L, const StoredMsg& m) {
     lua_newtable(L);
     lua_pushstring(L, m.from);      lua_setfield(L, -2, "from");
     lua_pushstring(L, m.peer);      lua_setfield(L, -2, "peer");
-    lua_pushstring(L, m.text);      lua_setfield(L, -2, "text");
+    {   // UI space carries composed (PUA) text; the log files keep real Unicode
+        char * comp = emoji_compose(m.text);
+        lua_pushstring(L, comp ? comp : m.text);
+        if (comp) free(comp);
+    }
+    lua_setfield(L, -2, "text");
     lua_pushinteger(L, m.timestamp); lua_setfield(L, -2, "timestamp");   // authoritative
     lua_pushinteger(L, m.sender_ts); lua_setfield(L, -2, "sender_ts");   // recorded extra
     lua_pushinteger(L, m.hops);      lua_setfield(L, -2, "hops");

@@ -1465,7 +1465,7 @@ local function anim_start_next()
     anim_dot:set({ bg_opa = 255 })
     anim_dot:clear_flag(lvgl.FLAG.HIDDEN)
     if a.replay then
-        replay_from_lbl:set({ text = "From: " .. (a.from or "?") })
+        replay_from_lbl:set({ text = "From: " .. utils.emojiText(a.from or "?") })
         replay_prog_lbl:set({ text = a.num .. " / " .. replay.total })
         replay_box:clear_flag(lvgl.FLAG.HIDDEN)
     end
@@ -2127,9 +2127,9 @@ local function show_contact_popup(contact)
         })
     end
 
-    -- Title
+    -- Title (display-composed; identity uses raw contact.name everywhere else)
     box:Label({
-        text = contact.name or "Unknown",
+        text = utils.emojiText(contact.name or "Unknown"),
         text_color = "#FFFFFF",
         w = W - 40, h = 22,
     })
@@ -3040,10 +3040,10 @@ show_meshprint_screen = function()
         list_holder:clean()
         for _, cn in ipairs(names) do
             local b = list_holder:Button({ w = W - 16, h = 28 })
-            b:Label({ text = cn, align = lvgl.ALIGN.LEFT_MID })
+            b:Label({ text = utils.emojiText(cn), align = lvgl.ALIGN.LEFT_MID })
             b:onClicked(function()
-                selected_node = cn
-                target_lbl:set({ text = "Target: " .. cn, text_color = "#24ba24" })
+                selected_node = cn   -- raw: feeds the routing-store scan by name
+                target_lbl:set({ text = "Target: " .. utils.emojiText(cn), text_color = "#24ba24" })
             end)
         end
         if note then

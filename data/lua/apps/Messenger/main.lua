@@ -200,7 +200,7 @@ local function show_msg_info(msg, on_reply, on_dismiss)
     end
 
     info_label("-- Message Info --")
-    info_label("From: " .. (msg.from or "?"))
+    info_label("From: " .. utils.emojiText(msg.from or "?"))
     local ci_btn = box:Button { w = 100, h = 22 }
     ci_btn:Label { text = "Contact Info", align = lvgl.ALIGN.CENTER }
     ci_btn:onevent(lvgl.EVENT.RELEASED, function()
@@ -489,10 +489,12 @@ show_inbox = function()
         local prefix = c.kind == "channel" and "" or "@"
         local preview = ""
         if c.last then
-            preview = truncate((c.last.from or "") .. ": " .. (c.last.text or ""), 24)
+            -- last.text arrives composed from C; sender names do not (they
+            -- round-trip as identity) — compose them for display only.
+            preview = truncate(utils.emojiText(c.last.from or "") .. ": " .. (c.last.text or ""), 24)
         end
         local left = row:Label { align = lvgl.ALIGN.LEFT_MID }
-        left.text = prefix .. c.name .. (preview ~= "" and ("  " .. preview) or "")
+        left.text = prefix .. utils.emojiText(c.name) .. (preview ~= "" and ("  " .. preview) or "")
         if c.unread and c.unread > 0 then left:set { text_color = COL_FOCUS } end
         local right = row:Label { align = lvgl.ALIGN.RIGHT_MID, text_color = COL_META }
         local rt = (c.ts and c.ts > 0) and utils.relTime(c.ts) or ""
@@ -595,7 +597,8 @@ show_chat = function(target)
 
     local me = self_name()
     -- Channel names already include their '#'; only DMs get an '@' marker.
-    local title = (target.type == "dm") and ("@" .. target.name) or target.name
+    local title = (target.type == "dm") and ("@" .. utils.emojiText(target.name))
+                                          or utils.emojiText(target.name)
     set_header(title, "")
 
     local body = gridnav_body(root, HEADER_H, H - HEADER_H, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST, true)
@@ -683,7 +686,7 @@ show_chat = function(target)
 
         -- Header line: sender + time. Hop count and signal detail (SNR/RSSI)
         -- live in the long-press info popup, not the bubble.
-        local hdr = is_me and "You" or (msg.from or "?")
+        local hdr = is_me and "You" or utils.emojiText(msg.from or "?")
         local meta = utils.clockHM(msg.timestamp)
         -- Live sends carry msg.status (sent/delivered/failed); persisted/received
         -- messages don't, so they show no delivery word.
@@ -862,10 +865,30 @@ show_chat = function(target)
         textArea.text = ""
     end
 
+    -- Composed sequence emojis (PUA form, 3 bytes each in the textarea) expand
+    -- to their real Unicode on the wire (up to ~25 bytes each), so max_length
+    -- alone can't guarantee the 160-byte wire cap. Enforce the true budget
+    -- live: drop trailing codepoints while the decomposed form is over.
+    local function enforce_wire_budget()
+        local t = textArea.text
+        if not t or #t == 0 then return end
+        local ok, wire = pcall(_emoji_decompose, t)
+        if not ok or not wire then return end   -- pre-rebuild firmware: no-op
+        while #wire > max_len and #t > 0 do
+            local i = #t
+            while i > 1 and t:byte(i) >= 0x80 and t:byte(i) < 0xC0 do i = i - 1 end
+            t = t:sub(1, i - 1)
+            ok, wire = pcall(_emoji_decompose, t)
+            if not ok or not wire then return end
+        end
+        if t ~= textArea.text then textArea.text = t end
+    end
+
     textArea:onevent(lvgl.EVENT.KEY, function()
         local indev = lvgl.indev.get_act()
         local key = indev:get_key()
-        if key == lvgl.KEY.ENTER then do_send() end
+        if key == lvgl.KEY.ENTER then do_send() return end
+        enforce_wire_budget()
     end)
 
     -- Hold the input to open the clipboard menu (paste a copied card, etc.).
@@ -894,6 +917,7 @@ show_chat = function(target)
         paste_b:onevent(lvgl.EVENT.RELEASED, function()
             if clipboard.has() then
                 textArea.text = (textArea.text or "") .. clipboard.paste()
+                enforce_wire_budget()
             end
             close()
         end)
@@ -983,7 +1007,7 @@ show_my_node = function()
     local ok, ni = pcall(_mesh_get_node_info)
     if ok and ni then
         my_name = ni.name
-        info("Name: " .. (ni.name or "?"))
+        info("Name: " .. utils.emojiText(ni.name or "?"))
         info("Key: " .. string.sub(ni.pubkey or "", 1, 16) .. "..")
         info(string.format("Radio: %.3f MHz", ni.freq or 0))
         info(string.format("SF%d  BW%.0f  CR%s",
@@ -1517,7 +1541,7 @@ show_contacts = function()
                 local seen = (c.last_seen and c.last_seen > 0) and utils.relTime(c.last_seen) or ""
                 local row = list:Button { w = lvgl.PCT(100), h = 24 }
                 local left = row:Label { align = lvgl.ALIGN.LEFT_MID }
-                left.text = (c.favorite and "* " or "") .. type_icon(c.type) .. c.name
+                left.text = (c.favorite and "* " or "") .. type_icon(c.type) .. utils.emojiText(c.name)
                 row:Label { align = lvgl.ALIGN.RIGHT_MID, text = seen, text_color = COL_META }
                 bind_row(row, c.name, c.type)
                 contact_rows[c.name] = row
@@ -1624,7 +1648,7 @@ show_channels = function()
         local unread = messages:unreadInChannel(ch.idx)
         local chat_btn = body:Button { w = lvgl.PCT(72), h = 24 }
         local lbl = chat_btn:Label { align = lvgl.ALIGN.LEFT_MID }
-        lbl.text = ch.name .. (unread > 0 and ("  (" .. unread .. ")") or "")
+        lbl.text = utils.emojiText(ch.name) .. (unread > 0 and ("  (" .. unread .. ")") or "")
         if unread > 0 then lbl:set { text_color = COL_ACCENT } end
         local ch_copy = { type = "channel", idx = ch.idx, name = ch.name }
         chat_btn:onevent(lvgl.EVENT.RELEASED, function() show_chat(ch_copy) end)
@@ -1702,7 +1726,9 @@ show_contact_detail = function(contact_name)
     end
 
     info_label("-- Contact Info --")
-    local nm = box:Label { text = "Name: " .. contact.name, w = lvgl.PCT(100) }
+    -- Display name is composed; name_color stays keyed on the RAW name so the
+    -- color matches the chat bubbles (which also hash the raw name).
+    local nm = box:Label { text = "Name: " .. utils.emojiText(contact.name), w = lvgl.PCT(100) }
     nm:set { text_color = name_color(contact.name) }
     info_label("Type: " .. (contact.type_name or "?"))
     info_label("Key: " .. string.sub(contact.pubkey or "", 1, 16) .. "..")
