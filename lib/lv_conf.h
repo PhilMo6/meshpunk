@@ -133,11 +133,15 @@
  *With PSRAM available we can cache decoded images to avoid re-decoding each frame.
  *Lowered 3MB->2MB (2026-06-19), then 2MB->256KB (tile-pool refactor): the Map app
  *no longer routes tiles through this cache — it draws them from a fixed contiguous
- *2MB pool (in-memory RGB565 descriptors, used_directly, no cache buffers). So this
- *cache now only holds small UI icons; 256KB hard-bounds it and frees ~1.75MB of the
- *PSRAM ceiling (LVGL + Lua share the PSRAM heap, and a full pool null-crashes
- *lv_draw_add_task).*/
-#define LV_CACHE_DEF_SIZE       (256 * 1024)
+ *2MB pool (in-memory RGB565 descriptors, used_directly, no cache buffers).
+ *Raised 256KB->512KB (2026-07-03): at 256KB one full-screen decoded PNG (~300KB
+ *ARGB) EXCEEDS the whole cache, and LVGL 9's decoder FAILS the decode when the
+ *cache is full — the image silently doesn't render, plus per-frame re-decode
+ *churn (Flappy Bird's missing background + lag). 512KB fits a full-screen image
+ *alongside the UI icons while still hard-bounding the ceiling; games that
+ *animate multiple full-screen layers must own their pixels in canvases instead
+ *of leaning on this cache (see Flappy's ImageScroll).*/
+#define LV_CACHE_DEF_SIZE       (512 * 1024)
 
 #define LV_IMAGE_HEADER_CACHE_DEF_CNT 32
 #define LV_GRADIENT_MAX_STOPS   2

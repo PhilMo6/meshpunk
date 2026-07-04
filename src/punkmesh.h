@@ -323,6 +323,24 @@ public:
                        const uint8_t* sender_pub_key = nullptr,
                        uint32_t sender_ts = 0);
 
+  // ── Unread counters (RAM-only) ──────────────────────────────────
+  // Live C-side so they keep counting while Lua is torn down for an ELF run
+  // (the mesh task keeps receiving). Bumped in the RX handlers next to the
+  // notify calls; own echoes never bump. All access under MESH_LOCK (the mesh
+  // task holds it around loop(); the Lua bindings take it like every other
+  // binding). Reset at reboot — same semantics the Lua counters had.
+  uint16_t _unread_channel[MAX_GROUP_CHANNELS] = {0};
+  struct DMUnread { char name[32]; uint16_t count; };
+  DMUnread _unread_dm[16] = {};   // slot reusable once its count clears to 0
+
+  void unreadBumpChannel(int channel_idx);
+  void unreadBumpDM(const char* name);
+  void unreadClearChannel(int channel_idx);
+  void unreadClearDM(const char* name);
+  uint16_t unreadChannel(int channel_idx);
+  uint16_t unreadDM(const char* name);
+  uint32_t unreadTotal();
+
   // ── Per-contact path history ────────────────────────────────────
   ContactPathHistory _path_history[MAX_PATH_CONTACTS];
   int _path_history_count = 0;

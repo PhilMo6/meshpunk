@@ -99,8 +99,9 @@ function M.updateUnread()
 end
 
 function M.create()
-    -- The topbar only needs the live unread COUNTERS (countUnread sums
-    -- __channel_unread/__dm_unread, bumped by live __dispatch) — it never reads
+    -- The topbar only needs the live unread COUNTERS (countUnread reads the
+    -- C-side _mesh_unread_total, bumped at mesh-task RX — so the count keeps
+    -- accruing even while Lua is torn down for an ELF run) — it never reads
     -- message history. Histories don't sit in Lua at all anymore: the Messenger
     -- runs its inbox on C-side summaries (messages:loadSummaries) and loads a
     -- single conversation only while its chat view is open (openThread), so the

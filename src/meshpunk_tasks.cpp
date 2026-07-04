@@ -36,8 +36,8 @@ static void mesh_task_body(void *param) {
     // here. Runs before the paused check so an in-flight blink still finishes.
     notify_tick();
 
-    // When paused (e.g. during ELF module execution), skip all work
-    // but keep yielding so the watchdog is fed.
+    // Escape hatch (currently never set — the mesh keeps running during ELF
+    // module execution): skip all work but keep yielding to feed the watchdog.
     if (mesh_task_paused) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;

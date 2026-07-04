@@ -1888,6 +1888,68 @@ static bool append_routing_record(fs::FS* storage, const String& prefix,
     return new_day;
 }
 
+// ── Unread counters ─────────────────────────────────────────────
+// See punkmesh.h: C-side so they keep counting through Lua teardown (ELF
+// runs). Callers hold MESH_LOCK (mesh task in loop(); Lua bindings take it).
+
+void PunkMesh::unreadBumpChannel(int channel_idx) {
+    // Unknown-channel (-1) messages surface under Public (idx 0) in the UI,
+    // so their unread lands there too.
+    int bucket = channel_idx >= 0 ? channel_idx : 0;
+    if (bucket >= MAX_GROUP_CHANNELS) return;
+    if (_unread_channel[bucket] < 0xFFFF) _unread_channel[bucket]++;
+}
+
+void PunkMesh::unreadBumpDM(const char* name) {
+    if (!name || name[0] == '\0') return;
+    int free_slot = -1;
+    for (int i = 0; i < (int)(sizeof(_unread_dm) / sizeof(_unread_dm[0])); i++) {
+        if (_unread_dm[i].count > 0 && strcmp(_unread_dm[i].name, name) == 0) {
+            if (_unread_dm[i].count < 0xFFFF) _unread_dm[i].count++;
+            return;
+        }
+        if (free_slot < 0 && _unread_dm[i].count == 0) free_slot = i;
+    }
+    if (free_slot < 0) return;   // all slots busy: drop (undercount beats a stuck badge)
+    strncpy(_unread_dm[free_slot].name, name, sizeof(_unread_dm[free_slot].name) - 1);
+    _unread_dm[free_slot].name[sizeof(_unread_dm[free_slot].name) - 1] = '\0';
+    _unread_dm[free_slot].count = 1;
+}
+
+void PunkMesh::unreadClearChannel(int channel_idx) {
+    if (channel_idx < 0 || channel_idx >= MAX_GROUP_CHANNELS) return;
+    _unread_channel[channel_idx] = 0;
+}
+
+void PunkMesh::unreadClearDM(const char* name) {
+    if (!name) return;
+    for (int i = 0; i < (int)(sizeof(_unread_dm) / sizeof(_unread_dm[0])); i++) {
+        if (strcmp(_unread_dm[i].name, name) == 0) _unread_dm[i].count = 0;
+    }
+}
+
+uint16_t PunkMesh::unreadChannel(int channel_idx) {
+    if (channel_idx < 0 || channel_idx >= MAX_GROUP_CHANNELS) return 0;
+    return _unread_channel[channel_idx];
+}
+
+uint16_t PunkMesh::unreadDM(const char* name) {
+    if (!name) return 0;
+    for (int i = 0; i < (int)(sizeof(_unread_dm) / sizeof(_unread_dm[0])); i++) {
+        if (_unread_dm[i].count > 0 && strcmp(_unread_dm[i].name, name) == 0)
+            return _unread_dm[i].count;
+    }
+    return 0;
+}
+
+uint32_t PunkMesh::unreadTotal() {
+    uint32_t total = 0;
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) total += _unread_channel[i];
+    for (int i = 0; i < (int)(sizeof(_unread_dm) / sizeof(_unread_dm[0])); i++)
+        total += _unread_dm[i].count;
+    return total;
+}
+
 void PunkMesh::appendChannelMessage(int channel_idx, const char* from, const char* text,
                                     uint32_t timestamp, float snr, float rssi,
                                     uint8_t hops, bool direct,
@@ -3250,8 +3312,10 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
         }
     }
 
-    // C-side alert (melody + kbd blink). Fires from this mesh-task context so
-    // DMs still notify while Lua is torn down for an ELF run.
+    // C-side alert (melody + kbd blink) + unread bump. Both fire from this
+    // mesh-task context so DMs still notify and count while Lua is torn down
+    // for an ELF run. The chat view clears the counter when the thread opens.
+    unreadBumpDM(from.name);
     notify_message_alert();
 
 #if BLE_COMPANION_ENABLED
@@ -3342,6 +3406,9 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
     // this instant. Unknown channels surface under Public in the UI, so they
     // follow Public's mode. Own echoes never alert.
     if (strcmp(sender_name, _prefs.node_name) != 0) {
+        // Unread bump is NOT gated by the notify mode — a muted channel still
+        // accrues unread (only the melody/blink is mode-gated below).
+        unreadBumpChannel(channel_idx);
         const char* notify_name = "Public";
         ChannelDetails ncd;
         if (channel_idx >= 0 && getChannel(channel_idx, ncd) && ncd.name[0] != '\0')

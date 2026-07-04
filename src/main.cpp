@@ -3424,6 +3424,57 @@ static int lua_mesh_get_msg_summaries(lua_State *L) {
   return the_mesh->pushMsgSummariesToLua(L);
 }
 
+// ── Unread counters (C-side, survive Lua teardown during ELF runs) ──
+// The mesh task bumps these at RX (punkmesh.cpp); Lua only reads/clears.
+// messages.lua wraps them so the topbar/Messenger API is unchanged.
+
+// Usage: local n = _mesh_unread_total()
+static int lua_mesh_unread_total(lua_State *L) {
+  MESH_LOCK();
+  uint32_t n = the_mesh->unreadTotal();
+  MESH_UNLOCK();
+  lua_pushinteger(L, (lua_Integer)n);
+  return 1;
+}
+
+// Usage: local n = _mesh_unread_channel(idx)
+static int lua_mesh_unread_channel(lua_State *L) {
+  int idx = luaL_checkinteger(L, 1);
+  MESH_LOCK();
+  uint16_t n = the_mesh->unreadChannel(idx);
+  MESH_UNLOCK();
+  lua_pushinteger(L, n);
+  return 1;
+}
+
+// Usage: local n = _mesh_unread_dm(name)
+static int lua_mesh_unread_dm(lua_State *L) {
+  const char *name = luaL_checkstring(L, 1);
+  MESH_LOCK();
+  uint16_t n = the_mesh->unreadDM(name);
+  MESH_UNLOCK();
+  lua_pushinteger(L, n);
+  return 1;
+}
+
+// Usage: _mesh_unread_clear_channel(idx)
+static int lua_mesh_unread_clear_channel(lua_State *L) {
+  int idx = luaL_checkinteger(L, 1);
+  MESH_LOCK();
+  the_mesh->unreadClearChannel(idx);
+  MESH_UNLOCK();
+  return 0;
+}
+
+// Usage: _mesh_unread_clear_dm(name)
+static int lua_mesh_unread_clear_dm(lua_State *L) {
+  const char *name = luaL_checkstring(L, 1);
+  MESH_LOCK();
+  the_mesh->unreadClearDM(name);
+  MESH_UNLOCK();
+  return 0;
+}
+
 // Configure the max records retained per message log file.
 // Usage: _mesh_set_max_messages(100)
 static int lua_mesh_set_max_messages(lua_State *L) {
@@ -5018,6 +5069,13 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
   lua_register(L, "_mesh_get_msg_summaries", lua_mesh_get_msg_summaries);
   lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
+
+  // Unread counters (C-side so they survive Lua teardown during ELF runs)
+  lua_register(L, "_mesh_unread_total", lua_mesh_unread_total);
+  lua_register(L, "_mesh_unread_channel", lua_mesh_unread_channel);
+  lua_register(L, "_mesh_unread_dm", lua_mesh_unread_dm);
+  lua_register(L, "_mesh_unread_clear_channel", lua_mesh_unread_clear_channel);
+  lua_register(L, "_mesh_unread_clear_dm", lua_mesh_unread_clear_dm);
 
   // Identity management
   lua_register(L, "_mesh_export_private_key", lua_mesh_export_private_key);

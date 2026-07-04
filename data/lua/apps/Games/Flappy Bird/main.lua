@@ -96,12 +96,25 @@ local function randomY()
     return math.random(TOP_Y + 20, BOTTOM_Y - PIPE_GAP - 20)
 end
 
+-- One managed root (apps.new_root) for the whole app; every layer after that
+-- is a plain child Object. Calling new_root per layer (the old behavior)
+-- repointed M._screen and RESET M._timers each time — go_home then deleted
+-- only the LAST layer, leaving the sky/land/bird layers orphaned on the
+-- screen (the "ground stays over the launcher" bug) with their infinite
+-- scroll anims and the lost wing timer still running (the permanent lag).
 local function screenCreate(parent)
-    local scr = apps.new_root({
+    local props = {
         w = W, h = H,
         bg_opa = lvgl.OPA(0),
         border_width = 0, pad_all = 0
-    })
+    }
+    local scr
+    if parent then
+        scr = parent:Object(props)
+        scr:set{ x = 0, y = 0 }
+    else
+        scr = apps.new_root(props)
+    end
     scr:clear_flag(lvgl.FLAG.SCROLLABLE)
     scr:clear_flag(lvgl.FLAG.CLICKABLE)
     return scr
@@ -117,12 +130,32 @@ local function Image(parent, src)
     return img
 end
 
+-- Endless horizontal scroller. The PNG is decoded ONCE into two app-owned
+-- Canvas buffers (same pattern as the pipes) and the canvases slide; drawing
+-- a canvas is a direct blit of its own pixels. The old version slid two Image
+-- widgets, which re-render from the decoder cache every frame — full-screen
+-- layers overflow LV_CACHE_DEF_SIZE, and a full cache makes LVGL FAIL the
+-- decode: invisible background + per-frame re-decode churn (the lag).
 local function ImageScroll(root, src, animSpeed, y)
-    local right = Image(root, src).widget
-    right:set{ src = src, x = W, y = y, pad_all = 0 }
+    local probe = Image(root, src)   -- just to read the image dimensions
+    local iw, ih = probe.w, probe.h
+    probe.widget:delete()
 
-    local img = Image(root, src).widget
-    img:set{ x = 0, y = y, src = src, pad_all = 0 }
+    local function makeStrip(x)
+        local c = root:Canvas{
+            w = iw, h = ih,
+            cf = lvgl.COLOR_FORMAT.ARGB8888,
+            x = x, y = y
+        }
+        c:fill_bg("#000000", 0)
+        c:draw_image{ x1 = 0, y1 = 0, x2 = iw - 1, y2 = ih - 1,
+                      src = src, opa = 255 }
+        c:clear_flag(lvgl.FLAG.CLICKABLE)
+        return c
+    end
+
+    local img = makeStrip(0)
+    local right = makeStrip(W)
 
     local anim = img:Anim{
         run = true,
@@ -139,7 +172,6 @@ local function ImageScroll(root, src, animSpeed, y)
     }
     game:trackAnim(anim)
 
-    img:clear_flag(lvgl.FLAG.CLICKABLE)
     return {
         widget = img,
         anim = anim,

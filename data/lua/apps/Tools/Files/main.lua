@@ -513,12 +513,21 @@ show_browser = function(path)
                 }
             end
             local entry = e
-            row:onClicked(function()
+            -- Short tap enters a folder (or opens the menu for a file / when
+            -- select mode is on); a long press ALWAYS opens the action menu, so
+            -- a folder can be selected without navigating into it. SHORT_CLICKED
+            -- (not CLICKED) is deliberate: LVGL suppresses it after a long press,
+            -- so the two gestures never both fire on one row. Applies to the
+            -- trackball's enter too (same long_pr_sent gate in the keypad path).
+            row:onevent(lvgl.EVENT.SHORT_CLICKED, function()
                 if not select_mode and entry.type == "dir" then
                     show_browser(fileman.join(cur_path, entry.name))
                 else
                     action_menu(entry)
                 end
+            end)
+            row:onevent(lvgl.EVENT.LONG_PRESSED, function()
+                action_menu(entry)
             end)
         end
 

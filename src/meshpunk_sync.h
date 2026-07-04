@@ -155,7 +155,9 @@ void gps_notify_wake();
 bool meshpunk_gps_last_fix(double* lat, double* lon);
 
 // When true, mesh_task pauses its loop body (radio/BLE processing).
-// Set by elf_host during module execution to isolate Core 1 activity.
+// Currently NOTHING sets it — the mesh keeps running during ELF module
+// execution (messages are received, persisted, notified and unread-counted
+// while Lua is torn down). Kept as an escape hatch.
 extern volatile bool mesh_task_paused;
 
 #endif
