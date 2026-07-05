@@ -13,6 +13,19 @@ function utils.file_exists(path)
     return false
 end
 
+-- Compose multi-codepoint emoji sequences (ZWJ families, skin tones, flags)
+-- into their single-glyph PUA form for DISPLAY. Use this ONLY when building
+-- label text from a name — never on identity strings that go back into C
+-- bindings, table keys, or comparisons (contact search, unread counters and
+-- history files are keyed by the RAW name). Message text is already composed
+-- C-side on its way up to Lua; names are not, because they round-trip.
+function utils.emojiText(s)
+    if not s or s == "" then return s end
+    local ok, r = pcall(_emoji_compose, s)
+    if ok and r then return r end
+    return s
+end
+
 -- Format time string
 function utils.formatTime(timestamp)
     local time = os.date("*t", timestamp or os.time())

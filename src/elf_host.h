@@ -43,6 +43,11 @@ void     host_sleep_ms(uint32_t ms);
 // *key = Doom key code (ASCII or special constant).
 int host_get_key(int* pressed, unsigned char* key);
 
+// Input: raw trackball deltas for modules emulating a pointing device.
+// First call opts in — the input task then stops consuming the trackball
+// (no more 0x81-0x85 pseudo-keys) for the rest of the module run.
+void host_trackball_read(int* dx, int* dy, int* click);
+
 // Audio: push PCM samples (mono, 16-bit signed) to the I2S output.
 void host_audio_push(const int16_t* samples, int count, int sample_rate);
 

@@ -128,6 +128,7 @@ typedef struct {
 #define ELF32_R_SYM(i)     ((i) >> 8)
 #define ELF32_R_TYPE(i)    ((unsigned char)(i))
 #define ELF32_ST_BIND(i)   ((i) >> 4)
+#define STB_WEAK           2
 
 // ---------------------------------------------------------------------------
 // Module handle
@@ -275,6 +276,12 @@ static int process_rela_section(elf_module_t* mod, void* load_base,
                 const char* name = mod->dynstr + sym->st_name;
                 void* addr = resolve_symbol(mod, sym, name);
                 if (!addr) {
+                    // Weak undefined resolves to NULL per the ELF spec
+                    // (modules use this for optional __init_array_* refs).
+                    if (ELF32_ST_BIND(sym->st_info) == STB_WEAK) {
+                        *target = 0;
+                        break;
+                    }
                     LOG_E("unresolved symbol: %s", name);
                     return -1;
                 }

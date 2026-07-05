@@ -87,11 +87,26 @@ static const char kb_map[KB_COLS_N][KB_ROWS_N] = {
   {'o','l','i',  0, '$','m','k'},
 };
 
+// SYM-held layer — digits and symbols. Mirrors main.cpp's kb_matrix_symbol so
+// the ELF-module keyboard path can produce numbers/symbols (essential for DOS
+// and other modules; without this only letters were reachable).
+static const char kb_map_sym[KB_COLS_N][KB_ROWS_N] = {
+  {'#','1',  0, '*',  0,   0, '0'},
+  {'2','4','5','@','8','7',  0 },
+  {'3','/','(',  0, '?','9','6'},
+  {'_',':',')',  0, '!',',',';'},
+  {'+','"','-',  0,   0, '.','\''},
+};
+
 // Modifier positions in the matrix
 #define MOD_LSHIFT_COL 1
 #define MOD_LSHIFT_ROW 6
 #define MOD_RSHIFT_COL 2
 #define MOD_RSHIFT_ROW 3
+#define MOD_SYM_COL    0
+#define MOD_SYM_ROW    2
+#define MOD_ALT_COL    0
+#define MOD_ALT_ROW    4
 #define KEY_ENTER_COL  3
 #define KEY_ENTER_ROW  3
 #define KEY_BS_COL     4
@@ -139,11 +154,17 @@ static bool kq_pop(KeyEvent* out) {
 }
 
 // Previous key states for edge detection (136 to cover trackball pseudo-codes 0x80-0x87)
-#define INPUT_STATE_SIZE 136
+// 256 so the full byte range is addressable — the module extension codes for
+// F1-F10 live at 0xB0-0xB9 (Alt+digit), above the old 136 ceiling.
+#define INPUT_STATE_SIZE 256
 static bool prev_key_state[INPUT_STATE_SIZE] = {0};
 static bool esc_held = false;
 static uint32_t esc_hold_start = 0;
 #define ESC_EXIT_HOLD_MS 1500
+
+// Raw-delta mode: set by host_trackball_read() (module emulates a mouse and
+// owns the ISR counters); reset before each module run.
+static volatile bool s_trk_raw_mode = false;
 
 // Trackball momentum state
 static float trk_vel_x = 0, trk_vel_y = 0;
@@ -214,6 +235,8 @@ static void poll_input(bool kb_only = false) {
 
     bool shift = (matrix[MOD_LSHIFT_COL] & (1 << MOD_LSHIFT_ROW)) ||
                  (matrix[MOD_RSHIFT_COL] & (1 << MOD_RSHIFT_ROW));
+    bool sym = (matrix[MOD_SYM_COL] & (1 << MOD_SYM_ROW));
+    bool alt = (matrix[MOD_ALT_COL] & (1 << MOD_ALT_ROW));
 
     // Decode matrix into character states
     for (int c = 0; c < KB_COLS_N; c++) {
@@ -223,15 +246,28 @@ static void poll_input(bool kb_only = false) {
             // Skip modifiers
             if (c == MOD_LSHIFT_COL && r == MOD_LSHIFT_ROW) continue;
             if (c == MOD_RSHIFT_COL && r == MOD_RSHIFT_ROW) continue;
-            if (c == 0 && r == 2) continue; // sym
-            if (c == 0 && r == 4) continue; // alt
+            if (c == MOD_SYM_COL && r == MOD_SYM_ROW) continue; // sym
+            if (c == MOD_ALT_COL && r == MOD_ALT_ROW) continue; // alt
 
             if (c == KEY_ENTER_COL && r == KEY_ENTER_ROW) {
                 cur_state[0x0D] = true;
             } else if (c == KEY_BS_COL && r == KEY_BS_ROW) {
                 cur_state[0x08] = true; // backspace (BS)
             } else {
-                char ch = kb_map[c][r];
+                // Layer select: Alt + a digit-position key -> F1..F10 (module
+                // maps 0xB0-0xB9); Sym -> number/symbol layer; else base.
+                char ch;
+                if (alt) {
+                    char s = kb_map_sym[c][r];
+                    if (s >= '1' && s <= '9')  ch = (char)(0xB0 + (s - '1'));
+                    else if (s == '0')         ch = (char)0xB9; // F10
+                    else if (s == '/')         ch = '\\';       // Alt+/ (G key) -> backslash for DOS paths
+                    else                       ch = kb_map[c][r];
+                } else if (sym) {
+                    ch = kb_map_sym[c][r];
+                } else {
+                    ch = kb_map[c][r];
+                }
                 if (ch) cur_state[(uint8_t)ch] = true;
             }
         }
@@ -240,7 +276,10 @@ static void poll_input(bool kb_only = false) {
     // Shift state
     if (shift) cur_state[0x80] = true; // pseudo-code for shift
 
-    if (!kb_only) {
+    if (!kb_only && s_trk_raw_mode) {
+        // Module reads raw deltas via host_trackball_read() (e.g. PC-XT's
+        // serial mouse) — leave the ISR counters alone, emit no 0x81-0x85.
+    } else if (!kb_only) {
         // Trackball — momentum or legacy mode
         if (trk_momentum) {
             // Accumulate all pending ISR ticks into velocity
@@ -491,6 +530,23 @@ int host_get_key(int* pressed, unsigned char* key) {
         return 1;
     }
     return 0;
+}
+
+// Raw trackball deltas for modules that emulate a pointing device (PC-XT's
+// serial mouse). First call opts the module in: the Core 1 input task stops
+// consuming the ISR counters and stops emitting 0x81-0x85 pseudo-keys.
+// Subtract-what-was-read (not =0) so ticks landing between the read and the
+// write survive — same tolerance as the input task's own consumption.
+void host_trackball_read(int* dx, int* dy, int* click) {
+    s_trk_raw_mode = true;
+    int up = trackball_up;    trackball_up    -= up;
+    int dn = trackball_down;  trackball_down  -= dn;
+    int lt = trackball_left;  trackball_left  -= lt;
+    int rt = trackball_right; trackball_right -= rt;
+    int ck = trackball_click; trackball_click -= ck;
+    if (dx)    *dx = rt - lt;
+    if (dy)    *dy = dn - up;
+    if (click) *click = ck;
 }
 
 // Track the sample rate across calls so we only reconfigure the mixer when
@@ -917,6 +973,7 @@ static const elf_symbol_t host_exports[] = {
     { "host_get_ticks_us",  (void*)host_get_ticks_us },
     { "host_sleep_ms",      (void*)host_sleep_ms },
     { "host_get_key",       (void*)host_get_key },
+    { "host_trackball_read", (void*)host_trackball_read },
     { "host_audio_push",    (void*)host_audio_push },
     { "host_audio_set_pull", (void*)host_audio_set_pull },
     { "host_should_exit",   (void*)host_should_exit },
@@ -1366,6 +1423,7 @@ int elf_host_run_pending(void) {
     memset(prev_key_state, 0, INPUT_STATE_SIZE);
     kq_head = kq_tail = 0;
     esc_held = false;
+    s_trk_raw_mode = false; // modules opt in via host_trackball_read()
 
     // Check for -keymap argument; default is passthrough (raw key codes).
     // Modules that need translated keycodes (e.g. Doom) pass their own
