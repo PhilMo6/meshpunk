@@ -148,7 +148,9 @@ struct ContactPathHistory {
   PathRecord records[MAX_PATH_RECORDS];
 };
 
-#define MAX_PENDING_REPEATS 4
+// 6 slots: the send retry ladder can register a repeat per attempt (up to 5)
+// on top of concurrent channel sends; 4 evicted too eagerly.
+#define MAX_PENDING_REPEATS 6
 #define MAX_REPEAT_HISTORY  8
 
 struct PendingRepeat {
@@ -159,6 +161,11 @@ struct PendingRepeat {
   uint8_t attempts_remaining;
   unsigned long next_retry_time;
   bool active;
+  // Direct-routed packets re-air via sendDirect and need their route kept
+  // (the payload doesn't carry it). direct=false → re-air as flood.
+  bool direct;
+  uint8_t path_len;
+  uint8_t path[MAX_PATH_SIZE];
 };
 
 struct RepeatOutcome {
@@ -370,8 +377,11 @@ public:
   RepeatOutcome  _repeat_history[MAX_REPEAT_HISTORY];
   int            _repeat_history_next = 0;
 
+  // path != nullptr registers a DIRECT repeat (re-aired via sendDirect on
+  // the saved route); nullptr = flood repeat (the original behavior).
   void registerPendingRepeat(const uint8_t* hash, uint8_t header,
-                             const uint8_t* payload, uint16_t payload_len);
+                             const uint8_t* payload, uint16_t payload_len,
+                             const uint8_t* path = nullptr, uint8_t path_len = 0);
   void checkPendingRepeats();
   int  getRepeatStatus(const uint8_t* hash);
 
@@ -398,8 +408,92 @@ public:
   int lookupPersistedPaths(lua_State* L, const char* hash_hex, int channel_idx, const char* peer);
 
   bool hasConnectionToContact(const uint8_t* pub_key) { return hasConnectionTo(pub_key); }
-  void stopConnectionToContact(const uint8_t* pub_key) { stopConnection(pub_key); }
-  bool startConnectionToContact(const ContactInfo& contact, uint16_t keep_alive_secs) { return startConnection(contact, keep_alive_secs); }
+  // Manual logout: unwatch FIRST so the expiry scan in loop() doesn't read
+  // the dropped slot as a lost connection.
+  void stopConnectionToContact(const uint8_t* pub_key) { unwatchConnection(pub_key); stopConnection(pub_key); }
+  bool startConnectionToContact(const ContactInfo& contact, uint16_t keep_alive_secs) {
+    bool ok = startConnection(contact, keep_alive_secs);
+    if (ok) watchConnection(contact);   // expiry → CONN_LOST event (see loop())
+    return ok;
+  }
+
+  // ── Room/repeater login (device UI) ─────────────────────────────
+  // 4-byte pubkey prefix of the server the Lua UI last sent a login /
+  // status request to (0 = none pending). Set under MESH_LOCK by the Lua
+  // bindings, consumed in onContactResponse. Mirrors — and coexists with —
+  // the BLE companion's own pending_login/pending_status, so a phone login
+  // and a device login can be in flight independently.
+  uint32_t pending_login_prefix = 0;
+  uint32_t pending_status_prefix = 0;
+
+  // sync_since sidecar: ContactInfo.sync_since is runtime-only in the fixed
+  // CONTACT_REC record (contacts.bin AND the archive share that stride), so
+  // a reboot would make the next room login re-fetch the room's whole
+  // retained history over LoRa. /room_sync.bin keeps just the sync cursors
+  // (pubkey_prefix(8) + sync_since(4) per record): loaded after
+  // loadContacts(), lazily saved from the mesh task ~30s after a change so
+  // a chatty room doesn't wear flash with per-message writes.
+  bool _room_sync_dirty = false;
+  unsigned long _room_sync_save_at = 0;
+  void loadRoomSync();
+  void saveRoomSync();
+  void markRoomSyncDirty();
+
+  // ── DM send retry ladder ─────────────────────────────────────────
+  // One outstanding tracked send (mirrors the firmware's single expected-ack
+  // model). Armed only by the device-UI send binding — BLE sends are excluded
+  // (the phone app runs its own retries). Ladder: the original send plus
+  // direct_left retries on the stored path, then the path auto-resets to
+  // flood and flood_left retries go out flooded; only then is the send
+  // declared failed. `attempt` increments per resend so each wire packet
+  // (and its ack hash) is unique; the UI correlates delivery by orig_ack —
+  // see armPendingSend / onSendTimeout / processAck.
+  struct PendingSend {
+    bool     active = false;
+    uint8_t  recipient_pub[PUB_KEY_SIZE];
+    uint32_t orig_ack;        // the ack the Lua UI indexed at send time
+    uint32_t timestamp;       // original msg timestamp (reused on resends)
+    char     text[160];
+    uint8_t  attempt;         // last attempt number sent (0 = original)
+    uint8_t  direct_left;     // remaining retries via the stored path
+    uint8_t  flood_left;      // remaining retries via flood
+    uint8_t  total_attempts;  // for the UI's "retry n/m"
+    // Every attempt's expected ack. A repeat-until-heard re-air can deliver
+    // an OLD attempt long after the ladder moved on — its late ack must
+    // still count as delivered (level-1 repeats must not corrupt level-2).
+    // Note attempt 4 shares attempt 0's ack (composeMsgPacket hashes only
+    // 2 attempt bits) — a harmless duplicate entry here.
+    uint32_t acks[5];
+    uint8_t  ack_count;
+  };
+  PendingSend _pending_send;
+  void armPendingSend(const ContactInfo& recipient, uint32_t orig_ack,
+                      uint32_t timestamp, const char* text, bool sent_direct);
+  void failPendingSend();   // queue failed-ACK event for orig_ack + clear
+
+  // ── Keep-alive session watch ─────────────────────────────────────
+  // Servers we (or the phone) logged into with a keep-alive interval.
+  // checkConnections() silently frees an expired slot; this watch turns that
+  // into a CONN_LOST event for the UI. Manual logout unwatches first, so it
+  // never fires a false alarm. Path is NOT reset on expiry (Noah's call —
+  // the server may just have been down; the login flood fallback in the
+  // Messenger covers the dead-path case on the next login).
+  struct ConnWatch { bool active; uint8_t pub_key[PUB_KEY_SIZE]; char name[32]; };
+  ConnWatch _conn_watch[16];   // matches BaseChatMesh MAX_CONNECTIONS
+  void watchConnection(const ContactInfo& contact);
+  void unwatchConnection(const uint8_t* pub_key);
+
+  // ── Path history persistence ─────────────────────────────────────
+  // _path_history (below) feeds the Paths picker; persist it so the picker
+  // isn't empty after every reboot. /path_hist.bin = version + record size +
+  // count + raw array dump; ignored on version/size mismatch. Lazy write:
+  // first change arms ~1 min, then at most one write per 10 min (the ring
+  // is dirtied by every RX message, so write-through would wear flash).
+  bool _path_hist_dirty = false;
+  unsigned long _path_hist_save_at = 0;
+  void loadPathHistory();
+  void savePathHistory();
+  void markPathHistDirty();
   const uint8_t* getPrivateKey() const { return ((const uint8_t*)&self_id) + PUB_KEY_SIZE; }
   bool saveIdentity();
 
@@ -461,6 +555,10 @@ public:
 protected:
   void sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override;
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
+  // MESHPUNK BaseChatMesh hook: direct-routed TXT sends (DMs, room posts,
+  // CLI commands) — captures the tx hash and registers repeat-until-heard
+  // for routes with at least one repeater to echo.
+  void sendDirectScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override;
   // Flood through the configured default transport scope (region key) when one
   // is set, else an unscoped flood. Applies the multi-byte path size.
   void sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis);

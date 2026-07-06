@@ -28,6 +28,11 @@ local M = {
     __onMessageMention = nil,
     __onMessageMentionFirst = nil,
     __onAck = nil,         -- fires when a sent DM is delivered or fails
+    __onRoomMessage = nil, -- room server post (msg.room = thread key, msg.from = author)
+    __onLoginResult = nil, -- (name, ok, perms, keepalive_secs) after _mesh_login
+    __onCliResponse = nil, -- repeater CLI reply (msg.from = repeater name)
+    __onStatusText = nil,  -- (name, text) decoded GET_STATUS response
+    __onConnectionLost = nil, -- (name) keep-alive session to a server expired
     __ack_index = {},      -- [expected_ack_crc] = sent msg (latest send only)
     __dm_threads = {},     -- grouped by contact name: {[name] = {msg, msg, ...}}
     __channel_history = {}, -- grouped by channel idx: {[idx] = {msg, msg, ...}}
@@ -110,7 +115,10 @@ function M:openThread(target)
             M.__channel_history[target.idx] = list
         end
         M.__open_thread = { kind = "channel", key = target.idx }
-    elseif target.type == "dm" then
+    elseif target.type == "dm" or target.type == "room" or target.type == "repeater" then
+        -- Rooms and repeaters persist in the same DM store, keyed by the
+        -- server contact's name (posts carry the author in msg.from; CLI
+        -- replies come from the repeater itself).
         local ok, list = pcall(_mesh_get_dm_messages, target.name)
         if ok and type(list) == "table" then
             trim_list(list)
@@ -209,6 +217,32 @@ end
 
 function M:onMessageMentionFirst(cb)
     M.__onMessageMentionFirst = cb
+end
+
+-- Room server posts (both live pushes and the history sync after login).
+function M:onRoomMessage(cb)
+    M.__onRoomMessage = cb
+end
+
+-- Login results: cb(name, ok, perms, keepalive_secs).
+function M:onLoginResult(cb)
+    M.__onLoginResult = cb
+end
+
+-- Repeater CLI replies.
+function M:onCliResponse(cb)
+    M.__onCliResponse = cb
+end
+
+-- Decoded GET_STATUS responses: cb(name, text).
+function M:onStatusText(cb)
+    M.__onStatusText = cb
+end
+
+-- Keep-alive session expiry: cb(name). The path is NOT reset — re-login
+-- (with its flood fallback) is the recovery route.
+function M:onConnectionLost(cb)
+    M.__onConnectionLost = cb
 end
 
 -- Send a public channel message via MeshCore
@@ -372,10 +406,63 @@ function M:shareContact(name_prefix)
     return _mesh_share_contact(name_prefix)
 end
 
--- ── Room server ─────────────────────────────────────────────────
+-- ── Room server / repeater login ────────────────────────────────
 
-function M:loginRoom(name_prefix, password)
-    return _mesh_login_room(name_prefix, password)
+-- Send a login to a room server or repeater. Returns ok, route, est_timeout
+-- (ms); the actual result arrives later via onLoginResult. Password caps at
+-- 15 chars on the wire.
+function M:login(name_prefix, password)
+    local fn = _mesh_login or _mesh_login_room   -- older firmware: alias only
+    return fn(name_prefix, password or "")
+end
+
+function M:loginRoom(name_prefix, password)   -- legacy alias
+    return M:login(name_prefix, password)
+end
+
+-- Drop the keep-alive session (local; the server just stops hearing us).
+function M:logout(name_prefix)
+    return _mesh_logout(name_prefix)
+end
+
+-- True while a keep-alive connection to this server is live.
+function M:isConnected(name_prefix)
+    local ok, up = pcall(_mesh_is_connected, name_prefix)
+    return ok and up or false
+end
+
+-- Send a CLI command to a (logged-in) repeater. The reply arrives via
+-- onCliResponse; there is no delivery ack for CLI traffic.
+function M:sendCommand(name_prefix, text)
+    local ok, route, hash_hex = _mesh_send_command(name_prefix, text)
+    if not ok then
+        print("Failed to send command: " .. tostring(route))
+        return false
+    end
+
+    -- Local echo — C++ side already persisted it. The hash feeds the chat's
+    -- repeat-until-heard indicator ("repeating…"/"repeated").
+    local info = _mesh_get_node_info()
+    local msg = {
+        from = info and info.name or "me",
+        text = text,
+        timestamp = now_ts(),
+        direct = (route == "direct"),
+        hops = 0,
+        is_dm = true,
+        to = name_prefix,
+        snr = 0,
+        rssi = 0,
+        hash = hash_hex,
+    }
+    local list = M.__dm_threads[name_prefix]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
+    end
+    summary_touch_dm(name_prefix, msg)
+    if M.__onAnyMessage then M.__onAnyMessage(msg) end
+    return true, msg   -- msg so the open console view can render the echo
 end
 
 function M:sendRequest(name_prefix, req_type)
@@ -489,6 +576,86 @@ function M.__dispatch_ack(ack, rtt)
         msg.status = "failed"
     end
     if M.__onAck then M.__onAck(msg) end
+end
+
+-- Called from C++ for room server posts. Threads under the ROOM's name;
+-- msg.from is the resolved AUTHOR. C++ has already persisted it (and bumped
+-- the room's unread counter at mesh-task RX).
+function M.__dispatch_room(room, author, text, timestamp, direct, hops, snr, rssi, path, hash)
+    local msg = {
+        from = author or "unknown",
+        room = room,
+        text = text,
+        timestamp = timestamp,
+        direct = direct,
+        hops = hops,
+        is_dm = true,
+        snr = snr or 0,
+        rssi = rssi or 0,
+        path = path or {},
+        hash = hash
+    }
+
+    local list = M.__dm_threads[room]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
+    end
+    summary_touch_dm(room, msg)
+
+    if M.__onRoomMessage then M.__onRoomMessage(msg) end
+    if M.__onAnyMessage then M.__onAnyMessage(msg) end
+end
+
+-- Called from C++ for repeater CLI replies. Threads under the repeater's
+-- name (its chat view is the CLI console). Persisted C-side; no unread bump.
+function M.__dispatch_cli(name, text, timestamp)
+    local msg = {
+        from = name or "unknown",
+        text = text,
+        timestamp = timestamp,
+        is_dm = true,
+        is_cli = true,
+        hops = 0,
+        snr = 0,
+        rssi = 0,
+    }
+
+    local list = M.__dm_threads[name]
+    if list then
+        table.insert(list, msg)
+        trim_list(list)
+    end
+    summary_touch_dm(name, msg)
+
+    if M.__onCliResponse then M.__onCliResponse(msg) end
+end
+
+-- Called from C++ with the result of a login sent via M:login().
+function M.__dispatch_login(name, ok, perms, keepalive_secs)
+    if M.__onLoginResult then M.__onLoginResult(name, ok, perms, keepalive_secs) end
+end
+
+-- Called from C++ when the retry ladder resends a tracked DM (attempt n of
+-- total). Keyed by the ORIGINAL expected-ack; the index entry stays live —
+-- the final delivered/failed __dispatch_ack still needs it.
+function M.__dispatch_retry(ack, n, total)
+    local msg = M.__ack_index[ack]
+    if not msg then return end
+    msg.status = "retrying"
+    msg.retry_n = n
+    msg.retry_total = total
+    if M.__onAck then M.__onAck(msg) end   -- same bubble-update path
+end
+
+-- Called from C++ when a keep-alive session to a room/repeater expires.
+function M.__dispatch_conn_lost(name)
+    if M.__onConnectionLost then M.__onConnectionLost(name) end
+end
+
+-- Called from C++ with a decoded GET_STATUS response (preformatted text).
+function M.__dispatch_status(name, text)
+    if M.__onStatusText then M.__onStatusText(name, text) end
 end
 
 -- Total unread across all channels + DMs. Used by the topbar's global mail

@@ -143,10 +143,16 @@ end
 -- single SCROLL_END (used here for windowed paging).
 local scroll_aware_list = nav.scroll_aware
 
--- Delivery word shown after the time on our own DM bubbles.
-local function dm_status_text(status)
+-- Delivery word shown after the time on our own DM bubbles. `msg` is only
+-- needed for the retry-ladder progress ("retry 2/5").
+local function dm_status_text(status, msg)
     if status == "delivered" then return "delivered"
     elseif status == "failed" then return "failed"
+    elseif status == "retrying" then
+        if msg and msg.retry_n then
+            return string.format("retry %d/%d", msg.retry_n, msg.retry_total or 0)
+        end
+        return "retrying"
     else return "sent" end
 end
 
@@ -168,6 +174,355 @@ local function contact_uri(name, pubkey, ctype)
     return "meshcore://contact/add?name=" .. url_encode(name)
         .. "&public_key=" .. (pubkey or "")
         .. "&type=" .. tostring(ctype or 1)
+end
+
+-- ── Saved login passwords (rooms / repeaters) ────────────────────
+-- One "pubkeyprefix=password" line per server. Keyed by the first 8 hex
+-- chars of the pubkey so a rename doesn't lose the credential. Plain text
+-- on flash — these are mesh guest/admin passwords, not secrets worth more.
+-- Saved only after a login the server accepted; login itself stays manual.
+--
+-- Lives on the mesh-data filesystem: SD (under /meshpunk, next to
+-- contacts/messages) when the card is the primary storage, else LittleFS.
+-- Resolved per call — the user can switch storage at runtime in Settings.
+local function logins_path()
+    local ok, info = pcall(_storage_get_info)
+    if ok and info and info.type == "SD" then
+        return "S:/meshpunk/messenger_logins"   -- mirrors the firmware's SD prefix
+    end
+    return "L:/messenger_logins"
+end
+
+local function load_logins()
+    local t = {}
+    local f = io.open(logins_path(), "r")
+    if not f then
+        -- Continuity across a storage switch: the C-side migration moves only
+        -- the mesh's own files, so fall back to reading the other drive.
+        local other = logins_path():sub(1, 1) == "S"
+            and "L:/messenger_logins" or "S:/meshpunk/messenger_logins"
+        f = io.open(other, "r")
+    end
+    if not f then return t end
+    -- NOTE: this firmware's io handles have no :lines() — whole-file read
+    -- + gmatch, same as every other app's prefs loader.
+    local txt = f:read("*a") or ""
+    f:close()
+    for k, v in string.gmatch(txt, "(%x+)=([^\r\n]*)") do
+        t[k] = v
+    end
+    return t
+end
+
+local function save_logins(t)
+    local f = io.open(logins_path(), "w")
+    if not f then return end
+    for k, v in pairs(t) do
+        if v and v ~= "" then f:write(k .. "=" .. v .. "\n") end
+    end
+    f:close()
+end
+
+local function contact_login_key(name)
+    local ok, raw = pcall(_mesh_get_contacts)
+    if ok and type(raw) == "table" then
+        for _, c in ipairs(raw) do
+            if c.name == name and c.pubkey and #c.pubkey >= 8 then
+                return string.sub(c.pubkey, 1, 8)
+            end
+        end
+    end
+    return nil
+end
+
+local function get_saved_password(name)
+    local key = contact_login_key(name)
+    if not key then return nil end
+    return load_logins()[key]
+end
+
+local function set_saved_password(name, pw)
+    local key = contact_login_key(name)
+    if not key then return end
+    local t = load_logins()
+    t[key] = pw
+    save_logins(t)
+end
+
+-- ── Login flow (rooms / repeaters) ───────────────────────────────
+-- One login may be in flight per server: name → {password, on_status, timer}.
+-- The single onLoginResult handler below routes the result back to whoever
+-- asked (chat header or contact detail) and saves the accepted password.
+local login_pending = {}
+
+messages:onLoginResult(function(name, ok, perms, keepalive)
+    local p = login_pending[name]
+    login_pending[name] = nil
+    if p and p.timer then pcall(function() p.timer:delete() end) end
+    local status
+    if ok then
+        if p and p.password then set_saved_password(name, p.password) end
+        status = (perms and perms > 0) and "Logged in (admin)" or "Logged in"
+    else
+        status = "Login failed"
+    end
+    if p and p.on_status then p.on_status(status, ok) end
+end)
+
+-- Password prompt → sendLogin. Result (or timeout) lands via on_status(text,
+-- ok): ok == true/false for a server verdict, nil while still in flight.
+local function show_login_popup(contact_name, on_status)
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
+    local box = overlay:Object {
+        w = W - 40, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555", pad_all = 8,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    nav.push(box)
+
+    box:Label { text = "Login: " .. utils.emojiText(contact_name), w = lvgl.PCT(100) }
+    local pw_ta = box:Textarea {
+        one_line = true,
+        max_length = 15,   -- wire cap: sendLogin truncates at 15 chars
+        w = lvgl.PCT(100), h = 30,
+        text = get_saved_password(contact_name) or "",
+    }
+    box:Label { text = "Blank = guest login", text_color = COL_META, w = lvgl.PCT(100) }
+
+    local row = box:Object {
+        w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    }
+
+    local function close()
+        nav.pop()
+        overlay:delete()
+    end
+
+    -- Send the login and arm a timeout for the firmware's route estimate
+    -- (+ slack). A DIRECT login that gets no response likely rode a dead
+    -- learned path: drop the path and retry ONCE flooded (the response then
+    -- re-teaches a fresh route). Only the flood attempt's silence is final.
+    local function send_login(pw, is_flood_retry)
+        local lok, route, est = messages:login(contact_name, pw)
+        if not lok then
+            if on_status then on_status("Login send failed", false) end
+            return
+        end
+        local p = { password = pw, on_status = on_status }
+        login_pending[contact_name] = p
+        local timer
+        timer = apps.add_timer {
+            period = (tonumber(est) or 8000) + 2000,
+            cb = function()
+                if timer then timer:delete(); timer = nil end
+                if login_pending[contact_name] ~= p then return end
+                login_pending[contact_name] = nil
+                if route == "direct" and not is_flood_retry then
+                    pcall(_mesh_reset_path, contact_name)
+                    send_login(pw, true)
+                else
+                    if on_status then on_status("No response", false) end
+                end
+            end,
+        }
+        p.timer = timer
+        if on_status then
+            on_status(is_flood_retry and "Retrying via flood.." or "Logging in..", nil)
+        end
+    end
+
+    local function do_login()
+        local pw = pw_ta.text or ""
+        close()
+        send_login(pw, false)
+    end
+
+    local login_btn = row:Button { w = lvgl.PCT(48), h = 26 }
+    login_btn:Label { text = "Login", align = lvgl.ALIGN.CENTER }
+    login_btn:onevent(lvgl.EVENT.RELEASED, do_login)
+
+    local cancel_btn = row:Button { w = lvgl.PCT(48), h = 26 }
+    cancel_btn:Label { text = "Cancel", align = lvgl.ALIGN.CENTER }
+    cancel_btn:onevent(lvgl.EVENT.RELEASED, close)
+
+    pw_ta:onevent(lvgl.EVENT.KEY, function()
+        local indev = lvgl.indev.get_act()
+        if indev:get_key() == lvgl.KEY.ENTER then do_login() end
+    end)
+end
+
+-- Decoded GET_STATUS responses pop a modal (they arrive seconds after the
+-- user taps "Req Status", wherever they are by then).
+local function show_status_popup(name, text)
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
+    local box = overlay:Object {
+        w = W - 30, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555", pad_all = 8,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    nav.push(box)
+    box:Label { text = "-- Status: " .. utils.emojiText(name) .. " --", w = lvgl.PCT(100) }
+    box:Label { text = text or "", w = lvgl.PCT(100) }
+    local close_btn = box:Button { w = lvgl.PCT(100), h = 26 }
+    close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+    close_btn:onevent(lvgl.EVENT.RELEASED, function()
+        nav.pop()
+        overlay:delete()
+    end)
+end
+
+messages:onStatusText(function(name, text)
+    show_status_popup(name, text)
+end)
+
+-- ── Server admin console popup (rooms + repeaters) ───────────────
+-- Canned admin tasks + free-form CLI. Commands only take effect once logged
+-- in with the server's ADMIN password (non-admin CLI is ignored). Replies
+-- render inline while the popup is open (they also persist into the
+-- server's thread like any CLI traffic).
+local function show_server_admin(server_name)
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)  -- modal
+    local box = overlay:Object {
+        w = W - 20, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555", pad_all = 8,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    nav.push(box)
+
+    box:Label { text = "-- Admin: " .. utils.emojiText(server_name) .. " --", w = lvgl.PCT(100) }
+
+    local reply_lbl = box:Label {
+        text = "Needs admin login. Replies show here.",
+        text_color = COL_META, w = lvgl.PCT(100),
+    }
+
+    -- Live CLI replies render inline. onCliResponse is a single slot and the
+    -- repeater console (behind this popup) registers its own — chain to it
+    -- so the console keeps rendering, and restore it on close.
+    local prev_cli = messages.__onCliResponse
+    messages:onCliResponse(function(msg)
+        if prev_cli then pcall(prev_cli, msg) end
+        if msg.from == server_name then
+            pcall(function()
+                reply_lbl.text = msg.text or ""
+                reply_lbl:set { text_color = COL_ACCENT }
+            end)
+        end
+    end)
+
+    local function send_cli(cmd)
+        if not cmd or #cmd == 0 then return end
+        local okc = messages:sendCommand(server_name, cmd)
+        pcall(function()
+            reply_lbl.text = okc and ("> " .. cmd) or "Send failed"
+            reply_lbl:set { text_color = COL_META }
+        end)
+    end
+
+    -- Canned tasks. "Sync clock" sets the room's clock from THIS device's
+    -- timestamp (CommonCLI "clock sync") — run it after every room power
+    -- cycle, or post sync breaks (see the room clock/cursor saga).
+    local row1 = box:Object {
+        w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    }
+    local sync_btn = row1:Button { w = lvgl.PCT(48), h = 26 }
+    sync_btn:Label { text = "Sync clock", align = lvgl.ALIGN.CENTER }
+    sync_btn:onevent(lvgl.EVENT.RELEASED, function() send_cli("clock sync") end)
+
+    local clock_btn = row1:Button { w = lvgl.PCT(48), h = 26 }
+    clock_btn:Label { text = "Show clock", align = lvgl.ALIGN.CENTER }
+    clock_btn:onevent(lvgl.EVENT.RELEASED, function() send_cli("clock") end)
+
+    local row2 = box:Object {
+        w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    }
+    local adv_btn = row2:Button { w = lvgl.PCT(48), h = 26 }
+    adv_btn:Label { text = "Advert", align = lvgl.ALIGN.CENTER }
+    adv_btn:onevent(lvgl.EVENT.RELEASED, function() send_cli("advert") end)
+
+    local st_btn = row2:Button { w = lvgl.PCT(48), h = 26 }
+    st_btn:Label { text = "Status", align = lvgl.ALIGN.CENTER }
+    st_btn:onevent(lvgl.EVENT.RELEASED, function()
+        -- Binary GET_STATUS (works for any perms); decoded result pops the
+        -- status modal (rooms also get their Posted/Pushed counters).
+        pcall(_mesh_send_request, server_name, 1)
+        pcall(function() reply_lbl.text = "Status requested.." end)
+    end)
+
+    -- Free-form CLI ("get ...", "set ...", "password ...", "time <epoch>").
+    local cmd_ta = box:Textarea {
+        one_line = true, max_length = 140,
+        w = lvgl.PCT(100), h = 30,
+    }
+    local function send_freeform()
+        local cmd = cmd_ta.text
+        if cmd and #cmd > 0 then
+            send_cli(cmd)
+            cmd_ta.text = ""
+        end
+    end
+    cmd_ta:onevent(lvgl.EVENT.KEY, function()
+        local indev = lvgl.indev.get_act()
+        if indev:get_key() == lvgl.KEY.ENTER then send_freeform() end
+    end)
+
+    local row3 = box:Object {
+        w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
+        bg_opa = 0, border_width = 0, pad_all = 0,
+        flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    }
+    local send_btn = row3:Button { w = lvgl.PCT(48), h = 26 }
+    send_btn:Label { text = "Send", align = lvgl.ALIGN.CENTER }
+    send_btn:onevent(lvgl.EVENT.RELEASED, send_freeform)
+
+    local close_btn = row3:Button { w = lvgl.PCT(48), h = 26 }
+    close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+    close_btn:onevent(lvgl.EVENT.RELEASED, function()
+        messages:onCliResponse(prev_cli)   -- restore the console's listener
+        nav.pop()
+        overlay:delete()
+    end)
+end
+
+-- Resolve a DM-thread name to the right chat target: rooms and repeaters
+-- get their own chat types (login button; the repeater chat is a CLI
+-- console). Falls back to a plain DM when the contact is unknown.
+local function thread_target(name)
+    local ok, raw = pcall(_mesh_get_contacts)
+    if ok and type(raw) == "table" then
+        for _, c in ipairs(raw) do
+            if c.name == name then
+                if c.type == 2 then return { type = "repeater", name = name } end
+                if c.type == 3 then return { type = "room", name = name } end
+                break
+            end
+        end
+    end
+    return { type = "dm", name = name }
 end
 
 -- Forward declarations
@@ -509,7 +864,9 @@ show_inbox = function()
         if c.kind == "channel" then
             show_chat { type = "channel", idx = c.idx, name = c.name }
         else
-            show_chat { type = "dm", name = c.name }
+            -- Room / repeater threads live in the DM store; resolve the
+            -- contact type so their chats get the login/CLI features.
+            show_chat(thread_target(c.name))
         end
     end
 
@@ -576,6 +933,16 @@ show_inbox = function()
             unread = messages:unreadInDM(thread_name),
         })
     end)
+
+    messages:onRoomMessage(function(msg)
+        if current_mode ~= "inbox" then return end
+        if not current_view then return end
+        -- Room posts thread under the ROOM's name (msg.from is the author).
+        touch_row("@" .. msg.room, {
+            kind = "dm", name = msg.room, last = msg, ts = msg.timestamp,
+            unread = messages:unreadInDM(msg.room),
+        })
+    end)
 end
 
 -- ── CHAT VIEW ───────────────────────────────────────────────────
@@ -588,10 +955,11 @@ show_chat = function(target)
     -- clear_view -> closeThread drops it again on the way out of the chat.
     messages:openThread(target)
 
-    -- Clear unread for this thread now that it's open.
+    -- Clear unread for this thread now that it's open. Rooms and repeaters
+    -- share the DM store/counters, keyed by the server contact's name.
     if target.type == "channel" then
         messages:markChannelSeen(target.idx)
-    elseif target.type == "dm" then
+    else
         messages:markDMSeen(target.name)
     end
 
@@ -614,16 +982,60 @@ show_chat = function(target)
     scope_btn:Label { text = "Rgn", align = lvgl.ALIGN.CENTER }
     scope_btn:onevent(lvgl.EVENT.RELEASED, function() show_flood_scope() end)
 
-    if target.type == "dm" then
+    -- Info (contact detail — also the way to favorite a room/repeater so its
+    -- contact record survives removal/eviction).
+    if target.type ~= "channel" then
         local info_btn = body:Button { w = 45, h = 20 }
         info_btn:Label { text = "Info", align = lvgl.ALIGN.CENTER }
         info_btn:onevent(lvgl.EVENT.RELEASED, function() show_contact_detail(target.name) end)
-    elseif target.type == "room" then
+    end
+
+    -- Login/Logout (room server or repeater). The button reads Logout while a
+    -- keep-alive session is live; legacy servers (no keep-alive) just re-login.
+    if target.type == "room" or target.type == "repeater" then
         local login_btn = body:Button { w = 50, h = 20 }
-        login_btn:Label { text = "Login", align = lvgl.ALIGN.CENTER }
+        local login_lbl = login_btn:Label {
+            text = messages:isConnected(target.name) and "Logout" or "Login",
+            align = lvgl.ALIGN.CENTER,
+        }
         login_btn:onevent(lvgl.EVENT.RELEASED, function()
-            local ok = pcall(_mesh_login_room, target.name, "")
-            set_header(title, ok and "Logging in.." or "Login fail")
+            if messages:isConnected(target.name) then
+                messages:logout(target.name)
+                login_lbl.text = "Login"
+                set_header(title, "Logged out")
+            else
+                show_login_popup(target.name, function(status, lok)
+                    -- Only touch the header while this chat is still the view.
+                    if current_mode == "chat" and chat_target and chat_target.name == target.name then
+                        set_header(title, status)
+                        if lok and messages:isConnected(target.name) then
+                            login_lbl.text = "Logout"
+                        end
+                    end
+                end)
+            end
+        end)
+
+        -- Keep-alive expiry for THIS server: header note + button flips back.
+        -- (Path is intentionally kept — re-login covers the dead-path case
+        -- with its flood fallback.)
+        messages:onConnectionLost(function(name)
+            if name ~= target.name then return end
+            if current_mode ~= "chat" or not chat_target or chat_target.name ~= target.name then return end
+            pcall(function()
+                set_header(title, "Connection lost")
+                login_lbl.text = "Login"
+            end)
+        end)
+
+        -- Admin console (clock sync, advert, status, free-form CLI) for
+        -- rooms AND repeaters. Server-side it only obeys admins; the button
+        -- is always offered. The repeater chat stays a plain console — this
+        -- is the canned-tasks shortcut on top of it.
+        local adm_btn = body:Button { w = 45, h = 20 }
+        adm_btn:Label { text = "Adm", align = lvgl.ALIGN.CENTER }
+        adm_btn:onevent(lvgl.EVENT.RELEASED, function()
+            show_server_admin(target.name)
         end)
     end
 
@@ -689,10 +1101,12 @@ show_chat = function(target)
         local hdr = is_me and "You" or utils.emojiText(msg.from or "?")
         local meta = utils.clockHM(msg.timestamp)
         -- Live sends carry msg.status (sent/delivered/failed); persisted/received
-        -- messages don't, so they show no delivery word.
-        local track_status = is_me and target.type == "dm" and msg.status ~= nil
+        -- messages don't, so they show no delivery word. Room posts are acked
+        -- by the room server, so they track delivery like DMs.
+        local track_status = is_me and (target.type == "dm" or target.type == "room")
+                                   and msg.status ~= nil
         local head_text = hdr .. "  " .. meta
-        if track_status then head_text = head_text .. "  " .. dm_status_text(msg.status) end
+        if track_status then head_text = head_text .. "  " .. dm_status_text(msg.status, msg) end
         local head_lbl = bubble:Label {
             text = head_text,
             w = lvgl.PCT(100),
@@ -766,11 +1180,12 @@ show_chat = function(target)
         return bubble
     end
 
-    -- Existing messages: the bucket openThread just loaded (rooms stay empty).
+    -- Existing messages: the bucket openThread just loaded. Rooms and
+    -- repeaters persist in the DM store keyed by the server's name.
     local history = {}
     if target.type == "channel" then
         history = messages:getChannelHistory(target.idx)
-    elseif target.type == "dm" then
+    else
         history = messages:getDMThread(target.name)
     end
 
@@ -821,6 +1236,29 @@ show_chat = function(target)
                 messages:clearUnreadDM(target.name)
             end
         end)
+    elseif target.type == "room" then
+        -- Two live sources: our own posts echo via the DM path (msg.to =
+        -- room), other members' posts arrive as room messages.
+        messages:onDirectMessage(function(msg)
+            if msg.to == target.name then
+                local lbl = render_msg(msg)
+                if lbl then lbl:scroll_to_view(false) end
+            end
+        end)
+        messages:onRoomMessage(function(msg)
+            if msg.room == target.name then
+                local lbl = render_msg(msg)
+                if lbl then lbl:scroll_to_view(false) end
+                messages:clearUnreadDM(target.name)
+            end
+        end)
+    elseif target.type == "repeater" then
+        messages:onCliResponse(function(msg)
+            if msg.from == target.name then
+                local lbl = render_msg(msg)
+                if lbl then lbl:scroll_to_view(false) end
+            end
+        end)
     end
 
     -- Live delivery status for our own DMs: update the bubble header when the
@@ -833,7 +1271,7 @@ show_chat = function(target)
         if not lbl then return end
         pcall(function()
             lbl.text = "You  " .. utils.clockHM(m.timestamp)
-                .. "  " .. dm_status_text(m.status)
+                .. "  " .. dm_status_text(m.status, m)
             lbl:set { text_color = (m.status == "failed") and "#ff8080" or COL_META }
         end)
     end)
@@ -861,6 +1299,14 @@ show_chat = function(target)
             else messages:sendToChannel(target.idx, text) end
         elseif target.type == "dm" or target.type == "room" then
             messages:sendDirect(target.name, text)
+        elseif target.type == "repeater" then
+            -- The repeater chat is a CLI console: sends go out as commands
+            -- (needs a logged-in session or the repeater ignores them).
+            local okc, m = messages:sendCommand(target.name, text)
+            if okc and m then
+                local lbl = render_msg(m)
+                if lbl then lbl:scroll_to_view(false) end
+            end
         end
         textArea.text = ""
     end
@@ -1189,7 +1635,15 @@ show_contact_settings = function()
     }
     nav.push(box)
 
-    box:Label { text = "-- Contact Settings --", w = lvgl.PCT(100) }
+    local hdr = box:Object {
+        w = lvgl.PCT(100), h = 20, pad_all = 0, border_width = 0,
+        bg_opa = 0, flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    }
+    hdr:clear_flag(lvgl.FLAG.SCROLLABLE)
+    hdr:Label { text = "-- Contact Settings --", flex_grow = 1 }
+    local x_btn = hdr:Button { w = 22, h = 20 }
+    x_btn:Label { text = "X", align = lvgl.ALIGN.CENTER }
+    x_btn:onevent(lvgl.EVENT.RELEASED, function() close_popup(true) end)
 
     local function toggle_btn(label, get, set)
         local b = box:Button { w = lvgl.PCT(100), h = 26 }
@@ -1482,6 +1936,7 @@ show_contacts = function()
     local function bind_row(row, c_name, c_type)
         bind_click(row, function()
             if c_type == 1 then show_chat { type = "dm", name = c_name }
+            elseif c_type == 2 then show_chat { type = "repeater", name = c_name }
             elseif c_type == 3 then show_chat { type = "room", name = c_name }
             else show_contact_detail(c_name) end
         end)
@@ -1743,8 +2198,22 @@ show_contact_detail = function(contact_name)
 
     local paths_btn = box:Button { w = lvgl.PCT(38), h = 22 }
     paths_btn:Label { text = "Paths", align = lvgl.ALIGN.CENTER }
-    paths_btn:onevent(lvgl.EVENT.RELEASED, function()
+    -- Path history + picker: every record can be made the CURRENT route
+    -- ("Use"), and "Flood" drops the learned path. After an action the popup
+    -- is recreated fresh (pop-before-delete; no in-place clean of an active
+    -- nav scope) so the current-marker reflects the new state.
+    local show_paths_popup
+    show_paths_popup = function(note)
         local ok2, paths = pcall(_mesh_get_contact_paths, contact.pubkey)
+        if not ok2 or type(paths) ~= "table" then paths = {} end
+        -- Proven routes first (delivery successes), then most recently seen.
+        table.sort(paths, function(a, b)
+            if (a.success or 0) ~= (b.success or 0) then
+                return (a.success or 0) > (b.success or 0)
+            end
+            return (a.timestamp or 0) > (b.timestamp or 0)
+        end)
+
         local overlay2 = root:Object {
             w = W, h = H, x = 0, y = 0,
             bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
@@ -1758,35 +2227,69 @@ show_contact_detail = function(contact_name)
             flex = { flex_direction = "column", flex_wrap = "nowrap" },
         }
         nav.push(box2)
+        local function close2()
+            nav.pop()
+            overlay2:delete()
+        end
+
         box2:Label { text = "-- Paths: " .. contact.name .. " --", w = lvgl.PCT(100) }
-        if not ok2 or not paths or #paths == 0 then
+        if note then
+            box2:Label { text = note, text_color = COL_ACCENT, w = lvgl.PCT(100) }
+        end
+
+        local any_current = false
+        if #paths == 0 then
             box2:Label { text = "No path data", w = lvgl.PCT(100) }
         else
             for i, rec in ipairs(paths) do
-                local chain = "Direct"
-                if not rec.direct and rec.path and #rec.path > 0 then
-                    chain = table.concat(rec.path, ">")
-                elseif not rec.direct then chain = "Flood" end
-                box2:Label {
-                    text = string.format("#%d %s h:%d snr:%.0f rssi:%.0f",
-                        i, rec.source or "?", rec.hops or 0, rec.snr or 0, rec.rssi or 0),
+                local chain = "Direct (0 hop)"
+                if rec.path and #rec.path > 0 then chain = table.concat(rec.path, ">") end
+                if rec.current then any_current = true end
+                local head = box2:Label {
+                    text = string.format("%s %s h:%d snr:%.0f rssi:%.0f",
+                        rec.current and ">" or ("#" .. i),
+                        rec.source or "?", rec.hops or 0, rec.snr or 0, rec.rssi or 0),
                     w = lvgl.PCT(100),
                 }
+                if rec.current then head:set { text_color = COL_ACCENT } end
                 box2:Label { text = "  " .. chain, w = lvgl.PCT(100) }
                 box2:Label {
                     text = string.format("  ok:%d fail:%d %dms",
                         rec.success or 0, rec.failure or 0, rec.trip_time_ms or 0),
                     w = lvgl.PCT(100),
                 }
+                if not rec.current and rec.path_len and rec.path_hex then
+                    local use_btn = box2:Button { w = 70, h = 22 }
+                    use_btn:Label { text = "Use", align = lvgl.ALIGN.CENTER }
+                    use_btn:onevent(lvgl.EVENT.RELEASED, function()
+                        local pok, sok = pcall(_mesh_set_contact_path, contact.pubkey,
+                                               rec.path_len, rec.path_hex)
+                        close2()
+                        show_paths_popup((pok and sok) and "Path set" or "Set failed")
+                    end)
+                end
             end
         end
-        local close_btn2 = box2:Button { w = lvgl.PCT(100), h = 26 }
-        close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
-        close_btn2:onevent(lvgl.EVENT.RELEASED, function()
-            nav.pop()
-            overlay2:delete()
+        if not any_current then
+            box2:Label {
+                text = "Current: flood (no set path)",
+                text_color = COL_META, w = lvgl.PCT(100),
+            }
+        end
+
+        local flood_btn = box2:Button { w = lvgl.PCT(48), h = 26 }
+        flood_btn:Label { text = "Flood", align = lvgl.ALIGN.CENTER }
+        flood_btn:onevent(lvgl.EVENT.RELEASED, function()
+            pcall(_mesh_reset_path, contact_name)
+            close2()
+            show_paths_popup("Path reset - sends flood")
         end)
-    end)
+
+        local close_btn2 = box2:Button { w = lvgl.PCT(48), h = 26 }
+        close_btn2:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+        close_btn2:onevent(lvgl.EVENT.RELEASED, close2)
+    end
+    paths_btn:onevent(lvgl.EVENT.RELEASED, function() show_paths_popup() end)
 
     -- Favourite toggle
     local is_fav = contact.favorite or false
@@ -1816,13 +2319,21 @@ show_contact_detail = function(contact_name)
         end)
     end
 
-    -- Login (room server)
-    if contact.type == 3 then
+    -- Chat / console + login (room server or repeater)
+    if contact.type == 2 or contact.type == 3 then
+        local chat_btn = box:Button { w = lvgl.PCT(48), h = 26 }
+        chat_btn:Label { text = contact.type == 2 and "Console" or "Chat", align = lvgl.ALIGN.CENTER }
+        chat_btn:onevent(lvgl.EVENT.RELEASED, function()
+            close_popup()
+            show_chat { type = contact.type == 2 and "repeater" or "room", name = contact_name }
+        end)
+
         local login_btn = box:Button { w = lvgl.PCT(48), h = 26 }
         login_btn:Label { text = "Login", align = lvgl.ALIGN.CENTER }
         login_btn:onevent(lvgl.EVENT.RELEASED, function()
-            local lok = pcall(_mesh_login_room, contact_name, "")
-            set_header(contact_name, lok and "Logging in.." or "Login fail")
+            show_login_popup(contact_name, function(status)
+                set_header(contact_name, status)
+            end)
         end)
     end
 

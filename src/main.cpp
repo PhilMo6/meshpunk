@@ -2215,11 +2215,16 @@ static int lua_mesh_send_direct(lua_State *L) {
     return 2;
   }
 
-  uint32_t expected_ack = 0;
-  uint32_t est_timeout = 0;
   uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
 
   auto r = the_mesh->sendAndPersistDM(*recipient, timestamp, 0, text);
+  if (r.code != MSG_SEND_FAILED && r.expected_ack != 0) {
+    // Track this send in the retry ladder (3 tries via path, then the path
+    // resets and 2 more go flooded). Device-UI sends only — BLE sends run
+    // the phone app's own retry logic.
+    the_mesh->armPendingSend(*recipient, r.expected_ack, timestamp, text,
+                             r.code == MSG_SEND_SENT_DIRECT);
+  }
   MESH_UNLOCK();
 
   if (r.code == MSG_SEND_FAILED) {
@@ -2808,6 +2813,10 @@ static int lua_mesh_get_contact_paths(lua_State *L) {
   lua_newtable(L);
 
   MESH_LOCK();
+  // The live contact (if any) — used to flag which record is the CURRENT
+  // out_path, so the picker can mark it and offer the others.
+  ContactInfo *contact = the_mesh->lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+
   ContactPathHistory *h = nullptr;
   for (int i = 0; i < the_mesh->_path_history_count; i++) {
     if (memcmp(the_mesh->_path_history[i].pub_key, pub_key, PUB_KEY_SIZE) == 0) {
@@ -2821,10 +2830,13 @@ static int lua_mesh_get_contact_paths(lua_State *L) {
       PathRecord &r = h->records[i];
       lua_newtable(L);
 
+      uint8_t hash_size = (r.path_len >> 6) + 1;
+      uint8_t hash_count = r.path_len & 63;
+      uint16_t byte_len = (uint16_t)hash_count * hash_size;
+      if (byte_len > MAX_PATH_SIZE) byte_len = MAX_PATH_SIZE;
+
       // path as array of hex hashes
       {
-        uint8_t hash_size = (r.path_len >> 6) + 1;
-        uint8_t hash_count = r.path_len & 63;
         lua_newtable(L);
         char hex[7];
         for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
@@ -2837,6 +2849,24 @@ static int lua_mesh_get_contact_paths(lua_State *L) {
         lua_pushinteger(L, hash_count);
         lua_setfield(L, -2, "hops");
       }
+
+      // Raw round-trip form for _mesh_set_contact_path ("Use this path").
+      lua_pushinteger(L, r.path_len);
+      lua_setfield(L, -2, "path_len");
+      {
+        char phex[MAX_PATH_SIZE * 2 + 1];
+        mesh::Utils::toHex(phex, r.path, byte_len);
+        lua_pushstring(L, phex);
+        lua_setfield(L, -2, "path_hex");
+      }
+
+      // Is this record the contact's CURRENT out_path?
+      bool is_current = contact &&
+                        contact->out_path_len != OUT_PATH_UNKNOWN &&
+                        (uint16_t)contact->out_path_len == r.path_len &&
+                        memcmp(contact->out_path, r.path, byte_len) == 0;
+      lua_pushboolean(L, is_current ? 1 : 0);
+      lua_setfield(L, -2, "current");
 
       lua_pushboolean(L, r.is_direct);
       lua_setfield(L, -2, "direct");
@@ -2868,6 +2898,57 @@ static int lua_mesh_get_contact_paths(lua_State *L) {
   }
   MESH_UNLOCK();
 
+  return 1;
+}
+
+// Set a contact's CURRENT out_path from a history record ("Use this path"
+// in the Paths picker). Takes the raw round-trip form that
+// _mesh_get_contact_paths exposes per record (path_len + path_hex).
+// path_len 0 with empty hex = zero-hop direct. Persisted via saveOneContact.
+// Usage: local ok, err = _mesh_set_contact_path(pubkey_hex, path_len, path_hex)
+static int lua_mesh_set_contact_path(lua_State *L) {
+  const char *pubkey_hex = luaL_checkstring(L, 1);
+  int path_len = luaL_checkinteger(L, 2);
+  const char *path_hex = luaL_optstring(L, 3, "");
+
+  if (strlen(pubkey_hex) != PUB_KEY_SIZE * 2) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Bad pubkey");
+    return 2;
+  }
+  if (path_len < 0 || path_len >= OUT_PATH_UNKNOWN) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Bad path_len");
+    return 2;
+  }
+  uint16_t byte_len = (uint16_t)(path_len & 63) * ((path_len >> 6) + 1);
+  if (byte_len > MAX_PATH_SIZE || strlen(path_hex) != (size_t)byte_len * 2) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Bad path");
+    return 2;
+  }
+
+  uint8_t pub_key[PUB_KEY_SIZE];
+  mesh::Utils::fromHex(pub_key, PUB_KEY_SIZE, pubkey_hex);
+  uint8_t path_bytes[MAX_PATH_SIZE];
+  if (byte_len > 0) mesh::Utils::fromHex(path_bytes, byte_len, path_hex);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh->lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+  memset(c->out_path, 0, sizeof(c->out_path));
+  if (byte_len > 0) memcpy(c->out_path, path_bytes, byte_len);
+  c->out_path_len = (uint8_t)path_len;
+  c->lastmod = the_mesh->getRTCClock()->getCurrentTime();
+  the_mesh->saveOneContact(*c);   // persists + bumps contacts_generation
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, 1);
   return 1;
 }
 
@@ -3348,8 +3429,11 @@ static int lua_mesh_share_contact(lua_State *L) {
   return 1;
 }
 
-// Login to a room server
-// Usage: local ok, route = _mesh_login_room("myroom", "password123")
+// Login to a room server or repeater (sendLogin handles both types; rooms get
+// their sync_since cursor in the request, repeaters just the password).
+// Usage: local ok, route, est_timeout = _mesh_login("myroom", "password123")
+// The result arrives later via messages.__dispatch_login (LOGIN_RESULT event);
+// est_timeout (ms) is how long the UI should wait before declaring no response.
 static int lua_mesh_login_room(lua_State *L) {
   const char *name_prefix = luaL_checkstring(L, 1);
   const char *password = luaL_checkstring(L, 2);
@@ -3365,6 +3449,9 @@ static int lua_mesh_login_room(lua_State *L) {
 
   uint32_t est_timeout = 0;
   int result = the_mesh->sendLogin(*c, password, est_timeout);
+  if (result != MSG_SEND_FAILED) {
+    memcpy(&the_mesh->pending_login_prefix, c->id.pub_key, 4);
+  }
   MESH_UNLOCK();
 
   if (result == MSG_SEND_FAILED) {
@@ -3379,8 +3466,85 @@ static int lua_mesh_login_room(lua_State *L) {
   return 3;
 }
 
+// Drop the keep-alive connection to a logged-in server (local only — MeshCore
+// has no logout packet; the server just stops hearing our keep-alives).
+// Usage: _mesh_logout("myroom")
+static int lua_mesh_logout(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
+  if (c) the_mesh->stopConnectionToContact(c->id.pub_key);
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, c != nullptr);
+  return 1;
+}
+
+// True while a keep-alive connection to this server is live (only servers
+// that returned a keep-alive interval at login appear here).
+// Usage: local up = _mesh_is_connected("myroom")
+static int lua_mesh_is_connected(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
+  bool up = c && the_mesh->hasConnectionToContact(c->id.pub_key);
+  MESH_UNLOCK();
+
+  lua_pushboolean(L, up ? 1 : 0);
+  return 1;
+}
+
+// Send a CLI command to a logged-in repeater (TXT_TYPE_CLI_DATA — no ack on
+// the reply). The command is persisted into the repeater's thread first so
+// the console history reads like a chat.
+// Usage: local ok, route = _mesh_send_command("repeater1", "ver")
+static int lua_mesh_send_command(lua_State *L) {
+  const char *name_prefix = luaL_checkstring(L, 1);
+  const char *raw = luaL_checkstring(L, 2);
+  char text[160];
+  prepare_outgoing_text(raw, text, sizeof(text));
+
+  MESH_LOCK();
+  ContactInfo *c = the_mesh->searchContactsByPrefix(name_prefix);
+  if (!c) {
+    MESH_UNLOCK();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Contact not found");
+    return 2;
+  }
+
+  uint32_t est_timeout = 0;
+  uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
+  int result = the_mesh->sendCommandData(*c, timestamp, 0, text, est_timeout);
+  char hash_hex[MAX_HASH_SIZE * 2 + 1] = {0};
+  if (result != MSG_SEND_FAILED) {
+    // Both routes set _last_tx_hash (sendFloodScoped / sendDirectScoped), so
+    // the console echo gets the repeat-until-heard indicator like DMs do.
+    the_mesh->appendDMMessage(c->name, the_mesh->_prefs.node_name, text, timestamp,
+                              0, 0, 0, result == MSG_SEND_SENT_DIRECT,
+                              0, nullptr, the_mesh->_last_tx_hash);
+    the_mesh->preRegisterSentHash(the_mesh->_last_tx_hash, true, -1, c->name);
+    mesh::Utils::toHex(hash_hex, the_mesh->_last_tx_hash, MAX_HASH_SIZE);
+  }
+  MESH_UNLOCK();
+
+  if (result == MSG_SEND_FAILED) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "Command send failed");
+    return 2;
+  }
+
+  lua_pushboolean(L, 1);
+  lua_pushstring(L, result == MSG_SEND_SENT_DIRECT ? "direct" : "flood");
+  lua_pushstring(L, hash_hex);
+  return 3;
+}
+
 // Send a request to a contact (e.g. get stats from repeater/room)
 // Usage: local ok, route = _mesh_send_request("repeater1", 1)  -- 1=GET_STATUS
+// A GET_STATUS response comes back decoded via messages.__dispatch_status.
 static int lua_mesh_send_request(lua_State *L) {
   const char *name_prefix = luaL_checkstring(L, 1);
   int req_type = luaL_checkinteger(L, 2);
@@ -3397,6 +3561,9 @@ static int lua_mesh_send_request(lua_State *L) {
   uint32_t tag = 0;
   uint32_t est_timeout = 0;
   int result = the_mesh->sendRequest(*c, (uint8_t)req_type, tag, est_timeout);
+  if (result != MSG_SEND_FAILED && req_type == REQ_TYPE_GET_STATUS) {
+    memcpy(&the_mesh->pending_status_prefix, c->id.pub_key, 4);
+  }
   MESH_UNLOCK();
 
   if (result == MSG_SEND_FAILED) {
@@ -5224,7 +5391,11 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_import_contact", lua_mesh_import_contact);
   lua_register(L, "_mesh_share_contact", lua_mesh_share_contact);
   lua_register(L, "_mesh_set_contact_favorite", lua_mesh_set_contact_favorite);
-  lua_register(L, "_mesh_login_room", lua_mesh_login_room);
+  lua_register(L, "_mesh_login_room", lua_mesh_login_room);  // legacy alias of _mesh_login
+  lua_register(L, "_mesh_login", lua_mesh_login_room);
+  lua_register(L, "_mesh_logout", lua_mesh_logout);
+  lua_register(L, "_mesh_is_connected", lua_mesh_is_connected);
+  lua_register(L, "_mesh_send_command", lua_mesh_send_command);
   lua_register(L, "_mesh_send_request", lua_mesh_send_request);
   lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
   lua_register(L, "_mesh_get_rx_boost", lua_mesh_get_rx_boost);
@@ -5282,6 +5453,7 @@ void setupLuaVGL() {
     return 1;
   });
   lua_register(L, "_mesh_get_contact_paths", lua_mesh_get_contact_paths);
+  lua_register(L, "_mesh_set_contact_path", lua_mesh_set_contact_path);
   lua_register(L, "_mesh_get_message_paths", lua_mesh_get_message_paths);
   lua_register(L, "_mesh_get_msg_repeat", lua_mesh_get_msg_repeat);
   lua_register(L, "_mesh_set_msg_repeat", lua_mesh_set_msg_repeat);
@@ -6887,6 +7059,12 @@ extern void lua_mesh_push_channel_message(lua_State* L, const char* sender_name,
 extern void lua_mesh_push_direct_message(lua_State* L, const char* sender_name, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash);
 extern void lua_mesh_push_contact_update(lua_State* L, const char* name, uint8_t contact_type);
 extern void lua_mesh_push_ack(lua_State* L, uint32_t ack, int32_t rtt);
+extern void lua_mesh_push_room_message(lua_State* L, const char* room_name, const char* author, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash);
+extern void lua_mesh_push_cli_response(lua_State* L, const char* name, const char* text, uint32_t timestamp);
+extern void lua_mesh_push_login_result(lua_State* L, const char* name, bool ok, uint8_t perms, uint32_t keepalive_secs);
+extern void lua_mesh_push_status_text(lua_State* L, const char* name, const char* text);
+extern void lua_mesh_push_send_retry(lua_State* L, uint32_t ack, uint8_t n, uint8_t total);
+extern void lua_mesh_push_conn_lost(lua_State* L, const char* name);
 
 // Drain RX events posted by the mesh core. Runs every UI tick.
 // Bounded per call so a flood on the queue can't starve LVGL.
@@ -6908,6 +7086,20 @@ static void drain_rx_events() {
       lua_mesh_push_contact_update(L, ev.sender, ev.hops);
     } else if (ev.kind == RxEvent::ACK) {
       lua_mesh_push_ack(L, ev.ack, ev.rtt);
+    } else if (ev.kind == RxEvent::ROOM_MSG) {
+      lua_mesh_push_room_message(L, ev.sender, ev.origin, ev.hops, ev.direct,
+                                 ev.timestamp, ev.text, ev.snr, ev.rssi,
+                                 ev.path_len, ev.path, ev.pkt_hash);
+    } else if (ev.kind == RxEvent::CLI_RESPONSE) {
+      lua_mesh_push_cli_response(L, ev.sender, ev.text, ev.timestamp);
+    } else if (ev.kind == RxEvent::LOGIN_RESULT) {
+      lua_mesh_push_login_result(L, ev.sender, ev.channel_idx != 0, ev.hops, ev.ack);
+    } else if (ev.kind == RxEvent::STATUS_TEXT) {
+      lua_mesh_push_status_text(L, ev.sender, ev.text);
+    } else if (ev.kind == RxEvent::SEND_RETRY) {
+      lua_mesh_push_send_retry(L, ev.ack, ev.hops, (uint8_t)ev.channel_idx);
+    } else if (ev.kind == RxEvent::CONN_LOST) {
+      lua_mesh_push_conn_lost(L, ev.sender);
     }
   }
 }

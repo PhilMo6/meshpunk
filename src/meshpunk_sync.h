@@ -105,11 +105,16 @@ inline void sd_spi_take()    { SPI_LOCK();   }
 
 // Event structs shuttled across the cores.
 struct RxEvent {
-  enum Kind : uint8_t { DIRECT_MSG, CHANNEL_MSG, CONTACT_UPDATE, ACK } kind;
-  uint8_t  hops;
-  int8_t   channel_idx;   // -1 for DM
+  enum Kind : uint8_t { DIRECT_MSG, CHANNEL_MSG, CONTACT_UPDATE, ACK,
+                        ROOM_MSG, CLI_RESPONSE, LOGIN_RESULT, STATUS_TEXT,
+                        SEND_RETRY, CONN_LOST } kind;
+  uint8_t  hops;          // LOGIN_RESULT: permissions byte from the server
+                          // SEND_RETRY: attempt number now in flight (1-based)
+  int8_t   channel_idx;   // -1 for DM; LOGIN_RESULT: 1 = success, 0 = fail
+                          // SEND_RETRY: total attempts in the ladder
   bool     direct;
-  char     sender[32];
+  char     sender[32];    // ROOM_MSG/CLI_RESPONSE/LOGIN_RESULT/STATUS_TEXT: server contact name (thread key)
+  char     origin[32];    // ROOM_MSG only: resolved author display name
   char     text[160];
   uint32_t timestamp;
   float    snr;
@@ -118,6 +123,7 @@ struct RxEvent {
   uint8_t  path[MAX_PATH_SIZE];
   uint8_t  pkt_hash[MAX_HASH_SIZE];
   uint32_t ack;           // ACK: the expected-ack CRC this delivery matches
+                          // LOGIN_RESULT: keep-alive interval in seconds (0 = none)
   int32_t  rtt;           // ACK: round-trip ms (>=0 delivered, <0 failed/timeout)
 };
 

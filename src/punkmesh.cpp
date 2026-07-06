@@ -268,6 +268,162 @@ void lua_mesh_push_ack(lua_State* L, uint32_t ack, int32_t rtt) {
     lua_pop(L, 1); // pop module
 }
 
+// Room server post: threads under the ROOM's name, displayed as `author`.
+void lua_mesh_push_room_message(lua_State* L, const char* room_name, const char* author, uint8_t hops, bool direct, uint32_t timestamp, const char *text, float snr, float rssi, uint16_t path_len, const uint8_t* path, const uint8_t* pkt_hash) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "__dispatch_room");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+
+    lua_pushstring(L, room_name);               // arg1: room (thread key)
+    lua_pushstring(L, author);                  // arg2: author (display from)
+    {                                           // arg3: text (composed for UI)
+        char * comp = emoji_compose(text);
+        lua_pushstring(L, comp ? comp : text);
+        if (comp) free(comp);
+    }
+    lua_pushinteger(L, timestamp);              // arg4: timestamp
+    lua_pushboolean(L, direct);                 // arg5: direct
+    lua_pushinteger(L, hops);                   // arg6: hops
+    lua_pushnumber(L, snr);                     // arg7: snr
+    lua_pushnumber(L, rssi);                    // arg8: rssi
+    push_path_table(L, path_len, path);         // arg9: path
+    if (pkt_hash) {                             // arg10: hash (hex string)
+        char hex[MAX_HASH_SIZE * 2 + 1];
+        mesh::Utils::toHex(hex, pkt_hash, MAX_HASH_SIZE);
+        lua_pushstring(L, hex);
+    } else {
+        lua_pushnil(L);
+    }
+
+    if (lua_pcall(L, 10, 0, 0) != LUA_OK) {
+        SLog.printf("__dispatch_room failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1); // pop module
+}
+
+// Repeater CLI reply: threads under the repeater's name (its chat = console).
+void lua_mesh_push_cli_response(lua_State* L, const char* name, const char* text, uint32_t timestamp) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "__dispatch_cli");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+    lua_pushstring(L, name);
+    lua_pushstring(L, text);
+    lua_pushinteger(L, timestamp);
+    if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+        SLog.printf("__dispatch_cli failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1); // pop module
+}
+
+// Login result for a room/repeater login sent from the device UI.
+void lua_mesh_push_login_result(lua_State* L, const char* name, bool ok, uint8_t perms, uint32_t keepalive_secs) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "__dispatch_login");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+    lua_pushstring(L, name);
+    lua_pushboolean(L, ok);
+    lua_pushinteger(L, perms);
+    lua_pushinteger(L, (lua_Integer)keepalive_secs);
+    if (lua_pcall(L, 4, 0, 0) != LUA_OK) {
+        SLog.printf("__dispatch_login failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1); // pop module
+}
+
+// Decoded REQ_TYPE_GET_STATUS response, preformatted as display text.
+void lua_mesh_push_status_text(lua_State* L, const char* name, const char* text) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "__dispatch_status");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+    lua_pushstring(L, name);
+    lua_pushstring(L, text);
+    if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+        SLog.printf("__dispatch_status failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1); // pop module
+}
+
+// Retry-ladder progress: attempt `n` of `total` is now in flight for the
+// send the UI indexed under `ack`.
+void lua_mesh_push_send_retry(lua_State* L, uint32_t ack, uint8_t n, uint8_t total) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "__dispatch_retry");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+    lua_pushinteger(L, (lua_Integer)ack);
+    lua_pushinteger(L, n);
+    lua_pushinteger(L, total);
+    if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+        SLog.printf("__dispatch_retry failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1); // pop module
+}
+
+// A keep-alive session expired (server stopped acking our pings).
+void lua_mesh_push_conn_lost(lua_State* L, const char* name) {
+    lua_getglobal(L, "require");
+    lua_pushstring(L, "lib/mesh/messages");
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "__dispatch_conn_lost");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return;
+    }
+    lua_pushstring(L, name);
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+        SLog.printf("__dispatch_conn_lost failed: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1); // pop module
+}
+
 void PunkMesh::store_message(const char* from, const char* text, uint32_t timestamp, uint8_t hops, bool direct) {
     int idx = (msg_head + msg_count) % MAX_MESSAGES;
 
@@ -456,6 +612,196 @@ void PunkMesh::saveOneContact(const ContactInfo& c)
     f.write(rec, CONTACT_REC);
     f.close();
     if (is_sd) sd_spi_release();
+}
+
+// ── Room sync_since sidecar ──────────────────────────────────────────
+// ContactInfo.sync_since is runtime-only in CONTACT_REC (live store AND the
+// archive share that stride), so a reboot would make the next room login
+// re-fetch the room's whole retained history over LoRa. /room_sync.bin keeps
+// just the sync cursors: pubkey_prefix(8) + sync_since(4) per record.
+// Loaded after loadContacts(); saved lazily from loop() (markRoomSyncDirty)
+// so a chatty room doesn't wear flash with a write per post.
+static const int ROOM_SYNC_REC = 12;
+
+void PunkMesh::loadRoomSync()
+{
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/room_sync.bin");
+    int applied = 0;
+    if (_storage->exists(path.c_str())) {
+        File file = _storage->open(path.c_str());
+        if (file) {
+            uint8_t rec[ROOM_SYNC_REC];
+            while (file.available() >= ROOM_SYNC_REC) {
+                if (file.read(rec, ROOM_SYNC_REC) != ROOM_SYNC_REC) break;
+                ContactInfo* c = lookupContactByPubKey(rec, 8);
+                if (c) {
+                    memcpy(&c->sync_since, &rec[8], 4);
+                    applied++;
+                }
+            }
+            file.close();
+        }
+    }
+
+    if (is_sd) sd_spi_release();
+    if (applied) SLog.printf("[MESH INIT] Restored %d room sync cursors\n", applied);
+}
+
+void PunkMesh::saveRoomSync()
+{
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/room_sync.bin");
+    File file = _storage->open(path.c_str(), "w", true);
+    if (file) {
+        int n = getNumContacts();
+        for (int i = 0; i < n; i++) {
+            ContactInfo c;
+            if (!getContactByIdx(i, c)) break;
+            if (c.sync_since == 0) continue;   // no cursor to remember
+            uint8_t rec[ROOM_SYNC_REC];
+            memcpy(rec, c.id.pub_key, 8);
+            memcpy(&rec[8], &c.sync_since, 4);
+            file.write(rec, ROOM_SYNC_REC);
+        }
+        file.close();
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+// First change after a save arms a short delay; while the delay from a
+// PREVIOUS save hasn't elapsed the pending write keeps that later deadline,
+// so a busy room coalesces to at most ~one write per minute (see loop()).
+void PunkMesh::markRoomSyncDirty()
+{
+    if (!_room_sync_dirty) {
+        _room_sync_dirty = true;
+        unsigned long at = futureMillis(5000);
+        if ((long)(at - _room_sync_save_at) > 0 || _room_sync_save_at == 0)
+            _room_sync_save_at = at;
+    }
+}
+
+// ── Keep-alive session watch ─────────────────────────────────────────
+// See punkmesh.h. checkConnections() silently frees an expired connection
+// slot; the watch turns that into a CONN_LOST event in loop().
+
+void PunkMesh::watchConnection(const ContactInfo& contact)
+{
+    int free_idx = -1;
+    for (int i = 0; i < 16; i++) {
+        if (_conn_watch[i].active) {
+            if (memcmp(_conn_watch[i].pub_key, contact.id.pub_key, PUB_KEY_SIZE) == 0) {
+                strncpy(_conn_watch[i].name, contact.name, sizeof(_conn_watch[i].name) - 1);
+                return;   // already watching (re-login refresh)
+            }
+        } else if (free_idx < 0) {
+            free_idx = i;
+        }
+    }
+    if (free_idx < 0) return;   // table full — connection still works, just unwatched
+    _conn_watch[free_idx].active = true;
+    memcpy(_conn_watch[free_idx].pub_key, contact.id.pub_key, PUB_KEY_SIZE);
+    strncpy(_conn_watch[free_idx].name, contact.name, sizeof(_conn_watch[free_idx].name) - 1);
+    _conn_watch[free_idx].name[sizeof(_conn_watch[free_idx].name) - 1] = '\0';
+}
+
+void PunkMesh::unwatchConnection(const uint8_t* pub_key)
+{
+    for (int i = 0; i < 16; i++) {
+        if (_conn_watch[i].active &&
+            memcmp(_conn_watch[i].pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+            _conn_watch[i].active = false;
+            return;
+        }
+    }
+}
+
+// ── Path history persistence ─────────────────────────────────────────
+// See punkmesh.h. Raw dump of _path_history with a version + record-size
+// guard so a struct change just invalidates the file instead of corrupting
+// the ring.
+static const uint8_t PATH_HIST_VER = 1;
+
+void PunkMesh::loadPathHistory()
+{
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/path_hist.bin");
+    if (_storage->exists(path.c_str())) {
+        File file = _storage->open(path.c_str());
+        if (file) {
+            uint8_t ver = 0, count = 0;
+            uint16_t rec_size = 0;
+            bool hdr_ok = file.read(&ver, 1) == 1 &&
+                          file.read((uint8_t*)&rec_size, 2) == 2 &&
+                          file.read(&count, 1) == 1;
+            if (hdr_ok && ver == PATH_HIST_VER && rec_size == sizeof(ContactPathHistory)) {
+                if (count > MAX_PATH_CONTACTS) count = MAX_PATH_CONTACTS;
+                int n = 0;
+                while (n < count &&
+                       file.read((uint8_t*)&_path_history[n], sizeof(ContactPathHistory))
+                           == sizeof(ContactPathHistory)) {
+                    n++;
+                }
+                _path_history_count = n;
+                SLog.printf("[MESH INIT] Restored path history for %d contacts\n", n);
+            } else {
+                SLog.println("[MESH INIT] path_hist.bin version/size mismatch — ignored");
+            }
+            file.close();
+        }
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+void PunkMesh::savePathHistory()
+{
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/path_hist.bin");
+    File file = _storage->open(path.c_str(), "w", true);
+    if (file) {
+        uint8_t ver = PATH_HIST_VER;
+        uint16_t rec_size = sizeof(ContactPathHistory);
+        uint8_t count = (uint8_t)_path_history_count;
+        file.write(&ver, 1);
+        file.write((uint8_t*)&rec_size, 2);
+        file.write(&count, 1);
+        for (int i = 0; i < _path_history_count; i++) {
+            file.write((uint8_t*)&_path_history[i], sizeof(ContactPathHistory));
+            if (is_sd && (i + 1) % 8 == 0) {
+                file.flush();
+                sd_spi_release();
+                vTaskDelay(1);
+                sd_spi_take();
+            }
+        }
+        file.close();
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+// The ring is dirtied by every received message (timestamp refreshes), so
+// this coalesces hard: first change arms ~1 min, and loop() floors the next
+// write to 10 min after each save.
+void PunkMesh::markPathHistDirty()
+{
+    if (!_path_hist_dirty) {
+        _path_hist_dirty = true;
+        unsigned long at = futureMillis(60000);
+        if ((long)(at - _path_hist_save_at) > 0 || _path_hist_save_at == 0)
+            _path_hist_save_at = at;
+    }
 }
 
 // ── Contact archive ──────────────────────────────────────────────────
@@ -3237,34 +3583,110 @@ void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
 #endif
 }
 
+// Arm the retry ladder for a device-UI send. Called from the Lua send
+// binding right after a successful sendAndPersistDM — this is also what
+// restores expected_ack_crc/last_msg_sent for UI sends (the CLI 'send'
+// path was the only thing setting them since the sendAndPersistDM refactor,
+// which had silently killed delivered/failed feedback and path stats).
+void PunkMesh::armPendingSend(const ContactInfo& recipient, uint32_t orig_ack,
+                              uint32_t timestamp, const char* text, bool sent_direct)
+{
+    if (_pending_send.active) failPendingSend();   // abandoned send = failed
+
+    memcpy(_pending_send.recipient_pub, recipient.id.pub_key, PUB_KEY_SIZE);
+    _pending_send.orig_ack    = orig_ack;
+    _pending_send.timestamp   = timestamp;
+    strncpy(_pending_send.text, text, sizeof(_pending_send.text) - 1);
+    _pending_send.text[sizeof(_pending_send.text) - 1] = '\0';
+    _pending_send.attempt     = 0;
+    _pending_send.direct_left = sent_direct ? 2 : 0;   // original was try 1 of 3
+    _pending_send.flood_left  = 2;
+    _pending_send.total_attempts = 1 + _pending_send.direct_left + _pending_send.flood_left;
+    _pending_send.acks[0]     = orig_ack;
+    _pending_send.ack_count   = 1;
+    _pending_send.active      = true;
+
+    expected_ack_crc = orig_ack;
+    last_msg_sent    = _ms->getMillis();
+    curr_recipient   = lookupContactByPubKey(recipient.id.pub_key, PUB_KEY_SIZE);
+}
+
+// Declare the tracked send failed: tell the UI (keyed by the ORIGINAL ack,
+// the one messages.lua indexed) and clear the slot.
+void PunkMesh::failPendingSend()
+{
+    if (!_pending_send.active) return;
+    _pending_send.active = false;
+    expected_ack_crc = 0;
+    if (rx_event_queue) {
+        RxEvent ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = RxEvent::ACK;
+        ev.ack  = _pending_send.orig_ack;
+        ev.rtt  = -1;
+        xQueueSend(rx_event_queue, &ev, 0);
+    }
+}
+
 ContactInfo* PunkMesh::processAck(const uint8_t *data)
 {
-    if (memcmp(data, &expected_ack_crc, 4) == 0)
+#if BLE_COMPANION_ENABLED
+    // BLE-companion sends track their own expected-ack table; let it check
+    // every ack (it self-filters and computes rtt from its own send times).
+    // Previously this only ran inside the single-slot match below, which UI
+    // sends never armed — phone delivery confirmations were dead too.
+    if (ble_companion) {
+        uint32_t raw_ack;
+        memcpy(&raw_ack, data, 4);
+        ble_companion->pushSendConfirmed(raw_ack);
+    }
+#endif
+
+    // Match the tracked send: with the retry ladder active, an ack for ANY
+    // attempt counts — repeat-until-heard (level 1) can deliver an older
+    // attempt long after the ladder (level 2) moved on, and that late
+    // success must stop the ladder instead of burning attempts / resetting
+    // a path that just proved itself.
+    bool matched = false;
+    if (_pending_send.active) {
+        for (int i = 0; i < _pending_send.ack_count && !matched; i++) {
+            if (memcmp(data, &_pending_send.acks[i], 4) == 0) matched = true;
+        }
+    } else if (expected_ack_crc != 0 && memcmp(data, &expected_ack_crc, 4) == 0) {
+        matched = true;   // untracked send (serial-CLI path)
+    }
+
+    if (matched)
     {
         uint32_t rtt = _ms->getMillis() - last_msg_sent;
-        uint32_t acked_crc = expected_ack_crc;
+        uint32_t ui_ack = expected_ack_crc;
         SLog.printf("   Got ACK! (round trip: %d millis)\n", rtt);
         expected_ack_crc = 0;
+
+        if (_pending_send.active) {
+            // Whatever attempt landed, the UI indexed the original ack.
+            ui_ack = _pending_send.orig_ack;
+            _pending_send.active = false;
+            curr_recipient = lookupContactByPubKey(_pending_send.recipient_pub, PUB_KEY_SIZE);
+        }
         if (curr_recipient) {
             recordPathSuccess(curr_recipient->id.pub_key, rtt);
         }
-#if BLE_COMPANION_ENABLED
-        uint32_t ack_crc;
-        memcpy(&ack_crc, data, 4);
-        if (ble_companion) ble_companion->pushSendConfirmed(ack_crc, rtt);
-#endif
+
         // Notify the Lua UI so it can mark the sent DM delivered.
         if (rx_event_queue) {
             RxEvent ev;
             memset(&ev, 0, sizeof(ev));
             ev.kind = RxEvent::ACK;
-            ev.ack  = acked_crc;
+            ev.ack  = ui_ack;
             ev.rtt  = (int32_t)rtt;
             xQueueSend(rx_event_queue, &ev, 0);
         }
         return curr_recipient;
     }
-    return nullptr;
+    // Not our pending DM ack — maybe a keep-alive ack from a logged-in
+    // room/repeater (matches MyMesh.cpp:425 upstream behavior).
+    return checkConnectionsAck(data);
 }
 
 void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text)
@@ -3280,6 +3702,8 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
         setClock(sender_timestamp + 1);
         return;
     }
+
+    markConnectionActive(from);   // in case this is a logged-in server talking to us
 
     // Normalize UTF-8 smart quotes to ASCII so they render from montserrat
     // instead of tofu. Do it once, before both persistence and Lua dispatch.
@@ -3344,12 +3768,174 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
 
 void PunkMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text)
 {
+    SLog.printf("[MESH RX] CLI reply from %s: \"%s\"\n", from.name, text);
+    markConnectionActive(from);
+
+    char norm_text[160];
+    normalize_smart_quotes(text, norm_text, sizeof(norm_text));
+
+    // Authoritative time = OUR clock at receipt; the sender's value is recorded only.
+    uint32_t rx_ts = getRTCClock()->getCurrentTime();
+
+    // Persist into the repeater's thread — its chat view IS the CLI console.
+    // No unread bump / melody: replies arrive while the user drives the console.
+    appendDMMessage(from.name, from.name, norm_text, rx_ts,
+                    last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
+                    pkt->isRouteDirect(), pkt->path_len, pkt->path,
+                    _last_pkt_hash, from.id.pub_key, /*sender_ts=*/sender_timestamp);
+
+    if (rx_event_queue) {
+        RxEvent ev = {};
+        ev.kind        = RxEvent::CLI_RESPONSE;
+        ev.hops        = pkt->getPathHashCount();
+        ev.channel_idx = -1;
+        ev.direct      = pkt->isRouteDirect();
+        strncpy(ev.sender, from.name, sizeof(ev.sender) - 1);
+        strncpy(ev.text, norm_text, sizeof(ev.text) - 1);
+        ev.timestamp = rx_ts;
+        ev.snr       = last_rx_snr;
+        ev.rssi      = last_rx_rssi;
+        ev.path_len  = pkt->path_len;
+        memcpy(ev.path, pkt->path, pkt->getPathByteLen());
+        memcpy(ev.pkt_hash, _last_pkt_hash, MAX_HASH_SIZE);
+        if (xQueueSend(rx_event_queue, &ev, 0) != pdTRUE) {
+            SLog.println("[MESH RX] WARNING: rx_event_queue full, dropping CLI reply");
+        }
+    }
+
 #if BLE_COMPANION_ENABLED
     if (ble_companion) ble_companion->queueCliResponse(from, pkt, sender_timestamp, text);
 #endif
 }
+
+// ── Room post dedupe ─────────────────────────────────────────────
+// A room server re-sends a post (attempt++) until the client's ACK gets
+// through, and every attempt is a distinct packet hash — the mesh-layer
+// packet dedupe can't catch it. Remember the last few (room, sender_ts,
+// text) tuples and skip re-persisting. RAM-only: after a reboot the lazy
+// sync-cursor save (markRoomSyncDirty) bounds any re-fetch overlap to the
+// last ~minute before power-off.
+struct RoomDedupeEntry { uint32_t room_prefix; uint32_t sender_ts; uint32_t text_hash; };
+static RoomDedupeEntry s_room_dedupe[16];
+static int s_room_dedupe_next = 0;
+
+static uint32_t fnv1a32(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+// True if this (room, post) was already seen; records it otherwise.
+static bool room_dedupe_seen(const uint8_t* room_pub, uint32_t sender_ts, const char* text) {
+    uint32_t prefix; memcpy(&prefix, room_pub, 4);
+    uint32_t th = fnv1a32(text);
+    for (int i = 0; i < 16; i++) {
+        if (s_room_dedupe[i].room_prefix == prefix &&
+            s_room_dedupe[i].sender_ts == sender_ts &&
+            s_room_dedupe[i].text_hash == th) return true;
+    }
+    s_room_dedupe[s_room_dedupe_next].room_prefix = prefix;
+    s_room_dedupe[s_room_dedupe_next].sender_ts   = sender_ts;
+    s_room_dedupe[s_room_dedupe_next].text_hash   = th;
+    s_room_dedupe_next = (s_room_dedupe_next + 1) % 16;
+    return false;
+}
+
+// Room server posts (both the history sync after login and live pushes).
+// `sender_prefix` is the 4-byte pubkey prefix of the ORIGINAL author; the
+// post is persisted under the ROOM's thread with the author as `from`.
 void PunkMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const uint8_t *sender_prefix, const char *text)
 {
+    SLog.println("[MESH RX] ========== ROOM MSG RECEIVED ==========");
+    SLog.printf("[MESH RX] Room: %s, route: %s, hops: %d, sender_ts: %u\n",
+        from.name, pkt->isRouteDirect() ? "DIRECT" : "FLOOD", pkt->getPathHashCount(), sender_timestamp);
+    SLog.printf("[MESH RX] Text: \"%s\"\n", text);
+
+    markConnectionActive(from);
+    // BaseChatMesh already advanced from.sync_since before calling us —
+    // schedule the cursor's lazy persist regardless of what we do below.
+    markRoomSyncDirty();
+
+#if BLE_COMPANION_ENABLED
+    if (ble_companion) ble_companion->queueReceivedSigned(from, pkt, sender_timestamp, sender_prefix, text);
+#endif
+
+    // Our own posts echo back (live and on every history sync); they were
+    // persisted at send time.
+    if (memcmp(sender_prefix, self_id.pub_key, 4) == 0) {
+        SLog.println("[MESH RX] Own room post echo — skipped");
+        return;
+    }
+
+    if (room_dedupe_seen(from.id.pub_key, sender_timestamp, text)) {
+        SLog.println("[MESH RX] Duplicate room post (server resend) — skipped");
+        return;
+    }
+
+    // Resolve the author's display name from the 4-byte key prefix.
+    char author[32];
+    uint8_t author_key[6] = {0};
+    ContactInfo* ac = lookupContactByPubKey(sender_prefix, 4);
+    if (ac) {
+        strncpy(author, ac->name, sizeof(author) - 1);
+        author[sizeof(author) - 1] = '\0';
+        memcpy(author_key, ac->id.pub_key, 6);
+    } else {
+        snprintf(author, sizeof(author), "%02x%02x%02x%02x",
+                 sender_prefix[0], sender_prefix[1], sender_prefix[2], sender_prefix[3]);
+        memcpy(author_key, sender_prefix, 4);
+    }
+
+    char norm_text[160];
+    normalize_smart_quotes(text, norm_text, sizeof(norm_text));
+
+    // Authoritative time = OUR clock at receipt; the room's post timestamp
+    // (sender_timestamp) is recorded only.
+    uint32_t rx_ts = getRTCClock()->getCurrentTime();
+
+    // Persist under the ROOM's thread (peer = room, from = author).
+    appendDMMessage(from.name, author, norm_text, rx_ts,
+                    last_rx_snr, last_rx_rssi, pkt->getPathHashCount(),
+                    pkt->isRouteDirect(), pkt->path_len, pkt->path,
+                    _last_pkt_hash, author_key, /*sender_ts=*/sender_timestamp);
+
+    recordPath(from.id.pub_key, pkt->path_len, pkt->path,
+               last_rx_snr, last_rx_rssi, PATH_SRC_MSG_RX, pkt->isRouteDirect());
+
+    MsgPathEntry* mpe = findMsgPaths(_last_pkt_hash);
+    if (mpe) {
+        mpe->is_message   = true;
+        mpe->is_dm        = true;
+        mpe->channel_idx  = -1;
+        strncpy(mpe->peer, from.name, sizeof(mpe->peer) - 1);
+        mpe->peer[sizeof(mpe->peer) - 1] = '\0';
+    }
+
+    // Hand off to the UI core (see onMessageRecv for the why).
+    if (rx_event_queue) {
+        RxEvent ev = {};
+        ev.kind        = RxEvent::ROOM_MSG;
+        ev.hops        = pkt->getPathHashCount();
+        ev.channel_idx = -1;
+        ev.direct      = pkt->isRouteDirect();
+        strncpy(ev.sender, from.name, sizeof(ev.sender) - 1);   // thread key = room
+        strncpy(ev.origin, author, sizeof(ev.origin) - 1);      // display author
+        strncpy(ev.text, norm_text, sizeof(ev.text) - 1);
+        ev.timestamp = rx_ts;
+        ev.snr       = last_rx_snr;
+        ev.rssi      = last_rx_rssi;
+        ev.path_len  = pkt->path_len;
+        memcpy(ev.path, pkt->path, pkt->getPathByteLen());
+        memcpy(ev.pkt_hash, _last_pkt_hash, MAX_HASH_SIZE);
+        if (xQueueSend(rx_event_queue, &ev, 0) != pdTRUE) {
+            SLog.println("[MESH RX] WARNING: rx_event_queue full, dropping room msg");
+        }
+    }
+
+    // C-side alert + unread bump, same rationale as DMs (fires from the
+    // mesh task so rooms still notify/count while Lua is torn down).
+    unreadBumpDM(from.name);
+    notify_message_alert();
 }
 
 void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp, const char *text)
@@ -3448,8 +4034,103 @@ uint8_t PunkMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_t
     return 0; // unknown
 }
 
+// Server status response payload (REQ_TYPE_GET_STATUS, after the 4-byte tag).
+// Matches the stats structs in MeshCore's simple_repeater / simple_room_server
+// examples — this is their common prefix; the trailing fields differ per
+// server type and are left undecoded.
+struct ServerStatsCommon {
+    uint16_t batt_milli_volts;
+    uint16_t curr_tx_queue_len;
+    int16_t  noise_floor;
+    int16_t  last_rssi;
+    uint32_t n_packets_recv;
+    uint32_t n_packets_sent;
+    uint32_t total_air_time_secs;
+    uint32_t total_up_time_secs;
+    uint32_t n_sent_flood, n_sent_direct;
+    uint32_t n_recv_flood, n_recv_direct;
+    uint16_t err_events;
+    int16_t  last_snr;   // x 4
+    uint16_t n_direct_dups, n_flood_dups;
+};
+
 void PunkMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len)
 {
+    markConnectionActive(contact);
+
+    // Device-UI pending login? (The BLE companion keeps its own independent
+    // pending flags for phone-initiated logins — both paths coexist.)
+    if (pending_login_prefix && memcmp(&pending_login_prefix, contact.id.pub_key, 4) == 0) {
+        pending_login_prefix = 0;
+
+        bool ok = false;
+        uint8_t perms = 0;
+        uint16_t keep_alive_secs = 0;
+        if (len >= 6 && memcmp(&data[4], "OK", 2) == 0) {          // legacy repeater login
+            ok = true;
+        } else if (len >= 7 && data[4] == RESP_SERVER_LOGIN_OK) {  // current servers
+            ok = true;
+            keep_alive_secs = ((uint16_t)data[5]) * 16;
+            perms = data[6];
+            // The wrapper also registers the conn-watch (CONN_LOST on expiry).
+            if (keep_alive_secs > 0) startConnectionToContact(contact, keep_alive_secs);
+        }
+        SLog.printf("[MESH RX] Login response from %s: %s (perms=%u keepalive=%us)\n",
+                    contact.name, ok ? "OK" : "FAIL", perms, keep_alive_secs);
+
+        if (rx_event_queue) {
+            RxEvent ev = {};
+            ev.kind        = RxEvent::LOGIN_RESULT;
+            ev.channel_idx = ok ? 1 : 0;     // success flag
+            ev.hops        = perms;          // permissions byte
+            ev.ack         = keep_alive_secs;
+            ev.timestamp   = getRTCClock()->getCurrentTime();
+            strncpy(ev.sender, contact.name, sizeof(ev.sender) - 1);
+            xQueueSend(rx_event_queue, &ev, 0);
+        }
+    } else if (pending_status_prefix && len > 4 &&
+               memcmp(&pending_status_prefix, contact.id.pub_key, 4) == 0) {
+        pending_status_prefix = 0;
+
+        ServerStatsCommon st = {};
+        size_t copy = len - 4;
+        if (copy > sizeof(st)) copy = sizeof(st);
+        memcpy(&st, &data[4], copy);
+
+        uint32_t up = st.total_up_time_secs;
+        if (rx_event_queue) {
+            RxEvent ev = {};
+            ev.kind      = RxEvent::STATUS_TEXT;
+            ev.timestamp = getRTCClock()->getCurrentTime();
+            strncpy(ev.sender, contact.name, sizeof(ev.sender) - 1);
+            snprintf(ev.text, sizeof(ev.text),
+                     "Batt %u.%02uV  Up %ud %uh %um\n"
+                     "RX %u  TX %u  Err %u\n"
+                     "Air TX %us\n"
+                     "Noise %d  RSSI %d  SNR %.1f\n"
+                     "Queue %u  Dups d%u f%u",
+                     (unsigned)(st.batt_milli_volts / 1000), (unsigned)((st.batt_milli_volts % 1000) / 10),
+                     (unsigned)(up / 86400), (unsigned)((up % 86400) / 3600), (unsigned)((up % 3600) / 60),
+                     (unsigned)st.n_packets_recv, (unsigned)st.n_packets_sent, (unsigned)st.err_events,
+                     (unsigned)st.total_air_time_secs,
+                     (int)st.noise_floor, (int)st.last_rssi, st.last_snr / 4.0f,
+                     (unsigned)st.curr_tx_queue_len, (unsigned)st.n_direct_dups, (unsigned)st.n_flood_dups);
+            // Room servers append n_posted/n_post_push after the common
+            // prefix (repeaters have rx-air/recv-errors there instead).
+            // These are THE counters for "are posts entering the queue and
+            // is the server attempting pushes" when sync misbehaves.
+            if (contact.type == ADV_TYPE_ROOM && len >= 4 + (int)sizeof(st) + 4) {
+                uint16_t n_posted, n_pushed;
+                memcpy(&n_posted, &data[4 + sizeof(st)], 2);
+                memcpy(&n_pushed, &data[4 + sizeof(st) + 2], 2);
+                size_t l = strlen(ev.text);
+                snprintf(ev.text + l, sizeof(ev.text) - l, "\nPosted %u  Pushed %u",
+                         (unsigned)n_posted, (unsigned)n_pushed);
+            }
+            xQueueSend(rx_event_queue, &ev, 0);
+        }
+    }
+
 #if BLE_COMPANION_ENABLED
     if (ble_companion) ble_companion->pushContactResponse(contact, data, len);
 #endif
@@ -3511,6 +4192,78 @@ uint32_t PunkMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8
 
 void PunkMesh::onSendTimeout()
 {
+    // Retry ladder for device-UI sends: up to 3 tries via the stored path,
+    // then the path auto-resets and up to 2 more go out flooded; only after
+    // that is the send declared failed. Runs on the mesh task under MESH_LOCK
+    // (BaseChatMesh::loop fires this), so resending here is safe.
+    if (_pending_send.active) {
+        ContactInfo* c = lookupContactByPubKey(_pending_send.recipient_pub, PUB_KEY_SIZE);
+        if (!c) {
+            SLog.println("   ERROR: timed out and contact gone — send failed.");
+            failPendingSend();
+            return;
+        }
+        curr_recipient = c;
+        recordPathFailure(c->id.pub_key);   // per-attempt, against the current out_path
+
+        bool resend = false;
+        if (_pending_send.direct_left > 0) {
+            _pending_send.direct_left--;
+            resend = true;
+        } else if (_pending_send.flood_left > 0) {
+            if (c->out_path_len != OUT_PATH_UNKNOWN) {
+                // The auto flood fallback: direct budget exhausted, drop the
+                // learned path (persisted) so this and all future sends flood
+                // until a fresh path-return re-teaches a route.
+                resetPathTo(*c);
+                saveOneContact(*c);
+                SLog.printf("   no ACK x3 — path to %s reset, falling back to FLOOD\n", c->name);
+            }
+            _pending_send.flood_left--;
+            resend = true;
+        }
+
+        if (resend) {
+            _pending_send.attempt++;
+            uint32_t new_ack = 0;
+            uint32_t est_timeout = 0;
+            // Send-only resend (the message was persisted at the original
+            // send); attempt++ makes the packet + ack hash unique, and
+            // sendMessage re-arms txt_send_timeout itself.
+            int rc = sendMessage(*c, _pending_send.timestamp, _pending_send.attempt,
+                                 _pending_send.text, new_ack, est_timeout);
+            if (rc != MSG_SEND_FAILED) {
+                expected_ack_crc = new_ack;
+                last_msg_sent = _ms->getMillis();
+                // Remember every attempt's ack: repeat-until-heard can land
+                // an OLD attempt late, and its ack must still count.
+                if (_pending_send.ack_count < 5) {
+                    _pending_send.acks[_pending_send.ack_count++] = new_ack;
+                }
+                SLog.printf("   no ACK — retry %u/%u via %s\n",
+                            (unsigned)_pending_send.attempt + 1,
+                            (unsigned)_pending_send.total_attempts,
+                            rc == MSG_SEND_SENT_DIRECT ? "path" : "flood");
+                if (rx_event_queue) {
+                    RxEvent ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.kind        = RxEvent::SEND_RETRY;
+                    ev.ack         = _pending_send.orig_ack;
+                    ev.hops        = _pending_send.attempt + 1;      // 1-based try number
+                    ev.channel_idx = (int8_t)_pending_send.total_attempts;
+                    xQueueSend(rx_event_queue, &ev, 0);
+                }
+                return;
+            }
+            // couldn't compose/send (packet pool empty) — fall through to fail
+        }
+
+        SLog.println("   ERROR: retries exhausted, no ACK — send failed.");
+        failPendingSend();
+        return;
+    }
+
+    // Untracked sends (serial-CLI 'send'): original single-shot behavior.
     SLog.println("   ERROR: timed out, no ACK.");
     if (curr_recipient) {
         recordPathFailure(curr_recipient->id.pub_key);
@@ -3586,6 +4339,7 @@ void PunkMesh::recordPath(const uint8_t* pub_key, uint16_t path_len,
             if (rssi != 0) h->records[i].rssi = rssi;
             h->records[i].source = source;
             h->records[i].is_direct = is_direct;
+            markPathHistDirty();
             return;
         }
     }
@@ -3615,6 +4369,7 @@ void PunkMesh::recordPath(const uint8_t* pub_key, uint16_t path_len,
     slot->rssi = rssi;
     slot->source = source;
     slot->is_direct = is_direct;
+    markPathHistDirty();
 }
 
 void PunkMesh::recordPathSuccess(const uint8_t* pub_key, uint32_t trip_time_ms) {
@@ -3630,6 +4385,7 @@ void PunkMesh::recordPathSuccess(const uint8_t* pub_key, uint32_t trip_time_ms) 
             h->records[i].success_count++;
             h->records[i].trip_time_ms = trip_time_ms;
             h->records[i].timestamp = getRTCClock()->getCurrentTime();
+            markPathHistDirty();
             return;
         }
     }
@@ -3656,6 +4412,7 @@ void PunkMesh::recordPathFailure(const uint8_t* pub_key) {
         if (paths_equal(h->records[i].path_len, h->records[i].path,
                         curr_recipient->out_path_len, curr_recipient->out_path)) {
             h->records[i].failure_count++;
+            markPathHistDirty();
             return;
         }
     }
@@ -3820,10 +4577,42 @@ void PunkMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* 
     }
 }
 
+// MESHPUNK BaseChatMesh hook target: every direct-routed TXT send (DM, room
+// post, CLI command — sendMessage/sendCommandData direct branches) lands
+// here, so repeat-until-heard covers direct sends too. Zero-hop routes are
+// excluded: no repeater exists to echo the packet, so "heard" can never
+// confirm and the retransmits would be pure noise.
+void PunkMesh::sendDirectScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis)
+{
+    pkt->calculatePacketHash(_last_tx_hash);
+
+    bool has_repeater = recipient.out_path_len != OUT_PATH_UNKNOWN &&
+                        (recipient.out_path_len & 63) > 0;
+    bool want_repeat = _prefs.msg_repeat_enabled && has_repeater;
+
+    uint8_t saved_header = pkt->header;
+    uint8_t saved_payload[MAX_PACKET_PAYLOAD];
+    uint16_t saved_len = pkt->payload_len;
+    uint8_t saved_path[MAX_PATH_SIZE];
+    uint8_t saved_path_len = recipient.out_path_len;
+    if (want_repeat) {
+        memcpy(saved_payload, pkt->payload, pkt->payload_len);
+        memcpy(saved_path, recipient.out_path, MAX_PATH_SIZE);
+    }
+
+    BaseChatMesh::sendDirectScoped(recipient, pkt, delay_millis);
+
+    if (want_repeat) {
+        registerPendingRepeat(_last_tx_hash, saved_header, saved_payload, saved_len,
+                              saved_path, saved_path_len);
+    }
+}
+
 // ── Message repeat ───────────────────────────────────────────────
 
 void PunkMesh::registerPendingRepeat(const uint8_t* hash, uint8_t header,
-                                     const uint8_t* payload, uint16_t payload_len) {
+                                     const uint8_t* payload, uint16_t payload_len,
+                                     const uint8_t* path, uint8_t path_len) {
     int slot = -1;
     for (int i = 0; i < MAX_PENDING_REPEATS; i++) {
         if (!_pending_repeats[i].active) { slot = i; break; }
@@ -3843,9 +4632,15 @@ void PunkMesh::registerPendingRepeat(const uint8_t* hash, uint8_t header,
     memcpy(pr.pkt_hash, hash, MAX_HASH_SIZE);
     pr.attempts_remaining = _prefs.msg_repeat_max;
     pr.next_retry_time = millis() + (unsigned long)_prefs.msg_repeat_interval_secs * 1000UL;
+    // Direct packets re-air on their saved route (the payload doesn't carry it).
+    pr.direct = (path != nullptr);
+    pr.path_len = path_len;
+    memset(pr.path, 0, sizeof(pr.path));
+    if (path) memcpy(pr.path, path, MAX_PATH_SIZE);
     pr.active = true;
 
-    SLog.printf("[MSG REPEAT] registered, %d retries, interval %ds\n",
+    SLog.printf("[MSG REPEAT] registered (%s), %d retries, interval %ds\n",
+                  pr.direct ? "direct" : "flood",
                   pr.attempts_remaining, _prefs.msg_repeat_interval_secs);
 }
 
@@ -3884,12 +4679,17 @@ void PunkMesh::checkPendingRepeats() {
         pkt->header = pr.header;
         memcpy(pkt->payload, pr.payload, pr.payload_len);
         pkt->payload_len = pr.payload_len;
-        sendFlood(pkt, (uint32_t)0, pathHashSize());
+        if (pr.direct) {
+            sendDirect(pkt, pr.path, pr.path_len);
+        } else {
+            sendFlood(pkt, (uint32_t)0, pathHashSize());
+        }
 
         pr.attempts_remaining--;
         pr.next_retry_time = now + (unsigned long)_prefs.msg_repeat_interval_secs * 1000UL;
 
-        SLog.printf("[MSG REPEAT] retransmit, %d remaining\n", pr.attempts_remaining);
+        SLog.printf("[MSG REPEAT] retransmit (%s), %d remaining\n",
+                    pr.direct ? "direct" : "flood", pr.attempts_remaining);
     }
 }
 
@@ -4104,6 +4904,8 @@ void PunkMesh::begin()
 
     loadContacts();
     SLog.printf("[MESH INIT] Loaded %d contacts from flash\n", getNumContacts());
+    loadRoomSync();     // restore room sync cursors (sync_since isn't in CONTACT_REC)
+    loadPathHistory();  // restore the Paths-picker history ring
 
     // Restore saved channels (slots 1-7) FIRST — this also sets _public_deleted
     // from the channels-file "pubdel" marker, so we know whether to recreate Public.
@@ -4245,19 +5047,17 @@ PunkMesh::SendResult PunkMesh::sendAndPersistDM(ContactInfo& recipient,
                          r.expected_ack, r.est_timeout);
     if (r.code == MSG_SEND_FAILED) return r;
 
-    bool is_flood = (r.code == MSG_SEND_SENT_FLOOD);
-    if (is_flood) {
-        memcpy(r.tx_hash, _last_tx_hash, MAX_HASH_SIZE);
-        r.has_hash = true;
-    }
+    // Both routes set _last_tx_hash now (sendFloodScoped and the MESHPUNK
+    // sendDirectScoped hook), so direct sends get echo tracking + the chat's
+    // "repeating..." indicator too — repeat-until-heard covers all messages.
+    memcpy(r.tx_hash, _last_tx_hash, MAX_HASH_SIZE);
+    r.has_hash = true;
 
     appendDMMessage(recipient.name, _prefs.node_name, text,
                    timestamp, 0.0f, 0.0f, 0,
                    r.code == MSG_SEND_SENT_DIRECT,
-                   0, nullptr, is_flood ? r.tx_hash : nullptr);
-    if (is_flood) {
-        preRegisterSentHash(r.tx_hash, true, -1, recipient.name);
-    }
+                   0, nullptr, r.tx_hash);
+    preRegisterSentHash(r.tx_hash, true, -1, recipient.name);
     return r;
 }
 
@@ -4586,6 +5386,40 @@ void PunkMesh::loop()
 {
     BaseChatMesh::loop();
     if (_prefs.msg_repeat_enabled) checkPendingRepeats();
+
+    // Keep-alive pings for logged-in rooms/repeaters (self-rate-limited via
+    // each connection's next_ping; the table is empty unless a login succeeded
+    // with a keep-alive interval).
+    checkConnections();
+
+    // Watched sessions whose connection slot vanished expired (manual logout
+    // unwatches first) — tell the UI. Path is deliberately NOT reset here.
+    for (int i = 0; i < 16; i++) {
+        if (_conn_watch[i].active && !hasConnectionTo(_conn_watch[i].pub_key)) {
+            _conn_watch[i].active = false;
+            SLog.printf("[MESH] Connection to %s lost (keep-alive expired)\n", _conn_watch[i].name);
+            if (rx_event_queue) {
+                RxEvent ev = {};
+                ev.kind = RxEvent::CONN_LOST;
+                strncpy(ev.sender, _conn_watch[i].name, sizeof(ev.sender) - 1);
+                xQueueSend(rx_event_queue, &ev, 0);
+            }
+        }
+    }
+
+    // Lazy room sync-cursor persistence (see markRoomSyncDirty).
+    if (_room_sync_dirty && millisHasNowPassed(_room_sync_save_at)) {
+        _room_sync_dirty = false;
+        _room_sync_save_at = futureMillis(60000);   // floor for the next write
+        saveRoomSync();
+    }
+
+    // Lazy path-history persistence (see markPathHistDirty).
+    if (_path_hist_dirty && millisHasNowPassed(_path_hist_save_at)) {
+        _path_hist_dirty = false;
+        _path_hist_save_at = futureMillis(600000);  // ≥10 min between writes
+        savePathHistory();
+    }
 
     int len = strlen(command);
     while (Serial.available() && len < sizeof(command) - 1)

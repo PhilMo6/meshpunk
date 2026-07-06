@@ -152,24 +152,29 @@ end
 
 local downloading = false
 
+-- Blocking: fetch to a .part, validate the EMJB header + exact size, then swap
+-- it in and reload the font. Returns a result message (newlines allowed) for
+-- the popup — never touches status/downloading/UI itself.
 local function do_download()
     local part = EXT_PATH .. ".part"
-    local function fail(msg)
-        pcall(fileman.remove, part)
-        status.text = msg
-        downloading = false
-    end
 
     local r = _wifi_download_file(EXT_URL, part)
     pcall(_wifi_download_end)   -- drop the socket, free the TLS buffers
     if not r or not r.success then
-        return fail("Download failed: " .. tostring(r and r.error or "no result"))
+        pcall(fileman.remove, part)
+        return "Download failed:\n" .. tostring(r and r.error or "no result")
     end
 
     local expect, herr = blob_expected_size(part)
-    if not expect then return fail("Bad blob: " .. tostring(herr)) end
+    if not expect then
+        pcall(fileman.remove, part)
+        return "Bad blob: " .. tostring(herr)
+    end
     local st = fileman.stat(part)
-    if not st or st.size ~= expect then return fail("Bad blob: size mismatch") end
+    if not st or st.size ~= expect then
+        pcall(fileman.remove, part)
+        return "Bad blob: size mismatch"
+    end
 
     -- Release the open blob before replacing the file it may point at, then
     -- re-init (picks up the new SD blob).
@@ -177,14 +182,13 @@ local function do_download()
     if fileman.exists(EXT_PATH) then fileman.remove(EXT_PATH) end
     local ok, err = fileman.rename(part, EXT_PATH)
     BLOB_TOTAL = _emoji_font_reload()
-    if not ok then
-        refresh_ext()
-        return fail("Rename failed: " .. tostring(err))
-    end
     refresh_faces()
     refresh_ext()
-    status.text = "Extended set active: " .. BLOB_TOTAL .. " emoji"
-    downloading = false
+    if not ok then
+        pcall(fileman.remove, part)
+        return "Rename failed:\n" .. tostring(err)
+    end
+    return "Extended set active:\n" .. BLOB_TOTAL .. " emoji"
 end
 
 local dl_btn = content:Button { w = lvgl.PCT(100), h = 28 }
@@ -200,11 +204,43 @@ dl_btn:onClicked(function()
         return
     end
     downloading = true
-    status.text = "Downloading... screen pauses until done"
-    -- One-shot timer: lets the status label paint before the blocking fetch.
+
+    -- Modal progress popup. The fetch is a synchronous blocking call that
+    -- freezes the whole UI, so the popup must PAINT before it starts: create
+    -- it now, defer the download one timer tick, then swap the popup to a
+    -- result dialog with a Close button. Same overlay/nav pattern as the picker.
+    local overlay = root:Object {
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 160, border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)   -- modal (also swallows taps mid-freeze)
+    local box = overlay:Object {
+        w = W - 40, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        bg_color = "#333333", radius = 6,
+        border_width = 1, border_color = "#555555", pad_all = 10, pad_row = 6,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    local msg = box:Label {
+        text = "Downloading extended set...\nThe screen freezes until it\nfinishes (~3.7MB over WiFi).",
+        w = lvgl.PCT(100),
+    }
+
     apps.add_timer { period = 60, cb = function(t)
         t:delete()
-        do_download()
+        local result = do_download()
+        downloading = false
+        status.text = (result:gsub("\n", " "))
+        msg:set { text = result }
+        local close_b = box:Button { w = lvgl.PCT(100), h = 28 }
+        close_b:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+        close_b:onClicked(function()
+            nav.pop()
+            overlay:delete()
+        end)
+        -- Push now that there's a focusable child, so trackball focus lands on
+        -- Close (the page below stays suspended until nav.pop above).
+        nav.push(box)
     end }
 end)
 

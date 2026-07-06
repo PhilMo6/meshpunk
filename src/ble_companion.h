@@ -195,8 +195,13 @@ public:
                                 uint32_t timestamp, const char* text, int channel_idx);
   void queueCliResponse(const ContactInfo& from, mesh::Packet* pkt,
                          uint32_t timestamp, const char* text);
+  void queueReceivedSigned(const ContactInfo& from, mesh::Packet* pkt,
+                            uint32_t timestamp, const uint8_t* sender_prefix,
+                            const char* text);
   void pushAdvert(const ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path);
-  void pushSendConfirmed(uint32_t ack_crc, uint32_t trip_time_ms);
+  // Called for EVERY received ack (self-filters against expected_ack_table
+  // and computes the round-trip from the entry's own send time).
+  void pushSendConfirmed(uint32_t ack_crc);
   void pushPathUpdated(const ContactInfo& contact);
   void pushLogRxData(mesh::Packet* pkt, float snr, float rssi);
   void pushContactResponse(const ContactInfo& contact, const uint8_t* data, uint8_t len);

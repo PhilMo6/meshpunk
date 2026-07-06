@@ -1377,6 +1377,29 @@ void BleCompanionHandler::queueCliResponse(const ContactInfo& from, mesh::Packet
   _serial.writeFrame(out_frame, i);
 }
 
+// Room server post (signed message). Same live frame as queueCliResponse but
+// typed TXT_TYPE_SIGNED_PLAIN with the author's 4-byte pubkey prefix between
+// the timestamp and the text — matches upstream MyMesh::queueMessage framing.
+void BleCompanionHandler::queueReceivedSigned(const ContactInfo& from, mesh::Packet* pkt,
+                                               uint32_t timestamp, const uint8_t* sender_prefix,
+                                               const char* text) {
+  if (!_serial.isConnected()) return;
+  int i = 0;
+  out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
+  out_frame[i++] = (int8_t)(pkt->getSNR() * 4);
+  out_frame[i++] = 0; // reserved
+  out_frame[i++] = 0; // reserved
+  memcpy(&out_frame[i], from.id.pub_key, 6); i += 6;
+  out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
+  out_frame[i++] = TXT_TYPE_SIGNED_PLAIN;
+  memcpy(&out_frame[i], &timestamp, 4); i += 4;
+  memcpy(&out_frame[i], sender_prefix, 4); i += 4;
+  int tlen = strlen(text);
+  if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
+  memcpy(&out_frame[i], text, tlen); i += tlen;
+  _serial.writeFrame(out_frame, i);
+}
+
 void BleCompanionHandler::pushAdvert(const ContactInfo& contact, bool is_new,
                                       uint8_t path_len, const uint8_t* path) {
   if (!_serial.isConnected()) return;
@@ -1391,11 +1414,12 @@ void BleCompanionHandler::pushAdvert(const ContactInfo& contact, bool is_new,
   }
 }
 
-void BleCompanionHandler::pushSendConfirmed(uint32_t ack_crc, uint32_t trip_time_ms) {
+void BleCompanionHandler::pushSendConfirmed(uint32_t ack_crc) {
   if (!_serial.isConnected()) return;
 
   for (int j = 0; j < EXPECTED_ACK_TABLE_SIZE; j++) {
     if (expected_ack_table[j].ack == ack_crc && expected_ack_table[j].ack != 0) {
+      uint32_t trip_time_ms = millis() - expected_ack_table[j].msg_sent;
       uint8_t buf[11];
       buf[0] = PUSH_CODE_SEND_CONFIRMED;
       memcpy(&buf[1], expected_ack_table[j].contact->id.pub_key, 6);
