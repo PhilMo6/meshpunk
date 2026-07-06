@@ -13,7 +13,10 @@
   Quick ops (synchronous, bounded work — fine to call directly):
       fileman.drives()               -> { {id="L", label=, root=, mounted=, total=, used=}, ... }
       fileman.list(path [, opts])    -> entries|nil, err   (sorted dirs-first;
-                                        opts.filter = function(entry) -> bool)
+                                        opts.filter = function(entry) -> bool;
+                                        opts.sizes = false skips per-entry
+                                        sizes — much faster on big folders,
+                                        entries come back with size = 0)
       fileman.stat(path)             -> { type="file"|"dir", size= } | nil
       fileman.exists(path)           -> bool
       fileman.is_dir(path)           -> bool
@@ -124,8 +127,11 @@ end
 
 -- Entries sorted directories-first, then case-insensitive by name.
 -- opts.filter(entry) -> bool keeps only matching entries.
+-- opts.sizes = false skips the per-entry size lookup (the slow part of
+-- listing a big directory); entries then carry size = 0.
 function M.list(path, opts)
-    local ok, entries, err = pcall(_fs_list, M.normalize(path))
+    local want_sizes = not (opts and opts.sizes == false)
+    local ok, entries, err = pcall(_fs_list, M.normalize(path), want_sizes)
     if not ok then return nil, tostring(entries) end
     if not entries then return nil, err or "list failed" end
     if opts and opts.filter then
@@ -290,7 +296,9 @@ local function scan_step(t)
     if rel == nil then return false end
     local base = (rel == "") and t.src or (t.src .. rel)
     t.current = M.basename(base)
-    local entries = M.list(base)
+    -- sizes=false: the tree walk only needs names/types, and skipping the
+    -- per-entry size lookup keeps one step bounded even on huge directories.
+    local entries = M.list(base, { sizes = false })
     if entries then
         for _, e in ipairs(entries) do
             local child = rel .. "/" .. e.name

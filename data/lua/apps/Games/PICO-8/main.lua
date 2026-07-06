@@ -1,5 +1,6 @@
 local lvgl = require("lvgl")
 local apps = require("lib/apps")
+local fileman = require("lib/fileman")
 
 local app_dir = ...
 
@@ -51,26 +52,24 @@ local root = apps.new_root({
 })
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local function scan_dir_for_carts(dir_path, prefix)
-    local entries = {}
-    if prefix == "S:" then
-        local sd_path = dir_path:gsub("^S:", "")
-        entries = _list_all_sd and _list_all_sd(sd_path) or {}
-    else
-        local lfs_path = dir_path:gsub("^L:", "")
-        entries = _list_all and _list_all(lfs_path) or {}
-    end
+-- fileman routes the drive from the L:/S: prefix itself; sizes=false skips
+-- the per-entry size lookup, so huge cart folders list fast (watchdog-safe).
+local function scan_dir_for_carts(dir_path)
+    local entries = fileman.list(dir_path, {
+        sizes = false,
+        filter = function(e)
+            return e.type == "file"
+                and (e.name:lower():match("%.p8$") or e.name:lower():match("%.p8%.png$"))
+        end,
+    }) or {}
     for _, e in ipairs(entries) do
-        if e.type == "file" and (e.name:lower():match("%.p8$") or e.name:lower():match("%.p8%.png$")) then
-            local low = e.name:lower()
-            if not seen_lower[low] then
-                seen_lower[low] = true
-                local full_path = dir_path .. "/" .. e.name
-                found_carts[#found_carts + 1] = {
-                    name = e.name,
-                    path = full_path,
-                }
-            end
+        local low = e.name:lower()
+        if not seen_lower[low] then
+            seen_lower[low] = true
+            found_carts[#found_carts + 1] = {
+                name = e.name,
+                path = dir_path .. "/" .. e.name,
+            }
         end
     end
 end
@@ -681,14 +680,14 @@ return function()
 
     -- Phase 1-3: directory scanning
     if init_phase == 1 then
-        scan_dir_for_carts(app_dir, "L:")
+        scan_dir_for_carts(app_dir)
         return false
     elseif init_phase == 2 then
-        scan_dir_for_carts(sd_app_dir, "S:")
+        scan_dir_for_carts(sd_app_dir)
         return false
     elseif init_phase == 3 then
         if sd_app_dir ~= "S:/p8carts" then
-            scan_dir_for_carts("S:/p8carts", "S:")
+            scan_dir_for_carts("S:/p8carts")
         end
         return false
     end

@@ -1,5 +1,6 @@
 local lvgl = require("lvgl")
 local apps = require("lib/apps")
+local fileman = require("lib/fileman")
 
 local app_dir = ...
 
@@ -45,25 +46,24 @@ local root = apps.new_root({
 })
 root:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local function scan_dir_for_imgs(dir_path, prefix)
-    local entries = {}
-    if prefix == "S:" then
-        local sd_path = dir_path:gsub("^S:", "")
-        entries = _list_all_sd and _list_all_sd(sd_path) or {}
-    else
-        local lfs_path = dir_path:gsub("^L:", "")
-        entries = _list_all and _list_all(lfs_path) or {}
-    end
+-- fileman routes the drive from the L:/S: prefix itself; sizes=false skips
+-- the per-entry size lookup, so huge image folders list fast (watchdog-safe).
+local function scan_dir_for_imgs(dir_path)
+    local entries = fileman.list(dir_path, {
+        sizes = false,
+        filter = function(e)
+            return e.type == "file"
+                and (e.name:lower():match("%.img$") or e.name:lower():match("%.raw$"))
+        end,
+    }) or {}
     for _, e in ipairs(entries) do
-        if e.type == "file" and (e.name:lower():match("%.img$") or e.name:lower():match("%.raw$")) then
-            local low = e.name:lower()
-            if not seen_lower[low] then
-                seen_lower[low] = true
-                found_imgs[#found_imgs + 1] = {
-                    name = e.name,
-                    path = dir_path .. "/" .. e.name,
-                }
-            end
+        local low = e.name:lower()
+        if not seen_lower[low] then
+            seen_lower[low] = true
+            found_imgs[#found_imgs + 1] = {
+                name = e.name,
+                path = dir_path .. "/" .. e.name,
+            }
         end
     end
 end
@@ -821,14 +821,14 @@ return function()
     init_phase = init_phase + 1
 
     if init_phase == 1 then
-        scan_dir_for_imgs(app_dir, "L:")
+        scan_dir_for_imgs(app_dir)
         return false
     elseif init_phase == 2 then
-        scan_dir_for_imgs(sd_app_dir, "S:")
+        scan_dir_for_imgs(sd_app_dir)
         return false
     elseif init_phase == 3 then
         if sd_app_dir ~= "S:/dos" then
-            scan_dir_for_imgs("S:/dos", "S:")
+            scan_dir_for_imgs("S:/dos")
         end
         return false
     end

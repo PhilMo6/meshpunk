@@ -3,7 +3,9 @@
 // One binding family for BOTH storages, routed by the same L:/S: path prefix
 // io.open() already uses (no prefix = LittleFS):
 //
-//   _fs_list(path)        -> { {name=, type="file"|"dir", size=}, ... } | nil, err
+//   _fs_list(path[, sz])  -> { {name=, type="file"|"dir", size=}, ... } | nil, err
+//                            (sz defaults true; false skips per-entry sizes —
+//                             much faster on big directories, size comes back 0)
 //   _fs_stat(path)        -> { type="file"|"dir", size= } | nil
 //   _fs_exists(path)      -> bool
 //   _fs_mkdir(path)       -> bool                 (creates missing parents too)
@@ -31,6 +33,8 @@
 #include <SD.h>
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 extern "C" {
 #include <lua.h>
@@ -62,14 +66,17 @@ static FsTarget fs_resolve(const char* raw) {
     return t;
 }
 
-// Last path component ("/lua/apps/foo" -> "foo"). Entry names from
-// openNextFile() are full paths on some cores, bare names on others.
-static const char* fs_basename(const char* path) {
-    const char* last = strrchr(path, '/');
-    return last ? last + 1 : path;
-}
-
-// _fs_list(path) -> array | nil, err
+// _fs_list(path [, want_sizes]) -> array | nil, err
+// want_sizes defaults to true; pass false to skip per-entry sizes (size = 0).
+//
+// Enumeration is POSIX opendir/readdir on the VFS path, NOT Arduino
+// openNextFile(): the latter re-opens every entry by full path, and both FAT
+// and LittleFS do a linear directory lookup per open — a whole listing was
+// quadratic in the entry count and starved the task watchdog on ROM folders
+// with hundreds of files. readdir walks the directory once. Sizes still cost
+// a stat() (a path lookup) per file, which is why callers that only need
+// names — the ELF launchers, fileman's tree scans — pass want_sizes=false.
+//
 // Two-phase: the directory walk collects entries into a growable C array with
 // the SPI lock held, then the Lua table is built with the lock released and the
 // dir handle closed. lua_push* can longjmp on a true OOM — escaping with the
@@ -78,6 +85,7 @@ static const char* fs_basename(const char* path) {
 // cap): the Files app operates on them, so truncation would corrupt ops.
 static int lua_fs_list(lua_State* L) {
     const char* raw = luaL_checkstring(L, 1);
+    bool want_sizes = lua_isnoneornil(L, 2) ? true : (lua_toboolean(L, 2) != 0);
     FsTarget t = fs_resolve(raw);
     if (!t.ok) {
         lua_pushnil(L);
@@ -85,10 +93,14 @@ static int lua_fs_list(lua_State* L) {
         return 2;
     }
 
+    // VFS-level base path for opendir/stat ("/sd/..." or "/littlefs/...").
+    char base[384];
+    snprintf(base, sizeof(base), "%s%s", t.is_sd ? "/sd" : "/littlefs", t.path);
+    size_t base_len = strlen(base);
+
     if (t.is_sd) sd_spi_take();
-    File root = t.fs->open(t.path);
-    if (!root || !root.isDirectory()) {
-        if (root) root.close();
+    DIR* dir = opendir(base);
+    if (!dir) {
         if (t.is_sd) sd_spi_release();
         lua_pushnil(L);
         lua_pushstring(L, "not a directory");
@@ -105,34 +117,52 @@ static int lua_fs_list(lua_State* L) {
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     int iter = 0;
-    File entry = ents ? root.openNextFile() : File();
-    while (entry) {
-        const char* name = fs_basename(entry.name());
-        if (name[0] != '\0') {
-            if (n >= cap) {
-                Ent* grown = (Ent*)heap_caps_realloc(
-                    ents, sizeof(Ent) * cap * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (!grown) break;   // partial listing beats a deadlock
-                ents = grown;
-                cap *= 2;
+    struct dirent* de;
+    while (ents && (de = readdir(dir)) != NULL) {
+        const char* name = de->d_name;
+        if (name[0] == '\0') continue;
+        if (name[0] == '.' && (name[1] == '\0' ||
+            (name[1] == '.' && name[2] == '\0'))) continue;   // "." / ".."
+
+        bool   is_dir = (de->d_type == DT_DIR);
+        double size   = 0;
+        // stat() only when the caller needs sizes (or d_type is missing) —
+        // it is exactly the per-entry path lookup readdir lets us avoid.
+        if ((want_sizes && !is_dir) || de->d_type == DT_UNKNOWN) {
+            char full[576];
+            snprintf(full, sizeof(full), "%s%s%s", base,
+                     (base_len && base[base_len - 1] == '/') ? "" : "/", name);
+            struct stat st;
+            if (stat(full, &st) == 0) {
+                is_dir = S_ISDIR(st.st_mode);
+                if (!is_dir) size = (double)st.st_size;
             }
-            char* dup = strdup(name);
-            if (!dup) break;
-            ents[n].name   = dup;
-            ents[n].is_dir = entry.isDirectory();
-            ents[n].size   = (double)entry.size();
-            n++;
         }
-        // Long SD directories: give the bus back periodically so the mesh
-        // task never waits a whole listing for the radio.
-        if (t.is_sd && (++iter % 20 == 0)) {
-            sd_spi_release();
+
+        if (n >= cap) {
+            Ent* grown = (Ent*)heap_caps_realloc(
+                ents, sizeof(Ent) * cap * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!grown) break;   // partial listing beats a deadlock
+            ents = grown;
+            cap *= 2;
+        }
+        char* dup = strdup(name);
+        if (!dup) break;
+        ents[n].name   = dup;
+        ents[n].is_dir = is_dir;
+        ents[n].size   = size;
+        n++;
+
+        // Yield periodically so IDLE0 feeds the task watchdog even on huge
+        // directories; on SD also give the bus back so the Core-1 mesh task
+        // can use the radio between our transactions.
+        if (++iter % 32 == 0) {
+            if (t.is_sd) sd_spi_release();
             vTaskDelay(1);
-            sd_spi_take();
+            if (t.is_sd) sd_spi_take();
         }
-        entry = root.openNextFile();
     }
-    root.close();
+    closedir(dir);
     if (t.is_sd) sd_spi_release();
 
     if (!ents) {

@@ -1,5 +1,6 @@
 local lvgl = require("lvgl")
 local apps = require("lib/apps")
+local fileman = require("lib/fileman")
 
 local app_dir = ...
 
@@ -51,27 +52,24 @@ end
 local found_wads = {}  -- { {name, path, wtype="iwad"|"pwad"}, ... }
 local seen_lower = {}
 
-local function scan_dir_for_wads(dir_path, prefix)
-    local entries = {}
-    if prefix == "S:" then
-        local sd_path = dir_path:gsub("^S:", "")
-        entries = _list_all_sd and _list_all_sd(sd_path) or {}
-    else
-        local lfs_path = dir_path:gsub("^L:", "")
-        entries = _list_all and _list_all(lfs_path) or {}
-    end
+-- fileman routes the drive from the L:/S: prefix itself; sizes=false skips
+-- the per-entry size lookup, so huge WAD folders list fast (watchdog-safe).
+local function scan_dir_for_wads(dir_path)
+    local entries = fileman.list(dir_path, {
+        sizes = false,
+        filter = function(e)
+            return e.type == "file" and e.name:lower():match("%.wad$")
+        end,
+    }) or {}
     for _, e in ipairs(entries) do
-        if e.type == "file" and e.name:lower():match("%.wad$") then
-            local low = e.name:lower()
-            if not seen_lower[low] then
-                seen_lower[low] = true
-                local full_path = dir_path .. "/" .. e.name
-                found_wads[#found_wads + 1] = {
-                    name = e.name,
-                    path = full_path,
-                    wtype = "unknown",  -- classified one-per-tick in deferred init
-                }
-            end
+        local low = e.name:lower()
+        if not seen_lower[low] then
+            seen_lower[low] = true
+            found_wads[#found_wads + 1] = {
+                name = e.name,
+                path = dir_path .. "/" .. e.name,
+                wtype = "unknown",  -- classified one-per-tick in deferred init
+            }
         end
     end
 end
@@ -831,14 +829,14 @@ return function()
 
     -- Phases 1-3: directory scanning (no file I/O per WAD)
     if init_phase == 1 then
-        scan_dir_for_wads(app_dir, "L:")
+        scan_dir_for_wads(app_dir)
         return false
     elseif init_phase == 2 then
-        scan_dir_for_wads(sd_app_dir, "S:")
+        scan_dir_for_wads(sd_app_dir)
         return false
     elseif init_phase == 3 then
         if sd_app_dir ~= "S:/doom" then
-            scan_dir_for_wads("S:/doom", "S:")
+            scan_dir_for_wads("S:/doom")
         end
         classify_idx = 0
         return false
