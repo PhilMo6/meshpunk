@@ -177,7 +177,12 @@ Audio::Audio(bool internalDAC /* = false */, uint8_t channelEnabled /* = I2S_DAC
     m_i2s_config.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
     m_i2s_config.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
     m_i2s_config.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1; // interrupt priority
-    m_i2s_config.dma_buf_count        = 16;
+    // MESHPUNK: was 16 buffers (32KB internal DMA, ~186ms of I2S latency —
+    // far more than the mixer needs). Halved to 8 (16KB internal, ~93ms) to
+    // free scarce internal SRAM for USB-host + ELF-module coexistence, and it
+    // lowers audio latency as a bonus. 8x512 is still deep margin against the
+    // mixer's ~5.8ms chunk cadence. If audio underruns, step back toward 12.
+    m_i2s_config.dma_buf_count        = 8;
     m_i2s_config.dma_buf_len          = 512;
     m_i2s_config.use_apll             = APLL_DISABLE; // must be disabled in V2.0.1-RC1
     m_i2s_config.tx_desc_auto_clear   = true;   // new in V1.0.1

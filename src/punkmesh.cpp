@@ -6,6 +6,7 @@
 #include "meshpunk_sync.h"
 #include "ble_companion.h"
 #include "notify.h"
+#include "usb_manager.h"   // UsbFlashGuard — pause USB audio around flash writes
 
 // Shared-SPI-bus lock pair (defined in main.cpp).
 // sd_spi_take()    — acquire spi_bus_mutex before any SD operation.
@@ -3588,8 +3589,11 @@ void PunkMesh::onContactPathUpdated(const ContactInfo &contact)
 // restores expected_ack_crc/last_msg_sent for UI sends (the CLI 'send'
 // path was the only thing setting them since the sendAndPersistDM refactor,
 // which had silently killed delivered/failed feedback and path stats).
+// Tracked sends don't arm the base class's txt_send_timeout — the deadline
+// here drives the ladder from loop() (pendingSendLadderStep).
 void PunkMesh::armPendingSend(const ContactInfo& recipient, uint32_t orig_ack,
-                              uint32_t timestamp, const char* text, bool sent_direct)
+                              uint32_t timestamp, const char* text, bool sent_direct,
+                              uint32_t est_timeout_ms)
 {
     if (_pending_send.active) failPendingSend();   // abandoned send = failed
 
@@ -3604,6 +3608,7 @@ void PunkMesh::armPendingSend(const ContactInfo& recipient, uint32_t orig_ack,
     _pending_send.total_attempts = 1 + _pending_send.direct_left + _pending_send.flood_left;
     _pending_send.acks[0]     = orig_ack;
     _pending_send.ack_count   = 1;
+    _pending_send.deadline    = futureMillis(est_timeout_ms);
     _pending_send.active      = true;
 
     expected_ack_crc = orig_ack;
@@ -4190,80 +4195,82 @@ uint32_t PunkMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8
            ((pkt_airtime_millis * DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (path_len + 1));
 }
 
-void PunkMesh::onSendTimeout()
+// Retry ladder for device-UI sends: up to 3 tries via the stored path, then
+// the path auto-resets and up to 2 more go out flooded; only after that is
+// the send declared failed. Driven from loop() by _pending_send.deadline
+// (tracked sends never arm the base class's txt_send_timeout), on the mesh
+// task under MESH_LOCK, so resending here is safe.
+void PunkMesh::pendingSendLadderStep()
 {
-    // Retry ladder for device-UI sends: up to 3 tries via the stored path,
-    // then the path auto-resets and up to 2 more go out flooded; only after
-    // that is the send declared failed. Runs on the mesh task under MESH_LOCK
-    // (BaseChatMesh::loop fires this), so resending here is safe.
-    if (_pending_send.active) {
-        ContactInfo* c = lookupContactByPubKey(_pending_send.recipient_pub, PUB_KEY_SIZE);
-        if (!c) {
-            SLog.println("   ERROR: timed out and contact gone — send failed.");
-            failPendingSend();
-            return;
-        }
-        curr_recipient = c;
-        recordPathFailure(c->id.pub_key);   // per-attempt, against the current out_path
-
-        bool resend = false;
-        if (_pending_send.direct_left > 0) {
-            _pending_send.direct_left--;
-            resend = true;
-        } else if (_pending_send.flood_left > 0) {
-            if (c->out_path_len != OUT_PATH_UNKNOWN) {
-                // The auto flood fallback: direct budget exhausted, drop the
-                // learned path (persisted) so this and all future sends flood
-                // until a fresh path-return re-teaches a route.
-                resetPathTo(*c);
-                saveOneContact(*c);
-                SLog.printf("   no ACK x3 — path to %s reset, falling back to FLOOD\n", c->name);
-            }
-            _pending_send.flood_left--;
-            resend = true;
-        }
-
-        if (resend) {
-            _pending_send.attempt++;
-            uint32_t new_ack = 0;
-            uint32_t est_timeout = 0;
-            // Send-only resend (the message was persisted at the original
-            // send); attempt++ makes the packet + ack hash unique, and
-            // sendMessage re-arms txt_send_timeout itself.
-            int rc = sendMessage(*c, _pending_send.timestamp, _pending_send.attempt,
-                                 _pending_send.text, new_ack, est_timeout);
-            if (rc != MSG_SEND_FAILED) {
-                expected_ack_crc = new_ack;
-                last_msg_sent = _ms->getMillis();
-                // Remember every attempt's ack: repeat-until-heard can land
-                // an OLD attempt late, and its ack must still count.
-                if (_pending_send.ack_count < 5) {
-                    _pending_send.acks[_pending_send.ack_count++] = new_ack;
-                }
-                SLog.printf("   no ACK — retry %u/%u via %s\n",
-                            (unsigned)_pending_send.attempt + 1,
-                            (unsigned)_pending_send.total_attempts,
-                            rc == MSG_SEND_SENT_DIRECT ? "path" : "flood");
-                if (rx_event_queue) {
-                    RxEvent ev;
-                    memset(&ev, 0, sizeof(ev));
-                    ev.kind        = RxEvent::SEND_RETRY;
-                    ev.ack         = _pending_send.orig_ack;
-                    ev.hops        = _pending_send.attempt + 1;      // 1-based try number
-                    ev.channel_idx = (int8_t)_pending_send.total_attempts;
-                    xQueueSend(rx_event_queue, &ev, 0);
-                }
-                return;
-            }
-            // couldn't compose/send (packet pool empty) — fall through to fail
-        }
-
-        SLog.println("   ERROR: retries exhausted, no ACK — send failed.");
+    ContactInfo* c = lookupContactByPubKey(_pending_send.recipient_pub, PUB_KEY_SIZE);
+    if (!c) {
+        SLog.println("   ERROR: timed out and contact gone — send failed.");
         failPendingSend();
         return;
     }
+    curr_recipient = c;
+    recordPathFailure(c->id.pub_key);   // per-attempt, against the current out_path
 
-    // Untracked sends (serial-CLI 'send'): original single-shot behavior.
+    bool resend = false;
+    if (_pending_send.direct_left > 0) {
+        _pending_send.direct_left--;
+        resend = true;
+    } else if (_pending_send.flood_left > 0) {
+        if (c->out_path_len != OUT_PATH_UNKNOWN) {
+            // The auto flood fallback: direct budget exhausted, drop the
+            // learned path (persisted) so this and all future sends flood
+            // until a fresh path-return re-teaches a route.
+            resetPathTo(*c);
+            saveOneContact(*c);
+            SLog.printf("   no ACK x3 — path to %s reset, falling back to FLOOD\n", c->name);
+        }
+        _pending_send.flood_left--;
+        resend = true;
+    }
+
+    if (resend) {
+        _pending_send.attempt++;
+        uint32_t new_ack = 0;
+        uint32_t est_timeout = 0;
+        // Send-only resend (the message was persisted at the original send);
+        // attempt++ makes the packet + ack hash unique.
+        int rc = sendMessageTracked(*c, _pending_send.timestamp, _pending_send.attempt,
+                                    _pending_send.text, new_ack, est_timeout);
+        if (rc != MSG_SEND_FAILED) {
+            expected_ack_crc = new_ack;
+            last_msg_sent = _ms->getMillis();
+            _pending_send.deadline = futureMillis(est_timeout);
+            // Remember every attempt's ack: repeat-until-heard can land
+            // an OLD attempt late, and its ack must still count.
+            if (_pending_send.ack_count < 5) {
+                _pending_send.acks[_pending_send.ack_count++] = new_ack;
+            }
+            SLog.printf("   no ACK — retry %u/%u via %s\n",
+                        (unsigned)_pending_send.attempt + 1,
+                        (unsigned)_pending_send.total_attempts,
+                        rc == MSG_SEND_SENT_DIRECT ? "path" : "flood");
+            if (rx_event_queue) {
+                RxEvent ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.kind        = RxEvent::SEND_RETRY;
+                ev.ack         = _pending_send.orig_ack;
+                ev.hops        = _pending_send.attempt + 1;      // 1-based try number
+                ev.channel_idx = (int8_t)_pending_send.total_attempts;
+                xQueueSend(rx_event_queue, &ev, 0);
+            }
+            return;
+        }
+        // couldn't compose/send (packet pool empty) — fall through to fail
+    }
+
+    SLog.println("   ERROR: retries exhausted, no ACK — send failed.");
+    failPendingSend();
+}
+
+void PunkMesh::onSendTimeout()
+{
+    // Only untracked sends (serial-CLI 'send') arm the base timeout that
+    // fires this; tracked sends run the ladder from loop() instead.
     SLog.println("   ERROR: timed out, no ACK.");
     if (curr_recipient) {
         recordPathFailure(curr_recipient->id.pub_key);
@@ -4271,7 +4278,7 @@ void PunkMesh::onSendTimeout()
     // Tell the Lua UI the send failed (only if there is still a pending ack —
     // a successful processAck clears expected_ack_crc, so this won't fire a
     // false failure after a delivery).
-    if (rx_event_queue && expected_ack_crc != 0) {
+    if (rx_event_queue && expected_ack_crc != 0 && !_pending_send.active) {
         RxEvent ev;
         memset(&ev, 0, sizeof(ev));
         ev.kind = RxEvent::ACK;
@@ -4577,12 +4584,17 @@ void PunkMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* 
     }
 }
 
-// MESHPUNK BaseChatMesh hook target: every direct-routed TXT send (DM, room
-// post, CLI command — sendMessage/sendCommandData direct branches) lands
-// here, so repeat-until-heard covers direct sends too. Zero-hop routes are
-// excluded: no repeater exists to echo the packet, so "heard" can never
-// confirm and the retransmits would be pure noise.
-void PunkMesh::sendDirectScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis)
+// ── Tracked sends ────────────────────────────────────────────────
+// Local variants of BaseChatMesh::sendMessage / sendCommandData (see the
+// punkmesh.h comment: MeshCore is a pristine submodule, and its versions
+// compose the packet internally — the direct branch is invisible to us).
+// Wire behavior is IDENTICAL; keep the composition in sync on upgrades.
+
+// Every direct-routed tracked TXT send (DM, room post, CLI command) goes
+// through here, so repeat-until-heard covers direct sends too. Zero-hop
+// routes are excluded: no repeater exists to echo the packet, so "heard"
+// could never confirm and the retransmits would be pure noise.
+void PunkMesh::sendDirectTracked(const ContactInfo& recipient, mesh::Packet* pkt)
 {
     pkt->calculatePacketHash(_last_tx_hash);
 
@@ -4600,12 +4612,84 @@ void PunkMesh::sendDirectScoped(const ContactInfo& recipient, mesh::Packet* pkt,
         memcpy(saved_path, recipient.out_path, MAX_PATH_SIZE);
     }
 
-    BaseChatMesh::sendDirectScoped(recipient, pkt, delay_millis);
+    sendDirect(pkt, recipient.out_path, recipient.out_path_len);
 
     if (want_repeat) {
         registerPendingRepeat(_last_tx_hash, saved_header, saved_payload, saved_len,
                               saved_path, saved_path_len);
     }
+}
+
+// Mirrors BaseChatMesh::composeMsgPacket (private upstream).
+mesh::Packet* PunkMesh::composeTrackedMsgPacket(const ContactInfo& recipient, uint32_t timestamp,
+                                                uint8_t attempt, const char* text,
+                                                uint32_t& expected_ack)
+{
+    int text_len = strlen(text);
+    if (text_len > MAX_TEXT_LEN) return NULL;
+    if (attempt > 3 && text_len > MAX_TEXT_LEN - 2) return NULL;
+
+    uint8_t temp[5 + MAX_TEXT_LEN + 1];
+    memcpy(temp, &timestamp, 4);
+    temp[4] = (attempt & 3);
+    memcpy(&temp[5], text, text_len + 1);
+
+    // calc expected ACK reply
+    mesh::Utils::sha256((uint8_t *)&expected_ack, 4, temp, 5 + text_len, self_id.pub_key, PUB_KEY_SIZE);
+
+    int len = 5 + text_len;
+    if (attempt > 3) {
+        temp[len++] = 0;        // null terminator
+        temp[len++] = attempt;  // hide attempt number at tail end of payload
+    }
+
+    return createDatagram(PAYLOAD_TYPE_TXT_MSG, recipient.id, recipient.getSharedSecret(self_id), temp, len);
+}
+
+int PunkMesh::sendMessageTracked(const ContactInfo& recipient, uint32_t timestamp,
+                                 uint8_t attempt, const char* text,
+                                 uint32_t& expected_ack, uint32_t& est_timeout)
+{
+    mesh::Packet* pkt = composeTrackedMsgPacket(recipient, timestamp, attempt, text, expected_ack);
+    if (pkt == NULL) return MSG_SEND_FAILED;
+
+    uint32_t t = _radio->getEstAirtimeFor(pkt->getRawLength());
+    if (recipient.out_path_len == OUT_PATH_UNKNOWN) {
+        sendFloodScoped(recipient, pkt);    // computes _last_tx_hash + flood repeat
+        est_timeout = calcFloodTimeoutMillisFor(t);
+        return MSG_SEND_SENT_FLOOD;
+    }
+    sendDirectTracked(recipient, pkt);      // computes _last_tx_hash + direct repeat
+    est_timeout = calcDirectTimeoutMillisFor(t, recipient.out_path_len);
+    return MSG_SEND_SENT_DIRECT;
+}
+
+// Mirrors BaseChatMesh::sendCommandData. Bonus over the base version: no
+// ack timeout is armed for CLI (replies carry no ack — the base one fired a
+// spurious "timed out, no ACK" after every CLI command).
+int PunkMesh::sendCommandTracked(const ContactInfo& recipient, uint32_t timestamp,
+                                 uint8_t attempt, const char* text, uint32_t& est_timeout)
+{
+    int text_len = strlen(text);
+    if (text_len > MAX_TEXT_LEN) return MSG_SEND_FAILED;
+
+    uint8_t temp[5 + MAX_TEXT_LEN + 1];
+    memcpy(temp, &timestamp, 4);
+    temp[4] = (attempt & 3) | (TXT_TYPE_CLI_DATA << 2);
+    memcpy(&temp[5], text, text_len + 1);
+
+    auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, recipient.id, recipient.getSharedSecret(self_id), temp, 5 + text_len);
+    if (pkt == NULL) return MSG_SEND_FAILED;
+
+    uint32_t t = _radio->getEstAirtimeFor(pkt->getRawLength());
+    if (recipient.out_path_len == OUT_PATH_UNKNOWN) {
+        sendFloodScoped(recipient, pkt);
+        est_timeout = calcFloodTimeoutMillisFor(t);
+        return MSG_SEND_SENT_FLOOD;
+    }
+    sendDirectTracked(recipient, pkt);
+    est_timeout = calcDirectTimeoutMillisFor(t, recipient.out_path_len);
+    return MSG_SEND_SENT_DIRECT;
 }
 
 // ── Message repeat ───────────────────────────────────────────────
@@ -5002,34 +5086,40 @@ static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
 void PunkMesh::savePrefs()
 {
     bool is_sd = (_storage != &LittleFS);
-    if (is_sd) sd_spi_take();
-
-    String path = storagePath(_storage_prefix, "/node_prefs");
-    writePrefsToFile(_storage, path.c_str(), _prefs);
 
     if (is_sd) {
+        sd_spi_take();
+        String path = storagePath(_storage_prefix, "/node_prefs");
+        writePrefsToFile(_storage, path.c_str(), _prefs);   // SD (SPI, no cache stall)
         sd_spi_release();
+        // The LittleFS fallback copy is an internal-flash write — guard it so a
+        // mesh/BLE event firing this mid-USB-stream can't crash the host stack.
+        UsbFlashGuard _g;
         writePrefsToFile(&LittleFS, "/node_prefs", _prefs);
+    } else {
+        UsbFlashGuard _g;   // _storage IS LittleFS — the write is internal flash
+        String path = storagePath(_storage_prefix, "/node_prefs");
+        writePrefsToFile(_storage, path.c_str(), _prefs);
     }
 }
 
 bool PunkMesh::saveIdentity() {
     String idPath = storagePath(_storage_prefix, "/identity");
     bool is_sd = (_storage != &LittleFS);
-    if (is_sd) sd_spi_take();
-    File file = _storage->open(idPath.c_str(), "w", true);
     bool ok = false;
-    if (file) {
-        ok = self_id.writeTo(file);
-        file.close();
-    }
-    if (is_sd) sd_spi_release();
     if (is_sd) {
+        sd_spi_take();
+        File file = _storage->open(idPath.c_str(), "w", true);   // SD (SPI)
+        if (file) { ok = self_id.writeTo(file); file.close(); }
+        sd_spi_release();
+        // LittleFS fallback copy = internal flash — guard against USB crash.
+        UsbFlashGuard _g;
         File lfs_file = LittleFS.open("/identity", "w", true);
-        if (lfs_file) {
-            self_id.writeTo(lfs_file);
-            lfs_file.close();
-        }
+        if (lfs_file) { self_id.writeTo(lfs_file); lfs_file.close(); }
+    } else {
+        UsbFlashGuard _g;   // _storage IS LittleFS — internal-flash write
+        File file = _storage->open(idPath.c_str(), "w", true);
+        if (file) { ok = self_id.writeTo(file); file.close(); }
     }
     return ok;
 }
@@ -5043,13 +5133,13 @@ PunkMesh::SendResult PunkMesh::sendAndPersistDM(ContactInfo& recipient,
     r.est_timeout = 0;
     r.has_hash = false;
 
-    r.code = sendMessage(recipient, timestamp, attempt, text,
-                         r.expected_ack, r.est_timeout);
+    r.code = sendMessageTracked(recipient, timestamp, attempt, text,
+                                r.expected_ack, r.est_timeout);
     if (r.code == MSG_SEND_FAILED) return r;
 
-    // Both routes set _last_tx_hash now (sendFloodScoped and the MESHPUNK
-    // sendDirectScoped hook), so direct sends get echo tracking + the chat's
-    // "repeating..." indicator too — repeat-until-heard covers all messages.
+    // Both routes set _last_tx_hash now (sendFloodScoped / sendDirectTracked
+    // inside sendMessageTracked), so direct sends get echo tracking + the
+    // chat's "repeating..." indicator — repeat-until-heard covers all messages.
     memcpy(r.tx_hash, _last_tx_hash, MAX_HASH_SIZE);
     r.has_hash = true;
 
@@ -5386,6 +5476,12 @@ void PunkMesh::loop()
 {
     BaseChatMesh::loop();
     if (_prefs.msg_repeat_enabled) checkPendingRepeats();
+
+    // Retry-ladder ack timeout for the tracked send (tracked sends don't arm
+    // the base class's private txt_send_timeout — this deadline replaces it).
+    if (_pending_send.active && millisHasNowPassed(_pending_send.deadline)) {
+        pendingSendLadderStep();
+    }
 
     // Keep-alive pings for logged-in rooms/repeaters (self-rate-limited via
     // each connection's next_ping; the table is empty unless a login succeeded

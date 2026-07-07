@@ -351,8 +351,9 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       if (txt_type == TXT_TYPE_CLI_DATA) {
         // CLI commands use node's RTC (not app timestamp) to avoid replay protection
         msg_timestamp = _mesh.getRTCClock()->getCurrentTimeUnique();
-        result = _mesh.sendCommandData(*recipient, msg_timestamp, attempt, text, est_timeout);
-        // no ACK expected for CLI commands
+        // Tracked variant: identical wire behavior + repeat-until-heard on
+        // direct routes (and no spurious ack timeout — CLI has no acks).
+        result = _mesh.sendCommandTracked(*recipient, msg_timestamp, attempt, text, est_timeout);
       } else {
         auto r = _mesh.sendAndPersistDM(*recipient, msg_timestamp, attempt, text);
         result = r.code;

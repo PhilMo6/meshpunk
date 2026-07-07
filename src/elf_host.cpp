@@ -399,8 +399,14 @@ static void elf_input_start() {
     memset(prev_key_state, 0, INPUT_STATE_SIZE);
     esc_held = false;
     s_input_task_run = true;
+    // Priority 5: ABOVE usb_mgr (4), sound_task (3) and elf_blit (3). The
+    // keyboard poll is a tiny, latency-critical task (one I2C read every 10ms);
+    // when USB host is streaming, those higher-priority core-1 tasks were
+    // starving it at priority 2 — the game saw laggy/missed/doubled keys. Input
+    // responsiveness beats a few ms of audio/blit jitter (absorbed by their
+    // buffers), and the poll yields immediately so it can't starve them.
     if (xTaskCreatePinnedToCore(elf_input_task_body, "elf_input", 3072,
-                                nullptr, 2, &s_input_task, 1 /* Core 1 */) != pdPASS) {
+                                nullptr, 5, &s_input_task, 1 /* Core 1 */) != pdPASS) {
         // Couldn't spawn — fall back to host_get_key's own polling.
         s_input_task = nullptr;
         s_input_task_run = false;

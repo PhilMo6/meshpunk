@@ -465,11 +465,35 @@ public:
     // 2 attempt bits) — a harmless duplicate entry here.
     uint32_t acks[5];
     uint8_t  ack_count;
+    // Our own ack deadline: tracked sends don't arm the base class's
+    // (private) txt_send_timeout, so the ladder is driven from loop().
+    unsigned long deadline;
   };
   PendingSend _pending_send;
   void armPendingSend(const ContactInfo& recipient, uint32_t orig_ack,
-                      uint32_t timestamp, const char* text, bool sent_direct);
+                      uint32_t timestamp, const char* text, bool sent_direct,
+                      uint32_t est_timeout_ms);
   void failPendingSend();   // queue failed-ACK event for orig_ack + clear
+  void pendingSendLadderStep();   // deadline passed: retry or declare failed
+
+  // ── Tracked sends ────────────────────────────────────────────────
+  // Local variants of BaseChatMesh::sendMessage / sendCommandData with the
+  // SAME wire behavior (MeshCore is a git submodule and must stay pristine;
+  // its versions compose the packet internally, so the direct branch is
+  // invisible to us). Differences: the direct branch goes through
+  // sendDirectTracked (tx hash + repeat-until-heard, zero-hop excluded) and
+  // no base txt_send_timeout is armed — the retry ladder's own deadline
+  // covers timeouts, and CLI sends (no acks ever) get no timeout at all.
+  // Keep the packet composition in sync with BaseChatMesh.cpp on upgrades.
+  int  sendMessageTracked(const ContactInfo& recipient, uint32_t timestamp,
+                          uint8_t attempt, const char* text,
+                          uint32_t& expected_ack, uint32_t& est_timeout);
+  int  sendCommandTracked(const ContactInfo& recipient, uint32_t timestamp,
+                          uint8_t attempt, const char* text, uint32_t& est_timeout);
+  mesh::Packet* composeTrackedMsgPacket(const ContactInfo& recipient, uint32_t timestamp,
+                                        uint8_t attempt, const char* text,
+                                        uint32_t& expected_ack);
+  void sendDirectTracked(const ContactInfo& recipient, mesh::Packet* pkt);
 
   // ── Keep-alive session watch ─────────────────────────────────────
   // Servers we (or the phone) logged into with a keep-alive interval.
@@ -555,10 +579,6 @@ public:
 protected:
   void sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override;
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
-  // MESHPUNK BaseChatMesh hook: direct-routed TXT sends (DMs, room posts,
-  // CLI commands) — captures the tx hash and registers repeat-until-heard
-  // for routes with at least one repeater to echo.
-  void sendDirectScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override;
   // Flood through the configured default transport scope (region key) when one
   // is set, else an unscoped flood. Applies the multi-byte path size.
   void sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis);

@@ -23,6 +23,7 @@
 #include "elf_host.h"
 #include "meshpunk_fs.h"
 #include "fs_bridge.h"
+#include "usb_manager.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -235,6 +236,8 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("dst=%d\n", dst_enabled ? 1 : 0);
   f.printf("sound_vol=%d\n",   sound_get_volume());
   f.printf("sound_muted=%d\n", sound_get_muted() ? 1 : 0);
+  f.printf("usb_audio=%d\n",   usb_audio_pref_get() ? 1 : 0);
+  f.printf("usb_speaker=%d\n", usb_speaker_pref_get() ? 1 : 0);
   f.printf("kbd_bright=%d\n", kbd_brightness);
   f.printf("disp_bright=%d\n", display_brightness);
   f.printf("screen_timeout=%d\n", screen_timeout_secs);
@@ -259,7 +262,15 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
 }
 
 static void firmware_prefs_save() {
-  write_firmware_prefs(LittleFS, "/firmware_prefs");
+  // The LittleFS (internal flash) write must be bracketed by the USB flash
+  // guard: a flash write disables the cache and stalls both cores for ms,
+  // which crashes an active USB host audio stream. The guard drains/pauses the
+  // ISO stream around it (no-op when USB isn't streaming). The SD copy is SPI
+  // (no cache stall), so it keeps streaming normally.
+  {
+    UsbFlashGuard _g;
+    write_firmware_prefs(LittleFS, "/firmware_prefs");
+  }
   if (sd_mounted && use_sd_pref) {
     sd_spi_take();
     write_firmware_prefs(SD, "/meshpunk/firmware_prefs");
@@ -353,6 +364,10 @@ static void firmware_prefs_load() {
       if (v >= 0 && v <= 21) sound_set_volume((uint8_t)v);
     } else if (strcmp(key, "sound_muted") == 0) {
       sound_set_muted(atoi(val) == 1);
+    } else if (strcmp(key, "usb_audio") == 0) {
+      usb_audio_pref_set(atoi(val) == 1);
+    } else if (strcmp(key, "usb_speaker") == 0) {
+      usb_speaker_pref_set(atoi(val) == 1);
     } else if (strcmp(key, "kbd_bright") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 255) kbd_brightness = (uint8_t)v;
@@ -848,6 +863,7 @@ static void kb_emoji_map_load() {
 }
 
 static void kb_emoji_map_save() {
+  UsbFlashGuard _g;   // internal-flash write — pause USB audio around it (crash-safe)
   File f = LittleFS.open("/emoji_keymap", "w", true);
   if (!f) { SLog.println("[KB_EMOJI] cannot write /emoji_keymap"); return; }
   for (int c = 32; c < 128; c++) {
@@ -1741,7 +1757,7 @@ static int lua_wifi_connect(lua_State *L) {
   SLog.print("Connecting to WiFi: ");
   SLog.println(network);
 
-  WiFi.begin(network, pass);
+  { UsbFlashGuard _g; WiFi.begin(network, pass); }  // WiFi init can write PHY cal to NVS
 
   return 0;
 }
@@ -2089,14 +2105,19 @@ static int lua_wifi_get_enabled(lua_State *L) {
 
 static int lua_wifi_set_enabled(lua_State *L) {
   wifi_enabled_pref = lua_toboolean(L, 1);
-  if (wifi_enabled_pref) {
-    WiFi.mode(WIFI_STA);
-    if (wifi_saved_ssid.length() > 0) {
-      WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
+  {
+    // WiFi mode/connect can write PHY calibration to NVS (internal flash) —
+    // pause any USB audio stream around it so the cache stall can't crash it.
+    UsbFlashGuard _g;
+    if (wifi_enabled_pref) {
+      WiFi.mode(WIFI_STA);
+      if (wifi_saved_ssid.length() > 0) {
+        WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
+      }
+    } else {
+      WiFi.disconnect();
+      WiFi.mode(WIFI_OFF);
     }
-  } else {
-    WiFi.disconnect();
-    WiFi.mode(WIFI_OFF);
   }
   firmware_prefs_save();
   return 0;
@@ -2127,7 +2148,7 @@ static int lua_wifi_clear_creds(lua_State *L) {
 
 static int lua_wifi_auto_connect(lua_State *L) {
   if (wifi_enabled_pref && wifi_saved_ssid.length() > 0) {
-    WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
+    { UsbFlashGuard _g; WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str()); }
     lua_pushboolean(L, 1);
   } else {
     lua_pushboolean(L, 0);
@@ -2223,7 +2244,7 @@ static int lua_mesh_send_direct(lua_State *L) {
     // resets and 2 more go flooded). Device-UI sends only — BLE sends run
     // the phone app's own retry logic.
     the_mesh->armPendingSend(*recipient, r.expected_ack, timestamp, text,
-                             r.code == MSG_SEND_SENT_DIRECT);
+                             r.code == MSG_SEND_SENT_DIRECT, r.est_timeout);
   }
   MESH_UNLOCK();
 
@@ -3517,10 +3538,10 @@ static int lua_mesh_send_command(lua_State *L) {
 
   uint32_t est_timeout = 0;
   uint32_t timestamp = the_mesh->getRTCClock()->getCurrentTime();
-  int result = the_mesh->sendCommandData(*c, timestamp, 0, text, est_timeout);
+  int result = the_mesh->sendCommandTracked(*c, timestamp, 0, text, est_timeout);
   char hash_hex[MAX_HASH_SIZE * 2 + 1] = {0};
   if (result != MSG_SEND_FAILED) {
-    // Both routes set _last_tx_hash (sendFloodScoped / sendDirectScoped), so
+    // Both routes set _last_tx_hash (sendFloodScoped / sendDirectTracked), so
     // the console echo gets the repeat-until-heard indicator like DMs do.
     the_mesh->appendDMMessage(c->name, the_mesh->_prefs.node_name, text, timestamp,
                               0, 0, 0, result == MSG_SEND_SENT_DIRECT,
@@ -5537,6 +5558,9 @@ void setupLuaVGL() {
   // Unified drive-aware _fs_* family (fs_bridge.cpp) — used by lib/fileman.lua
   fs_bridge_register(L);
 
+  // USB-OTG host manager (_usb_*) — used by Tools/USB (also PHY boot self-heal)
+  usb_manager_register_lua(L);
+
   // System
   lua_register(L, "_system_reboot", [](lua_State *L) -> int {
     SLog.println("[SYSTEM] Reboot requested from Lua");
@@ -6852,6 +6876,13 @@ void setup() {
   the_mesh->_msg_retain_days = msg_retain_days;  // routing/message retention window
 
   wifi_creds_load();
+  // Creds live in LittleFS and we always call WiFi.begin() explicitly — stop
+  // Arduino from ALSO writing SSID/pass to NVS on every begin(). That's an
+  // internal-flash write that would crash an active USB audio stream, and it's
+  // pure redundancy here. Process-wide setting, so once at boot covers all
+  // later WiFi.begin() calls. (No UsbFlashGuard needed here: USB host is
+  // manually started from the launcher, well after this boot code runs.)
+  WiFi.persistent(false);
   if (wifi_enabled_pref) {
     WiFi.mode(WIFI_STA);
     if (wifi_saved_ssid.length() > 0) {
@@ -6916,6 +6947,7 @@ void setup() {
   audio = new Audio();
   audio->setPinout(TDECK_I2S_BCK, TDECK_I2S_WS, TDECK_I2S_DOUT);
   sound_init(audio, firmware_prefs_save);
+  usb_manager_init(firmware_prefs_save);   // USB audio route/speaker prefs persist here
   notify_init();   // pre-render the notification melody (C-owned, survives lua_close)
   // Boot watermark: every sound id below this is C-owned (the notify melody)
   // and survives every sweep; everything at/above it is Lua-created and gets
@@ -7123,14 +7155,9 @@ void loop() {
   // Handle LVGL tasks
   lv_timer_handler();
 
-  // Audio: file streaming (SD needs SPI mutex)
-  if (sound_file_is_sd()) {
-    sd_spi_take();
-    audio->loop();
-    sd_spi_release();
-  } else {
-    audio->loop();
-  }
+  // Audio file decode (ESP32-audioI2S) now runs on Core 1 inside sound_task —
+  // moved off this loop so a heavy MP3/FLAC decode can't stutter LVGL/Lua.
+  // See sound.cpp: the s_audio->isRunning() branch pumps audio->loop() there.
 
   // GPS one-shot time sync runs on Core 1 (gps_task). Nothing to do here.
 

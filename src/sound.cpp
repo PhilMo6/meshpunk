@@ -1,5 +1,6 @@
 #include "sound.h"
 #include "Audio.h"
+#include "usb_manager.h"
 #include <driver/i2s.h>
 #include <esp_random.h>
 #include <math.h>
@@ -50,7 +51,16 @@ static bool tone_sr_set = false;
 
 static TaskHandle_t      s_sound_task  = nullptr;
 static SemaphoreHandle_t s_sound_mutex = nullptr;
+// Guards the ESP32-audioI2S decoder object (loop/stopSong/connectToFile/
+// pauseResume) so the Core-1 decode pump (in sound_task) can't race Lua
+// play/stop/pause on Core 0 or notify on Core 1. Lock order: s_sound_mutex
+// OUTER, s_audio_mutex INNER. The one inversion — the pump holds s_audio_mutex
+// while audio_process_extern try-takes s_sound_mutex — is deadlock-free
+// because that inner take uses timeout 0 and never blocks.
+static SemaphoreHandle_t s_audio_mutex = nullptr;
 static volatile bool     s_sound_suspended = false;  // I2S halted for native module
+
+extern void sd_spi_release();   // sd_spi_take() is inline in meshpunk_sync.h
 
 // ── External audio ring buffer (mono → upsampled to 44100 Hz stereo) ──────────
 #define EXTERN_RING_SIZE 4096
@@ -70,6 +80,7 @@ void sound_init(Audio* audio_ptr, void (*prefs_save_fn)()) {
     s_audio      = audio_ptr;
     s_prefs_save = prefs_save_fn;
     s_sound_mutex = xSemaphoreCreateMutex();
+    s_audio_mutex = xSemaphoreCreateMutex();
     // 12KB stack: a pull-model ELF module's synth (sound_extern_set_pull)
     // runs its code on this task, on top of the mixer's ~4KB of locals.
     xTaskCreatePinnedToCore(
@@ -83,8 +94,12 @@ void sound_init(Audio* audio_ptr, void (*prefs_save_fn)()) {
 void sound_suspend() {
     if (s_sound_suspended) return;
     s_sound_suspended = true;
-    // Stop any file playback so audio->loop() (Core 0) won't touch I2S either.
-    if (s_audio && s_audio->isRunning()) s_audio->stopSong();
+    // Stop any file playback so the Core-1 decode pump won't touch I2S either.
+    if (s_audio && s_audio->isRunning()) {
+        xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
+        s_audio->stopSong();
+        xSemaphoreGive(s_audio_mutex);
+    }
     // Let the sound task observe the flag and leave any in-flight i2s_write.
     vTaskDelay(pdMS_TO_TICKS(30));
     // Halt the I2S peripheral + DMA so its TX-EOF ISR stops firing while the
@@ -204,7 +219,9 @@ static void sound_obj_remove(int id) {
     // Removing the file the mixer is streaming from: disconnect BEFORE the
     // File is closed below, or the streamer keeps reading a dead handle.
     if (obj && obj->type == SoundObject::AUDIO_FILE && obj->id == s_active_file_id) {
+        xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
         s_audio->stopSong();
+        xSemaphoreGive(s_audio_mutex);
         active_file_is_sd = false;
         s_active_file_id  = -1;
     }
@@ -758,6 +775,8 @@ void sound_play(int id) {
         obj->tone_playing = true;
         obj->tone_paused  = false;
     } else {
+        // Decoder state changes — serialize against the Core-1 decode pump.
+        xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
         s_audio->stopSong();
         active_file_is_sd = false;
         obj->file->seek(0);
@@ -765,6 +784,7 @@ void sound_play(int id) {
         s_audio->connectToFile(*obj->file);
         active_file_is_sd = obj->file_is_sd;
         s_active_file_id  = obj->id;
+        xSemaphoreGive(s_audio_mutex);
     }
     xSemaphoreGive(s_sound_mutex);
     if (is_tone && s_sound_task) xTaskNotifyGive(s_sound_task);
@@ -778,7 +798,9 @@ void sound_stop(int id) {
         obj->tone_playing = false;
         obj->play_pos     = 0;
     } else {
+        xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
         s_audio->stopSong();
+        xSemaphoreGive(s_audio_mutex);
         active_file_is_sd = false;
         obj->file_paused  = false;
         s_active_file_id  = -1;
@@ -793,7 +815,9 @@ void sound_pause(int id) {
     if (obj->type == SoundObject::TONE) {
         obj->tone_paused = !obj->tone_paused;
     } else {
+        xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
         s_audio->pauseResume();
+        xSemaphoreGive(s_audio_mutex);
         obj->file_paused = !obj->file_paused;
     }
     xSemaphoreGive(s_sound_mutex);
@@ -824,8 +848,19 @@ static void sound_task_body(void* param) {
         }
 
         if (s_audio->isRunning()) {
+            // File decode runs HERE on Core 1 — moved off Core 0's loop() so a
+            // heavy MP3/FLAC decode can't stutter LVGL/Lua (the convention:
+            // anything that can interfere with the Core-0 UI moves to Core 1).
+            // s_audio_mutex serializes the decoder against Lua play/stop/pause
+            // (Core 0) and notify (Core 1). audio->loop() blocks on the I2S DMA
+            // for pacing, so this task is naturally rate-limited here.
             tone_sr_set = false;
-            vTaskDelay(pdMS_TO_TICKS(10));
+            xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
+            if (s_audio->isRunning()) {          // re-check: may have been stopped
+                if (active_file_is_sd) { sd_spi_take(); s_audio->loop(); sd_spi_release(); }
+                else                   { s_audio->loop(); }
+            }
+            xSemaphoreGive(s_audio_mutex);
             continue;
         }
 
@@ -840,7 +875,7 @@ static void sound_task_body(void* param) {
 
         bool has_extern = (s_extern_pull != nullptr) || sound_extern_active();
 
-        if (!any_tones && !has_extern) {
+        if (!any_tones && !has_extern && !usb_audio_active()) {
             // Don't reset tone_sr_set here — the ring buffer goes briefly empty
             // between module audio pushes, and reconfiguring I2S every wake cycle
             // causes audible DMA glitches.  Only the Audio-library path resets it.
@@ -848,6 +883,10 @@ static void sound_task_body(void* param) {
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
             continue;
         }
+        // While USB is routing, don't idle-sleep: fall through and produce a
+        // silent chunk each cycle so the USB ring stays primed. Otherwise the
+        // ring drains between sounds and each new sound starts into an empty
+        // ring — the click heard on the sound-settings test buttons.
 
         if (!tone_sr_set) {
             i2s_set_sample_rates(I2S_NUM_0, TONE_SR);
@@ -939,10 +978,22 @@ static void sound_task_body(void* param) {
 
         xSemaphoreGive(s_sound_mutex);
 
-        float vol_scale = sound_muted ? 0.0f : (float)sound_volume / 21.0f;
         int16_t out[CHUNK * 2];
+        // Full-scale clipped mix. USB gets PRE-volume audio (it applies the
+        // system volume at its own sink, so the slider tracks both outputs);
+        // the speaker copy is volume-scaled below. i2s_write still runs (its
+        // blocking DMA paces this loop); the speaker buffer is zeroed only if
+        // the speaker should stay silent while routed.
         for (int s = 0; s < CHUNK * 2; s++)
-            out[s] = (int16_t)(constrain(mix[s], -32768, 32767) * vol_scale);
+            out[s] = (int16_t)constrain(mix[s], -32768, 32767);
+        bool silence_spk = usb_audio_push(out, CHUNK, TONE_SR, 2);
+        if (silence_spk) {
+            memset(out, 0, sizeof(out));
+        } else {
+            float vol_scale = sound_muted ? 0.0f : (float)sound_volume / 21.0f;
+            for (int s = 0; s < CHUNK * 2; s++)
+                out[s] = (int16_t)(out[s] * vol_scale);
+        }
         size_t written = 0;
         i2s_write(I2S_NUM_0, out, sizeof(out), &written, pdMS_TO_TICKS(50));
     }
@@ -968,6 +1019,15 @@ void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
         }
     }
     xSemaphoreGive(s_sound_mutex);
+
+    // Mirror file playback to a USB DAC when routed. This runs on Core 0 from
+    // the Audio library while a file decodes (the mixer task idles then), so
+    // `buff` is interleaved at the file's native rate/channels. continueI2S
+    // stays true so playChunk's DMA write still paces decoding.
+    int ch = s_audio->getChannels();
+    if (usb_audio_push(buff, len, (int)s_audio->getSampleRate(), ch ? ch : 2))
+        memset(buff, 0, (size_t)len * (ch ? ch : 2) * sizeof(int16_t));
+
     *continueI2S = true;
 }
 
