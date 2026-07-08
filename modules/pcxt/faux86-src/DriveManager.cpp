@@ -77,11 +77,14 @@ bool DriveManager::insertDisk(DriveTarget targetDrive, DiskInterface* disk)
 		{
 			uint16_t partitionHeadEnd = sectorbuffer[partitionEntry + 5];
 			uint16_t partitionSectorEnd = sectorbuffer[partitionEntry + 6] & 0x3f;
-			uint16_t partitionCylinderEnd = sectorbuffer[partitionEntry + 7] | (sectorbuffer[partitionEntry + 6] << 8);
+			// MESHPUNK: end-cylinder is byte7 plus the top 2 bits of byte6 (<<2 to
+			// reach bits 8-9). The original `| (byte6 << 8)` folded the sector bits
+			// into the cylinder, yielding garbage geometry for any standard MBR.
+			uint16_t partitionCylinderEnd = sectorbuffer[partitionEntry + 7] | ((sectorbuffer[partitionEntry + 6] & 0xC0) << 2);
 
 			drive.sects = partitionSectorEnd;
 			drive.heads = partitionHeadEnd + 1;
-			drive.cyls = partitionCylinderEnd;
+			drive.cyls = partitionCylinderEnd + 1;	// count, not last index
 			#ifdef DEBUG_DISK
 			log(Log,"[DRIVEMANAGER::insertDisk] Detected HardDisk Partition size:%llu sects:%u heads:%u cyls:%u",
 				diskSize, drive.sects, drive.heads, drive.cyls);

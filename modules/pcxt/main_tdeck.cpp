@@ -234,6 +234,7 @@ int main(int argc, char** argv)
     const char* fdb = nullptr;
     const char* hda = nullptr;
     const char* hdb = nullptr;
+    const char* cfolder = nullptr; // manifest path: folder-backed C: (VVFAT)
     const char* bios_path = nullptr;
     const char* vbios_path = nullptr;
     const char* charrom_path = nullptr;
@@ -247,6 +248,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "-fdb")     && i + 1 < argc) fdb = argv[++i];
         else if (!strcmp(argv[i], "-hda")     && i + 1 < argc) hda = argv[++i];
         else if (!strcmp(argv[i], "-hdb")     && i + 1 < argc) hdb = argv[++i];
+        else if (!strcmp(argv[i], "-cfolder") && i + 1 < argc) cfolder = argv[++i];
         else if (!strcmp(argv[i], "-bios")    && i + 1 < argc) bios_path = argv[++i];
         else if (!strcmp(argv[i], "-vbios")   && i + 1 < argc) vbios_path = argv[++i];
         else if (!strcmp(argv[i], "-charrom") && i + 1 < argc) charrom_path = argv[++i];
@@ -296,12 +298,12 @@ int main(int argc, char** argv)
         host_log("pcxt: missing -bios/-vbios/-charrom paths");
         return 1;
     }
-    if (!fda && !hda) {
-        host_log("pcxt: no bootable disk image (-fda or -hda)");
+    if (!fda && !hda && !cfolder) {
+        host_log("pcxt: no bootable disk image (-fda / -hda / -cfolder)");
         return 1;
     }
-    printf("[pcxt] fda=%s hda=%s boot=%s mhz=%d audio=%d mouse=%d psram=%u\n",
-           fda ? fda : "-", hda ? hda : "-", boot, mhz, audio_on,
+    printf("[pcxt] fda=%s hda=%s cfolder=%s boot=%s mhz=%d audio=%d mouse=%d psram=%u\n",
+           fda ? fda : "-", hda ? hda : "-", cfolder ? cfolder : "-", boot, mhz, audio_on,
            s_mouse_enabled ? s_mouse_speed : 0,
            (unsigned)host_psram_largest_free());
 
@@ -340,7 +342,9 @@ int main(int argc, char** argv)
 
     if (fda) cfg->loadFD0(fda);
     if (fdb) cfg->loadFD1(fdb);
-    if (hda) cfg->loadHD0(hda);
+    // C: is either a plain image (-hda) or a folder-backed VVFAT disk (-cfolder).
+    if (cfolder)  cfg->diskDriveC = new FolderDisk(cfolder);
+    else if (hda) cfg->loadHD0(hda);
     if (hdb) cfg->loadHD1(hdb);
 
     if      (!strcmp(boot, "a")) cfg->bootDrive = DRIVE_A;
@@ -389,11 +393,10 @@ int main(int argc, char** argv)
 
     // --- Teardown: flush disk images, drop the VM ---
     printf("[pcxt] exiting after %u loops\n", (unsigned)loops);
-    delete vm;              // DriveManager/Config own no files...
-    delete cfg->diskDriveA; // ...FileDisks flush+close in their destructor
-    delete cfg->diskDriveB;
-    delete cfg->diskDriveC;
-    delete cfg->diskDriveD;
+    // ~DriveManager (inside ~VM) deletes every inserted disk — and insertDisk
+    // deletes invalid ones on the spot — so the diskDrive* pointers are NOT
+    // ours to free. The ROM files are only read by VM::init and stay ours.
+    delete vm;
     delete cfg->biosFile;
     delete cfg->videoRomFile;
     delete cfg->asciiFile;

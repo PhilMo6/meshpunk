@@ -31,10 +31,13 @@ $LDFLAGS = @(
     "-L$libdir",
     "-Wl,-e,main",
     "-Wl,--gc-sections",
-    # This codebase trips a BFD assertion (elf32-xtensa.c:3299, binutils
-    # 2.35.1) during xtensa linker relaxation; disable it. Costs a little
-    # code size/speed (longcalls stay indirect), doesn't affect the loader.
-    "-Wl,--no-relax"
+    "-Wl,--no-relax",  # BFD elf32-xtensa relaxation is buggy in this binutils
+    # elf32-xtensa places R_XTENSA_RTLD placeholder relocs at the head of
+    # .rela.got and asserts (elf32-xtensa.c:3288/3299) they are still there in
+    # finish_dynamic_sections — but the default -z combreloc sort runs first
+    # and shuffles them. Disable the sort; our elf_loader walks relocs
+    # linearly and ignores order.
+    "-Wl,-z,nocombreloc"
 )
 
 # Hot paths get -O2; the rest -Os
@@ -50,7 +53,7 @@ $core_sources = Get-ChildItem "$SRC\*.cpp" | Where-Object {
     $exclude -notcontains $_.Name
 } | ForEach-Object { $_.FullName }
 
-$glue_sources = @("tdeck_host.cpp", "main_tdeck.cpp", "cxxstubs.cpp")
+$glue_sources = @("tdeck_host.cpp", "folderdisk.cpp", "main_tdeck.cpp", "cxxstubs.cpp")
 $all_sources = $core_sources + ($glue_sources | ForEach-Object { (Get-Item $_).FullName })
 
 $obj_dir = "obj"

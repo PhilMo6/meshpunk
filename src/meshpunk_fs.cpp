@@ -1,5 +1,6 @@
 #include "meshpunk_fs.h"
 #include "meshpunk_sync.h"
+#include "usb_manager.h"   // UsbFlashGuardIf — pause USB audio around flash writes
 
 #include <SD.h>
 #include <LittleFS.h>
@@ -43,6 +44,11 @@ MeshpunkFile meshpunk_open(const char* path, const char* mode, bool default_sd) 
         sd_spi_take();
         mf.file = SD.open(actual, mode);
     } else {
+        // A "w"/"a"/"r+" open of a LittleFS file writes internal flash
+        // (truncate / create updates metadata) — that stalls the cache, which
+        // crashes an active USB host audio stream. Guarded; no-op when USB
+        // isn't running.
+        UsbFlashGuardIf _g(mode[0] != 'r' || strchr(mode, '+') != nullptr);
         mf.file = LittleFS.open(actual, mode);
     }
 
@@ -74,6 +80,8 @@ bool meshpunk_mkdirs(const char* path, bool default_sd) {
 
     bool ok = true;
     if (use_sd) sd_spi_take();
+    // LittleFS mkdir is an internal-flash (metadata) write — see meshpunk_open.
+    UsbFlashGuardIf _g(!use_sd);
     // Create each directory prefix; the final segment is the file name and
     // is not created.
     for (char* p = buf + 1; *p; p++) {

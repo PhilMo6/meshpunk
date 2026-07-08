@@ -32,11 +32,15 @@ end
 local CFG_PATH = app_dir .. "/controls.cfg"
 local ELF_PATH = find_file("pcxt.app.elf") or sd_app_dir .. "/pcxt.app.elf"
 
-local found_imgs = {}   -- { {name, path}, ... }
+local found_imgs = {}    -- { {name, path}, ... }
 local seen_lower = {}
-local sel_fda = 1       -- index into 1="None", 2.. = found_imgs[i-1]
-local sel_hda = 1
+local found_folders = {} -- { {name, path}, ... } folder-backed C: candidates
+local seen_folder_lower = {}
+local sel_fda = 1        -- index into 1="None", 2.. = found_imgs[i-1]
+local sel_hda = 1        -- index into 1="None", 2.. = hda_choices[i-1]
+local hda_choices = {}   -- imgs then folders: { {kind="img"|"folder", name, path}, ... }
 local sel_fda_name, sel_hda_name = nil, nil
+local sel_hda_folder_name = nil
 local scr = nil
 
 local root = apps.new_root({
@@ -66,6 +70,55 @@ local function scan_dir_for_imgs(dir_path)
             }
         end
     end
+end
+
+-- Subfolders double as C: drives (module synthesizes a FAT16 disk from them).
+local function scan_dir_for_folders(dir_path)
+    local entries = fileman.list(dir_path, {
+        sizes = false,
+        filter = function(e) return e.type == "dir" end,
+    }) or {}
+    for _, e in ipairs(entries) do
+        local low = e.name:lower()
+        if not seen_folder_lower[low] then
+            seen_folder_lower[low] = true
+            found_folders[#found_folders + 1] = {
+                name = e.name,
+                path = dir_path .. "/" .. e.name,
+            }
+        end
+    end
+end
+
+-- FolderDisk manifest: line 1 = folder VFS root, then one line per entry
+-- "relpath<TAB>size<TAB>isdir". The module resolves each entry's parent by
+-- prefix lookup, so a directory must appear before anything inside it
+-- (pre-order walk). Rewritten fresh at every boot.
+local MANIFEST_PATH = app_dir .. "/cdrive.man"
+local MANIFEST_MAX_ENTRIES = 1024
+local function write_cdrive_manifest(folder_path)
+    local f = io.open(MANIFEST_PATH, "w")
+    if not f then return nil end
+    f:write(to_vfs_path(folder_path) .. "\n")
+    local count = 0
+    local function walk(dir, rel, depth)
+        if depth > 8 or count >= MANIFEST_MAX_ENTRIES then return end
+        local entries = fileman.list(dir, { sizes = true }) or {}
+        for _, e in ipairs(entries) do
+            if count >= MANIFEST_MAX_ENTRIES then return end
+            local erel = (rel == "") and e.name or (rel .. "/" .. e.name)
+            count = count + 1
+            if e.type == "dir" then
+                f:write(erel .. "\t0\t1\n")
+                walk(dir .. "/" .. e.name, erel, depth + 1)
+            else
+                f:write(erel .. "\t" .. tostring(e.size or 0) .. "\t0\n")
+            end
+        end
+    end
+    walk(folder_path, "", 1)
+    f:close()
+    return to_vfs_path(MANIFEST_PATH)
 end
 
 -- ============================================================
@@ -201,7 +254,14 @@ local function save_config()
     f:write(string.format("mousespd=%d\n", mouse_speed))
     f:write(string.format("bootsel=%d\n", sel_boot))
     if sel_fda > 1 then f:write("fda=" .. found_imgs[sel_fda - 1].name .. "\n") end
-    if sel_hda > 1 then f:write("hda=" .. found_imgs[sel_hda - 1].name .. "\n") end
+    if sel_hda > 1 then
+        local c = hda_choices[sel_hda - 1]
+        if c and c.kind == "folder" then
+            f:write("hdafolder=" .. c.name .. "\n")
+        elseif c then
+            f:write("hda=" .. c.name .. "\n")
+        end
+    end
     f:close()
 end
 
@@ -245,6 +305,8 @@ local function load_config()
         if fname then sel_fda_name = fname end
         fname = line:match("^hda=(.+)$")
         if fname then sel_hda_name = fname end
+        fname = line:match("^hdafolder=(.+)$")
+        if fname then sel_hda_folder_name = fname end
     end
     return true
 end
@@ -294,6 +356,14 @@ create_main_screen = function()
         img_opts = table.concat(names, "\n")
     end
 
+    -- C: accepts images and folders
+    local hda_names = { "None" }
+    for _, c in ipairs(hda_choices) do
+        hda_names[#hda_names + 1] =
+            (c.kind == "folder") and ("Folder: " .. c.name) or c.name
+    end
+    local hda_opts = table.concat(hda_names, "\n")
+
     local font12 = lvgl.BUILTIN_FONT.MONTSERRAT_12
 
     scr:Label{
@@ -318,7 +388,7 @@ create_main_screen = function()
         align = { type = lvgl.ALIGN.TOP_LEFT, x_ofs = 8, y_ofs = 66 },
     }
     local hdaDd = scr:Dropdown{
-        options = img_opts,
+        options = hda_opts,
         w = 280, h = 26,
         align = { type = lvgl.ALIGN.TOP_LEFT, x_ofs = 30, y_ofs = 60 },
     }
@@ -328,9 +398,9 @@ create_main_screen = function()
         save_config()
     end)
 
-    local has_imgs = #found_imgs > 0
+    local has_imgs = #found_imgs > 0 or #hda_choices > 0
     local status = scr:Label{
-        text = has_imgs and "Ready" or "Place .img disks in S:/dos/",
+        text = has_imgs and "Ready" or "Put .img disks / game folders in S:/dos/",
         text_font = font12,
         text_color = has_imgs and "#888888" or "#FF6666",
         align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 92 },
@@ -356,6 +426,12 @@ create_main_screen = function()
             status:set{ text = "Select a boot disk first!" }
             return
         end
+        local hda_choice = (sel_hda > 1) and hda_choices[sel_hda - 1] or nil
+        if hda_choice and hda_choice.kind == "folder" and sel_fda == 1 then
+            -- Folder C: is a data drive; DOS itself must come off a floppy.
+            status:set{ text = "Folder C: needs a boot floppy in A:" }
+            return
+        end
         status:set{ text = "Booting..." }
         lvgl.Timer{
             period = 50,
@@ -366,11 +442,21 @@ create_main_screen = function()
                     args[#args + 1] = "-fda"
                     args[#args + 1] = to_vfs_path(found_imgs[sel_fda - 1].path)
                 end
-                if sel_hda > 1 then
+                if hda_choice and hda_choice.kind == "folder" then
+                    local man = write_cdrive_manifest(hda_choice.path)
+                    if man then
+                        args[#args + 1] = "-cfolder"
+                        args[#args + 1] = man
+                    end
+                elseif hda_choice then
                     args[#args + 1] = "-hda"
-                    args[#args + 1] = to_vfs_path(found_imgs[sel_hda - 1].path)
+                    args[#args + 1] = to_vfs_path(hda_choice.path)
                 end
-                if BOOTS[sel_boot] ~= "auto" then
+                if hda_choice and hda_choice.kind == "folder" then
+                    -- Folder C: is never bootable — always start from A:
+                    args[#args + 1] = "-boot"
+                    args[#args + 1] = "a"
+                elseif BOOTS[sel_boot] ~= "auto" then
                     args[#args + 1] = "-boot"
                     args[#args + 1] = BOOTS[sel_boot]
                 end
@@ -825,10 +911,12 @@ return function()
         return false
     elseif init_phase == 2 then
         scan_dir_for_imgs(sd_app_dir)
+        scan_dir_for_folders(sd_app_dir)
         return false
     elseif init_phase == 3 then
         if sd_app_dir ~= "S:/dos" then
             scan_dir_for_imgs("S:/dos")
+            scan_dir_for_folders("S:/dos")
         end
         return false
     end
@@ -836,16 +924,29 @@ return function()
     table.sort(found_imgs, function(a, b)
         return a.name:lower() < b.name:lower()
     end)
+    table.sort(found_folders, function(a, b)
+        return a.name:lower() < b.name:lower()
+    end)
+    for _, r in ipairs(found_imgs) do
+        hda_choices[#hda_choices + 1] = { kind = "img", name = r.name, path = r.path }
+    end
+    for _, r in ipairs(found_folders) do
+        hda_choices[#hda_choices + 1] = { kind = "folder", name = r.name, path = r.path }
+    end
     load_config()
-    -- Restore image selections by name
+    -- Restore selections by name
     if sel_fda_name then
         for i, r in ipairs(found_imgs) do
             if r.name == sel_fda_name then sel_fda = i + 1; break end
         end
     end
-    if sel_hda_name then
-        for i, r in ipairs(found_imgs) do
-            if r.name == sel_hda_name then sel_hda = i + 1; break end
+    if sel_hda_name or sel_hda_folder_name then
+        for i, c in ipairs(hda_choices) do
+            if (c.kind == "img" and c.name == sel_hda_name)
+                or (c.kind == "folder" and c.name == sel_hda_folder_name) then
+                sel_hda = i + 1
+                break
+            end
         end
     end
     create_main_screen()

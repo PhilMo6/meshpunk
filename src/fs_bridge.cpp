@@ -27,6 +27,7 @@
 #include "fs_bridge.h"
 #include "meshpunk_fs.h"
 #include "meshpunk_sync.h"
+#include "usb_manager.h"   // UsbFlashGuardIf — pause USB audio around flash writes
 
 #include <Arduino.h>
 #include <FS.h>
@@ -259,6 +260,11 @@ static int lua_fs_mkdir(lua_State* L) {
         return 1;
     }
 
+    // LittleFS directory creation is an internal-flash (metadata) write —
+    // pause USB audio around the whole thing (one pause spans the nested
+    // meshpunk_mkdirs guard too; the guard is recursive).
+    UsbFlashGuardIf _g(!t.is_sd);
+
     // meshpunk_mkdirs treats the last segment as a file name, so it creates
     // exactly the parents; then we create the directory itself.
     meshpunk_mkdirs(raw, /*default_sd=*/false);
@@ -293,6 +299,7 @@ static int lua_fs_remove(lua_State* L) {
         return 2;
     }
 
+    UsbFlashGuardIf _g(!t.is_sd);   // LittleFS remove/rmdir writes flash metadata
     if (t.is_sd) sd_spi_take();
     if (!t.fs->exists(t.path)) {
         if (t.is_sd) sd_spi_release();
@@ -333,6 +340,7 @@ static int lua_fs_rename(lua_State* L) {
         return 2;
     }
 
+    UsbFlashGuardIf _g(!s.is_sd);   // LittleFS rename writes flash metadata
     if (s.is_sd) sd_spi_take();
     bool ok = s.fs->rename(s.path, d.path);
     if (s.is_sd) sd_spi_release();
@@ -365,6 +373,11 @@ static int lua_fs_copy(lua_State* L) {
         return 2;
     }
     bool any_sd = s.is_sd || d.is_sd;
+
+    // LittleFS destination: every chunk write below is an internal-flash
+    // write. Hold the guard across the whole copy — pausing USB audio for a
+    // user-initiated file copy beats crashing the host stack mid-transfer.
+    UsbFlashGuardIf _g(!d.is_sd);
 
     if (any_sd) sd_spi_take();
     File fsrc = s.fs->open(s.path, "r");

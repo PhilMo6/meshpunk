@@ -33,6 +33,27 @@ private:
     bool     m_readOnly = false;
 };
 
+// Read-only "VVFAT": presents a folder tree on the SD card as a FAT16 hard
+// disk (C:), synthesizing the MBR/BPB/FAT/directories on the fly and streaming
+// file bytes from SD on demand. See folderdisk.cpp. Built from a manifest the
+// Lua launcher writes (the module can't enumerate SD directories itself).
+class FolderDisk : public DiskInterface
+{
+public:
+    explicit FolderDisk(const char* manifestPath);
+    virtual ~FolderDisk();
+
+    int read(uint8_t* buffer, unsigned count) override;
+    int write(const uint8_t* buffer, unsigned count) override;
+    uint64_t seek(uint64_t offset) override;
+    uint64_t getSize() override;
+    bool isValid() override;
+
+private:
+    struct Impl;
+    Impl* m_impl;
+};
+
 class TDeckFrameBuffer : public FrameBufferInterface
 {
 public:
