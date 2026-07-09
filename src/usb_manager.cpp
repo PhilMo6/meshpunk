@@ -129,11 +129,12 @@ struct AudioProfile {
 static AudioProfile s_prof;
 
 // ── PCM sink: rate-converting ring between sound.cpp and the ISO stream ─────
-// Producers: sound.cpp mixer tap (core 1) and Audio-lib file tap (core 0) —
-// never simultaneous (the mixer task idles while a file plays), but on
-// different cores, so the ring is guarded by a portMUX spinlock. Samples are
-// resampled to the dongle rate at push time and stored stereo. Consumer: the
-// ISO refill callback in usb_task. Ring lives in PSRAM.
+// Producers: sound.cpp's sound_task (core 1) — the mixer tap while tones or
+// module audio play, or the staged file-playout tap (play_staged) while a
+// file decodes. Same task, so never simultaneous. Consumer: the ISO refill
+// callback in usb_task (core 1, prio 4 — preempts the producer), hence the
+// portMUX spinlock. Samples are resampled to the dongle rate at push time and
+// stored stereo. Ring lives in PSRAM.
 
 #define SINK_FRAMES 8192                 // power of two; ~170 ms at 48 kHz
 #define SINK_MASK   (SINK_FRAMES - 1)
@@ -488,6 +489,15 @@ static void describe_device(uint8_t addr) {
             }
         }
 
+        // Malformed descriptors can advertise a 0 (or junk) sample rate, and
+        // the rate feeds divisions in the resampler and the packet-per-ms
+        // math — reject the profile instead of crashing on the first push.
+        // (The device stays listed; it's just never streamed to.)
+        if (s_prof.rate < 8000) {
+            ulog("bad sample rate %u — audio profile rejected", (unsigned)s_prof.rate);
+            s_prof.valid = false;
+        }
+
         // Patch the cached descriptor so the HCD accepts the claim (host RAM
         // only; the device never sees it).
         usb_ep_desc_t* epw = (usb_ep_desc_t*)s_prof.ep_desc;
@@ -817,14 +827,22 @@ static void usb_task(void*) {
 
 void usb_manager_init(void (*prefs_save_fn)()) {
     s_prefs_save = prefs_save_fn;
-    s_flash_mux  = xSemaphoreCreateMutex();
+    // Recursive: guarded call chains nest (e.g. a guarded prefs save calling
+    // meshpunk_open, which guards its own LittleFS truncate). Only the
+    // OUTERMOST level pauses/resumes the stream — see s_flash_guard_depth.
+    s_flash_mux  = xSemaphoreCreateRecursiveMutex();
 }
 
 // ── Flash-write guard (see header) ───────────────────────────────────────────
 
+// Nesting depth of the current holder. Mutated only while s_flash_mux is held,
+// so no extra locking needed.
+static int s_flash_guard_depth = 0;
+
 void usb_flash_guard_begin() {
     if (!s_flash_mux) return;                 // pre-init: USB can't be up yet
-    xSemaphoreTake(s_flash_mux, portMAX_DELAY);   // serialize; held until end()
+    xSemaphoreTakeRecursive(s_flash_mux, portMAX_DELAY);   // held until end()
+    if (++s_flash_guard_depth > 1) return;    // nested: outer level already paused
     if (!s_running) return;                   // no usb_task — nothing to coordinate
     // Always coordinate with the task when it's alive (even if not streaming
     // yet): the pause_req also blocks a stream from STARTING mid-write.
@@ -834,15 +852,27 @@ void usb_flash_guard_begin() {
     // Also unblocks early if the task is tearing down (s_running clears).
     for (int i = 0; i < 300 && !s_flash_paused && s_running; i++)
         vTaskDelay(pdMS_TO_TICKS(1));
+    // The usb_task can sit in a >300ms control-transfer wait during
+    // enumeration and miss the park request. The ISO callbacks still see
+    // pause_req and stop resubmitting, so wait (bounded) for the in-flight
+    // count itself before letting the caller stall the flash cache.
+    if (s_running && !s_flash_paused) {
+        for (int i = 0; i < 1700 && s_xf_busy > 0 && s_running; i++)
+            vTaskDelay(pdMS_TO_TICKS(1));
+        if (s_xf_busy > 0)
+            ulog("flash guard: ISO drain timed out — write proceeding");
+    }
 }
 
 void usb_flash_guard_end() {
     if (!s_flash_mux) return;
-    if (s_flash_pause_req) {
-        s_flash_pause_req = false;
-        if (s_running && s_client) usb_host_client_unblock(s_client);
+    if (s_flash_guard_depth > 0 && --s_flash_guard_depth == 0) {
+        if (s_flash_pause_req) {
+            s_flash_pause_req = false;
+            if (s_running && s_client) usb_host_client_unblock(s_client);
+        }
     }
-    xSemaphoreGive(s_flash_mux);
+    xSemaphoreGiveRecursive(s_flash_mux);
 }
 
 bool usb_manager_start() {

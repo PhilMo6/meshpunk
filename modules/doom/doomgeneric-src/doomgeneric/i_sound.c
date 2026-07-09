@@ -57,7 +57,7 @@ char *snd_musiccmd = "";
 static sound_module_t *sound_module = NULL;
 static music_module_t *music_module = NULL;
 
-int snd_musicdevice = SNDDEVICE_NONE; // T-Deck: no MIDI synth yet
+int snd_musicdevice = SNDDEVICE_SB;  // T-Deck: OPL music via music_opl_module
 int snd_sfxdevice = SNDDEVICE_SB;    // Enable SFX via DG_sound_module
 
 // DOS-specific options: These are unused but should be maintained
@@ -131,7 +131,9 @@ static void InitSfxModule(boolean use_sfx_prefix)
 static void InitMusicModule(void)
 {
 #ifdef FEATURE_SOUND
-    music_module = &DG_music_module;
+    // T-Deck: OPL FM synth (opl/i_oplmusic.c + dbopl); its audio is
+    // rendered into the SFX mix by i_tdeck_sound.c.
+    music_module = &music_opl_module;
 #endif /* FEATURE_SOUND */
 }
 

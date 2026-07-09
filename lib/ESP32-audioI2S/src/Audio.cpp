@@ -320,10 +320,20 @@ void Audio::setDefaults() {
     vector_clear_and_shrink(m_playlistURL);
     vector_clear_and_shrink(m_playlistContent);
     m_hashQueue.clear(); m_hashQueue.shrink_to_fit(); // uint32_t vector
-    client.stop();
-    client.flush(); // release memory
-    clientsecure.stop();
-    clientsecure.flush();
+    // MESHPUNK: only tear down the network clients when actually connected.
+    // On this core (arduino-esp32 2.x / espressif32@6.11.0) stop_ssl_socket()
+    // ends with memset(ssl_client, 0, ...) and only restores the timeout
+    // fields — the socket member becomes 0 instead of -1. Every subsequent
+    // unconditional clientsecure.stop() then passed the `socket >= 0` guard
+    // and called close(0), freeing global fd slot 0 (stdin). SD song files
+    // inherited fd 0 from the VFS (lowest free slot) and the NEXT track's
+    // setDefaults() closed the playing file out from under the decoder —
+    // ftell/size still answered from cached state, the first fread hit EBADF,
+    // and playback wedged silently after ~2-3 tracks (bar frozen at 0:00).
+    // Local-file playback never touches these clients; real web streaming
+    // still stops them properly via the connected() paths.
+    if (client.connected())       { client.stop();       client.flush(); }
+    if (clientsecure.connected()) { clientsecure.stop(); clientsecure.flush(); }
     _client = static_cast<WiFiClient*>(&client); /* default to *something* so that no NULL deref can happen */
     playI2Sremains();
     ts_parsePacket(0, 0, 0); // reset ts routine

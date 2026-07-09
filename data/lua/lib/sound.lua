@@ -7,6 +7,14 @@ function sound.mute()           return _sound_set_muted(true)        end
 function sound.unmute()         return _sound_set_muted(false)       end
 function sound.isPlaying()      return _sound_is_playing()           end
 
+-- ── File playback introspection (MP3 player) ─────────────────────────────────
+-- Only one file decodes at a time, so these are module-level, not per-object.
+function sound.getPosition()    return _sound_get_pos()              end  -- seconds
+function sound.getDuration()    return _sound_get_duration()         end  -- seconds
+function sound.seek(sec)        return _sound_seek(sec)              end  -- -> bool
+function sound.fileEnded()      return _sound_file_ended()           end  -- true once/track
+function sound.getInfo()        return _sound_get_info()             end  -- {bitrate,samplerate,channels}
+
 function sound.toggleMute()
     if _sound_get_muted() then _sound_set_muted(false)
     else                       _sound_set_muted(true) end

@@ -21,6 +21,13 @@ void exit(int code) {
     longjmp(exit_jmp, 1);
 }
 
+// Vendored code references abort() (dbopl.c defensive default: branches,
+// never reached in practice); the host exports no abort, so trap it too.
+void abort(void) {
+    host_log("doom: abort() called");
+    exit(1);
+}
+
 int main(int argc, char** argv) {
     host_log("doom: module starting");
 

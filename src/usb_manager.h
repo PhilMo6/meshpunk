@@ -53,6 +53,20 @@ struct UsbFlashGuard {
     UsbFlashGuard& operator=(const UsbFlashGuard&) = delete;
 };
 
+// Conditional RAII for call sites whose target is only sometimes internal
+// flash (e.g. an fs::FS* that may be SD or LittleFS). Guard ONLY when the
+// write really hits internal flash: SD writes are SPI (no cache stall), and
+// guarding them would pause the USB audio stream for nothing.
+struct UsbFlashGuardIf {
+    bool active;
+    explicit UsbFlashGuardIf(bool internal_flash) : active(internal_flash) {
+        if (active) usb_flash_guard_begin();
+    }
+    ~UsbFlashGuardIf() { if (active) usb_flash_guard_end(); }
+    UsbFlashGuardIf(const UsbFlashGuardIf&) = delete;
+    UsbFlashGuardIf& operator=(const UsbFlashGuardIf&) = delete;
+};
+
 // ── Prefs (persisted via firmware_prefs in main.cpp) ─────────────────────────
 // Setters do NOT save; the Lua bridge saves after set, the prefs loader
 // calls them bare.

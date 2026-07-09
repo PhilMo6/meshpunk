@@ -559,6 +559,7 @@ void PunkMesh::saveContacts()
     contacts_generation++;  // invalidate the Lua-side contacts cache
 
     bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/contacts.bin");
@@ -603,6 +604,7 @@ void PunkMesh::saveOneContact(const ContactInfo& c)
     if (idx < 0) { saveContacts(); return; }
 
     bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
     String path = storagePath(_storage_prefix, "/contacts.bin");
     File f = _storage->open(path.c_str(), "r+");
@@ -654,6 +656,7 @@ void PunkMesh::loadRoomSync()
 void PunkMesh::saveRoomSync()
 {
     bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/room_sync.bin");
@@ -766,6 +769,7 @@ void PunkMesh::loadPathHistory()
 void PunkMesh::savePathHistory()
 {
     bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/path_hist.bin");
@@ -1041,6 +1045,7 @@ void PunkMesh::appendArchiveEntry(const ContactInfo& c)
 {
     archive_generation++;  // invalidate the Lua-side union cache
     bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/contacts_arch.bin");
@@ -1233,6 +1238,11 @@ int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
     String path = storagePath(_storage_prefix, "/contacts_arch.bin");
     String tmp  = path + ".tmp";
     bool is_sd = (_storage != &LittleFS);
+    // LittleFS backend: passes 2+ and the swap are internal-flash writes and
+    // take the USB flash guard — but per-phase, NOT one guard spanning the
+    // whole function: the guard must never be held while ACQUIRING MESH_LOCK
+    // (the mesh-task append paths take the guard while holding MESH_LOCK, so
+    // the reverse order would deadlock). See the begin/end pairs below.
 
     // ── Pass 0: live-table pubkey prefixes + enter append-only mode ──
     // Transient heap block (4KB @ MAX_CONTACTS=500), not stack — the binding
@@ -1263,6 +1273,7 @@ int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
     uint8_t rec[CONTACT_REC];
 
     // ── Passes 1-2: stream without the mesh lock ──
+    if (!is_sd) usb_flash_guard_begin();   // pass 2 writes .tmp (internal flash)
     if (is_sd) sd_spi_take();
     do {
         if (!_storage->exists(path.c_str())) { rc = -1; break; }
@@ -1317,10 +1328,12 @@ int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
         out.close();
     } while (0);
     if (is_sd) sd_spi_release();
+    if (!is_sd) usb_flash_guard_end();
 
     if (rc == 0) {
         // ── Finish: tail merge + swap, MESH_LOCK then SD lock ──
         MESH_LOCK();
+        if (!is_sd) usb_flash_guard_begin();   // tail writes + swap hit flash
         if (is_sd) sd_spi_take();
 
         File src = _storage->open(path.c_str());
@@ -1372,13 +1385,18 @@ int PunkMesh::compactArchive(uint32_t* before_out, uint32_t* after_out)
         archive_generation++;      // Map union cache + pager windows are stale
 
         if (is_sd) sd_spi_release();
+        if (!is_sd) usb_flash_guard_end();
         MESH_UNLOCK();
     } else {
         // Failed mid-pass: original untouched, drop the .tmp, stay append-only
         // (the safe state) until the next successful compaction or reboot.
-        if (is_sd) sd_spi_take();
-        if (_storage->exists(tmp.c_str())) _storage->remove(tmp.c_str());
-        if (is_sd) sd_spi_release();
+        {
+            UsbFlashGuardIf _gf(!is_sd);   // the remove writes flash metadata;
+                                           // scoped: must end before MESH_LOCK
+            if (is_sd) sd_spi_take();
+            if (_storage->exists(tmp.c_str())) _storage->remove(tmp.c_str());
+            if (is_sd) sd_spi_release();
+        }
         MESH_LOCK();
         arch_idx_reset();
         s_arch_built = false;
@@ -1450,6 +1468,7 @@ void PunkMesh::loadChannels()
 void PunkMesh::saveChannels()
 {
     bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/channels");
@@ -1526,6 +1545,7 @@ void PunkMesh::loadChannelNotify()
 void PunkMesh::saveChannelNotify()
 {
     bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
 
     String path = storagePath(_storage_prefix, "/channel_notify");
@@ -1947,6 +1967,7 @@ static void append_msg_text(fs::FS* storage, const String& prefix,
                             const String& fpath, const StoredMsg& m, int cap) {
     if (!storage) return;
     bool is_sd = (storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
     ensure_messages_dir(storage, prefix);
 
@@ -2031,6 +2052,7 @@ static void append_path_record(fs::FS* storage, const String& msg_log_path,
                                const uint8_t* hash, const ObservedPath& op) {
     if (!storage) return;
     bool is_sd = (storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
     String spath = paths_sidecar_for(msg_log_path);
     size_t sz = 0;
@@ -2243,6 +2265,7 @@ static bool append_routing_record(fs::FS* storage, const String& prefix,
                                   const StoredMsg& m) {
     if (!storage) return false;
     bool is_sd = (storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
     bool new_day = route_write_record(storage, prefix, m);
     if (is_sd) sd_spi_release();
@@ -2585,19 +2608,33 @@ void PunkMesh::pruneStep() {
                         ? now_ts - (uint32_t)_msg_retain_days * 86400u : 0;
         if (_sweep_cutoff == 0) return;
         bool is_sd = (_storage != &LittleFS);
-        MESH_LOCK(); if (is_sd) sd_spi_take();
-        prune_routing_logs(_storage, _storage_prefix, _sweep_cutoff);  // quick deletes
-        _sweep_count = collect_message_logs(_storage, _storage_prefix, _sweep_files, 64);
-        if (is_sd) sd_spi_release(); MESH_UNLOCK();
+        MESH_LOCK();
+        // Guard INSIDE MESH_LOCK — lock order everywhere is MESH_LOCK, then
+        // the flash guard (the mesh-task append paths already take the guard
+        // under MESH_LOCK; taking them in the other order here would deadlock).
+        {
+            UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: deletes write flash
+            if (is_sd) sd_spi_take();
+            prune_routing_logs(_storage, _storage_prefix, _sweep_cutoff);  // quick deletes
+            _sweep_count = collect_message_logs(_storage, _storage_prefix, _sweep_files, 64);
+            if (is_sd) sd_spi_release();
+        }
+        MESH_UNLOCK();
         _sweep_idx = 0;
         _sweep_active = (_sweep_count > 0);
         return;
     }
     if (_sweep_idx >= _sweep_count) { _sweep_active = false; return; }
     bool is_sd = (_storage != &LittleFS);
-    MESH_LOCK(); if (is_sd) sd_spi_take();
-    prune_msg_file_by_age(_storage, _sweep_files[_sweep_idx], _sweep_cutoff);
-    if (is_sd) sd_spi_release(); MESH_UNLOCK();
+    MESH_LOCK();
+    {
+        // Same lock order as above: MESH_LOCK first, flash guard second.
+        UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: rewrite writes flash
+        if (is_sd) sd_spi_take();
+        prune_msg_file_by_age(_storage, _sweep_files[_sweep_idx], _sweep_cutoff);
+        if (is_sd) sd_spi_release();
+    }
+    MESH_UNLOCK();
     _sweep_files[_sweep_idx] = String();   // free the path now
     _sweep_idx++;
     if (_sweep_idx >= _sweep_count) _sweep_active = false;
@@ -4823,6 +4860,11 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
 
     memset(_pending_repeats, 0, sizeof(_pending_repeats));
     memset(_repeat_history, 0, sizeof(_repeat_history));
+    // The PunkMesh object lives on the heap, so members are NOT zeroed:
+    // without this, garbage `active` flags made loop() expire phantom
+    // connections at boot, printing their uninitialized (unterminated)
+    // name buffers as gibberish and queueing bogus CONN_LOST events.
+    memset(_conn_watch, 0, sizeof(_conn_watch));
 
     command[0] = 0;
     curr_recipient = NULL;

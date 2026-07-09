@@ -2,6 +2,7 @@
 #include "Audio.h"
 #include "usb_manager.h"
 #include <driver/i2s.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <math.h>
 #include <freertos/FreeRTOS.h>
@@ -14,9 +15,10 @@ extern "C" {
 #include <lauxlib.h>
 }
 
-struct LuaFileHandle {
+struct LuaFileHandle {   // must match the definition in main.cpp
     fs::File* file;
     bool is_sd;
+    bool is_write;
 };
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -36,6 +38,49 @@ static bool    active_file_is_sd = false;
 // sound_obj_remove/sound_sweep stopSong() before closing a File the streamer
 // is still reading (deleting a playing file object was a latent use-after-free).
 static int     s_active_file_id  = -1;
+
+// Set true by the ESP32-audioI2S end-of-file callback (audio_eof_mp3, defined
+// below) and cleared when a new file starts or when Lua polls _sound_file_ended.
+// Lets the Lua MP3 player auto-advance reliably. Safe because notifications use
+// TONE melodies (notify.cpp), so this callback only fires for app file playback.
+static volatile bool s_file_eof = false;
+
+// ── Staged file-PCM playout (decode/playout split) ────────────────────────────
+// audio_process_extern (fired inside audio->loop() by the decode pump below)
+// copies each decoded 16-bit chunk here and returns continueI2S=false, so the
+// library never blocks on I2S itself. The pump then plays the chunk AFTER
+// releasing s_audio_mutex and the SPI bus lock. Holding those across the I2S
+// DMA pacing wait (~26ms per MP3 frame, ~100% duty cycle with only a ~1µs
+// release window) starved every other waiter — FreeRTOS mutexes don't hand
+// off, so LVGL's flush (SPI, Core 0) and the pos/dur polls (s_audio_mutex)
+// lost the re-acquire race indefinitely: frozen UI while the MP3 kept playing.
+// With the split, the locks cover only the SD read + decode (a few ms) and the
+// pacing wait runs lock-free.
+//
+// History: briefly reverted 2026-07-07 chasing the played-without-USB-first
+// wedge, then RESTORED the same day — the fallback build reproduced that wedge
+// too, exonerating the split (and it had already hw-validated as the fix for
+// the play-over-USB UI freeze). The sequence wedge is a separate bug.
+static int16_t* s_stage        = nullptr;   // PSRAM; sized to the lib's m_outBuff
+static int      s_stage_frames = 0;         // frames staged by the hook this pass
+static int      s_stage_ch     = 2;
+static int      s_stage_rate   = 44100;
+#define STAGE_MAX_FRAMES 2048               // == lib m_outBuff (int16_t[2048*2])
+
+// Lock-free playback introspection. The decode pump refreshes these once per
+// loop() pass while it already holds s_audio_mutex; the Lua bindings read them
+// with no lock at all (aligned 32-bit reads can't tear). Cleared on play/stop/
+// disconnect so a dead track never reports stale times.
+static volatile uint32_t s_snap_pos = 0, s_snap_dur = 0;
+static volatile uint32_t s_snap_br  = 0, s_snap_sr  = 0, s_snap_ch = 0;
+
+// Speaker-gain replica of ESP32-audioI2S playSample(): input halved ("half
+// Vin"), then scaled by volumetable[vol] >> 6. Copying the exact curve keeps
+// the staged path loudness-identical to the lib's own playout. (The lib's IIR
+// tone-control filters are skipped: nothing here ever sets them, so they're
+// flat pass-throughs.)
+static const uint8_t kVolTable[22] = { 0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 17,
+                                       20, 23, 27, 30, 34, 38, 43, 48, 52, 58, 64 };
 
 static const uint32_t TONE_SR = 44100;
 static bool tone_sr_set = false;
@@ -62,6 +107,40 @@ static volatile bool     s_sound_suspended = false;  // I2S halted for native mo
 
 extern void sd_spi_release();   // sd_spi_take() is inline in meshpunk_sync.h
 
+// ── Playback diagnostics (permanent) ─────────────────────────────────────────
+// Lock-free counters bumped on the hot paths; read by the _sound_debug Lua
+// binding (the Tools/USB app shows a live line — the only window into the
+// pump when USB host mode has serial disabled) and by the pump's stall
+// detector, which prints the hidden decoder state to SLog when isRunning is
+// true but nothing has moved for 2s. Earned their keep in the 2026-07-08
+// every-3rd-track wedge hunt (see the MESHPUNK patch in vendored Audio.cpp:
+// the lib's setDefaults() closed fd 0 every track via a core ssl bug, and SD
+// songs inheriting fd 0 were closed out from under the decoder — the STALL
+// line's fpos=-1 + libsize-intact signature identifies exactly that class).
+static volatile uint32_t s_dbg_pass_decode = 0;  // decode-branch passes
+static volatile uint32_t s_dbg_pass_mixer  = 0;  // mixer-branch passes
+static volatile uint32_t s_dbg_staged      = 0;  // chunks staged by the hook
+static volatile uint32_t s_dbg_played      = 0;  // chunks played by play_staged
+static volatile uint32_t s_dbg_i2s_short   = 0;  // short/timed-out I2S writes
+static volatile uint32_t s_dbg_eof         = 0;  // audio_eof_mp3 fires
+static volatile uint32_t s_dbg_inbuff      = 0;  // lib InBuff fill (bytes)
+static volatile uint32_t s_dbg_filepos     = 0;  // decoder file position
+static volatile uint32_t s_dbg_fsize       = 0;  // lib's audiofile.size() (0 = invalid)
+
+// ESP32-audioI2S info hook (weak in Audio.h). The library narrates its whole
+// lifecycle through this — decoder allocs (with free-heap!), "stream ready",
+// file close, sync/decode errors. Mirror it to serial: it is the primary
+// evidence channel for the per-track wedge.
+void audio_info(const char* s) { SLog.printf("[AUDIO] %s\n", s); }
+
+// ESP32-audioI2S end-of-file hook (weak in Audio.h). Fired by the decode pump
+// when the current file finishes; the Lua player polls _sound_file_ended().
+void audio_eof_mp3(const char* name) {
+    s_file_eof = true;
+    s_dbg_eof++;
+    SLog.printf("[SOUND] EOF %s\n", name ? name : "?");
+}
+
 // ── External audio ring buffer (mono → upsampled to 44100 Hz stereo) ──────────
 #define EXTERN_RING_SIZE 4096
 static int16_t s_extern_ring[EXTERN_RING_SIZE];
@@ -81,6 +160,10 @@ void sound_init(Audio* audio_ptr, void (*prefs_save_fn)()) {
     s_prefs_save = prefs_save_fn;
     s_sound_mutex = xSemaphoreCreateMutex();
     s_audio_mutex = xSemaphoreCreateMutex();
+    // Staging buffer for the decode/playout split. If PSRAM ever fails here,
+    // the hook leaves continueI2S=true and the lib plays I2S itself (the old
+    // locks-held-while-pacing behavior) — degraded but functional.
+    s_stage = (int16_t*)ps_malloc(STAGE_MAX_FRAMES * 2 * sizeof(int16_t));
     // 12KB stack: a pull-model ELF module's synth (sound_extern_set_pull)
     // runs its code on this task, on top of the mixer's ~4KB of locals.
     xTaskCreatePinnedToCore(
@@ -221,6 +304,8 @@ static void sound_obj_remove(int id) {
     if (obj && obj->type == SoundObject::AUDIO_FILE && obj->id == s_active_file_id) {
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
         s_audio->stopSong();
+        s_snap_pos = 0; s_snap_dur = 0;
+        s_snap_br  = 0; s_snap_sr  = 0; s_snap_ch = 0;
         xSemaphoreGive(s_audio_mutex);
         active_file_is_sd = false;
         s_active_file_id  = -1;
@@ -230,7 +315,11 @@ static void sound_obj_remove(int id) {
     if (obj->type == SoundObject::TONE && obj->pcm_buffer)
         free(obj->pcm_buffer);
     if (obj->type == SoundObject::AUDIO_FILE && obj->file) {
+        // Closing an SD file is SPI traffic (directory-entry flush) — take the
+        // bus lock or this Core-0 close races the radio on Core 1.
+        if (obj->file_is_sd) sd_spi_take();
         obj->file->close();
+        if (obj->file_is_sd) sd_spi_release();
         delete obj->file;
     }
     delete obj;
@@ -779,12 +868,29 @@ void sound_play(int id) {
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
         s_audio->stopSong();
         active_file_is_sd = false;
+        s_file_eof = false;          // fresh track: drop any stale end-of-file flag
+        // The seek and connect touch the file (FAT walk; header probe/close on
+        // a failed decoder init) — SD SPI traffic that must hold the bus lock
+        // or it races the radio's transactions on Core 1. Lock order matches
+        // the decode pump: s_audio_mutex OUTER, SPI INNER. (stopSong above
+        // never touches external Files — the lib skips the close for them.)
+        if (obj->file_is_sd) sd_spi_take();
         obj->file->seek(0);
         obj->file_paused = false;
-        s_audio->connectToFile(*obj->file);
+        bool conn_ok = s_audio->connectToFile(*obj->file);
+        if (obj->file_is_sd) sd_spi_release();
         active_file_is_sd = obj->file_is_sd;
         s_active_file_id  = obj->id;
+        s_snap_pos = 0; s_snap_dur = 0;
+        s_snap_br  = 0; s_snap_sr  = 0; s_snap_ch = 0;
+        bool running_now = s_audio->isRunning();
         xSemaphoreGive(s_audio_mutex);
+        // Permanent diagnostic: a silent connect failure looks exactly like a
+        // frozen player (Lua's play() has no return path for it), so log it.
+        SLog.printf("[SOUND] play id=%d objs=%d connect=%s running=%d heap=%u largest=%u\n",
+                    id, sound_obj_count, conn_ok ? "OK" : "FAILED", (int)running_now,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
     xSemaphoreGive(s_sound_mutex);
     if (is_tone && s_sound_task) xTaskNotifyGive(s_sound_task);
@@ -800,6 +906,8 @@ void sound_stop(int id) {
     } else {
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
         s_audio->stopSong();
+        s_snap_pos = 0; s_snap_dur = 0;
+        s_snap_br  = 0; s_snap_sr  = 0; s_snap_ch = 0;
         xSemaphoreGive(s_audio_mutex);
         active_file_is_sd = false;
         obj->file_paused  = false;
@@ -837,6 +945,94 @@ void sound_set_loop(int id, bool loop) {
 
 // ── Sound task (Core 1) ──────────────────────────────────────────────────────
 
+// Play one staged file chunk: mix active notification tones, mirror to USB,
+// apply the speaker volume, expand mono, and do the blocking DMA-paced I2S
+// write. Runs on the decode pump with NO locks held except a short
+// s_sound_mutex window for the tone registry — the pacing wait (the bulk of
+// each cycle) leaves s_audio_mutex and the SPI bus free for the UI/radio.
+static void play_staged() {
+    int frames = s_stage_frames;
+    int ch     = s_stage_ch;
+    int rate   = s_stage_rate > 0 ? s_stage_rate : 44100;
+    s_stage_frames = 0;
+
+    // ── Mix tones (notifications during file playback) ──────────────────
+    // Tone PCM is 44.1k interleaved stereo; step it by 44100/file-rate per
+    // output frame so pitch survives 48k/22k files. The sub-frame remainder
+    // resets each chunk (≤1 frame drift per ~26ms chunk — inaudible; exact
+    // at 44.1k). Replaces the old audio_process_extern mix, which treated the
+    // frame count as an int16 count and only covered half of each chunk.
+    xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
+    for (int i = 0; i < sound_obj_count; i++) {
+        SoundObject* o = sound_objects[i];
+        if (o->type != SoundObject::TONE || !o->tone_playing || o->tone_paused) continue;
+        uint32_t step = ((uint32_t)44100 << 8) / (uint32_t)rate;   // .8 fixed point
+        uint32_t acc  = 0;
+        for (int f = 0; f < frames; f++) {
+            if (o->play_pos >= o->sample_count) {
+                if (o->tone_loop) { o->play_pos = 0; }
+                else { o->tone_playing = false; o->play_pos = 0; break; }
+            }
+            int32_t tl = o->pcm_buffer[o->play_pos];
+            int32_t tr = (o->play_pos + 1 < o->sample_count)
+                       ? o->pcm_buffer[o->play_pos + 1] : tl;
+            if (ch == 2) {
+                int32_t l = (int32_t)s_stage[f * 2]     + tl;
+                int32_t r = (int32_t)s_stage[f * 2 + 1] + tr;
+                s_stage[f * 2]     = (int16_t)constrain(l, -32768, 32767);
+                s_stage[f * 2 + 1] = (int16_t)constrain(r, -32768, 32767);
+            } else {
+                int32_t m = (int32_t)s_stage[f] + ((tl + tr) >> 1);
+                s_stage[f] = (int16_t)constrain(m, -32768, 32767);
+            }
+            acc += step;
+            o->play_pos += (int)(acc >> 8) * 2;   // whole tone FRAMES consumed
+            acc &= 0xFF;
+        }
+    }
+    xSemaphoreGive(s_sound_mutex);
+
+    // ── USB mirror ───────────────────────────────────────────────────────
+    // Pre-volume, native rate/channels — same feed the in-lib tap always gave
+    // it (the USB sink applies the system volume at playout). Now runs with
+    // the SPI/audio locks already released.
+    bool silence_spk = usb_audio_push(s_stage, frames, rate, ch);
+
+    // ── Speaker: lib-identical gain, mono→stereo, paced write ────────────
+    // Written in small slices so the stack buffer stays tiny. The blocking
+    // i2s_write here is the pacing point for the entire decode loop —
+    // deliberately outside every lock. When USB owns the output the slices
+    // are zeroed but still written: the DMA drain is what paces decoding.
+    int16_t slice[256 * 2];
+    uint8_t vol = sound_volume > 21 ? 21 : sound_volume;
+    int32_t g   = sound_muted ? 0 : kVolTable[vol];
+    int done = 0;
+    while (done < frames) {
+        int n = frames - done;
+        if (n > 256) n = 256;
+        if (silence_spk || g == 0) {
+            memset(slice, 0, (size_t)n * 2 * sizeof(int16_t));
+        } else {
+            for (int f = 0; f < n; f++) {
+                int32_t l, r;
+                if (ch == 2) { l = s_stage[(done + f) * 2]; r = s_stage[(done + f) * 2 + 1]; }
+                else         { l = r = s_stage[done + f]; }
+                // playSample() replica: half Vin, then volumetable gain >> 6.
+                slice[f * 2]     = (int16_t)(((l >> 1) * g) >> 6);
+                slice[f * 2 + 1] = (int16_t)(((r >> 1) * g) >> 6);
+            }
+        }
+        size_t written = 0;
+        i2s_write(I2S_NUM_0, slice, (size_t)n * 2 * sizeof(int16_t), &written,
+                  pdMS_TO_TICKS(100));
+        done += n;
+        // Short write = I2S halted under us (native-module suspend or stop
+        // race). Drop the remainder rather than spin.
+        if (written < (size_t)n * 2 * sizeof(int16_t)) { s_dbg_i2s_short++; break; }
+    }
+    s_dbg_played++;
+}
+
 static void sound_task_body(void* param) {
     const int CHUNK = 256;
 
@@ -849,18 +1045,67 @@ static void sound_task_body(void* param) {
 
         if (s_audio->isRunning()) {
             // File decode runs HERE on Core 1 — moved off Core 0's loop() so a
-            // heavy MP3/FLAC decode can't stutter LVGL/Lua (the convention:
-            // anything that can interfere with the Core-0 UI moves to Core 1).
-            // s_audio_mutex serializes the decoder against Lua play/stop/pause
-            // (Core 0) and notify (Core 1). audio->loop() blocks on the I2S DMA
-            // for pacing, so this task is naturally rate-limited here.
+            // heavy MP3/FLAC decode can't stutter LVGL/Lua. s_audio_mutex
+            // serializes the decoder against Lua play/stop/pause (Core 0) and
+            // notify (Core 1). The locks cover ONLY the SD read + decode:
+            // audio_process_extern stages the decoded PCM and skips the lib's
+            // own I2S write, so the DMA pacing wait happens in play_staged()
+            // below with both locks released. (Holding them across the pacing
+            // wait starved the Core-0 flush/poll waiters — the frozen-UI bug.)
             tone_sr_set = false;
+            s_stage_frames = 0;
+            s_dbg_pass_decode++;
             xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
             if (s_audio->isRunning()) {          // re-check: may have been stopped
                 if (active_file_is_sd) { sd_spi_take(); s_audio->loop(); sd_spi_release(); }
                 else                   { s_audio->loop(); }
+                // Refresh the lock-free introspection snapshot while the
+                // decoder is still ours (see the Lua bindings).
+                s_snap_pos = s_audio->getAudioCurrentTime();
+                s_snap_dur = s_audio->getAudioFileDuration();
+                s_snap_br  = s_audio->getBitRate();
+                s_snap_sr  = s_audio->getSampleRate();
+                s_snap_ch  = s_audio->getChannels();
+                s_dbg_inbuff  = s_audio->inBufferFilled();
+                s_dbg_filepos = s_audio->getFilePos();
+                s_dbg_fsize   = s_audio->getFileSize();
             }
             xSemaphoreGive(s_audio_mutex);
+            if (s_stage_frames > 0) {
+                play_staged();       // pacing happens here, no locks held
+            } else {
+                // No PCM this pass: prefill/header parse, the lib's MP3/FLAC
+                // decode-spreading skip (only every Nth pass decodes), or a
+                // non-16-bit file on the in-lib path. Sleep one tick — bounds
+                // the spin AND guarantees a real window in which Core-0/mesh
+                // waiters can take the locks this loop cycles.
+                vTaskDelay(1);
+            }
+            // Stall detector (wedge hunt): isRunning is true but neither the
+            // play position nor the staged-chunk count has moved for 2s —
+            // print the state the wedge hides in, at most once per 5s.
+            {
+                static uint32_t last_pos = 0, last_staged = 0;
+                static uint32_t quiet_since = 0, last_print = 0;
+                uint32_t now = millis();
+                if (quiet_since == 0 ||
+                    s_snap_pos != last_pos || s_dbg_staged != last_staged) {
+                    // (quiet_since==0: first-ever pass — arm the baseline so
+                    // track 1 doesn't trip a false STALL at boot.)
+                    last_pos = s_snap_pos; last_staged = s_dbg_staged;
+                    quiet_since = now;
+                } else if (now - quiet_since > 2000 && now - last_print > 5000) {
+                    last_print = now;
+                    SLog.printf("[SOUND] STALL pos=%u dur=%u sr=%u inbuff=%u fpos=%d "
+                                "libsize=%u staged=%u played=%u short=%u dec=%u mix=%u\n",
+                                (unsigned)s_snap_pos, (unsigned)s_snap_dur,
+                                (unsigned)s_snap_sr, (unsigned)s_dbg_inbuff,
+                                (int)s_dbg_filepos, (unsigned)s_dbg_fsize,
+                                (unsigned)s_dbg_staged,
+                                (unsigned)s_dbg_played, (unsigned)s_dbg_i2s_short,
+                                (unsigned)s_dbg_pass_decode, (unsigned)s_dbg_pass_mixer);
+                }
+            }
             continue;
         }
 
@@ -888,6 +1133,7 @@ static void sound_task_body(void* param) {
         // ring drains between sounds and each new sound starts into an empty
         // ring — the click heard on the sound-settings test buttons.
 
+        s_dbg_pass_mixer++;   // productive mixer pass (not the idle-sleep path)
         if (!tone_sr_set) {
             i2s_set_sample_rates(I2S_NUM_0, TONE_SR);
             tone_sr_set = true;
@@ -1002,32 +1248,32 @@ static void sound_task_body(void* param) {
 void sound_tone_tick() {}
 
 void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
-    if (xSemaphoreTake(s_sound_mutex, 0) != pdTRUE) {
-        *continueI2S = true;
+    // Fired from sendBytes() inside audio->loop() — i.e. on the Core-1 decode
+    // pump, with s_audio_mutex (and the SPI lock for SD files) held. `len` is
+    // FRAMES; buff is interleaved at the file's native channel count.
+    //
+    // Divert 16-bit playback into the staging buffer and skip the library's
+    // playChunk(): its blocking I2S write must not run under those locks (see
+    // the staging notes at the top). Tone mixing, the USB mirror, volume and
+    // the paced I2S write all happen in play_staged() after the locks drop.
+    // Non-16-bit files (8-bit WAV) stay on the in-lib path: their m_outBuff
+    // packing is byte-oriented and they're rare — the pump's no-PCM tick delay
+    // still gives lock waiters a window each pass. (No tones/USB mirror on
+    // that path.)
+    if (s_stage && len > 0 && s_audio->getBitsPerSample() == 16) {
+        int ch = s_audio->getChannels();
+        if (ch < 1) ch = 1;
+        if (ch > 2) ch = 2;
+        int frames = len;
+        if (frames > STAGE_MAX_FRAMES) frames = STAGE_MAX_FRAMES;
+        memcpy(s_stage, buff, (size_t)frames * ch * sizeof(int16_t));
+        s_stage_frames = frames;
+        s_stage_ch     = ch;
+        s_stage_rate   = (int)s_audio->getSampleRate();
+        s_dbg_staged++;
+        *continueI2S = false;
         return;
     }
-    for (int i = 0; i < sound_obj_count; i++) {
-        SoundObject* o = sound_objects[i];
-        if (o->type != SoundObject::TONE || !o->tone_playing || o->tone_paused) continue;
-        for (uint16_t s = 0; s < len; s++) {
-            if (o->play_pos >= o->sample_count) {
-                if (o->tone_loop) { o->play_pos = 0; }
-                else { o->tone_playing = false; o->play_pos = 0; break; }
-            }
-            int32_t mixed = (int32_t)buff[s] + (int32_t)o->pcm_buffer[o->play_pos++];
-            buff[s] = (int16_t)constrain(mixed, -32768, 32767);
-        }
-    }
-    xSemaphoreGive(s_sound_mutex);
-
-    // Mirror file playback to a USB DAC when routed. This runs on Core 0 from
-    // the Audio library while a file decodes (the mixer task idles then), so
-    // `buff` is interleaved at the file's native rate/channels. continueI2S
-    // stays true so playChunk's DMA write still paces decoding.
-    int ch = s_audio->getChannels();
-    if (usb_audio_push(buff, len, (int)s_audio->getSampleRate(), ch ? ch : 2))
-        memset(buff, 0, (size_t)len * (ch ? ch : 2) * sizeof(int16_t));
-
     *continueI2S = true;
 }
 
@@ -1061,6 +1307,68 @@ void sound_register_lua(lua_State* L) {
     });
     lua_register(L, "_sound_is_playing", [](lua_State* L) -> int {
         lua_pushboolean(L, sound_is_playing() ? 1 : 0);
+        return 1;
+    });
+
+    // ── File playback introspection (for the MP3 player) ──────────────────────
+    // Reads come from the volatile snapshot the decode pump refreshes each
+    // pass — no mutex. The pump used to hold s_audio_mutex near-continuously,
+    // so a blocking read here could stall the UI task for a decode cycle (or,
+    // pre-split, forever). Times are in whole seconds.
+    lua_register(L, "_sound_get_pos", [](lua_State* L) -> int {
+        lua_pushinteger(L, (lua_Integer)s_snap_pos);
+        return 1;
+    });
+    lua_register(L, "_sound_get_duration", [](lua_State* L) -> int {
+        lua_pushinteger(L, (lua_Integer)s_snap_dur);
+        return 1;
+    });
+    lua_register(L, "_sound_seek", [](lua_State* L) -> int {
+        int sec = luaL_checkinteger(L, 1);
+        if (sec < 0) sec = 0;
+        // Mutates decoder state, so it takes s_audio_mutex like play/stop. No
+        // SPI lock needed: setAudioPlayPosition only records m_resumeFilePos;
+        // the actual file seek happens on the pump's next pass, under its SPI
+        // bracket.
+        xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
+        bool ok = s_audio->setAudioPlayPosition((uint16_t)sec);
+        xSemaphoreGive(s_audio_mutex);
+        lua_pushboolean(L, ok ? 1 : 0);
+        return 1;
+    });
+    // Returns true exactly once per finished file (self-clearing). Clear only
+    // after observing true: an unconditional clear could wipe an EOF the
+    // Core-1 pump sets between our read and the store, losing an auto-advance.
+    lua_register(L, "_sound_file_ended", [](lua_State* L) -> int {
+        bool ended = s_file_eof;
+        if (ended) s_file_eof = false;
+        lua_pushboolean(L, ended ? 1 : 0);
+        return 1;
+    });
+    lua_register(L, "_sound_get_info", [](lua_State* L) -> int {
+        lua_newtable(L);
+        lua_pushinteger(L, (lua_Integer)s_snap_br); lua_setfield(L, -2, "bitrate");
+        lua_pushinteger(L, (lua_Integer)s_snap_sr); lua_setfield(L, -2, "samplerate");
+        lua_pushinteger(L, (lua_Integer)s_snap_ch); lua_setfield(L, -2, "channels");
+        return 1;
+    });
+    // Wedge-hunt instrumentation (see the s_dbg_* block). Lock-free reads; the
+    // Tools/USB app shows a compact line so the pump state is visible even
+    // when USB host mode has serial disabled.
+    lua_register(L, "_sound_debug", [](lua_State* L) -> int {
+        lua_newtable(L);
+        lua_pushboolean(L, s_audio->isRunning() ? 1 : 0); lua_setfield(L, -2, "running");
+        lua_pushinteger(L, (lua_Integer)s_dbg_pass_decode); lua_setfield(L, -2, "dec");
+        lua_pushinteger(L, (lua_Integer)s_dbg_pass_mixer);  lua_setfield(L, -2, "mix");
+        lua_pushinteger(L, (lua_Integer)s_dbg_staged);      lua_setfield(L, -2, "staged");
+        lua_pushinteger(L, (lua_Integer)s_dbg_played);      lua_setfield(L, -2, "played");
+        lua_pushinteger(L, (lua_Integer)s_dbg_i2s_short);   lua_setfield(L, -2, "short");
+        lua_pushinteger(L, (lua_Integer)s_dbg_eof);         lua_setfield(L, -2, "eof");
+        lua_pushinteger(L, (lua_Integer)s_dbg_inbuff);      lua_setfield(L, -2, "inbuff");
+        lua_pushinteger(L, (lua_Integer)s_dbg_filepos);     lua_setfield(L, -2, "fpos");
+        lua_pushinteger(L, (lua_Integer)s_snap_pos);        lua_setfield(L, -2, "pos");
+        lua_pushinteger(L, (lua_Integer)s_snap_dur);        lua_setfield(L, -2, "dur");
+        lua_pushinteger(L, (lua_Integer)sound_obj_count);   lua_setfield(L, -2, "objs");
         return 1;
     });
 

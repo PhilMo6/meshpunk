@@ -9,17 +9,21 @@ $SIZE = "$toolchain\xtensa-esp32s3-elf-size.exe"
 $DG = "doomgeneric-src/doomgeneric"
 $OUT = "doom.app.elf"
 
-# Common compiler flags
+# Common compiler flags (per-file -Os/-O2 chosen below)
 $CFLAGS = @(
     "-shared", "-fPIC", "-fno-common",
-    "-Os", "-mlongcalls",
+    "-mlongcalls",
     "-DDOOMGENERIC_RESX=320",
     "-DDOOMGENERIC_RESY=200",
-    "-I$DG",
+    "-DNDEBUG",                # assert() in vendored opl/ code would pull __assert_func
+    "-I$DG", "-Iopl",
     "-Wno-implicit-function-declaration",
     "-Wno-int-conversion",
     "-Wno-pointer-to-int-cast"
 )
+
+# Hot audio path gets -O2 (pcxt precedent); everything else -Os
+$hot = @("dbopl.c", "opl_tdeck.c")
 
 $LDFLAGS = @(
     "-nostartfiles", "-nodefaultlibs", "-nostdlib",
@@ -49,7 +53,16 @@ $tdeck_sources = @(
     "i_tdeck_sound.c"
 )
 
-$all_sources = $tdeck_sources + $dg_sources
+# OPL music: chocolate-doom 2.2.1 player + DBOPL synth + T-Deck backend
+$opl_sources = @(
+    "opl/opl_tdeck.c",
+    "opl/dbopl.c",
+    "opl/opl_queue.c",
+    "opl/i_oplmusic.c",
+    "opl/midifile.c"
+)
+
+$all_sources = $tdeck_sources + $opl_sources + $dg_sources
 
 Write-Host "Compiling Doom module ($($all_sources.Count) source files)..."
 Write-Host "  Resolution: 320x200"
@@ -71,8 +84,10 @@ foreach ($src in $all_sources) {
         continue
     }
 
-    Write-Host "  CC $name.c"
-    & $CC $CFLAGS -c -o $obj $src
+    $srcname = [System.IO.Path]::GetFileName($src)
+    $opt = if ($hot -contains $srcname) { "-O2" } else { "-Os" }
+    Write-Host "  CC $name.c ($opt)"
+    & $CC $CFLAGS $opt -c -o $obj $src
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  FAILED: $name.c"
         $failed = $true
@@ -90,6 +105,16 @@ Write-Host "Linking..."
 if ($LASTEXITCODE -eq 0) {
     $size = (Get-Item $OUT).Length
     Write-Host "Success: $OUT ($([math]::Round($size/1024, 1)) KB)"
+
+    # Every UND symbol must be resolvable from host_exports[] in src/elf_host.cpp
+    Write-Host ""
+    Write-Host "Undefined symbols (each must be a host export):"
+    & $READELF --dyn-syms $OUT | Select-String "\bUND\b" | ForEach-Object {
+        $parts = ($_ -replace '\s+', ' ').Trim().Split(' ')
+        $sym = $parts[$parts.Length - 1]
+        if ($sym -and $sym -ne "UND") { Write-Host "  $sym" }
+    }
+    Write-Host ""
 
     # Copy to LittleFS data dir so it's included in firmware flash
     $dest = "..\..\data\lua\apps\Games\Doom\doom.app.elf"

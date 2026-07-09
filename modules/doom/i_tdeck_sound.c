@@ -1,8 +1,9 @@
 // T-Deck sound driver for Doom — implements sound_module_t.
-// Mixes up to 8 SFX channels at 11025 Hz mono and pushes the result
-// to the firmware via host_audio_push(), where it is upsampled to
-// 44100 Hz stereo and mixed with notification tones.
-// Music is not handled here (use -nomusic on the command line).
+// Mixes up to 8 SFX channels plus OPL FM music at 22050 Hz mono and
+// pushes the result to the firmware via host_audio_push(), where it is
+// upsampled to 44100 Hz stereo and mixed with notification tones.
+// Music (music_opl_module, opl/i_oplmusic.c) renders into the same mix
+// buffer via OPL_TDeck_Mix() — see opl/opl_tdeck.c.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +21,11 @@
 #include "w_wad.h"
 #include "z_zone.h"
 
-// Host function provided by the firmware
+#include "opl_tdeck.h"
+
+// Host functions provided by the firmware
 extern void host_audio_push(const int16_t* samples, int count, int sample_rate);
+extern uint32_t host_get_ticks_ms(void);
 
 // Required by i_sound.c I_BindSoundVariables() when FEATURE_SOUND is enabled.
 // We don't use libsamplerate — these just need to exist to satisfy the linker.
@@ -29,8 +33,7 @@ int use_libsamplerate = 0;
 float libsamplerate_scale = 0.65f;
 
 #define NUM_CHANNELS     8
-#define MIX_RATE         11025
-#define MIX_SAMPLES_PER_TIC  (MIX_RATE / 35)  // 315 samples per game tic
+#define MIX_RATE         OPL_TDECK_MIX_RATE   // 22050 — shared with the OPL synth
 
 // Per-channel state
 typedef struct {
@@ -162,14 +165,19 @@ static boolean I_TDeck_SoundIsPlaying(int channel)
 // number of samples the elapsed wall-clock time demands.  This keeps the audio
 // output rate at MIX_RATE regardless of game performance.
 
-#define MAX_MIX_SAMPLES 2048  // cap per call (~186 ms at 11025 Hz)
+#define MAX_MIX_SAMPLES OPL_TDECK_MAX_SAMPLES  // cap per call (~93 ms at 22050 Hz)
 
 static uint32_t s_last_mix_ms = 0;
 
-static void I_TDeck_UpdateSound(void)
-{
-    if (!sound_initialized) return;
+// Static (module BSS, PSRAM-backed) rather than stack: 12 KB combined.
+static int32_t mix32[MAX_MIX_SAMPLES];
+static int16_t mixbuf[MAX_MIX_SAMPLES];
 
+// Core mixer, shared by the SFX module's Update and the music-only Poll
+// pump (with -nosfx the engine has no sound module to drive the mixer, so
+// music_opl_module.Poll calls this instead — see I_TDeck_MusicPoll).
+static void I_TDeck_MixAndPush(void)
+{
     // Compute how many samples are needed based on real elapsed time.
     uint32_t now = host_get_ticks_ms();
     if (s_last_mix_ms == 0) { s_last_mix_ms = now; return; }
@@ -182,7 +190,6 @@ static void I_TDeck_UpdateSound(void)
     if (num_samples > MAX_MIX_SAMPLES) num_samples = MAX_MIX_SAMPLES;
 
     // Use int32_t for accumulation to avoid clipping when multiple channels mix.
-    int32_t mix32[MAX_MIX_SAMPLES];
     memset(mix32, 0, num_samples * sizeof(int32_t));
 
     for (int c = 0; c < NUM_CHANNELS; c++) {
@@ -210,8 +217,10 @@ static void I_TDeck_UpdateSound(void)
         }
     }
 
+    // Add FM music (sample-accurate MIDI sequencing happens inside).
+    OPL_TDeck_Mix(mix32, num_samples);
+
     // Clamp and convert to int16_t for output
-    int16_t mixbuf[MAX_MIX_SAMPLES];
     for (int i = 0; i < num_samples; i++) {
         int32_t v = mix32[i];
         if (v > 32767)  v = 32767;
@@ -221,6 +230,24 @@ static void I_TDeck_UpdateSound(void)
 
     // Push mixed buffer to firmware
     host_audio_push(mixbuf, num_samples, MIX_RATE);
+}
+
+static void I_TDeck_UpdateSound(void)
+{
+    if (!sound_initialized) return;
+    I_TDeck_MixAndPush();
+}
+
+// music_module_t Poll — runs every I_UpdateSound. With SFX enabled the
+// engine already drives the mixer via sound_module->Update, so this only
+// takes over when the SFX module is absent (-nosfx, music still on).
+// The channels[] array is all-zero then, so only music is mixed.
+void I_TDeck_MusicPoll(void)
+{
+    if (!sound_initialized)
+    {
+        I_TDeck_MixAndPush();
+    }
 }
 
 static void I_TDeck_PrecacheSounds(sfxinfo_t* sounds, int num_sounds)
@@ -256,25 +283,7 @@ sound_module_t DG_sound_module = {
     I_TDeck_PrecacheSounds,
 };
 
-// ── Stub music module (no MIDI synth — use -nomusic) ────────────────────────
-
-static boolean  MusicInit(void)         { return true; }
-static void     MusicShutdown(void)     {}
-static void     MusicSetVol(int v)      { (void)v; }
-static void     MusicPause(void)        {}
-static void     MusicResume(void)       {}
-static void*    MusicRegister(void* d, int l) { (void)d; (void)l; return NULL; }
-static void     MusicUnregister(void* h) { (void)h; }
-static void     MusicPlay(void* h, boolean l) { (void)h; (void)l; }
-static void     MusicStop(void)         {}
-static boolean  MusicPlaying(void)      { return false; }
-static void     MusicPoll(void)         {}
-
-music_module_t DG_music_module = {
-    NULL, 0,
-    MusicInit, MusicShutdown, MusicSetVol, MusicPause, MusicResume,
-    MusicRegister, MusicUnregister, MusicPlay, MusicStop, MusicPlaying,
-    MusicPoll,
-};
+// Music is provided by music_opl_module (opl/i_oplmusic.c), selected in
+// i_sound.c InitMusicModule(); its synth output is mixed in above.
 
 #endif /* FEATURE_SOUND */

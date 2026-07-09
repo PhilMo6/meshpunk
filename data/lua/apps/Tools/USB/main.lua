@@ -84,6 +84,9 @@ local log_panel = content:Object {
 local log_lbl = log_panel:Label { text = "(no output yet)", w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT }
 
 local heap_lbl = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
+-- Sound-pump debug line (wedge hunt): live even with the host off, and the
+-- only view into the pump when host mode has USB serial disabled.
+local snd_lbl = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
 
 local MAX_LINES = 40
 local lines = {}
@@ -143,6 +146,12 @@ apps.add_timer { period = 1000, cb = function()
         heap_lbl.text = string.format("int RAM %dK (big %dK)  host: %s",
             math.floor(int_free / 1024), math.floor(int_big / 1024),
             _usb_running() and "ON" or "off")
+    end
+    if _sound_debug then
+        local d = _sound_debug()
+        snd_lbl.text = string.format("snd %s d:%d m:%d st:%d pl:%d ib:%d p:%d/%d o:%d",
+            d.running and "RUN" or "idle", d.dec, d.mix, d.staged, d.played,
+            d.inbuff, d.pos, d.dur, d.objs)
     end
 end }
 

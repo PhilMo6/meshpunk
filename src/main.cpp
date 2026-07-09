@@ -267,9 +267,16 @@ static void firmware_prefs_save() {
   // which crashes an active USB host audio stream. The guard drains/pauses the
   // ISO stream around it (no-op when USB isn't streaming). The SD copy is SPI
   // (no cache stall), so it keeps streaming normally.
+  //
+  // Written ATOMICALLY (tmp + rename; littlefs rename replaces the target in
+  // one commit): a crash/reset mid-write must never leave a truncated
+  // /firmware_prefs — that reset every setting to defaults once (2026-07-07,
+  // device crashed during a volume save while USB audio was wedged).
   {
     UsbFlashGuard _g;
-    write_firmware_prefs(LittleFS, "/firmware_prefs");
+    write_firmware_prefs(LittleFS, "/firmware_prefs.tmp");
+    if (!LittleFS.rename("/firmware_prefs.tmp", "/firmware_prefs"))
+      SLog.println("[FW_PREFS] rename failed — prefs NOT updated");
   }
   if (sd_mounted && use_sd_pref) {
     sd_spi_take();
@@ -1029,6 +1036,7 @@ String readFile(const char *filename) {
 struct LuaFileHandle {
     fs::File* file;
     bool is_sd;
+    bool is_write;   // opened "w"/"a": close/flush can write internal flash
 };
 
 // Safe io.open that parses L: (LittleFS) or S: (SD) prefix
@@ -1053,6 +1061,7 @@ static int lua_io_open(lua_State *L) {
   LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
   ud->file = nullptr;
   ud->is_sd = false;
+  ud->is_write = false;
   luaL_getmetatable(L, "esp32_file");
   lua_setmetatable(L, -2);
 
@@ -1079,6 +1088,8 @@ static int lua_io_open(lua_State *L) {
   }
   ud->file = file;
   ud->is_sd = mf.is_sd;
+  // "r+" opens for update too — anything but a plain read can write flash.
+  ud->is_write = (mode[0] != 'r') || (strchr(mode, '+') != nullptr);
   return 1;
 }
 
@@ -2006,6 +2017,11 @@ static int lua_wifi_download_file(lua_State *L) {
   if (mf.is_sd) sd_spi_release();
 
   int total = 0;
+  // LittleFS target: every chunk write below is an internal-flash write, so
+  // hold the USB flash guard across the whole body (pausing USB audio for the
+  // download beats crashing the host stack; downloads are user-initiated and
+  // rare). SD targets skip it — SPI writes don't stall the cache.
+  UsbFlashGuardIf _dl_guard(!mf.is_sd);
   // Stall detector, not a total-time cap: big files legitimately take longer
   // than any fixed budget, so the deadline resets on every received chunk.
   uint32_t deadline = millis() + 20000;
@@ -4725,7 +4741,9 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
       return "sd";
     }
   } else {
-    // LittleFS target (L:) — internal flash, no SPI-bus contention.
+    // LittleFS target (L:) — internal flash, no SPI-bus contention, but the
+    // writes/rename below stall the flash cache: hold the USB flash guard.
+    UsbFlashGuardIf _g(true);
     MeshpunkFile mf = meshpunk_open(tmp_path, "w", false);
     if (!mf.valid) {
       SLog.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
@@ -6426,6 +6444,10 @@ void setupLuaVGL() {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
     size_t len;
     const char *str = luaL_checklstring(L, 2, &len);
+    if (!ud->file) { lua_pushnil(L); lua_pushstring(L, "file closed"); return 2; }
+    // LittleFS write = internal-flash write: pause USB audio around it or the
+    // cache stall crashes the host stack (no-op when USB is idle / target is SD).
+    UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);
     if (ud->is_sd) sd_spi_take();
     // write(buf, len), not print(str): binary-safe past embedded NULs
     size_t written = ud->file->write((const uint8_t *)str, len);
@@ -6435,9 +6457,38 @@ void setupLuaVGL() {
   });
   lua_setfield(L, -2, "write");
 
+  // file:seek([whence[, offset]]) — Lua io semantics. whence "set"|"cur"|"end"
+  // (default "cur"), offset default 0. Returns the new absolute position, or
+  // nil+message on error. Needed for tail reads (e.g. ID3v1 in the last 128B).
+  lua_pushcfunction(L, [](lua_State *L) -> int {
+    LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
+    if (!ud->file) { lua_pushnil(L); lua_pushstring(L, "file closed"); return 2; }
+    const char *whence = luaL_optstring(L, 2, "cur");
+    long offset = (long)luaL_optinteger(L, 3, 0);
+    if (ud->is_sd) sd_spi_take();
+    size_t sz  = ud->file->size();
+    size_t cur = ud->file->position();
+    long base;
+    if      (strcmp(whence, "set") == 0) base = 0;
+    else if (strcmp(whence, "end") == 0) base = (long)sz;
+    else                                 base = (long)cur;   // "cur" / default
+    long target = base + offset;
+    if (target < 0) target = 0;
+    if (target > (long)sz) target = (long)sz;
+    bool ok = ud->file->seek((uint32_t)target);
+    size_t newpos = ud->file->position();
+    if (ud->is_sd) sd_spi_release();
+    if (!ok) { lua_pushnil(L); lua_pushstring(L, "seek failed"); return 2; }
+    lua_pushinteger(L, (lua_Integer)newpos);
+    return 1;
+  });
+  lua_setfield(L, -2, "seek");
+
   // file:flush()
   lua_pushcfunction(L, [](lua_State *L) -> int {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
+    if (!ud->file) return 0;
+    UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);   // LittleFS flush writes flash
     if (ud->is_sd) sd_spi_take();
     ud->file->flush();
     if (ud->is_sd) sd_spi_release();
@@ -6449,6 +6500,8 @@ void setupLuaVGL() {
   lua_pushcfunction(L, [](lua_State *L) -> int {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
     if (ud->file) {
+      // Closing a written LittleFS file commits data/metadata to flash.
+      UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);
       if (ud->is_sd) sd_spi_take();
       ud->file->close();
       if (ud->is_sd) sd_spi_release();
@@ -6466,6 +6519,13 @@ void setupLuaVGL() {
   lua_pushcfunction(L, [](lua_State *L) -> int {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
     if (ud->file) {
+      // Permanent leak detector: a GC-close only happens for a handle that
+      // was ABANDONED (never close()d, never consumed by loadFile). Every
+      // one of these lines is a bug sighting in some Lua file-handling path.
+      SLog.printf("[FS] GC-close ud=%p f=%p sd=%d\n",
+                  (void*)ud, (void*)ud->file, (int)ud->is_sd);
+      // Same flash-commit hazard as close() when the file was written.
+      UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);
       if (ud->is_sd) sd_spi_take();
       ud->file->close();
       if (ud->is_sd) sd_spi_release();

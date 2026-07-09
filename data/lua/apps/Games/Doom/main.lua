@@ -178,6 +178,7 @@ end
 
 -- Audio toggle state
 local sfx_enabled = true
+local music_enabled = true
 
 -- Trackball momentum settings
 local trk_momentum = true     -- enable momentum mode
@@ -202,6 +203,7 @@ local function save_config()
         f:write(a.id .. "=" .. k1 .. "," .. k2 .. "\n")
     end
     f:write(string.format("sfx=%d\n", sfx_enabled and 1 or 0))
+    f:write(string.format("music=%d\n", music_enabled and 1 or 0))
     f:write(string.format("trk_momentum=%d\n", trk_momentum and 1 or 0))
     f:write(string.format("trk_impulse=%d\n", trk_impulse))
     f:write(string.format("trk_friction=%d\n", trk_friction))
@@ -231,6 +233,7 @@ local function load_config()
         end
         local setting, val = line:match("^(%a+)=([01])$")
         if setting == "sfx" then sfx_enabled = (val == "1") end
+        if setting == "music" then music_enabled = (val == "1") end
         if setting == "trk_momentum" then trk_momentum = (val == "1") end
         local trk_key, trk_val = line:match("^(trk_%a+)=(%d+)$")
         if trk_key == "trk_impulse" then trk_impulse = tonumber(trk_val) end
@@ -396,7 +399,7 @@ create_main_screen = function()
         align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 110 },
     }
 
-    -- Options row: SFX toggle
+    -- Options row: SFX + Music toggles
     local optBox = scr:Object{
         w = 260, h = lvgl.SIZE_CONTENT,
         align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 138 },
@@ -417,6 +420,17 @@ create_main_screen = function()
     sfxBtn:onClicked(function()
         sfx_enabled = not sfx_enabled
         sfxLbl:set{ text = sfx_enabled and "SFX: ON" or "SFX: OFF" }
+        save_config()
+    end)
+
+    local musBtn = optBox:Button{ w = 100, h = 28 }
+    local musLbl = musBtn:Label{
+        text = music_enabled and "Music: ON" or "Music: OFF",
+        align = lvgl.ALIGN.CENTER,
+    }
+    musBtn:onClicked(function()
+        music_enabled = not music_enabled
+        musLbl:set{ text = music_enabled and "Music: ON" or "Music: OFF" }
         save_config()
     end)
 
@@ -463,13 +477,18 @@ create_main_screen = function()
                     local vfs_base = to_vfs_path(base.path)
                     args = {ELF_PATH, "-iwad", vfs_base,
                             "-file", vfs_wad,
-                            "-configdir", wad_dir, "-nomusic"}
+                            "-configdir", wad_dir}
                 else
                     args = {ELF_PATH, "-iwad", vfs_wad,
-                            "-configdir", wad_dir, "-nomusic"}
+                            "-configdir", wad_dir}
                 end
+                -- Independent audio flags: -nosfx keeps music alive (the
+                -- module pumps it via the music Poll), unlike -nosound.
                 if not sfx_enabled then
-                    args[#args + 1] = "-nosound"
+                    args[#args + 1] = "-nosfx"
+                end
+                if not music_enabled then
+                    args[#args + 1] = "-nomusic"
                 end
                 args[#args + 1] = "-keymap"
                 args[#args + 1] = km
