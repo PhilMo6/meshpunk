@@ -7,8 +7,8 @@
 // called from the SFX mixer in i_tdeck_sound.c. No other task touches
 // this state, so OPL_Lock/OPL_Unlock are no-ops.
 //
-// Time is a uint32 sample counter at OPL_TDECK_MIX_RATE (22050 Hz);
-// it wraps after ~54 hours of continuous play, which is accepted.
+// Time is a uint32 sample counter at OPL_TDECK_MIX_RATE; it wraps after
+// ~54-108 hours of continuous play (rate-dependent), which is accepted.
 
 #include <stdio.h>
 
@@ -23,9 +23,9 @@ static uint32_t current_sample;
 static int opl_paused;
 static int opl_initialized;
 
-// Chip__GenerateBlock2 zeroes its output before accumulating voices, so
-// music is rendered here first and then added into the SFX mix.
-static Bit32s opl_scratch[OPL_TDECK_MAX_SAMPLES];
+// The synth scratch buffer is a local in OPL_TDeck_Mix (task stack =
+// internal SRAM): keeps synth output off the PSRAM bus and module BSS
+// small. Chip__GenerateBlock2 zeroes it before accumulating voices.
 
 // Cap on callbacks dispatched per Mix call: a malformed MIDI that
 // schedules zero-delay events forever stalls the music, not the game.
@@ -209,6 +209,7 @@ void OPL_Unlock(void)
 void OPL_TDeck_Mix(int32_t *mix, int nsamples)
 {
     int dispatched = 0;
+    Bit32s opl_scratch[OPL_TDECK_MAX_SAMPLES];   // internal RAM (task stack)
 
     if (!opl_initialized || opl_paused)
     {
@@ -263,9 +264,12 @@ void OPL_TDeck_Mix(int32_t *mix, int nsamples)
 
         Chip__GenerateBlock2(&opl_chip, (Bitu)chunk, opl_scratch);
 
+        // >>1: 6 dB headroom, matching the SFX mixer's half-scale
+        // convention (see i_tdeck_sound.c) — keeps the summed mix from
+        // hard-clipping at the int16 clamp.
         for (i = 0; i < chunk; i++)
         {
-            mix[i] += opl_scratch[i];
+            mix[i] += opl_scratch[i] >> 1;
         }
 
         mix += chunk;

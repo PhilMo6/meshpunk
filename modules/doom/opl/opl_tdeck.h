@@ -8,6 +8,10 @@
 #include <stdint.h>
 
 // Sample rate shared by the SFX mixer and the OPL chip emulator.
+// 22050 doubles the FM bandwidth (music harmonics to ~11 kHz) at 2x the
+// mix/synth-resample cost. (An earlier drop to 11025 chased a starvation
+// theory that turned out to be a signed/unsigned bug in the SFX
+// interpolation — 22050 never got a fair trial before this retry.)
 #define OPL_TDECK_MIX_RATE     22050
 
 // Largest number of samples the mixer requests per call; sizes the

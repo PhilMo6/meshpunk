@@ -23,6 +23,9 @@ extern int  printf(const char*, ...);
 extern int  snprintf(char*, unsigned int, const char*, ...);
 extern void free(void*);
 
+// Audio pump (i_tdeck_sound.c) — refills the firmware ring mid-frame.
+extern void I_TDeck_AudioPump(void);
+
 // RGB565 conversion buffer (320x200 = 64000 pixels × 2 bytes = 128KB)
 static uint16_t rgb565_buf[DOOMGENERIC_RESX * DOOMGENERIC_RESY];
 
@@ -47,6 +50,11 @@ void DG_DrawFrame(void) {
     }
 
     host_blit_frame(rgb565_buf, DOOMGENERIC_RESX, DOOMGENERIC_RESY);
+
+    // Rendering + blit is the frame's long pole; top the audio ring back
+    // up here so it isn't drained by the time the next frame's
+    // S_UpdateSounds pump comes around.
+    I_TDeck_AudioPump();
 }
 
 void DG_SleepMs(uint32_t ms) {
