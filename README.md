@@ -13,15 +13,20 @@
 - GPS automatically gets time
 - Loads Lua scripts from the filesystem automatically as apps
 - Full MeshCore support
-- Emoji support
+- Room server and repeater support: log in, sync messages, and run admin commands right from the Messenger app
+- Full emoji support! Type emoji with the alt key layer (customize per-key in Settings > Emoji), plus a downloadable extended emoji set that lives on SD
 - Map app with offline tile caching, message path animations, message path replay, and meshprint sender triangulation!
 - Lua games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of development)
 - Elf file loader
-- Doom! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
+- Doom! Now with music and sound effects! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
 - Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts. (thanks to https://github.com/mintylinux)
--Gameboy emulator!
-- Themes! make Meshpunk look the way you want. 14 themes are included!
-- File manager 
+- GameBoy emulator! you must provide your own .gb/.gbc roms.
+- PC-XT DOS emulator! Boots real DOS from .img disk images — or pick a folder of games on your SD card and it becomes the C: drive
+- MP3 music player with a tag-based library, playlists, and auto-organizing by artist/album
+- Background apps — music keeps playing while you use the rest of the device
+- USB host support (experimental): route all device audio to a USB-C audio dongle (Tools > USB)
+- Themes! make Meshpunk look the way you want. 15 themes are included!
+- File manager (Tools > Files) for both internal flash and SD
 
 
 ## Installation 
@@ -37,9 +42,11 @@
 7. Set your extra settings, RX boost, Contact Overwrite, and Message Repeat
 8. Get meshing!
 
-Optional. Download and place doom wad files onto the sd card in either /doom or /meshpunk/apps/Games/doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
-Pico8 carts go onto the sd card in either /p8carts or /meshpunk/apps/Games/PICO-8 folder.
-Gameboy roms go onto the sd card in either /gb or /meshpunk/apps/Games/Gameboy folder.
+Optional. Download and place doom wad files onto the sd card in either /doom or /lua/apps/Games/Doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
+Pico8 carts go onto the sd card in either /p8carts or /lua/apps/Games/PICO-8 folder.
+Gameboy roms go onto the sd card in either /gb or /lua/apps/Games/GameBoy folder.
+DOS disk images go onto the sd card in /dos. The PC-XT app needs a bootable DOS floppy image (.img) to start; game folders in /dos can then be mounted directly as the C: drive.
+MP3s go onto the sd card in /Music. The Music app can auto-sort tagged files into /Music/Artist/Album for you, and playlists live in /Music/Playlists.
 
 ## Using with the Launcher (optional)
 
@@ -84,7 +91,7 @@ Long-press on a contact marker (touchscreen) or center the trackball on one and 
 
 - Meshprint
 
-With enough mesh data you can run a meshprint on the sender of a message to try to capture the first and second hop repeaters which will then be used to triangulate the senders general locaton.
+With enough mesh data you can run a meshprint on the sender of a message to try to capture the first and second hop repeaters which will then be used to triangulate the senders general location.
 The more data you have the better your results will be!
 
 ## Project Structure
@@ -103,7 +110,7 @@ The more data you have the better your results will be!
 
 ## Building and Development
 
-0. `softwareupdate --install-rosetta`
+0. `softwareupdate --install-rosetta` (macOS on Apple Silicon only — the xtensa toolchain needs Rosetta)
 1. Clone this repository
 2. Initialize the submodules:
    ```
@@ -184,8 +191,11 @@ MIT
 - Emojis from https://github.com/googlefonts/noto-emoji
 - Emoji converted to .bin with ImageMagick
 - doomgeneric https://github.com/ozkl/doomgeneric
+   Doom music via Chocolate Doom's OPL/MIDI stack and the DOSBox dbopl emulator
 - Pico8 emulation done with fake08 https://github.com/jtothebell/fake-08
    conversion of fake08 to meshpunk elf done by https://github.com/mintylinux
+- GameBoy emulation via the gnuboy core from retro-go https://github.com/ducalex/retro-go
+- PC-XT emulation via Faux86-remake https://github.com/ArnoldUK/Faux86-remake (lineage: Fake86 by Mike Chambers, Faux86 by James Howard)
 
 ## Branch
 This branch of the Meshpunk project focuses on extending functionality.
