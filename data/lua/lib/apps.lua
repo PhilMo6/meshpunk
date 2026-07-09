@@ -22,6 +22,21 @@
     when creating a timer:              local t = apps.add_timer{ period=.., cb=.. }
     on exit (after app-specific cleanup like nulling message callbacks / sounds):
                                         apps.go_home()        -- do NOT delete root yourself
+
+  Background apps (opt-in; see the Music app for the reference client):
+    an app may register a BACKGROUND CONTRACT (apps.register_background) naming
+    what survives when its UI closes: a state table (the rendezvous point a
+    relaunched instance rebinds to), a UI-FREE tick the manager runs on its own
+    timer while backgrounded, a LIVE sound-id provider consulted at sweep time
+    so exit sweeps spare those ids, and an on_close that stops everything
+    without any UI existing. apps.go_background(key) exits keeping all that
+    alive; apps.close_background(key) is the deliberate close (the launcher
+    shows one row per backgrounded app with exactly that as its X button).
+    Rules: ticks run inside every other app's frame budget — keep them CHEAP;
+    re-register on every launch (fresh closures; stops the manager tick while
+    the app is foreground); route exits through go_background/close — a plain
+    go_home keeps the contract's sounds alive but does not start the tick.
+    ELF launches still tear down the whole Lua state, background apps included.
 ]]
 
 local lvgl = require("lvgl")
@@ -43,6 +58,8 @@ M._screen = nil       -- root object of the current screen owner (app or launche
 M._timers = {}        -- timers registered since the last set_root
 M._busy = false       -- re-entrancy guard for launch / go_home
 M._sound_mark = nil   -- _sound_mark() watermark: sound ids owned by the current app
+M._background = {}    -- key -> background contract record (see register_background)
+M._bg_listener = nil  -- launcher callback(rec, status): a record's status changed
 
 function M.set_current(name)
     M.current = name
@@ -240,6 +257,124 @@ function M.add_timer(opts)
     return M.track_timer(lvgl.Timer(opts))
 end
 
+-- ── Background contracts ─────────────────────────────────────────────────────
+-- See the header. A record survives app exits; only close_background (or an
+-- ELF launch's full Lua teardown) removes it.
+
+-- Register (or refresh) a background contract. Re-registering on every launch
+-- is the intended pattern: it swaps fresh closures in and stops the manager's
+-- background tick — the app's own foreground timers take over while open.
+--   key      caller-chosen record id ("music"); go/close/background_of use it
+--   app_name registry name, so the launcher row can relaunch the app
+--   state    the app's survivable state table (rendezvous on relaunch)
+--   period   background tick cadence in ms (default 400)
+--   tick     UI-FREE heartbeat run while backgrounded (auto-advance etc.)
+--   sounds   LIVE provider fn -> array of sound ids to spare from exit sweeps
+--   on_close deliberate-close handler; must work with NO UI alive
+--   status   fn -> short line for the launcher's background row
+function M.register_background(c)
+    if not (c and c.key) then return nil end
+    local rec = M._background[c.key] or {}
+    if rec._timer then pcall(function() rec._timer:delete() end); rec._timer = nil end
+    rec.key      = c.key
+    rec.app_name = c.app_name or rec.app_name
+    rec.state    = c.state or rec.state or {}
+    rec.period   = c.period or rec.period or 400
+    rec.tick     = c.tick
+    rec.sounds   = c.sounds
+    rec.on_close = c.on_close
+    rec.status   = c.status
+    M._background[c.key] = rec
+    return rec
+end
+
+function M.background_of(key)
+    return M._background[key]
+end
+
+-- Sorted array of records, for the launcher's background rows. Also snapshots
+-- each record's current status so the change relay below has a baseline.
+function M.background_list()
+    local out = {}
+    for _, rec in pairs(M._background) do
+        if rec.status then
+            local ok, s = pcall(rec.status)
+            rec._last_status = ok and s or nil
+        end
+        out[#out + 1] = rec
+    end
+    table.sort(out, function(a, b) return a.key < b.key end)
+    return out
+end
+
+-- The launcher registers ONE listener while its page shows background rows;
+-- it's cleared on page swaps and app launches (the labels die with the page).
+-- Called as listener(rec, status) whenever a record's status() output changes
+-- after its background tick — event-driven row updates, no polling.
+function M.set_background_listener(fn)
+    M._bg_listener = fn
+end
+
+-- Sound ids currently protected by background contracts. Consulted at SWEEP
+-- time, not registration: a backgrounded app's tick keeps creating NEW ids
+-- (e.g. each auto-advanced track) that fall inside later apps' watermark
+-- ranges — only the provider knows the live set.
+local function protected_sound_ids()
+    local ids = {}
+    for _, rec in pairs(M._background) do
+        if rec.sounds then
+            local ok, list = pcall(rec.sounds)
+            if ok and type(list) == "table" then
+                for _, id in ipairs(list) do
+                    if type(id) == "number" then ids[#ids + 1] = id end
+                end
+            end
+        end
+    end
+    table.sort(ids)
+    return ids
+end
+
+-- _sound_sweep(from[, to]) that spares protected ids by sweeping the gaps
+-- around them. Drop-in for every sweep site below.
+local function sweep_protected(from, to)
+    if not (_sound_sweep and from) then return end
+    local lo = from
+    for _, id in ipairs(protected_sound_ids()) do
+        if id >= lo and (to == nil or id < to) then
+            if id > lo then _sound_sweep(lo, id) end
+            lo = id + 1
+        end
+    end
+    if to == nil then
+        _sound_sweep(lo)
+    elseif lo < to then
+        _sound_sweep(lo, to)
+    end
+end
+
+-- The deliberate close: stop the tick, run the app's on_close, safety-delete
+-- any still-protected sound ids (idempotent — on_close normally already did),
+-- and drop the record. Callable with the app closed (the launcher's X row),
+-- so on_close must not touch UI.
+function M.close_background(key)
+    local rec = M._background[key]
+    if not rec then return end
+    if rec._timer then pcall(function() rec._timer:delete() end); rec._timer = nil end
+    local ids = {}
+    if rec.sounds then
+        local ok, list = pcall(rec.sounds)
+        if ok and type(list) == "table" then ids = list end
+    end
+    if rec.on_close then pcall(rec.on_close) end
+    if _sound_delete then
+        for _, id in ipairs(ids) do
+            if type(id) == "number" then pcall(_sound_delete, id) end
+        end
+    end
+    M._background[key] = nil
+end
+
 -- ── Teardown + navigation ───────────────────────────────────────────────────
 -- Tear down a (possibly large) view WITHOUT a watchdog-tripping synchronous
 -- delete. A view whose object count scales with data (e.g. a few hundred contact
@@ -321,9 +456,10 @@ function M.go_home()
         destroy(scr, timers)
         -- Sweep the closed app's C-side sound objects. The Lua handles are
         -- plain int wrappers with no __gc — anything the app didn't delete()
-        -- on this exit path would leak its PCM buffers permanently.
-        if M._sound_mark and _sound_sweep then
-            _sound_sweep(M._sound_mark)
+        -- on this exit path would leak its PCM buffers permanently. Ids named
+        -- by background contracts are spared (sweep_protected).
+        if M._sound_mark then
+            sweep_protected(M._sound_mark)
             M._sound_mark = nil
         end
         -- Drop the captured refs and force a full GC before building the
@@ -332,6 +468,54 @@ function M.go_home()
         -- garbage. Reclaiming them here keeps the largest-free PSRAM block
         -- healthy app-to-app on this tight device; any hitch is masked by the
         -- screen rebuild.
+        scr, timers = nil, nil
+        collectgarbage("collect")
+        M._busy = false
+        require("launcher").create()
+    end })
+end
+
+-- Exit to the launcher KEEPING the app's background contract alive: the same
+-- teardown as go_home (nav, UI root, foreground timers, sound sweep) except
+-- the sweep spares the contract's live sound ids and the manager starts the
+-- record's background tick. Falls back to a normal go_home when the key has
+-- no registered contract.
+function M.go_background(key)
+    local rec = key and M._background[key] or nil
+    if not rec then return M.go_home() end
+    if M._busy then return end
+    M._busy = true
+    M.clear_current()
+    _nav_clear()
+    local scr, timers = M._screen, M._timers
+    M._screen, M._timers = nil, {}
+    lvgl.Timer({ period = 1, cb = function(t)
+        t:delete()
+        destroy(scr, timers)
+        -- Leak protection still applies to everything the contract does NOT
+        -- name — only the provider's live ids survive.
+        if M._sound_mark then
+            sweep_protected(M._sound_mark)
+            M._sound_mark = nil
+        end
+        -- Manager-owned heartbeat; deleted when the app re-registers on
+        -- relaunch or the record is closed. After each tick, relay a status
+        -- change to the launcher's listener (background-row label updates).
+        if rec.tick and not rec._timer then
+            rec._timer = lvgl.Timer({
+                period = rec.period or 400,
+                cb = function()
+                    pcall(rec.tick)
+                    if rec.status and M._bg_listener then
+                        local ok, s = pcall(rec.status)
+                        if ok and s ~= rec._last_status then
+                            rec._last_status = s
+                            pcall(M._bg_listener, rec, s)
+                        end
+                    end
+                end,
+            })
+        end
         scr, timers = nil, nil
         collectgarbage("collect")
         M._busy = false
@@ -365,9 +549,10 @@ function M.launch(name_or_record)
 
     local function finish_ok()
         M.set_current(rec.name)
+        M._bg_listener = nil   -- the launcher page (and its row labels) is gone
         destroy(prev_screen, prev_timers)   -- target already _nav_setup'd; no _nav_clear here
-        if M._sound_mark and sound_mark and _sound_sweep then
-            _sound_sweep(M._sound_mark, sound_mark)
+        if M._sound_mark and sound_mark then
+            sweep_protected(M._sound_mark, sound_mark)
         end
         M._sound_mark = sound_mark
         M._busy = false
@@ -376,7 +561,7 @@ function M.launch(name_or_record)
         print("[apps] launch error: " .. tostring(msg))
         -- Sweep the failed app's partial sounds (nothing newer exists);
         -- the restored app's mark stays in force.
-        if sound_mark and _sound_sweep then _sound_sweep(sound_mark) end
+        if sound_mark then sweep_protected(sound_mark) end
         M._screen, M._timers = prev_screen, prev_timers   -- restore; keep current screen
         -- We stay on the launcher, so put back the chrome we tore down for the
         -- launch attempt: resume the topbar and redraw the freed wallpaper.

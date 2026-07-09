@@ -35,15 +35,25 @@ local MAX_SHOW = 150
 
 -- ── App state ────────────────────────────────────────────────────────────────
 local library    = nil          -- musiclib index, or nil until scanned/loaded
-local queue      = {}            -- array of song entries
-local order      = {}            -- play order (indices into queue); shuffle-aware
-local opos       = 0             -- position within `order`
-local cur_obj    = nil           -- current sound object (owns the open file)
-local cur_song   = nil
-local playing    = false
-local paused     = false
-local shuffle    = false
-local repeat_mode = "off"        -- "off" | "one" | "all"
+
+-- Playback state lives in ONE table so the background contract can carry it
+-- across app exits (apps.register_background{ state = pb }): when the app is
+-- relaunched over live background playback, it rebinds to the same table and
+-- the views pick up mid-track. Everything UI stays in ordinary locals.
+local bg_rec = apps.background_of("music")
+local pb = (bg_rec and bg_rec.state) or {
+    queue = {},            -- array of song entries
+    order = {},            -- play order (indices into queue); shuffle-aware
+    opos  = 0,             -- position within order
+    cur_obj  = nil,        -- current sound object (owns the open file)
+    cur_song = nil,
+    playing  = false,
+    paused   = false,
+    shuffle  = false,
+    repeat_mode = "off",   -- "off" | "one" | "all"
+    dur_exact = nil,       -- Xing/Info-derived seconds (see track_duration)
+    dur_latch = nil,       -- first decoder estimate, latched per track
+}
 
 -- Playlist multi-select picker. nil = normal (tap plays); otherwise a session:
 --   { playlist = name, sel = { [path]=song }, list = { path,... }, count, bar_lbl }
@@ -163,41 +173,39 @@ local function disp_title(s)  return musiclib.song_title(s) end
 -- Track duration handling: the C decoder's getDuration() re-estimates VBR
 -- durations from the first ~180 frames and then freezes — the display visibly
 -- "corrects" to a slightly WRONG value. Preferred source is the exact frame
--- count from the file's Xing/Info header (id3.duration); files without one
--- fall back to the decoder's FIRST non-zero estimate, latched for the track.
-local cur_dur_exact = nil     -- Xing/Info-derived seconds, or nil
-local cur_dur_latch = nil     -- first decoder estimate, latched per track
-
+-- count from the file's Xing/Info header (id3.duration, pb.dur_exact); files
+-- without one fall back to the decoder's FIRST non-zero estimate, latched.
 local function track_duration()
-    if cur_dur_exact then return cur_dur_exact end
-    if cur_dur_latch then return cur_dur_latch end
-    if playing then
+    if pb.dur_exact then return pb.dur_exact end
+    if pb.dur_latch then return pb.dur_latch end
+    if pb.playing then
         local d = sound.getDuration() or 0
-        if d > 0 then cur_dur_latch = d; return d end
+        if d > 0 then pb.dur_latch = d; return d end
     end
     return 0
 end
 
 local function stop_current()
-    if cur_obj then
-        cur_obj:stop()
-        cur_obj:delete()          -- removes the C SoundObject and closes the file
-        cur_obj = nil
+    if pb.cur_obj then
+        pb.cur_obj:stop()
+        pb.cur_obj:delete()       -- removes the C SoundObject and closes the file
+        pb.cur_obj = nil
     end
-    cur_song = nil
-    playing = false
-    paused  = false
-    cur_dur_exact = nil
-    cur_dur_latch = nil
+    pb.cur_song = nil
+    pb.playing = false
+    pb.paused  = false
+    pb.dur_exact = nil
+    pb.dur_latch = nil
 end
 
 -- Build the play order for the current queue. `start` (1-based queue index) goes
 -- first; the rest follow in order, or shuffled when shuffle is on.
 local function build_order(start)
-    order = {}
-    local n = #queue
-    if n == 0 then opos = 0; return end
-    if shuffle then
+    pb.order = {}
+    local order = pb.order
+    local n = #pb.queue
+    if n == 0 then pb.opos = 0; return end
+    if pb.shuffle then
         local rest = {}
         for i = 1, n do if i ~= start then rest[#rest + 1] = i end end
         for i = #rest, 2, -1 do
@@ -209,8 +217,8 @@ local function build_order(start)
     else
         for i = 1, n do order[i] = i end
     end
-    -- opos points at `start` within order
-    for i = 1, #order do if order[i] == start then opos = i; break end end
+    -- pb.opos points at `start` within the order
+    for i = 1, #order do if order[i] == start then pb.opos = i; break end end
 end
 
 local refresh_np   -- forward decl (Now-Playing UI updater)
@@ -218,10 +226,13 @@ local refresh_np   -- forward decl (Now-Playing UI updater)
 -- Try to play EXACTLY order position `p`. Silent on any failure (missing file,
 -- open/decode error) — returns false so the caller can skip. Never toasts, so
 -- scanning past a run of dead tracks doesn't spam.
+-- NOTE: play_at/play_scan/on_track_end are ENGINE functions — reachable from
+-- the background tick with no UI alive, so they must never touch np/views.
+-- The display timer detects track changes and refreshes on its own.
 local function play_at(p)
-    if p < 1 or p > #order then return false end
-    opos = p
-    local song = queue[order[opos]]
+    if p < 1 or p > #pb.order then return false end
+    pb.opos = p
+    local song = pb.queue[pb.order[pb.opos]]
     if not song then return false end
     stop_current()
     if not fileman.exists(song.path) then return false end
@@ -241,8 +252,8 @@ local function play_at(p)
     if not f then return false end
     local obj = sound.loadFile(f)     -- consumes f (owns the file handle now)
     if not obj then return false end
-    cur_obj  = obj
-    cur_song = song
+    pb.cur_obj  = obj
+    pb.cur_song = song
     -- Exact duration from the Xing/Info header, probed once per entry
     -- (false = probed, none found → track_duration() latches the decoder's
     -- first estimate instead).
@@ -250,12 +261,11 @@ local function play_at(p)
         local ok, d = pcall(id3.duration, song.path)
         song._dur = (ok and d) or false
     end
-    cur_dur_exact = song._dur or nil
-    cur_dur_latch = nil
+    pb.dur_exact = song._dur or nil
+    pb.dur_latch = nil
     obj:play()
-    playing = true
-    paused  = false
-    if np then refresh_np() end
+    pb.playing = true
+    pb.paused  = false
     return true
 end
 
@@ -263,7 +273,7 @@ end
 -- missing/unplayable tracks. Bounded to one pass over the queue so a playlist
 -- full of dead paths can't spin. Returns true if something started.
 local function play_scan(start, dir)
-    local n = #order
+    local n = #pb.order
     if n == 0 then return false end
     local p = start
     for _ = 1, n do
@@ -272,39 +282,38 @@ local function play_scan(start, dir)
         p = p + dir
     end
     stop_current()
-    if np then refresh_np() end
-    toast("No playable tracks")
+    toast("No playable tracks")   -- pcall-guarded; harmless with no UI
     return false
 end
 
 -- Replace the queue with `list` and start at index `start` (default 1).
 local function set_queue(list, start)
-    queue = list or {}
-    if #queue == 0 then stop_current(); return end
+    pb.queue = list or {}
+    if #pb.queue == 0 then stop_current(); return end
     start = start or 1
     if start < 1 then start = 1 end
-    if start > #queue then start = #queue end
+    if start > #pb.queue then start = #pb.queue end
     build_order(start)
-    play_scan(opos, 1)
+    play_scan(pb.opos, 1)
 end
 
 local function toggle_pause()
-    if not cur_obj then
+    if not pb.cur_obj then
         -- nothing loaded: (re)start the queue if we have one
-        if #queue > 0 then set_queue(queue, order[opos] or 1) end
+        if #pb.queue > 0 then set_queue(pb.queue, pb.order[pb.opos] or 1) end
         return
     end
-    cur_obj:pause()               -- toggles the decoder + file_paused
-    paused = not paused
+    pb.cur_obj:pause()            -- toggles the decoder + file_paused
+    pb.paused = not pb.paused
     if np then refresh_np() end
 end
 
 local function next_track()
-    if #order == 0 then return end
-    if opos < #order then
-        play_scan(opos + 1, 1)
-    elseif repeat_mode == "all" then
-        if shuffle then build_order(order[math.random(#order)]) end
+    if #pb.order == 0 then return end
+    if pb.opos < #pb.order then
+        play_scan(pb.opos + 1, 1)
+    elseif pb.repeat_mode == "all" then
+        if pb.shuffle then build_order(pb.order[math.random(#pb.order)]) end
         play_scan(1, 1)
     else
         toast("End of queue")
@@ -312,33 +321,41 @@ local function next_track()
 end
 
 local function prev_track()
-    if #order == 0 then return end
+    if #pb.order == 0 then return end
     -- restart the track if we're more than 3s in, else go to the previous one
-    if playing and (sound.getPosition() or 0) > 3 then play_scan(opos, 1)
-    elseif opos > 1 then play_scan(opos - 1, -1)
-    else play_scan(opos, 1) end
+    if pb.playing and (sound.getPosition() or 0) > 3 then play_scan(pb.opos, 1)
+    elseif pb.opos > 1 then play_scan(pb.opos - 1, -1)
+    else play_scan(pb.opos, 1) end
 end
 
--- Called by the timer when the current file finishes on its own.
+-- Called by the timer/background tick when the current file finishes on its
+-- own. ENGINE function: no UI here (see play_at's note).
 local function on_track_end()
-    if repeat_mode == "one" and play_at(opos) then return end
-    if opos < #order and play_scan(opos + 1, 1) then return end
-    if repeat_mode == "all" then
-        if shuffle then build_order(order[math.random(#order)]) end
+    if pb.repeat_mode == "one" and play_at(pb.opos) then return end
+    if pb.opos < #pb.order and play_scan(pb.opos + 1, 1) then return end
+    if pb.repeat_mode == "all" then
+        if pb.shuffle then build_order(pb.order[math.random(#pb.order)]) end
         if play_scan(1, 1) then return end
     end
     stop_current()
-    if np then refresh_np() end
 end
 
--- ── Single persistent timer: auto-advance + Now-Playing progress ──────────────
+-- ── Foreground timer: auto-advance + Now-Playing display ─────────────────────
+-- While the app is open this drives the engine; while backgrounded the
+-- manager's tick (background contract below) does the same auto-advance.
+local last_shown_song = false    -- sentinel ≠ nil so the first compare refreshes
 apps.add_timer { period = 400, cb = function()
-    if playing and not paused and cur_obj and sound.fileEnded() then
+    if pb.playing and not pb.paused and pb.cur_obj and sound.fileEnded() then
         on_track_end()
     end
+    -- The engine never touches the UI, so track changes (auto-advance, stop
+    -- at queue end) are detected here and re-rendered.
+    if np and pb.cur_song ~= last_shown_song then
+        refresh_np()
+    end
     if np and np.bar then
-        local dur = playing and track_duration() or 0
-        local pos = playing and (sound.getPosition() or 0) or 0
+        local dur = pb.playing and track_duration() or 0
+        local pos = pb.playing and (sound.getPosition() or 0) or 0
         np.time.text = mmss(pos) .. " / " .. mmss(dur)
         local c = np.bar:get_coords()
         local tw = c.x2 - c.x1
@@ -347,6 +364,47 @@ apps.add_timer { period = 400, cb = function()
         if tw > 0 then np.fill:set { w = math.floor(tw * frac) } end
     end
 end }
+
+-- ── Background contract ──────────────────────────────────────────────────────
+-- Registered on EVERY launch: swaps fresh closures in and stops the manager's
+-- background tick while we're foreground (the timer above takes over). The
+-- "Run in background" menu button exits via apps.go_background("music");
+-- Quit and the launcher's X row end playback via apps.close_background.
+apps.register_background{
+    key      = "music",
+    app_name = "Music",
+    state    = pb,
+    period   = 400,
+    -- UI-free heartbeat while backgrounded: same auto-advance as the timer.
+    tick     = function()
+        if pb.playing and not pb.paused and pb.cur_obj and sound.fileEnded() then
+            on_track_end()
+        end
+    end,
+    -- LIVE ids the app manager spares from exit sweeps.
+    sounds   = function()
+        if pb.cur_obj and pb.cur_obj.id then return { pb.cur_obj.id } end
+        return {}
+    end,
+    -- Deliberate close; must work with no UI alive (launcher X row).
+    on_close = function()
+        if pb.cur_obj then
+            pcall(function() pb.cur_obj:stop() end)
+            pcall(function() pb.cur_obj:delete() end)
+            pb.cur_obj = nil
+        end
+        pb.cur_song = nil
+        pb.playing  = false
+        pb.paused   = false
+    end,
+    status   = function()
+        if pb.playing and pb.cur_song then
+            local t = tostring(musiclib.song_title(pb.cur_song))
+            return "> " .. t:sub(1, 11)
+        end
+        return "Music (idle)"
+    end,
+}
 
 -- ── Now Playing ──────────────────────────────────────────────────────────────
 
@@ -429,19 +487,19 @@ show_nowplaying = function()
         vup:Label { text = "V+", align = lvgl.ALIGN.CENTER }
 
         local function upd_modes()
-            shuf_lbl.text = shuffle and "Shuf*" or "Shuf"
-            rep_lbl.text  = "Rep:" .. (repeat_mode == "one" and "1" or repeat_mode == "all" and "A" or "-")
+            shuf_lbl.text = pb.shuffle and "Shuf*" or "Shuf"
+            rep_lbl.text  = "Rep:" .. (pb.repeat_mode == "one" and "1" or pb.repeat_mode == "all" and "A" or "-")
             vlbl.text = "Vol " .. sound.getVolume()
-            play_lbl.text = (playing and not paused) and "||" or ">"
+            play_lbl.text = (pb.playing and not pb.paused) and "||" or ">"
         end
         shuf_btn:onClicked(function()
-            shuffle = not shuffle
-            if #queue > 0 and order[opos] then build_order(order[opos]) end
+            pb.shuffle = not pb.shuffle
+            if #pb.queue > 0 and pb.order[pb.opos] then build_order(pb.order[pb.opos]) end
             upd_modes()
         end)
         rep_btn:onClicked(function()
-            repeat_mode = (repeat_mode == "off") and "all"
-                or (repeat_mode == "all") and "one" or "off"
+            pb.repeat_mode = (pb.repeat_mode == "off") and "all"
+                or (pb.repeat_mode == "all") and "one" or "off"
             upd_modes()
         end)
         vdn:onClicked(function() sound.setVolume(math.max(0, sound.getVolume() - 1)); upd_modes() end)
@@ -470,10 +528,11 @@ end
 
 refresh_np = function()
     if not np then return end
-    if cur_song then
-        np.title.text  = disp_title(cur_song)
-        np.artist.text = cur_song.artist or "Unknown Artist"
-        np.album.text  = cur_song.album or ""
+    last_shown_song = pb.cur_song    -- keep the timer's change detector in sync
+    if pb.cur_song then
+        np.title.text  = disp_title(pb.cur_song)
+        np.artist.text = pb.cur_song.artist or "Unknown Artist"
+        np.album.text  = pb.cur_song.album or ""
     else
         np.title.text  = "(nothing playing)"
         np.artist.text = ""
@@ -853,21 +912,21 @@ end
 -- ── Queue ────────────────────────────────────────────────────────────────────
 
 show_queue = function(page)
-    list_view("Queue (" .. #queue .. ")", show_nowplaying, function(content)
-        if #queue == 0 then
+    list_view("Queue (" .. #pb.queue .. ")", show_nowplaying, function(content)
+        if #pb.queue == 0 then
             content:Label { text = "(empty)", w = lvgl.PCT(100), h = 22 }
             return
         end
-        local cur_qidx = order[opos]
+        local cur_qidx = pb.order[pb.opos]
         -- Default to the page holding the current track.
         if not page and cur_qidx then page = math.ceil(cur_qidx / PER_PAGE) end
-        paged(content, queue, page, function(s, i)
+        paged(content, pb.queue, page, function(s, i)
             local mark = (i == cur_qidx) and "> " or ""
             row_button(content, mark .. disp_title(s), s.artist and elide(s.artist, 8) or nil,
                 function()
                     -- jump to this track: find its order position
-                    for p = 1, #order do
-                        if order[p] == i then play_scan(p, 1); show_nowplaying(); return end
+                    for p = 1, #pb.order do
+                        if pb.order[p] == i then play_scan(p, 1); show_nowplaying(); return end
                     end
                 end)
         end, function(p) show_queue(p) end)
@@ -909,11 +968,11 @@ show_playlists = function()
         local newb = content:Button { w = lvgl.PCT(100), h = 26 }
         newb:Label { text = "+ New (from queue)", align = lvgl.ALIGN.CENTER }
         newb:onClicked(function()
-            if #queue == 0 then toast("Queue is empty"); return end
+            if #pb.queue == 0 then toast("Queue is empty"); return end
             prompt("Playlist name:", "", function(value)
                 if value == "" then return "Enter a name" end
                 local paths = {}
-                for _, s in ipairs(queue) do paths[#paths + 1] = s.path end
+                for _, s in ipairs(pb.queue) do paths[#paths + 1] = s.path end
                 local ok, err = musiclib.save_playlist(value, paths)
                 if not ok then return err or "Save failed" end
                 return nil, show_playlists
@@ -942,12 +1001,12 @@ show_playlists = function()
                         if not library then toast("Scan the library first"); return end
                         begin_pick(plist.name)
                     end)
-                    if cur_song then
+                    if pb.cur_song then
                         local addcur = box:Button { w = lvgl.PCT(100), h = 26 }
                         addcur:Label { text = "Add current song", align = lvgl.ALIGN.CENTER }
                         addcur:onevent(lvgl.EVENT.RELEASED, function()
                             close()
-                            musiclib.playlist_add(plist.name, cur_song.path)
+                            musiclib.playlist_add(plist.name, pb.cur_song.path)
                             toast("Added")
                         end)
                     end
@@ -1092,7 +1151,7 @@ show_organize = function()
                 run_organize(plan, function(moved, failed, pl_updated)
                     musiclib.clear_cache()
                     library = nil
-                    queue, order, opos = {}, {}, 0
+                    pb.queue, pb.order, pb.opos = {}, {}, 0
                     toast(moved .. " moved"
                         .. (failed > 0 and (", " .. failed .. " failed") or "")
                         .. ((pl_updated or 0) > 0 and (", " .. pl_updated .. " playlist(s) updated") or ""))
@@ -1112,7 +1171,9 @@ end
 -- ── Main menu ────────────────────────────────────────────────────────────────
 
 local function quit_app()
-    stop_current()
+    -- Deliberate close: runs the contract's on_close (stop + free playback)
+    -- and removes the background record, then a normal exit.
+    apps.close_background("music")
     apps.go_home()
 end
 
@@ -1131,9 +1192,9 @@ show_menu = function()
             or  "No library yet"
         col:Label { text = status, w = lvgl.PCT(100), h = 18 }
 
-        if cur_song then
+        if pb.cur_song then
             col:Label {
-                text = ((playing and not paused) and "> " or "|| ") .. elide(disp_title(cur_song), 30),
+                text = ((pb.playing and not pb.paused) and "> " or "|| ") .. elide(disp_title(pb.cur_song), 30),
                 w = lvgl.PCT(100), h = 18,
             }
         end
@@ -1152,6 +1213,7 @@ show_menu = function()
         if library then menu_btn("Rescan", function() run_scan(function() show_menu() end) end) end
         menu_btn("Playlists", show_playlists)
         menu_btn("Organize", show_organize)
+        menu_btn("Run in background", function() apps.go_background("music") end)
         menu_btn("Quit", quit_app)
     end)
 end

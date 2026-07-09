@@ -45,6 +45,8 @@ local bind_tap = nav.tap
 -- Build a page. category = nil for the root page, or a category name for a
 -- sub-page (adds a title + Back button).
 function build_page(items, category)
+    -- Any previous page's background-row labels are about to die with it.
+    apps.set_background_listener(nil)
     if body then
         pcall(function() body:delete() end)
         body = nil
@@ -80,6 +82,43 @@ function build_page(items, category)
         body:Label{text = category, align = lvgl.ALIGN.CENTER, w = 260, h = 40}
     else
         body:Label{text = "Home", align = lvgl.ALIGN.CENTER, w = 260, h = 40}
+        -- Backgrounded apps: one row each — tap the wide button to reopen the
+        -- app, X to close it for real (runs the contract's on_close; the app
+        -- itself never has to be launched for that).
+        local bg_rows = {}
+        for _, rec in ipairs(apps.background_list()) do
+            local key, app_name = rec.key, rec.app_name
+            local label = key
+            if rec.status then
+                local ok, s = pcall(rec.status)
+                if ok and s then label = tostring(s) end
+            end
+            local open_btn = body:Button{w = 106, h = 40}
+            local open_lbl = open_btn:Label{text = label, align = lvgl.ALIGN.CENTER}
+            bind_tap(open_btn, function()
+                if app_name then apps.launch(app_name) end
+            end)
+            local close_btn = body:Button{w = 30, h = 40}
+            close_btn:Label{text = "X", align = lvgl.ALIGN.CENTER}
+            bind_tap(close_btn, function()
+                apps.close_background(key)
+                request_swap(function() build_page(apps.list(), nil) end)
+            end)
+            bg_rows[#bg_rows + 1] = { rec = rec, lbl = open_lbl }
+        end
+        if #bg_rows > 0 then
+            -- Event-driven label refresh: the app manager notifies when a
+            -- record's status() output changes (checked after its background
+            -- tick — i.e. exactly when a track auto-advances). No polling.
+            apps.set_background_listener(function(rec, s)
+                for _, row in ipairs(bg_rows) do
+                    if row.rec == rec then
+                        pcall(function() row.lbl.text = tostring(s) end)
+                        return
+                    end
+                end
+            end)
+        end
     end
 
     for _, app in ipairs(items) do

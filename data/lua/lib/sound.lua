@@ -22,6 +22,7 @@ end
 
 local function make_obj(handle)
     return {
+        id      = handle,   -- C-side sound id (background contracts name these)
         play    = function(self) _sound_play(handle)   end,
         stop    = function(self) _sound_stop(handle)   end,
         pause   = function(self) _sound_pause(handle)  end,
