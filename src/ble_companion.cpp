@@ -134,7 +134,11 @@ void BleCompanionHandler::loop() {
     MESH_UNLOCK();
 
     if (has_next) {
-      if (contact.lastmod > _iter_filter_since) {
+      // >= not > (reference uses >): meshpunk lastmod is in-RAM and 0 until a
+      // contact's first post-boot advert, so with `>` a full sync (since=0)
+      // would skip every un-readverted contact. Cost: the newest contact
+      // re-sends on each incremental sync — harmless.
+      if (contact.lastmod >= _iter_filter_since) {
         writeContactRespFrame(RESP_CODE_CONTACT, contact);
         if (contact.lastmod > _most_recent_lastmod) {
           _most_recent_lastmod = contact.lastmod;
