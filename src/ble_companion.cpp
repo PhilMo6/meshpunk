@@ -1052,7 +1052,14 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
   // ── Flood scope key (runtime) ───────────────────────────────────
   } else if (cmd_frame[0] == CMD_SET_FLOOD_SCOPE_KEY && len >= 2 && cmd_frame[1] == 0) {
-    // Runtime scope - not persisted (companion_radio behavior)
+    // Session-only scope (companion_radio parity): overrides the persisted
+    // default for all sends until cleared or reboot; a per-channel region
+    // outranks it. Short frame = clear.
+    if (len >= 2 + 16) {
+      memcpy(_mesh._ble_send_scope_key, &cmd_frame[2], sizeof(_mesh._ble_send_scope_key));
+    } else {
+      memset(_mesh._ble_send_scope_key, 0, sizeof(_mesh._ble_send_scope_key));
+    }
     writeOKFrame();
 
   // ── Default flood scope (persisted) ─────────────────────────────

@@ -977,10 +977,35 @@ show_chat = function(target)
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
     back_btn:onevent(lvgl.EVENT.RELEASED, function() show_inbox() end)
 
-    -- Region / flood-scope settings (the default scope applies to all sends).
+    -- Region / flood-scope settings. Channel chats also get that channel's
+    -- per-channel override section; DMs/rooms/repeaters see only the global.
     local scope_btn = body:Button { w = 45, h = 20 }
     scope_btn:Label { text = "Rgn", align = lvgl.ALIGN.CENTER }
-    scope_btn:onevent(lvgl.EVENT.RELEASED, function() show_flood_scope() end)
+
+    -- Active-region indicator: which region this chat's floods go out under
+    -- (per-channel override > phone-set runtime scope > global; blank = none).
+    -- Shows "[phone]" for the runtime BLE scope — it's a raw key with no name.
+    local rgn_lbl = body:Label { text = "", text_color = COL_META, h = 20 }
+    local function refresh_rgn()
+        local rname = ""
+        if target.type == "channel" then
+            local okc, cs = pcall(_mesh_get_channel_scope, target.name)
+            if okc and cs and cs ~= "" then rname = cs end
+        end
+        if rname == "" then
+            local okb, ble_on = pcall(_mesh_ble_scope_active)
+            if okb and ble_on then rname = "phone" end
+        end
+        if rname == "" then
+            local okg, gs = pcall(_mesh_get_flood_scope)
+            if okg and gs and gs ~= "" then rname = gs end
+        end
+        rgn_lbl.text = (rname ~= "") and ("[" .. utils.emojiText(rname) .. "]") or ""
+    end
+    refresh_rgn()
+    scope_btn:onevent(lvgl.EVENT.RELEASED, function()
+        show_flood_scope(target.type == "channel" and target.name or nil, refresh_rgn)
+    end)
 
     -- Info (contact detail — also the way to favorite a room/repeater so its
     -- contact record survives removal/eviction).
@@ -1770,10 +1795,14 @@ show_contact_settings = function()
     close_btn:onevent(lvgl.EVENT.RELEASED, function() close_popup(true) end)
 end
 
--- Region / flood-scope settings popup. Floods (DMs + channel msgs) are only
--- accepted by nodes sharing the same region name (the name derives a transport
--- key on the firmware side); blank = global. Opened from the contacts view.
-show_flood_scope = function()
+-- Region / flood-scope settings popup. Floods carry a transport code derived
+-- from the region name; region-enforcing repeaters only relay matching codes.
+-- The GLOBAL region is the default for all sends. When opened from a channel
+-- chat (chan_name given) it also offers that channel's override: blank =
+-- inherit global, a name = use that region for this channel's sends only.
+-- on_change (optional) is called after any save/clear so the opener can
+-- refresh its active-region indicator.
+show_flood_scope = function(chan_name, on_change)
     local overlay = root:Object {
         w = W, h = H, x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
@@ -1796,15 +1825,35 @@ show_flood_scope = function()
     }
     nav.push(box)
 
-    box:Label { text = "-- Region / Flood Scope --", w = lvgl.PCT(100) }
+    -- Header row: title + small square X close (same pattern as the contact
+    -- settings popup) so the popup can be dismissed without scrolling to the
+    -- bottom Close button.
+    local hdr = box:Object {
+        w = lvgl.PCT(100), h = 20, pad_all = 0, border_width = 0,
+        bg_opa = 0, flex = { flex_direction = "row", flex_wrap = "nowrap" },
+    }
+    hdr:clear_flag(lvgl.FLAG.SCROLLABLE)
+    hdr:Label { text = "-- Region / Flood Scope --", flex_grow = 1 }
+    local x_btn = hdr:Button { w = 22, h = 20 }
+    x_btn:Label { text = "X", align = lvgl.ALIGN.CENTER }
+    x_btn:onevent(lvgl.EVENT.RELEASED, close_popup)
+
+    -- ── Global region (the default for every send) ──
+    box:Label { text = "GLOBAL REGION", w = lvgl.PCT(100) }
     box:Label {
-        text = "Floods reach only nodes with the same region name (blank = global). Must match other nodes exactly.",
+        text = "Default for ALL sends (DMs + channels) unless a channel overrides it. Blank = none (world-wide). Must match other nodes exactly.",
         w = lvgl.PCT(100), text_color = COL_META,
     }
 
     local cur = ""
     local ok_fs, name = pcall(_mesh_get_flood_scope)
     if ok_fs and name then cur = name end
+
+    -- The phone app can set a session-only scope key (no name) that outranks
+    -- the global default until cleared or reboot; flag it on the status line.
+    local ble_note = ""
+    local ok_ba, ble_on = pcall(_mesh_ble_scope_active)
+    if ok_ba and ble_on then ble_note = " (phone override active)" end
 
     local input = box:Textarea {
         one_line = true, text = cur, placeholder_text = "region name",
@@ -1813,28 +1862,78 @@ show_flood_scope = function()
     input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
     local status = box:Label {
-        text = (cur ~= "" and ("Current: " .. cur)) or "Current: global",
+        text = ((cur ~= "" and ("Current: " .. cur)) or "Current: none (world-wide)") .. ble_note,
         w = lvgl.PCT(100), text_color = COL_META,
     }
 
     local save_btn = box:Button { w = lvgl.PCT(100), h = 30 }
-    save_btn:Label { text = "Save", align = lvgl.ALIGN.CENTER }
+    save_btn:Label { text = "Save Global", align = lvgl.ALIGN.CENTER }
     save_btn:onevent(lvgl.EVENT.RELEASED, function()
         local n = input.text or ""
         if pcall(_mesh_set_flood_scope, n) then
-            status.text = (n ~= "") and ("Set: " .. n) or "Cleared (global)"
+            status.text = ((n ~= "") and ("Set: " .. n) or "Cleared (world-wide)") .. ble_note
+            if on_change then pcall(on_change) end
         else
             status.text = "Failed to save"
         end
     end)
 
     local clear_btn = box:Button { w = lvgl.PCT(100), h = 30 }
-    clear_btn:Label { text = "Clear (global)", align = lvgl.ALIGN.CENTER }
+    clear_btn:Label { text = "Clear Global", align = lvgl.ALIGN.CENTER }
     clear_btn:onevent(lvgl.EVENT.RELEASED, function()
         input.text = ""
         pcall(_mesh_set_flood_scope, "")
-        status.text = "Cleared (global)"
+        status.text = "Cleared (world-wide)" .. ble_note
+        if on_change then pcall(on_change) end
     end)
+
+    -- ── This channel's override (only when opened from a channel chat) ──
+    if chan_name then
+        box:Label {
+            text = "CHANNEL REGION - " .. utils.emojiText(chan_name),
+            w = lvgl.PCT(100),
+        }
+        box:Label {
+            text = "Overrides the global region for this channel's sends only. Blank = use global.",
+            w = lvgl.PCT(100), text_color = COL_META,
+        }
+
+        local ccur = ""
+        local ok_cs, cname = pcall(_mesh_get_channel_scope, chan_name)
+        if ok_cs and cname then ccur = cname end
+
+        local cinput = box:Textarea {
+            one_line = true, text = ccur, placeholder_text = "region name",
+            w = lvgl.PCT(100), h = 32,
+        }
+        cinput:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+        local cstatus = box:Label {
+            text = (ccur ~= "" and ("Override: " .. ccur)) or "Using global",
+            w = lvgl.PCT(100), text_color = COL_META,
+        }
+
+        local csave_btn = box:Button { w = lvgl.PCT(100), h = 30 }
+        csave_btn:Label { text = "Save Channel", align = lvgl.ALIGN.CENTER }
+        csave_btn:onevent(lvgl.EVENT.RELEASED, function()
+            local n = cinput.text or ""
+            if pcall(_mesh_set_channel_scope, chan_name, n) then
+                cstatus.text = (n ~= "") and ("Override: " .. n) or "Using global"
+                if on_change then pcall(on_change) end
+            else
+                cstatus.text = "Failed to save"
+            end
+        end)
+
+        local cclear_btn = box:Button { w = lvgl.PCT(100), h = 30 }
+        cclear_btn:Label { text = "Use Global", align = lvgl.ALIGN.CENTER }
+        cclear_btn:onevent(lvgl.EVENT.RELEASED, function()
+            cinput.text = ""
+            pcall(_mesh_set_channel_scope, chan_name, "")
+            cstatus.text = "Using global"
+            if on_change then pcall(on_change) end
+        end)
+    end
 
     local close_btn = box:Button { w = lvgl.PCT(100), h = 30 }
     close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }

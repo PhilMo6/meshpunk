@@ -1604,6 +1604,115 @@ void PunkMesh::setChannelNotifyMode(const char* name, uint8_t mode)
     saveChannelNotify();
 }
 
+// ── Per-channel region / flood scope ─────────────────────────────────────────
+// Stored by channel NAME in /channel_regions ("name \t region" lines). Only
+// channels with an override are written; a missing entry means the channel
+// inherits the device-global default scope. See the member comment in punkmesh.h.
+
+void PunkMesh::loadChannelScopes()
+{
+    _chan_scope_count = 0;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/channel_regions");
+    if (_storage->exists(path.c_str()))
+    {
+        File file = _storage->open(path.c_str());
+        if (file)
+        {
+            char line[80];
+            while (file.available() && _chan_scope_count < MAX_CHANNEL_SCOPE_PREFS)
+            {
+                int len = 0;
+                while (file.available() && len < (int)sizeof(line) - 1) {
+                    char ch = file.read();
+                    if (ch == '\n' || ch == '\r') break;
+                    line[len++] = ch;
+                }
+                line[len] = '\0';
+                if (len == 0) continue;
+
+                // Format: name \t region
+                char* tab = strchr(line, '\t');
+                if (!tab) continue;
+                *tab = '\0';
+                if (line[0] == '\0' || tab[1] == '\0') continue;
+
+                ChannelScopePref& p = _chan_scopes[_chan_scope_count++];
+                memset(&p, 0, sizeof(p));
+                strncpy(p.name, line, sizeof(p.name) - 1);
+                strncpy(p.scope, tab + 1, sizeof(p.scope) - 1);
+            }
+            file.close();
+        }
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+void PunkMesh::saveChannelScopes()
+{
+    bool is_sd = (_storage != &LittleFS);
+    UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
+    if (is_sd) sd_spi_take();
+
+    String path = storagePath(_storage_prefix, "/channel_regions");
+    File file = _storage->open(path.c_str(), "w", true);
+    if (file)
+    {
+        for (int i = 0; i < _chan_scope_count; i++)
+            file.printf("%s\t%s\n", _chan_scopes[i].name, _chan_scopes[i].scope);
+        file.close();
+    }
+
+    if (is_sd) sd_spi_release();
+}
+
+const char* PunkMesh::getChannelScope(const char* chan_name)
+{
+    if (!chan_name || !chan_name[0]) return "";
+    for (int i = 0; i < _chan_scope_count; i++) {
+        if (strcmp(_chan_scopes[i].name, chan_name) == 0) return _chan_scopes[i].scope;
+    }
+    return "";
+}
+
+void PunkMesh::setChannelScope(const char* chan_name, const char* region)
+{
+    if (!chan_name || !chan_name[0]) return;
+
+    int found = -1;
+    for (int i = 0; i < _chan_scope_count; i++) {
+        if (strcmp(_chan_scopes[i].name, chan_name) == 0) { found = i; break; }
+    }
+
+    if (!region || region[0] == '\0') {
+        // Inherit global = no entry; drop an existing one.
+        if (found >= 0) {
+            _chan_scopes[found] = _chan_scopes[_chan_scope_count - 1];
+            _chan_scope_count--;
+            saveChannelScopes();
+        }
+        return;
+    }
+
+    if (found >= 0) {
+        if (strcmp(_chan_scopes[found].scope, region) == 0) return;   // no change, skip the write
+    } else {
+        if (_chan_scope_count >= MAX_CHANNEL_SCOPE_PREFS) {
+            SLog.println("[MESH] channel-region table full, pref not saved");
+            return;
+        }
+        found = _chan_scope_count++;
+        memset(&_chan_scopes[found], 0, sizeof(_chan_scopes[found]));
+        strncpy(_chan_scopes[found].name, chan_name, sizeof(_chan_scopes[found].name) - 1);
+    }
+    memset(_chan_scopes[found].scope, 0, sizeof(_chan_scopes[found].scope));
+    strncpy(_chan_scopes[found].scope, region, sizeof(_chan_scopes[found].scope) - 1);
+    saveChannelScopes();
+}
+
 // Slot of the channel named "Public", or -1 if there isn't one. Public is treated
 // as a normal channel (no cached pointer), so callers resolve it by name on demand.
 int PunkMesh::publicChannelIdx()
@@ -4645,9 +4754,18 @@ void PunkMesh::setDefaultScope(const char* name) {
     savePrefs();
 }
 
-void PunkMesh::sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis) {
+void PunkMesh::sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis,
+                                  const uint8_t* key_override) {
+    // Precedence: per-channel override > phone-set runtime scope > default.
+    const uint8_t* key = key_override;
+    if (!key) {
+        key = _prefs.default_scope_key;
+        for (size_t i = 0; i < sizeof(_ble_send_scope_key); i++) {
+            if (_ble_send_scope_key[i]) { key = _ble_send_scope_key; break; }
+        }
+    }
     TransportKey scope;
-    memcpy(scope.key, _prefs.default_scope_key, sizeof(scope.key));
+    memcpy(scope.key, key, sizeof(scope.key));
     if (scope.isNull()) {
         sendFlood(pkt, delay_millis, pathHashSize());
     } else {
@@ -4688,10 +4806,33 @@ void PunkMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* 
         memcpy(saved_payload, pkt->payload, pkt->payload_len);
     }
 
+    // Per-channel region override: resolve the GroupChannel back to its slot by
+    // secret (the base class hands us only hash+secret) and look up a NAME-keyed
+    // scope pref. Missing pref = inherit the device-global default scope.
+    const uint8_t* key_override = nullptr;
+    uint8_t chan_key[16];
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+        ChannelDetails cd;
+        if (!getChannel(i, cd) || cd.name[0] == '\0') continue;
+        if (memcmp(cd.channel.secret, channel.secret, sizeof(cd.channel.secret)) != 0) continue;
+
+        const char* region = getChannelScope(cd.name);
+        if (region[0]) {
+            // Region key = SHA256(name) truncated to 16 bytes (same derivation
+            // as setDefaultScope / MeshCore hashtag regions).
+            SHA256 sha;
+            sha.update((const uint8_t*)region, strlen(region));
+            sha.finalize(chan_key, sizeof(chan_key));
+            key_override = chan_key;
+            SLog.printf("[MESH TX] channel '%s' scope '%s'\n", cd.name, region);
+        }
+        break;
+    }
+
     // Base sendFloodScoped ignores the channel and floods unscoped with a
     // 1-byte path hash; route through sendFloodWithScope so the multi-byte path
-    // size AND the configured default transport scope (region) are applied.
-    sendFloodWithScope(pkt, delay_millis);
+    // size AND the transport scope (per-channel or default region) are applied.
+    sendFloodWithScope(pkt, delay_millis, key_override);
 
     if (_prefs.msg_repeat_enabled) {
         registerPendingRepeat(_last_tx_hash, saved_header, saved_payload, saved_len);
@@ -5116,6 +5257,7 @@ void PunkMesh::begin()
     // from the channels-file "pubdel" marker, so we know whether to recreate Public.
     loadChannels();
     loadChannelNotify();
+    loadChannelScopes();
 
     if (!_public_deleted) {
         ChannelDetails* pub = addChannel("Public", PUBLIC_GROUP_PSK);

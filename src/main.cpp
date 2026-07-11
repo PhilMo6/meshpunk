@@ -5942,6 +5942,39 @@ void setupLuaVGL() {
     lua_pushboolean(L, 1);
     return 1;
   });
+  // Per-channel flood scope / region override, keyed by channel NAME.
+  // "" = no override (the channel inherits the default scope above).
+  lua_register(L, "_mesh_get_channel_scope", [](lua_State *L) -> int {
+    const char* chan = luaL_checkstring(L, 1);
+    MESH_LOCK();
+    const char* n = the_mesh ? the_mesh->getChannelScope(chan) : "";
+    lua_pushstring(L, n ? n : "");
+    MESH_UNLOCK();
+    return 1;
+  });
+  lua_register(L, "_mesh_set_channel_scope", [](lua_State *L) -> int {
+    const char* chan = luaL_checkstring(L, 1);
+    const char* region = luaL_optstring(L, 2, "");
+    MESH_LOCK();
+    if (the_mesh) the_mesh->setChannelScope(chan, region);
+    MESH_UNLOCK();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+  // True while the phone app's session-only scope key (CMD_SET_FLOOD_SCOPE_KEY)
+  // is set. It's a raw key with no name, so the UI can only flag its presence.
+  lua_register(L, "_mesh_ble_scope_active", [](lua_State *L) -> int {
+    bool on = false;
+    MESH_LOCK();
+    if (the_mesh) {
+      for (size_t i = 0; i < sizeof(the_mesh->_ble_send_scope_key); i++) {
+        if (the_mesh->_ble_send_scope_key[i]) { on = true; break; }
+      }
+    }
+    MESH_UNLOCK();
+    lua_pushboolean(L, on);
+    return 1;
+  });
   lua_register(L, "_mesh_get_contact_paths", lua_mesh_get_contact_paths);
   lua_register(L, "_mesh_set_contact_path", lua_mesh_set_contact_path);
   lua_register(L, "_mesh_get_message_paths", lua_mesh_get_message_paths);

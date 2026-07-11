@@ -287,6 +287,21 @@ public:
   uint8_t getChannelNotifyMode(const char* name);
   void    setChannelNotifyMode(const char* name, uint8_t mode);
 
+  // ── Per-channel region / flood scope ────────────────────────
+  // Keyed by channel NAME for the same reasons as ChannelNotifyPref (slots
+  // shift; Public isn't persisted in /channels). Missing entry = inherit the
+  // device-global default scope. The 16-byte transport key is derived from
+  // the region name at send time (same derivation as setDefaultScope), so
+  // only the names are stored here and in /channel_regions.
+  struct ChannelScopePref { char name[32]; char scope[31]; };
+  static const int MAX_CHANNEL_SCOPE_PREFS = 40;
+  ChannelScopePref _chan_scopes[MAX_CHANNEL_SCOPE_PREFS];
+  int _chan_scope_count = 0;
+  void        loadChannelScopes();
+  void        saveChannelScopes();
+  const char* getChannelScope(const char* chan_name);  // "" = inherit global
+  void        setChannelScope(const char* chan_name, const char* region);
+
   // ── Unified send + persist helpers ──────────────────────────
   struct SendResult {
     int code;              // MSG_SEND_FAILED / MSG_SEND_SENT_FLOOD / MSG_SEND_SENT_DIRECT
@@ -592,13 +607,20 @@ public:
   // via SHA256 (matches MeshCore's hashtag-region derivation). Empty = global.
   const char* getDefaultScopeName() const { return _prefs.default_scope_name; }
   void setDefaultScope(const char* name);
+  // Runtime flood scope set by the phone app (BLE CMD_SET_FLOOD_SCOPE_KEY):
+  // session-only — never persisted, zeroed at boot. When non-zero it overrides
+  // the default scope for all sends; a per-channel region outranks both.
+  // Mirrors companion_radio's 'send_scope' (MyMesh.h).
+  uint8_t _ble_send_scope_key[16] = {0};
 
 protected:
   void sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override;
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
-  // Flood through the configured default transport scope (region key) when one
-  // is set, else an unscoped flood. Applies the multi-byte path size.
-  void sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis);
+  // Flood through a transport scope (region key) when one applies, else an
+  // unscoped flood. Applies the multi-byte path size. key_override (16 bytes)
+  // replaces the default scope key for this send; nullptr = default scope.
+  void sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis,
+                          const uint8_t* key_override = nullptr);
   void logRx(mesh::Packet *pkt, int len, float score) override;
   float getAirtimeBudgetFactor() const override;
   int calcRxDelay(float score, uint32_t air_time) const override;
