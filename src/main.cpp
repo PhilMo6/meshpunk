@@ -7290,7 +7290,7 @@ void setup() {
   SLog.println("Delaying for 50ms...");
   delay(50);
 
-  SLog.println("MeshPunk LuaVGL Demo");
+  SLog.println("MeshPunk");
 
   // Push all mbedTLS allocations to PSRAM before any subsystem can open a TLS
   // session (BLE/WiFi come up later in setup). Frees the internal SRAM the HTTPS

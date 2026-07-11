@@ -5227,8 +5227,6 @@ void PunkMesh::showWelcome()
     // SLog.print("Private key: ");
     // mesh::Utils::printHex(Serial, self_id.prv_key, PRIV_KEY_SIZE);
 
-    self_id.printTo(Serial);
-
     SLog.println();
     SLog.println("   (enter 'help' for basic commands)");
     SLog.println();
