@@ -12,10 +12,6 @@
 #include <helpers/SensorManager.h>
 #include <helpers/TxtDataHelpers.h>
 
-// sd_spi_take() is inline in meshpunk_sync.h (just SPI_LOCK); no extern needed.
-// sd_spi_release() is defined in main.cpp — need the extern decl here.
-extern void sd_spi_release();
-
 BleCompanionHandler* ble_companion = nullptr;
 SerialBLEInterface*  ble_serial    = nullptr;
 
@@ -86,24 +82,43 @@ BleCompanionHandler::BleCompanionHandler(PunkMesh& mesh, SerialBLEInterface& ser
   sign_data = nullptr;
   sign_data_len = 0;
   memset(expected_ack_table, 0, sizeof(expected_ack_table));
-  _msg_sync.active = false;
-  _msg_sync.file_count = 0;
-  _msg_sync.current_file = 0;
-  _msg_sync.since = 0;
-  _msg_sync.most_recent_ts = 0;
-  _msg_sync.frames = nullptr;
-  _msg_sync.frame_count = 0;
-  _msg_sync.frame_idx = 0;
-  _msg_sync.has_pending_file = false;
-  _msg_sync.pending_file[0] = '\0';
+  _resp_retry_len = 0;
+  _msg_sync.begin(&mesh);
 }
 
 BleCompanionHandler::~BleCompanionHandler() {
-  freeSyncFrames();
+  _msg_sync.end();
   if (sign_data) { free(sign_data); sign_data = nullptr; }
 }
 
+// Response with a retry slot: the app awaits every reply, so a queue-full
+// drop would strand it until timeout. Retried from loop() until it lands.
+bool BleCompanionHandler::sendResp(size_t len) {
+  if (_serial.writeFrame(out_frame, len) > 0) return true;
+  if (_resp_retry_len > 0) {
+    SLog.printf("[BLE TX] retry slot overwritten (old=0x%02X new=0x%02X)\n",
+                _resp_retry[0], out_frame[0]);
+  }
+  memcpy(_resp_retry, out_frame, len);
+  _resp_retry_len = len;
+  return false;
+}
+
+// Push (async notification): best-effort, and yields while a response is
+// waiting on the retry slot so pushes can never starve a reply.
+bool BleCompanionHandler::pushFrame(const uint8_t* frame, size_t len) {
+  if (_resp_retry_len > 0) return false;
+  return _serial.writeFrame(frame, len) > 0;
+}
+
 void BleCompanionHandler::loop() {
+  // 1. A response that hit a full send queue retries until it lands.
+  if (_resp_retry_len > 0) {
+    if (_serial.writeFrame(_resp_retry, _resp_retry_len) > 0) {
+      _resp_retry_len = 0;
+    }
+  }
+
   size_t len = _serial.checkRecvFrame(cmd_frame);
 
   if (len > 0) {
@@ -119,7 +134,7 @@ void BleCompanionHandler::loop() {
     MESH_UNLOCK();
 
     if (has_next) {
-      if (contact.lastmod >= _iter_filter_since) {
+      if (contact.lastmod > _iter_filter_since) {
         writeContactRespFrame(RESP_CODE_CONTACT, contact);
         if (contact.lastmod > _most_recent_lastmod) {
           _most_recent_lastmod = contact.lastmod;
@@ -128,46 +143,18 @@ void BleCompanionHandler::loop() {
     } else {
       out_frame[0] = RESP_CODE_END_OF_CONTACTS;
       memcpy(&out_frame[1], &_most_recent_lastmod, 4);
-      _serial.writeFrame(out_frame, 5);
+      sendResp(5);
       _iter_started = false;
     }
+  } else {
+    // Idle: one bounded unit of background sync work (reconcile step or
+    // lazy ledger persist), then tell the app if new data turned up.
+    _msg_sync.step();
+    if (_msg_sync.takeTickle() && _serial.isConnected()) {
+      uint8_t push[1] = { PUSH_CODE_MSG_WAITING };
+      pushFrame(push, 1);
+    }
   }
-}
-
-// ── Sync timestamp persistence ───────────────────────────────────
-
-static String sync_ts_path(PunkMesh& mesh) {
-  return mesh._storage_prefix + "/messages/ble_sync_ts";
-}
-
-static uint32_t load_sync_timestamp(PunkMesh& mesh) {
-  if (!mesh._storage) return 0;
-  bool is_sd = (mesh._storage != &LittleFS);
-  if (is_sd) sd_spi_take();
-  File f = mesh._storage->open(sync_ts_path(mesh).c_str(), "r");
-  if (!f) {
-    if (is_sd) sd_spi_release();
-    return 0;
-  }
-  uint32_t ts = 0;
-  f.read((uint8_t*)&ts, 4);
-  f.close();
-  if (is_sd) sd_spi_release();
-  return ts;
-}
-
-static void save_sync_timestamp(PunkMesh& mesh, uint32_t ts) {
-  if (!mesh._storage || ts == 0) return;
-  bool is_sd = (mesh._storage != &LittleFS);
-  if (is_sd) sd_spi_take();
-  File f = mesh._storage->open(sync_ts_path(mesh).c_str(), "w");
-  if (!f) {
-    if (is_sd) sd_spi_release();
-    return;
-  }
-  f.write((uint8_t*)&ts, 4);
-  f.close();
-  if (is_sd) sd_spi_release();
 }
 
 // ── Command dispatch ─────────────────────────────────────────────
@@ -199,7 +186,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     out_frame[i++] = _mesh._prefs.client_repeat;  // v9+
     out_frame[i++] = _mesh._prefs.path_hash_mode; // v10+
 
-    _serial.writeFrame(out_frame, i);
+    sendResp(i);
 
   } else if (cmd_frame[0] == CMD_APP_START && len >= 8) {
     char* app_name = (char*)&cmd_frame[8];
@@ -208,10 +195,10 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
     _iter_started = false;
 
-    _msg_sync.has_pending_file = false;
-    startFullSync();
-    SLog.printf("[BLE] Message sync: %d files, %d frames ready\n",
-                  _msg_sync.file_count, _msg_sync.frame_count);
+    // No message-store work here — SELF_INFO must go out immediately (the
+    // app's command queue times out in ~5s and every settings screen
+    // re-sends APP_START). Sync serving is pull-driven via SYNC_NEXT.
+    _msg_sync.onAppStart();
 
     int i = 0;
     out_frame[i++] = RESP_CODE_SELF_INFO;
@@ -245,7 +232,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], _mesh._prefs.node_name, tlen);
     i += tlen;
 
-    _serial.writeFrame(out_frame, i);
+    sendResp(i);
 
   } else if (cmd_frame[0] == CMD_GET_CONTACTS && len >= 1) {
     _iter = _mesh.startContactsIterator();
@@ -258,7 +245,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     int num = _mesh.getNumContacts();
     out_frame[0] = RESP_CODE_CONTACTS_START;
     memcpy(&out_frame[1], &num, 4);
-    _serial.writeFrame(out_frame, 5);
+    sendResp(5);
     _iter_started = true;
 
   } else if (cmd_frame[0] == CMD_GET_CHANNEL && len >= 2) {
@@ -272,7 +259,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       i += 32;
       memcpy(&out_frame[i], ch.channel.secret, 16);
       i += 16;
-      _serial.writeFrame(out_frame, i);
+      sendResp(i);
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
     }
@@ -281,60 +268,56 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     uint32_t now = _mesh.getRTCClock()->getCurrentTime();
     out_frame[0] = RESP_CODE_CURR_TIME;
     memcpy(&out_frame[1], &now, 4);
-    _serial.writeFrame(out_frame, 5);
+    sendResp(5);
 
   } else if (cmd_frame[0] == CMD_SET_DEVICE_TIME && len >= 5) {
     uint32_t t;
     memcpy(&t, &cmd_frame[1], 4);
     // Forward-only, like the reference: our clock is GPS/RX-seeded and the
     // app pushes phone time — never let that move the device clock backwards.
-    if (t >= _mesh.getRTCClock()->getCurrentTime()) {
+    uint32_t curr = _mesh.getRTCClock()->getCurrentTime();
+    if (t >= curr) {
       _mesh.getRTCClock()->setCurrentTime(t);
       writeOKFrame();
     } else {
+      // Worth one line: the phone tried to drag our GPS/RX-seeded clock back.
+      SLog.printf("[BLE TIME] rejected backwards set app=%u < device=%u\n", t, curr);
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
 
   } else if (cmd_frame[0] == CMD_GET_BATT_AND_STORAGE && len >= 1) {
     // Standard layout: [batt_mv 2][used_kb 4][total_kb 4] = 11 bytes.
     // Storage figures are the internal LittleFS (same role as the
-    // reference's UserData FS); SD is not reported here.
+    // reference's UserData FS); SD is not reported here. usedBytes() walks
+    // the whole partition (~600ms on 6MB, measured on hw) so it's cached
+    // for 30s; totalBytes is constant after mount.
     uint16_t batt_mv = analogReadMilliVolts(PIN_VBAT_READ) * 2;
-    uint32_t used_kb  = LittleFS.usedBytes() / 1024;
-    uint32_t total_kb = LittleFS.totalBytes() / 1024;
+    static uint32_t cached_used_kb = 0, cached_total_kb = 0;
+    static uint32_t storage_cache_ms = 0;
+    if (cached_total_kb == 0 || millis() - storage_cache_ms > 30000) {
+      cached_used_kb  = LittleFS.usedBytes() / 1024;
+      cached_total_kb = LittleFS.totalBytes() / 1024;
+      storage_cache_ms = millis();
+    }
+    uint32_t used_kb = cached_used_kb, total_kb = cached_total_kb;
     out_frame[0] = RESP_CODE_BATT_AND_STORAGE;
     memcpy(&out_frame[1], &batt_mv, 2);
     memcpy(&out_frame[3], &used_kb, 4);
     memcpy(&out_frame[7], &total_kb, 4);
-    _serial.writeFrame(out_frame, 11);
+    sendResp(11);
 
   } else if (cmd_frame[0] == CMD_SYNC_NEXT_MESSAGE) {
-    if (!_msg_sync.active) {
-      if (_msg_sync.has_pending_file) {
-        // Targeted sync — only the file that just received a message
-        _msg_sync.since = load_sync_timestamp(_mesh);
-        _msg_sync.has_pending_file = false;
-        SLog.printf("[BLE SYNC] targeted file=%s, since=%u\n",
-                      _msg_sync.pending_file, _msg_sync.since);
-        loadFileFrames(_msg_sync.pending_file);
-      } else {
-        // Full sync — enumerate and read all files
-        startFullSync();
-      }
-    }
+    // Ledger-driven: only dirty files are opened, seek-positioned at their
+    // synced offset. An idle poll answers NO_MORE with zero file opens.
+    if (!_msg_sync.hasFrame()) _msg_sync.tryLoadMore();
 
-    if (_msg_sync.active && _msg_sync.frame_idx >= _msg_sync.frame_count)
-      loadNextFileFrames();
-
-    if (_msg_sync.active && _msg_sync.frame_idx < _msg_sync.frame_count) {
-      SyncFrame& sf = _msg_sync.frames[_msg_sync.frame_idx++];
-      _serial.writeFrame(sf.data, sf.len);
+    if (_msg_sync.hasFrame()) {
+      int flen = _msg_sync.nextFrame(out_frame);
+      sendResp(flen);
     } else {
-      saveWatermarkNow();
-      freeSyncFrames();
-      _msg_sync.active = false;
+      _msg_sync.onSyncSessionEnd();
       out_frame[0] = RESP_CODE_NO_MORE_MESSAGES;
-      _serial.writeFrame(out_frame, 1);
+      sendResp(1);
     }
 
   } else if (cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14) {
@@ -375,14 +358,13 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         if (expected_ack) {
           expected_ack_table[next_ack_idx].msg_sent = millis();
           expected_ack_table[next_ack_idx].ack = expected_ack;
-          expected_ack_table[next_ack_idx].contact = recipient;
           next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
         }
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &expected_ack, 4);
         memcpy(&out_frame[6], &est_timeout, 4);
-        _serial.writeFrame(out_frame, 10);
+        sendResp(10);
       }
     } else {
       writeErrFrame(recipient == nullptr ? ERR_CODE_NOT_FOUND : ERR_CODE_UNSUPPORTED_CMD);
@@ -593,7 +575,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         out_frame[0] = RESP_CODE_EXPORT_CONTACT;
         uint8_t out_len = pkt->writeTo(&out_frame[1]);
         _mesh.releasePacket(pkt);
-        _serial.writeFrame(out_frame, out_len + 1);
+        sendResp(out_len + 1);
       } else {
         writeErrFrame(ERR_CODE_TABLE_FULL);
       }
@@ -603,7 +585,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       uint8_t out_len;
       if (contact && (out_len = _mesh.exportContact(*contact, &out_frame[1])) > 0) {
         out_frame[0] = RESP_CODE_EXPORT_CONTACT;
-        _serial.writeFrame(out_frame, out_len + 1);
+        sendResp(out_len + 1);
       } else {
         writeErrFrame(ERR_CODE_NOT_FOUND);
       }
@@ -670,7 +652,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     out_frame[i++] = RESP_CODE_TUNING_PARAMS;
     memcpy(&out_frame[i], &rx, 4); i += 4;
     memcpy(&out_frame[i], &af, 4); i += 4;
-    _serial.writeFrame(out_frame, i);
+    sendResp(i);
 
   } else if (cmd_frame[0] == CMD_SET_OTHER_PARAMS && len >= 2) {
     // cmd_frame[1] = manual_add_contacts (bit0: auto-add ALL=0 / SELECTED=1).
@@ -710,7 +692,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       memcpy(&out_frame[2], &tag, 4);
       uint32_t est_timeout = 10000;
       memcpy(&out_frame[6], &est_timeout, 4);
-      _serial.writeFrame(out_frame, 10);
+      sendResp(10);
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
@@ -725,7 +707,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       out_frame[i++] = contact->out_path_len;
       memcpy(&out_frame[i], contact->out_path, contact->out_path_len);
       i += contact->out_path_len;
-      _serial.writeFrame(out_frame, i);
+      sendResp(i);
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
     }
@@ -738,7 +720,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_EXPORT_PRIVATE_KEY) {
     out_frame[0] = RESP_CODE_PRIVATE_KEY;
     memcpy(&out_frame[1], _mesh.getPrivateKey(), 64);
-    _serial.writeFrame(out_frame, 65);
+    sendResp(65);
 
   } else if (cmd_frame[0] == CMD_IMPORT_PRIVATE_KEY && len >= 65) {
     if (!mesh::LocalIdentity::validatePrivateKey(&cmd_frame[1])) {
@@ -788,7 +770,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &pending_login, 4);
         memcpy(&out_frame[6], &est_timeout, 4);
-        _serial.writeFrame(out_frame, 10);
+        sendResp(10);
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
@@ -809,7 +791,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
         memcpy(&out_frame[6], &est_timeout, 4);
-        _serial.writeFrame(out_frame, 10);
+        sendResp(10);
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
@@ -846,7 +828,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
         memcpy(&out_frame[6], &est_timeout, 4);
-        _serial.writeFrame(out_frame, 10);
+        sendResp(10);
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
@@ -869,7 +851,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
         memcpy(&out_frame[6], &est_timeout, 4);
-        _serial.writeFrame(out_frame, 10);
+        sendResp(10);
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
@@ -891,7 +873,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
         memcpy(&out_frame[6], &est_timeout, 4);
-        _serial.writeFrame(out_frame, 10);
+        sendResp(10);
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
@@ -910,7 +892,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], _mesh.self_id.pub_key, 6); i += 6;
     uint8_t tlen = telemetry.getSize();
     memcpy(&out_frame[i], telemetry.getBuffer(), tlen); i += tlen;
-    _serial.writeFrame(out_frame, i);
+    sendResp(i);
 
   // ── Path discovery request ──────────────────────────────────────
   } else if (cmd_frame[0] == CMD_SEND_PATH_DISCOVERY_REQ && cmd_frame[1] == 0 && len >= 2 + PUB_KEY_SIZE) {
@@ -936,7 +918,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
         memcpy(&out_frame[6], &est_timeout, 4);
-        _serial.writeFrame(out_frame, 10);
+        sendResp(10);
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
@@ -994,7 +976,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     out_frame[1] = 0;
     uint32_t max_len = MAX_SIGN_DATA_LEN;
     memcpy(&out_frame[2], &max_len, 4);
-    _serial.writeFrame(out_frame, 6);
+    sendResp(6);
 
     if (sign_data) free(sign_data);
     sign_data = (uint8_t*)malloc(MAX_SIGN_DATA_LEN);
@@ -1015,7 +997,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       free(sign_data);
       sign_data = NULL;
       out_frame[0] = RESP_CODE_SIGNATURE;
-      _serial.writeFrame(out_frame, 1 + SIGNATURE_SIZE);
+      sendResp(1 + SIGNATURE_SIZE);
     } else {
       writeErrFrame(ERR_CODE_BAD_STATE);
     }
@@ -1066,7 +1048,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     if (_mesh._prefs.contact_overwrite) cfg |= 0x01;  // overwrite-oldest
     out_frame[i++] = cfg;
     out_frame[i++] = _mesh._prefs.autoadd_max_hops;
-    _serial.writeFrame(out_frame, i);
+    sendResp(i);
 
   // ── Flood scope key (runtime) ───────────────────────────────────
   } else if (cmd_frame[0] == CMD_SET_FLOOD_SCOPE_KEY && len >= 2 && cmd_frame[1] == 0) {
@@ -1097,9 +1079,9 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     if (strlen(_mesh._prefs.default_scope_name) > 0) {
       memcpy(&out_frame[1], _mesh._prefs.default_scope_name, 31);
       memcpy(&out_frame[1 + 31], _mesh._prefs.default_scope_key, 16);
-      _serial.writeFrame(out_frame, 1 + 31 + 16);
+      sendResp(1 + 31 + 16);
     } else {
-      _serial.writeFrame(out_frame, 1);
+      sendResp(1);
     }
 
   // ── Stats ───────────────────────────────────────────────────────
@@ -1117,7 +1099,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       memcpy(&out_frame[i], &uptime_secs, 4); i += 4;
       memcpy(&out_frame[i], &err_flags, 2); i += 2;
       out_frame[i++] = queue_len;
-      _serial.writeFrame(out_frame, i);
+      sendResp(i);
     } else if (stats_type == STATS_TYPE_RADIO) {
       int i = 0;
       out_frame[i++] = RESP_CODE_STATS;
@@ -1132,7 +1114,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       out_frame[i++] = last_snr;
       memcpy(&out_frame[i], &tx_air_secs, 4); i += 4;
       memcpy(&out_frame[i], &rx_air_secs, 4); i += 4;
-      _serial.writeFrame(out_frame, i);
+      sendResp(i);
     } else if (stats_type == STATS_TYPE_PACKETS) {
       int i = 0;
       out_frame[i++] = RESP_CODE_STATS;
@@ -1151,7 +1133,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       memcpy(&out_frame[i], &n_recv_flood, 4); i += 4;
       memcpy(&out_frame[i], &n_recv_direct, 4); i += 4;
       memcpy(&out_frame[i], &n_recv_errors, 4); i += 4;
-      _serial.writeFrame(out_frame, i);
+      sendResp(i);
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
@@ -1168,12 +1150,12 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       memcpy(&out_frame[i], &ranges[k].lower, 4); i += 4;
       memcpy(&out_frame[i], &ranges[k].upper, 4); i += 4;
     }
-    _serial.writeFrame(out_frame, i);
+    sendResp(i);
 
   // ── Custom variables (stub — no SensorManager) ──────────────────
   } else if (cmd_frame[0] == CMD_GET_CUSTOM_VARS) {
     out_frame[0] = RESP_CODE_CUSTOM_VARS;
-    _serial.writeFrame(out_frame, 1);
+    sendResp(1);
 
   } else if (cmd_frame[0] == CMD_SET_CUSTOM_VAR) {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
@@ -1187,13 +1169,13 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
 void BleCompanionHandler::writeOKFrame() {
   out_frame[0] = RESP_CODE_OK;
-  _serial.writeFrame(out_frame, 1);
+  sendResp(1);
 }
 
 void BleCompanionHandler::writeErrFrame(uint8_t err_code) {
   out_frame[0] = RESP_CODE_ERR;
   out_frame[1] = err_code;
-  _serial.writeFrame(out_frame, 2);
+  sendResp(2);
 }
 
 void BleCompanionHandler::writeContactRespFrame(uint8_t code, const ContactInfo& contact) {
@@ -1209,133 +1191,10 @@ void BleCompanionHandler::writeContactRespFrame(uint8_t code, const ContactInfo&
   memcpy(&out_frame[i], &contact.gps_lat, 4); i += 4;
   memcpy(&out_frame[i], &contact.gps_lon, 4); i += 4;
   memcpy(&out_frame[i], &contact.lastmod, 4); i += 4;
-  _serial.writeFrame(out_frame, i);
-}
-
-// ── Disk-based message sync ──────────────────────────────────────
-
-void BleCompanionHandler::freeSyncFrames() {
-  if (_msg_sync.frames) {
-    heap_caps_free(_msg_sync.frames);
-    _msg_sync.frames = nullptr;
-  }
-  _msg_sync.frame_count = 0;
-  _msg_sync.frame_idx = 0;
-}
-
-void BleCompanionHandler::saveWatermarkNow() {
-  uint32_t now = _mesh.getRTCClock()->getCurrentTime();
-  if (now > 0)
-    save_sync_timestamp(_mesh, now);
-}
-
-void BleCompanionHandler::startFullSync() {
-  freeSyncFrames();
-  _msg_sync.file_count = _mesh.enumerateMessageFiles(
-      _msg_sync.files, MsgSyncState::MAX_FILES);
-  _msg_sync.current_file = 0;
-  _msg_sync.since = load_sync_timestamp(_mesh);
-  _msg_sync.most_recent_ts = 0;
-  _msg_sync.active = false;
-  SLog.printf("[BLE SYNC] full sync: files=%d, since=%u\n",
-                _msg_sync.file_count, _msg_sync.since);
-  if (_msg_sync.file_count > 0)
-    loadNextFileFrames();
-}
-
-bool BleCompanionHandler::loadFileFrames(const char* path) {
-  freeSyncFrames();
-
-  static const int SYNC_BATCH = 200;
-
-  StoredMsg* records = (StoredMsg*)heap_caps_malloc(
-      SYNC_BATCH * sizeof(StoredMsg), MALLOC_CAP_SPIRAM);
-  if (!records) return false;
-
-  int n = _mesh.readStoredMsgsSince(path, _msg_sync.since, records, SYNC_BATCH);
-  SLog.printf("[BLE SYNC] file=%s, records=%d, since=%u\n",
-                path, n, _msg_sync.since);
-  if (n <= 0) { heap_caps_free(records); return false; }
-
-  _msg_sync.frames = (SyncFrame*)heap_caps_malloc(
-      n * sizeof(SyncFrame), MALLOC_CAP_SPIRAM);
-  if (!_msg_sync.frames) { heap_caps_free(records); return false; }
-
-  int fc = 0;
-  for (int i = 0; i < n; i++) {
-    int flen = buildSyncFrame(records[i], _msg_sync.frames[fc].data);
-    if (flen > 0) {
-      _msg_sync.frames[fc].len = (uint8_t)flen;
-      fc++;
-    }
-  }
-  heap_caps_free(records);
-
-  if (fc > 0) {
-    _msg_sync.frame_count = fc;
-    _msg_sync.frame_idx = 0;
-    _msg_sync.active = true;
-    saveWatermarkNow();
-    return true;
-  }
-  heap_caps_free(_msg_sync.frames);
-  _msg_sync.frames = nullptr;
-  return false;
-}
-
-bool BleCompanionHandler::loadNextFileFrames() {
-  while (_msg_sync.current_file < _msg_sync.file_count) {
-    const char* path = _msg_sync.files[_msg_sync.current_file++];
-    if (loadFileFrames(path)) return true;
-  }
-  _msg_sync.active = false;
-  return false;
-}
-
-int BleCompanionHandler::buildSyncFrame(const StoredMsg& m, uint8_t* frame) {
-  if (strcmp(m.from, _mesh._prefs.node_name) == 0) return 0;
-
-  // Skip messages with absurdly future timestamps (corrupt data).
-  // Only check when RTC has been set (now > 86400 ≈ 1 day after epoch).
-  uint32_t now = _mesh.getRTCClock()->getCurrentTime();
-  if (now > 86400 && m.timestamp > now + 86400) return 0;
-
-  int i = 0;
-  bool is_dm = (m.flags & 0x02) != 0;
-  int8_t snr4 = (int8_t)(m.snr * 4);
-
-  if (is_dm) {
-    if (!m.has_pub_key) return 0;
-    frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
-    frame[i++] = (uint8_t)snr4;
-    frame[i++] = 0;
-    frame[i++] = 0;
-    memcpy(&frame[i], m.sender_pub_key, 6); i += 6;
-    frame[i++] = 0xFF;
-    frame[i++] = TXT_TYPE_PLAIN;
-    memcpy(&frame[i], &m.timestamp, 4); i += 4;
-  } else {
-    frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
-    frame[i++] = (uint8_t)snr4;
-    frame[i++] = 0;
-    frame[i++] = 0;
-    frame[i++] = (uint8_t)m.channel_idx;
-    frame[i++] = 0xFF;
-    frame[i++] = TXT_TYPE_PLAIN;
-    memcpy(&frame[i], &m.timestamp, 4); i += 4;
-  }
-
-  if (!is_dm && m.from[0]) {
-    int nlen = strlen(m.from);
-    if (nlen + 2 > MAX_FRAME_SIZE - i) return 0;
-    memcpy(&frame[i], m.from, nlen); i += nlen;
-    frame[i++] = ':'; frame[i++] = ' ';
-  }
-
-  int tlen = strlen(m.text);
-  if (tlen > MAX_FRAME_SIZE - i) tlen = MAX_FRAME_SIZE - i;
-  memcpy(&frame[i], m.text, tlen); i += tlen;
-  return i;
+  // Same layout serves two roles: 0x80+ codes are async pushes, the rest
+  // are awaited responses (GET_CONTACTS stream, GET_CONTACT_BY_KEY).
+  if (code >= 0x80) pushFrame(out_frame, i);
+  else              sendResp(i);
 }
 
 // ── Push methods (called from PunkMesh RX handlers on Core 1) ───
@@ -1344,14 +1203,11 @@ void BleCompanionHandler::queueReceivedDM(const ContactInfo& from,
                                            mesh::Packet* pkt,
                                            uint32_t timestamp,
                                            const char* text) {
+  String path = _mesh.dmMsgPath(from.name);
+  _msg_sync.markDirty(path.c_str());   // track even while app is away
   if (_serial.isConnected()) {
-    String path = _mesh.dmMsgPath(from.name);
-    strncpy(_msg_sync.pending_file, path.c_str(), MsgSyncState::MAX_PATH_LEN - 1);
-    _msg_sync.pending_file[MsgSyncState::MAX_PATH_LEN - 1] = '\0';
-    _msg_sync.has_pending_file = true;
-
     uint8_t push[1] = { PUSH_CODE_MSG_WAITING };
-    _serial.writeFrame(push, 1);
+    pushFrame(push, 1);
   }
 }
 
@@ -1360,14 +1216,11 @@ void BleCompanionHandler::queueReceivedChannelMsg(const mesh::GroupChannel& chan
                                                     uint32_t timestamp,
                                                     const char* text,
                                                     int channel_idx) {
+  String path = _mesh.channelMsgPath(channel_idx);
+  _msg_sync.markDirty(path.c_str());   // track even while app is away
   if (_serial.isConnected()) {
-    String path = _mesh.channelMsgPath(channel_idx);
-    strncpy(_msg_sync.pending_file, path.c_str(), MsgSyncState::MAX_PATH_LEN - 1);
-    _msg_sync.pending_file[MsgSyncState::MAX_PATH_LEN - 1] = '\0';
-    _msg_sync.has_pending_file = true;
-
     uint8_t push[1] = { PUSH_CODE_MSG_WAITING };
-    _serial.writeFrame(push, 1);
+    pushFrame(push, 1);
   }
 }
 
@@ -1386,7 +1239,7 @@ void BleCompanionHandler::queueCliResponse(const ContactInfo& from, mesh::Packet
   int tlen = strlen(text);
   if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
   memcpy(&out_frame[i], text, tlen); i += tlen;
-  _serial.writeFrame(out_frame, i);
+  pushFrame(out_frame, i);
 }
 
 // Room server post (signed message). Same live frame as queueCliResponse but
@@ -1409,7 +1262,7 @@ void BleCompanionHandler::queueReceivedSigned(const ContactInfo& from, mesh::Pac
   int tlen = strlen(text);
   if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
   memcpy(&out_frame[i], text, tlen); i += tlen;
-  _serial.writeFrame(out_frame, i);
+  pushFrame(out_frame, i);
 }
 
 void BleCompanionHandler::pushAdvert(const ContactInfo& contact, bool is_new,
@@ -1422,7 +1275,7 @@ void BleCompanionHandler::pushAdvert(const ContactInfo& contact, bool is_new,
     uint8_t buf[1 + PUB_KEY_SIZE];
     buf[0] = PUSH_CODE_ADVERT;
     memcpy(&buf[1], contact.id.pub_key, PUB_KEY_SIZE);
-    _serial.writeFrame(buf, 1 + PUB_KEY_SIZE);
+    pushFrame(buf, 1 + PUB_KEY_SIZE);
   }
 }
 
@@ -1438,7 +1291,7 @@ void BleCompanionHandler::pushSendConfirmed(uint32_t ack_crc) {
       buf[0] = PUSH_CODE_SEND_CONFIRMED;
       memcpy(&buf[1], &ack_crc, 4);
       memcpy(&buf[5], &trip_time_ms, 4);
-      _serial.writeFrame(buf, 9);
+      pushFrame(buf, 9);
       expected_ack_table[j].ack = 0;
       return;
     }
@@ -1453,7 +1306,7 @@ void BleCompanionHandler::pushPathUpdated(const ContactInfo& contact) {
   uint8_t buf[1 + PUB_KEY_SIZE];
   buf[0] = PUSH_CODE_PATH_UPDATED;
   memcpy(&buf[1], contact.id.pub_key, PUB_KEY_SIZE);
-  _serial.writeFrame(buf, 1 + PUB_KEY_SIZE);
+  pushFrame(buf, 1 + PUB_KEY_SIZE);
 }
 
 void BleCompanionHandler::pushLogRxData(mesh::Packet* pkt, float snr, float rssi) {
@@ -1466,7 +1319,7 @@ void BleCompanionHandler::pushLogRxData(mesh::Packet* pkt, float snr, float rssi
   buf[1] = (int8_t)(snr * 4);
   buf[2] = (int8_t)rssi;
   pkt->writeTo(&buf[3]);
-  _serial.writeFrame(buf, 3 + raw_len);
+  pushFrame(buf, 3 + raw_len);
 }
 
 void BleCompanionHandler::pushRawData(mesh::Packet* pkt, float snr, float rssi) {
@@ -1480,7 +1333,7 @@ void BleCompanionHandler::pushRawData(mesh::Packet* pkt, float snr, float rssi) 
   out_frame[i++] = 0xFF;
   memcpy(&out_frame[i], pkt->payload, pkt->payload_len);
   i += pkt->payload_len;
-  _serial.writeFrame(out_frame, i);
+  pushFrame(out_frame, i);
 }
 
 void BleCompanionHandler::pushTraceData(mesh::Packet* pkt, uint32_t tag, uint32_t auth_code,
@@ -1500,7 +1353,7 @@ void BleCompanionHandler::pushTraceData(mesh::Packet* pkt, uint32_t tag, uint32_
   memcpy(&out_frame[i], path_hashes, path_len); i += path_len;
   memcpy(&out_frame[i], path_snrs, path_len >> path_sz); i += (path_len >> path_sz);
   out_frame[i++] = (int8_t)(pkt->getSNR() * 4);
-  _serial.writeFrame(out_frame, i);
+  pushFrame(out_frame, i);
 }
 
 void BleCompanionHandler::pushControlData(mesh::Packet* pkt, float snr, float rssi) {
@@ -1514,7 +1367,7 @@ void BleCompanionHandler::pushControlData(mesh::Packet* pkt, float snr, float rs
   out_frame[i++] = pkt->path_len;
   memcpy(&out_frame[i], pkt->payload, pkt->payload_len);
   i += pkt->payload_len;
-  _serial.writeFrame(out_frame, i);
+  pushFrame(out_frame, i);
 }
 
 void BleCompanionHandler::pushChannelDataRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt,
@@ -1540,7 +1393,7 @@ void BleCompanionHandler::pushChannelDataRecv(const mesh::GroupChannel& channel,
     i += data_len;
   }
 
-  _serial.writeFrame(out_frame, i);
+  pushFrame(out_frame, i);
 }
 
 bool BleCompanionHandler::checkPendingDiscovery(ContactInfo& contact, uint8_t* in_path,
@@ -1568,7 +1421,7 @@ bool BleCompanionHandler::checkPendingDiscovery(ContactInfo& contact, uint8_t* i
   i += mesh::Packet::writePath(&out_frame[i], in_path, in_path_len);
 
   if (_serial.isConnected()) {
-    _serial.writeFrame(out_frame, i);
+    pushFrame(out_frame, i);
   }
   return true;
 }
@@ -1603,7 +1456,7 @@ void BleCompanionHandler::pushContactResponse(const ContactInfo& contact, const 
       out_frame[i++] = 0;
       memcpy(&out_frame[i], contact.id.pub_key, 6); i += 6;
     }
-    _serial.writeFrame(out_frame, i);
+    pushFrame(out_frame, i);
 
   } else if (len > 4 && pending_status && memcmp(&pending_status, contact.id.pub_key, 4) == 0) {
     pending_status = 0;
@@ -1613,7 +1466,7 @@ void BleCompanionHandler::pushContactResponse(const ContactInfo& contact, const 
     out_frame[i++] = 0;
     memcpy(&out_frame[i], contact.id.pub_key, 6); i += 6;
     memcpy(&out_frame[i], &data[4], len - 4); i += (len - 4);
-    _serial.writeFrame(out_frame, i);
+    pushFrame(out_frame, i);
 
   } else if (len > 4 && tag == pending_telemetry) {
     pending_telemetry = 0;
@@ -1623,7 +1476,7 @@ void BleCompanionHandler::pushContactResponse(const ContactInfo& contact, const 
     out_frame[i++] = 0;
     memcpy(&out_frame[i], contact.id.pub_key, 6); i += 6;
     memcpy(&out_frame[i], &data[4], len - 4); i += (len - 4);
-    _serial.writeFrame(out_frame, i);
+    pushFrame(out_frame, i);
 
   } else if (len > 4 && tag == pending_req) {
     pending_req = 0;
@@ -1633,7 +1486,7 @@ void BleCompanionHandler::pushContactResponse(const ContactInfo& contact, const 
     out_frame[i++] = 0;
     memcpy(&out_frame[i], &tag, 4); i += 4;
     memcpy(&out_frame[i], &data[4], len - 4); i += (len - 4);
-    _serial.writeFrame(out_frame, i);
+    pushFrame(out_frame, i);
   }
 }
 

@@ -3168,7 +3168,11 @@ int PunkMesh::pushMsgSummariesToLua(lua_State* L) {
     return 1;
 }
 
-int PunkMesh::enumerateMessageFiles(char paths[][MAX_SYNC_PATH_LEN], int max_paths) {
+String PunkMesh::messagesDirPath() {
+    return messages_dir(_storage_prefix);
+}
+
+int PunkMesh::enumerateMessageFiles(MsgFileInfo* out, int max_paths) {
     if (!_storage || max_paths <= 0) return 0;
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
@@ -3190,8 +3194,9 @@ int PunkMesh::enumerateMessageFiles(char paths[][MAX_SYNC_PATH_LEN], int max_pat
             if (base.endsWith(".log") &&
                 (base.startsWith("dm_") || base.startsWith("ch_"))) {
                 String full = dir + "/" + base;
-                strncpy(paths[count], full.c_str(), MAX_SYNC_PATH_LEN - 1);
-                paths[count][MAX_SYNC_PATH_LEN - 1] = '\0';
+                strncpy(out[count].path, full.c_str(), MAX_SYNC_PATH_LEN - 1);
+                out[count].path[MAX_SYNC_PATH_LEN - 1] = '\0';
+                out[count].size = (uint32_t)entry.size();
                 count++;
             }
         }
@@ -3201,6 +3206,10 @@ int PunkMesh::enumerateMessageFiles(char paths[][MAX_SYNC_PATH_LEN], int max_pat
     if (is_sd) sd_spi_release();
     return count;
 }
+
+// Shared key=value field mapping for stored-message records (used by both
+// the byte-wise read_one_record and the block-buffered batch reader).
+static void apply_record_field(StoredMsg& m, const char* key, const char* val);
 
 static bool read_one_record(File& f, StoredMsg& m) {
     memset(&m, 0, sizeof(m));
@@ -3223,11 +3232,14 @@ static bool read_one_record(File& f, StoredMsg& m) {
         char* eq = strchr(line, '=');
         if (!eq) continue;
         *eq = '\0';
-        const char* key = line;
-        const char* val = eq + 1;
         has_data = true;
+        apply_record_field(m, line, eq + 1);
+    }
+    return false;
+}
 
-        if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
+static void apply_record_field(StoredMsg& m, const char* key, const char* val) {
+    if (strcmp(key, "ts") == 0) m.timestamp = strtoul(val, nullptr, 10);
         else if (strcmp(key, "sender_ts") == 0) m.sender_ts = strtoul(val, nullptr, 10);
         else if (strcmp(key, "from") == 0) strncpy(m.from, val, sizeof(m.from) - 1);
         else if (strcmp(key, "peer") == 0) strncpy(m.peer, val, sizeof(m.peer) - 1);
@@ -3243,8 +3255,6 @@ static bool read_one_record(File& f, StoredMsg& m) {
             mesh::Utils::fromHex(m.sender_pub_key, 6, val);
             m.has_pub_key = true;
         }
-    }
-    return false;
 }
 
 int PunkMesh::readOneStoredMsg(fs::FS* storage, const char* path,
@@ -3297,8 +3307,42 @@ int PunkMesh::readAllStoredMsgs(const char* path, StoredMsg* out, int max_count)
     return count;
 }
 
-int PunkMesh::readStoredMsgsSince(const char* path, uint32_t since,
-                                  StoredMsg* out, int max_count) {
+// Block-buffered line reader that tracks the exact file offset of the next
+// unconsumed byte (BlockLineReader drops that information). Offsets returned
+// to callers always land on record boundaries.
+struct CountingLineReader {
+    File*    f;
+    uint8_t  buf[512];
+    int      len = 0;
+    int      pos = 0;
+    uint32_t consumed;   // absolute file offset of the next unconsumed byte
+    CountingLineReader(File* file, uint32_t start) : f(file), consumed(start) {}
+    int next(char* out, int outsz) {
+        int n = 0;
+        bool saw = false;
+        for (;;) {
+            if (pos >= len) {
+                len = f->read(buf, sizeof(buf));
+                pos = 0;
+                if (len <= 0) break;             // EOF (or read error)
+            }
+            saw = true;
+            char c = (char)buf[pos++];
+            consumed++;
+            if (c == '\n') { out[n] = '\0'; return n; }
+            if (c == '\r') continue;
+            if (n < outsz - 1) out[n++] = c;     // overflow chars dropped
+        }
+        out[n] = '\0';
+        return (saw || n > 0) ? n : -1;          // last line, or -1 at true EOF
+    }
+};
+
+int PunkMesh::readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32_t min_ts,
+                                 StoredMsg* out, uint32_t* end_offsets, int max_count,
+                                 uint32_t* next_offset, uint32_t* file_size) {
+    *next_offset = start_offset;
+    *file_size = 0;
     if (!_storage || max_count <= 0) return 0;
     bool is_sd = (_storage != &LittleFS);
     if (is_sd) sd_spi_take();
@@ -3308,16 +3352,49 @@ int PunkMesh::readStoredMsgsSince(const char* path, uint32_t since,
         if (is_sd) sd_spi_release();
         return 0;
     }
-
-    int count = 0;
-    while (f.available() && count < max_count) {
-        StoredMsg m;
-        if (read_one_record(f, m)) {
-            if (m.timestamp > since)
-                out[count++] = m;
-        } else
-            break;
+    uint32_t fsize = (uint32_t)f.size();
+    *file_size = fsize;
+    if (start_offset >= fsize) {
+        f.close();
+        if (is_sd) sd_spi_release();
+        return 0;   // nothing new (or caller must handle offset > size = compaction)
     }
+    f.seek(start_offset);
+
+    CountingLineReader lr(&f, start_offset);
+    char line[256];
+    StoredMsg m;
+    memset(&m, 0, sizeof(m));
+    bool has_data = false;
+    int count = 0, parsed = 0, llen;
+
+    // Parse at most max_count COMPLETE records per call (keeps every call
+    // bounded even when the min_ts filter drops all of them).
+    while (parsed < max_count && (llen = lr.next(line, sizeof(line))) >= 0) {
+        if (llen == 0) continue;
+
+        if (llen == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+            parsed++;
+            *next_offset = lr.consumed;          // record boundary
+            if (has_data && (min_ts == 0 || m.timestamp > min_ts)) {
+                out[count] = m;
+                end_offsets[count] = lr.consumed;
+                count++;
+            }
+            memset(&m, 0, sizeof(m));
+            has_data = false;
+            if (count >= max_count) break;
+            continue;
+        }
+
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        has_data = true;
+        apply_record_field(m, line, eq + 1);
+    }
+    // An unterminated tail record (crash mid-append) is never returned and
+    // never advances *next_offset — it re-parses once its "---" lands.
 
     f.close();
     if (is_sd) sd_spi_release();

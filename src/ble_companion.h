@@ -12,7 +12,6 @@
 
 // Forward declarations
 class PunkMesh;
-struct StoredMsg;
 
 // ── Companion protocol version ───────────────────────────────────
 #define MESHPUNK_FW_VER_CODE     11
@@ -154,32 +153,12 @@ struct StoredMsg;
 struct AckTableEntry {
   unsigned long msg_sent;
   uint32_t ack;
-  ContactInfo* contact;
 };
 
-// ── Disk-based message sync state ────────────────────────────────
-struct SyncFrame {
-  uint8_t len;
-  uint8_t data[MAX_FRAME_SIZE];
-};
-
-struct MsgSyncState {
-  static const int MAX_FILES = 40;
-  static const int MAX_FRAMES = 200;
-  static const int MAX_PATH_LEN = 64;
-  char files[MAX_FILES][MAX_PATH_LEN];
-  int file_count;
-  int current_file;
-  uint32_t since;
-  uint32_t most_recent_ts;
-  bool active;
-  SyncFrame* frames;
-  int frame_count;
-  int frame_idx;
-  // Targeted sync: set by push methods when a single file changed
-  char pending_file[MAX_PATH_LEN];
-  bool has_pending_file;
-};
+// ── Message sync ─────────────────────────────────────────────────
+// Per-file ledger engine (see ble_msg_sync.h). No full-store scans: the RX
+// path marks dirty files, commands read only those, idle polls open nothing.
+#include "ble_msg_sync.h"
 
 class BleCompanionHandler {
 public:
@@ -224,12 +203,11 @@ private:
   void writeErrFrame(uint8_t err_code);
   void writeContactRespFrame(uint8_t code, const ContactInfo& contact);
 
-  int buildSyncFrame(const StoredMsg& m, uint8_t* frame);
-  bool loadFileFrames(const char* path);
-  bool loadNextFileFrames();
-  void freeSyncFrames();
-  void saveWatermarkNow();
-  void startFullSync();
+  // Responses (replies the app is awaiting) get a single retry slot — the
+  // protocol is strictly sequential, so one slot suffices. Pushes are
+  // best-effort and yield to a pending response.
+  bool sendResp(size_t len);                        // sends out_frame[0..len)
+  bool pushFrame(const uint8_t* frame, size_t len);
 
   PunkMesh& _mesh;
   SerialBLEInterface& _serial;
@@ -243,7 +221,10 @@ private:
   uint8_t cmd_frame[MAX_FRAME_SIZE + 1];
   uint8_t out_frame[MAX_FRAME_SIZE + 1];
 
-  MsgSyncState _msg_sync;
+  BleMsgSync _msg_sync;
+
+  uint8_t _resp_retry[MAX_FRAME_SIZE];
+  size_t  _resp_retry_len;
 
   AckTableEntry expected_ack_table[EXPECTED_ACK_TABLE_SIZE];
   int next_ack_idx;

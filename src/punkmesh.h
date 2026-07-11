@@ -527,11 +527,25 @@ public:
   // BLE sync: enumerate message files and read records.
   static const int MAX_SYNC_FILES = 40;
   static const int MAX_SYNC_PATH_LEN = 64;
-  int enumerateMessageFiles(char paths[][MAX_SYNC_PATH_LEN], int max_paths);
+  struct MsgFileInfo {
+    char     path[MAX_SYNC_PATH_LEN];
+    uint32_t size;
+  };
+  // Directory metadata only (names + sizes) — opens no file contents.
+  int enumerateMessageFiles(MsgFileInfo* out, int max_paths);
   static int readOneStoredMsg(fs::FS* storage, const char* path,
                               size_t offset, StoredMsg& m);
   int readAllStoredMsgs(const char* path, StoredMsg* out, int max_count);
-  int readStoredMsgsSince(const char* path, uint32_t since, StoredMsg* out, int max_count);
+  // Seek-based batched read: parses up to max_count COMPLETE ("---"-terminated)
+  // records starting at byte start_offset. Records with ts <= min_ts are
+  // filtered from out[] (pass 0 for no filter) but still advance the cursor.
+  // end_offsets[] holds the offset just past each returned record;
+  // *next_offset lands just past the last parsed record (= resume cursor);
+  // *file_size is the file's current size. Returns records in out[].
+  int readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32_t min_ts,
+                         StoredMsg* out, uint32_t* end_offsets, int max_count,
+                         uint32_t* next_offset, uint32_t* file_size);
+  String messagesDirPath();
 
   // Path helpers (used by BLE companion for targeted sync)
   String channelMsgPath(int channel_idx);
