@@ -24,6 +24,7 @@
 #include "meshpunk_fs.h"
 #include "fs_bridge.h"
 #include "usb_manager.h"
+#include "usb_fs.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -44,8 +45,9 @@ static void gps_sync_begin();
 // Exposed so meshpunk_tasks.cpp's gps_task can drive it from Core 1.
 void gps_sync_poll();
 bool gps_sync_is_done();
-// Resets GPS state and re-opens serial for a fresh sync cycle.
-void gps_sync_restart();
+// Resets GPS state and re-opens serial for a fresh sync cycle. `manual` picks
+// the longer location-hunt budget (boot / user-triggered syncs).
+void gps_sync_restart(bool manual);
 
 
 extern "C" {
@@ -106,6 +108,29 @@ ESP32Board board;
 PunkSX1262Wrapper radio_driver(radio, board);
 PunkMesh* the_mesh = nullptr;
 
+// Live radio reconfiguration (declared in meshpunk_sync.h). Holding SPI_LOCK
+// across the whole sequence keeps the dispatcher's recvRaw() from re-arming
+// RX between the standby and the last set* call; once released, the next
+// dispatcher pass re-enters RX with the new params (state was forced IDLE).
+void radio_apply_params(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr) {
+  SPI_LOCK();
+  radio_driver.standbyForConfig();
+  int16_t s1 = radio.setFrequency(freq_mhz);
+  int16_t s2 = radio.setBandwidth(bw_khz);
+  int16_t s3 = radio.setSpreadingFactor(sf);
+  int16_t s4 = radio.setCodingRate(cr);
+  SPI_UNLOCK();
+  SLog.printf("[RADIO] live params: %.3f MHz BW=%.1f SF=%u CR=%u (%d,%d,%d,%d)\n",
+              freq_mhz, bw_khz, sf, cr, s1, s2, s3, s4);
+}
+
+void radio_apply_tx_power(int8_t dbm) {
+  SPI_LOCK();
+  int16_t s = radio.setOutputPower(dbm);
+  SPI_UNLOCK();
+  SLog.printf("[RADIO] live tx power: %d dBm (%d)\n", (int)dbm, s);
+}
+
 // One-shot GPS time sync: poll in loop() until first fix, then stop.
 static TinyGPSPlus gps_tinygps;
 static HardwareSerial GPSSerial(1);
@@ -113,10 +138,16 @@ static bool gps_sync_done = false;
 static uint32_t gps_sync_start_ms = 0;
 static uint32_t gps_last_stats_ms = 0;
 static uint32_t gps_last_chars = 0;
-static uint32_t gps_fix_acquired_ms = 0;    // when time fix was captured (for post-fix window)
+static uint32_t gps_fix_acquired_ms = 0;    // when the time fix was captured (location hunt starts here)
 static const uint32_t GPS_SYNC_TIMEOUT_MS = 600000;   // 10 min cold-start budget
 static const uint32_t GPS_STATS_INTERVAL_MS = 5000;   // print status every 5s
-static const uint32_t GPS_POST_FIX_MS = 2000;         // keep reading after fix to collect sat count
+static const uint32_t GPS_POST_FIX_MS = 2000;         // grace after a location fix to collect sat count
+// Location-hunt budget after the time fix. RMC time alone can come from the
+// module's battery-backed RTC with zero satellites tracked (status V), so the
+// receiver needs real airtime to acquire a position — but every cycle must
+// still end in standby (PMTK161): the GPS is a big power draw.
+static const uint32_t GPS_LOC_HUNT_MANUAL_MS = 120000; // boot / user-triggered sync
+static const uint32_t GPS_LOC_HUNT_AUTO_MS   = 60000;  // 5-min background cycle
 
 // Timezone state — "auto" uses longitude-from-GPS; otherwise a fixed offset in minutes.
 static bool    gps_location_valid_at_fix = false;
@@ -126,6 +157,9 @@ static bool    gps_time_fix_valid = false;   // true if last cycle got a time fi
 static bool    gps_manual_time_override = false;
 static uint32_t gps_sats_at_fix = 0;
 static uint32_t gps_hdop_at_fix = 0;        // HDOP * 100 (TinyGPSPlus integer representation)
+static uint32_t gps_loc_hunt_ms = GPS_LOC_HUNT_MANUAL_MS; // this cycle's hunt budget
+static bool     gps_loc_fixed_this_cycle = false;  // location fix landed THIS cycle
+static uint32_t gps_loc_fix_ms = 0;                // when it landed (for sat-count grace)
 static bool    tz_is_auto = true;
 static int32_t tz_manual_minutes = 0;
 static String  tz_setting_str = "auto";
@@ -137,8 +171,12 @@ static String clock_fmt_str = "12";
 static bool   ble_enabled_pref = true;
 bool   ble_bond_clear_pref = false;
 static bool   wifi_enabled_pref = true;
-static String wifi_saved_ssid = "";
-static String wifi_saved_pass = "";
+// Saved WiFi networks (multi-slot). /wifi_creds holds alternating ssid/pass
+// lines, so the legacy single-network file (2 lines) reads as one entry.
+#define WIFI_MAX_NETS 8
+static String wifi_saved_ssid[WIFI_MAX_NETS];
+static String wifi_saved_pass[WIFI_MAX_NETS];
+static int    wifi_saved_count = 0;
 
 // ── Audio ─────────────────────────────────────────────────────────────────
 static Audio*    audio = nullptr;          // ESP32-audioI2S player, created in setup()
@@ -288,8 +326,10 @@ static void firmware_prefs_save() {
 static void write_wifi_creds(fs::FS& fs, const char* path) {
   File f = fs.open(path, "w", true);
   if (!f) { SLog.printf("[WIFI_CREDS] cannot write %s\n", path); return; }
-  f.println(wifi_saved_ssid.c_str());
-  f.println(wifi_saved_pass.c_str());
+  for (int i = 0; i < wifi_saved_count; i++) {
+    f.println(wifi_saved_ssid[i].c_str());
+    f.println(wifi_saved_pass[i].c_str());
+  }
   f.close();
 }
 
@@ -306,24 +346,244 @@ static void wifi_creds_save() {
 static void wifi_creds_load() {
   File f = LittleFS.open("/wifi_creds", "r");
   if (!f) return;
-  wifi_saved_ssid = f.readStringUntil('\n');
-  wifi_saved_ssid.trim();
-  wifi_saved_pass = f.readStringUntil('\n');
-  wifi_saved_pass.trim();
+  wifi_saved_count = 0;
+  while (f.available() && wifi_saved_count < WIFI_MAX_NETS) {
+    String ssid = f.readStringUntil('\n'); ssid.trim();
+    String pass = f.readStringUntil('\n'); pass.trim();
+    if (ssid.length() == 0) continue;   // blank line / trailing newline
+    wifi_saved_ssid[wifi_saved_count] = ssid;
+    wifi_saved_pass[wifi_saved_count] = pass;
+    wifi_saved_count++;
+  }
   f.close();
-  if (wifi_saved_ssid.length() > 0) {
-    SLog.printf("[WIFI_CREDS] loaded SSID: %s\n", wifi_saved_ssid.c_str());
+  if (wifi_saved_count > 0) {
+    SLog.printf("[WIFI_CREDS] loaded %d saved network(s)\n", wifi_saved_count);
   }
 }
 
 static void wifi_creds_clear() {
-  wifi_saved_ssid = "";
-  wifi_saved_pass = "";
+  for (int i = 0; i < wifi_saved_count; i++) {
+    wifi_saved_ssid[i] = "";
+    wifi_saved_pass[i] = "";
+  }
+  wifi_saved_count = 0;
   LittleFS.remove("/wifi_creds");
   if (sd_mounted && use_sd_pref) {
     sd_spi_take();
     SD.remove("/meshpunk/wifi_creds");
     sd_spi_release();
+  }
+}
+
+static int wifi_creds_find(const char *ssid) {
+  for (int i = 0; i < wifi_saved_count; i++) {
+    if (wifi_saved_ssid[i].equals(ssid)) return i;
+  }
+  return -1;
+}
+
+// Add or update a saved network. At capacity the oldest entry is evicted.
+static void wifi_creds_upsert(const char *ssid, const char *pass) {
+  int idx = wifi_creds_find(ssid);
+  if (idx < 0) {
+    if (wifi_saved_count >= WIFI_MAX_NETS) {
+      SLog.printf("[WIFI_CREDS] full — dropping oldest (%s)\n", wifi_saved_ssid[0].c_str());
+      for (int i = 1; i < wifi_saved_count; i++) {
+        wifi_saved_ssid[i - 1] = wifi_saved_ssid[i];
+        wifi_saved_pass[i - 1] = wifi_saved_pass[i];
+      }
+      wifi_saved_count--;
+    }
+    idx = wifi_saved_count++;
+    wifi_saved_ssid[idx] = ssid;
+  }
+  wifi_saved_pass[idx] = pass;
+  wifi_creds_save();
+}
+
+static bool wifi_creds_forget(const char *ssid) {
+  int idx = wifi_creds_find(ssid);
+  if (idx < 0) return false;
+  for (int i = idx + 1; i < wifi_saved_count; i++) {
+    wifi_saved_ssid[i - 1] = wifi_saved_ssid[i];
+    wifi_saved_pass[i - 1] = wifi_saved_pass[i];
+  }
+  wifi_saved_count--;
+  wifi_saved_ssid[wifi_saved_count] = "";
+  wifi_saved_pass[wifi_saved_count] = "";
+  wifi_creds_save();
+  return true;
+}
+
+// ── WiFi auto-connect: bounded rounds ───────────────────────────────────────
+// The Arduino stack's own auto-reconnect retries an unreachable network
+// forever — nonstop scan+auth attempts that drain the battery, and while the
+// STA is mid-connect esp_wifi_scan_start() fails, which is why the Wireless
+// app showed "No networks found" whenever a network was saved. So:
+// auto-reconnect is OFF (setup() calls WiFi.setAutoReconnect(false)) and all
+// connect policy lives here as bounded rounds: one async scan, then one
+// begin() per known network heard in the scan, strongest first. If nothing
+// connects the radio is parked (WIFI_OFF) until the next trigger — boot,
+// WiFi toggled on, a scan/join in the Wireless app, or an app calling
+// _wifi_auto_connect (the downloader does before fetching). After an
+// unexpected AP loss one grace round runs ~10s later; if that fails the
+// radio parks rather than retrying forever.
+//
+// Everything here runs on Core 0 (loop()/Lua context) — the same thread as
+// the Lua WiFi bindings, so no locking is needed.
+enum WifiAutoState : uint8_t { WA_IDLE, WA_SCANNING, WA_CONNECTING };
+static WifiAutoState wa_state = WA_IDLE;
+static uint32_t wa_deadline = 0;         // current phase timeout (millis)
+static int      wa_cand[WIFI_MAX_NETS];  // saved-cred indices, strongest first
+static int      wa_cand_count = 0;
+static int      wa_cand_next = 0;
+static uint8_t  wa_scan_retries = 0;
+static bool     wa_user_scan = false;     // Wireless app is waiting on this scan
+static bool     wa_was_connected = false; // successful connect since last failure
+static uint32_t wa_reconnect_at = 0;      // pending grace round after AP loss
+
+static void wifi_radio_park() {
+  UsbFlashGuard _g;
+  WiFi.disconnect(true);   // true = radio off too
+  SLog.println("[WIFI] no known network reachable — radio parked");
+}
+
+// Start a connect round (scan phase). Returns false when there is nothing to
+// do (disabled / no saved networks); true when connected or a round is going.
+static bool wifi_auto_kick() {
+  if (!wifi_enabled_pref || wifi_saved_count == 0) return false;
+  if (WiFi.status() == WL_CONNECTED) return true;
+  if (wa_state != WA_IDLE) return true;   // round already in the works
+  {
+    UsbFlashGuard _g;          // mode/begin can write PHY cal to NVS
+    WiFi.mode(WIFI_STA);       // radio may be parked
+    WiFi.disconnect();         // abort any in-flight begin() so the scan can start
+    WiFi.scanNetworks(true);   // async; tick retries if it couldn't start yet
+  }
+  wa_state = WA_SCANNING;
+  wa_deadline = millis() + 12000;
+  wa_scan_retries = 0;
+  SLog.println("[WIFI] connect round: scanning for known networks");
+  return true;
+}
+
+static void wifi_auto_fail_round() {
+  wa_state = WA_IDLE;
+  wa_was_connected = false;
+  wa_reconnect_at = 0;
+  wifi_radio_park();
+}
+
+// Scan finished with n results still in the driver: pick known networks,
+// strongest first, and start connecting. Does NOT scanDelete — the caller
+// owns the results (lua_wifi_scan_results also reads them for the UI).
+static void wifi_auto_on_scan_done(int n) {
+  wa_cand_count = 0;
+  wa_cand_next = 0;
+  bool seen[WIFI_MAX_NETS] = {false};
+  int32_t rssi[WIFI_MAX_NETS];
+  for (int i = 0; i < n; i++) {
+    int idx = wifi_creds_find(WiFi.SSID(i).c_str());
+    if (idx < 0 || seen[idx]) continue;
+    seen[idx] = true;
+    int32_t r = WiFi.RSSI(i);
+    int pos = wa_cand_count++;
+    while (pos > 0 && rssi[pos - 1] < r) {   // insertion sort, RSSI desc
+      wa_cand[pos] = wa_cand[pos - 1];
+      rssi[pos] = rssi[pos - 1];
+      pos--;
+    }
+    wa_cand[pos] = idx;
+    rssi[pos] = r;
+  }
+  if (WiFi.status() == WL_CONNECTED) {   // user scan while connected — done
+    wa_state = WA_IDLE;
+    return;
+  }
+  if (wa_cand_count == 0) {
+    wifi_auto_fail_round();
+    return;
+  }
+  int idx = wa_cand[wa_cand_next++];
+  SLog.printf("[WIFI] connecting to %s (%d known network(s) in range)\n",
+              wifi_saved_ssid[idx].c_str(), wa_cand_count);
+  { UsbFlashGuard _g; WiFi.begin(wifi_saved_ssid[idx].c_str(), wifi_saved_pass[idx].c_str()); }
+  wa_state = WA_CONNECTING;
+  wa_deadline = millis() + 10000;
+}
+
+static void wifi_auto_tick() {
+  static uint32_t next_ms = 0;
+  uint32_t now = millis();
+  if ((int32_t)(now - next_ms) < 0) return;
+  next_ms = now + 250;
+  if (!wifi_enabled_pref) return;
+
+  switch (wa_state) {
+  case WA_IDLE: {
+    if (WiFi.status() == WL_CONNECTED) {
+      wa_was_connected = true;
+      wa_reconnect_at = 0;
+    } else if (wa_was_connected && wifi_saved_count > 0) {
+      // AP dropped on us: one grace round after a short settle, then park.
+      if (wa_reconnect_at == 0) {
+        wa_reconnect_at = now + 10000;
+        SLog.println("[WIFI] connection lost — grace round in 10s");
+      } else if ((int32_t)(now - wa_reconnect_at) >= 0) {
+        wa_reconnect_at = 0;
+        wa_was_connected = false;   // the grace round is one-shot
+        wifi_auto_kick();
+      }
+    }
+    break;
+  }
+  case WA_SCANNING: {
+    int n = WiFi.scanComplete();
+    bool expired = (int32_t)(now - wa_deadline) >= 0;
+    if (n >= 0) {
+      // A user scan's results are consumed by lua_wifi_scan_results (which
+      // feeds them back here); only take over if the app never collects.
+      if (!wa_user_scan || expired) {
+        wa_user_scan = false;
+        wifi_auto_on_scan_done(n);
+        WiFi.scanDelete();
+      }
+    } else if (n == WIFI_SCAN_FAILED) {
+      // Couldn't start (STA still tearing down a connect attempt) — retry.
+      if (wa_scan_retries++ < 8) {
+        WiFi.scanNetworks(true);
+      } else {
+        wa_user_scan = false;
+        wifi_auto_fail_round();
+      }
+    } else if (expired) {   // stuck in WIFI_SCAN_RUNNING
+      WiFi.scanDelete();
+      wa_user_scan = false;
+      wifi_auto_fail_round();
+    }
+    break;
+  }
+  case WA_CONNECTING: {
+    wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) {
+      wa_state = WA_IDLE;
+      wa_was_connected = true;
+      wa_reconnect_at = 0;
+      SLog.printf("[WIFI] connected to %s (%s)\n",
+                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    } else if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL ||
+               (int32_t)(now - wa_deadline) >= 0) {
+      if (wa_cand_next < wa_cand_count) {
+        int idx = wa_cand[wa_cand_next++];
+        SLog.printf("[WIFI] trying next candidate: %s\n", wifi_saved_ssid[idx].c_str());
+        { UsbFlashGuard _g; WiFi.begin(wifi_saved_ssid[idx].c_str(), wifi_saved_pass[idx].c_str()); }
+        wa_deadline = now + 10000;
+      } else {
+        wifi_auto_fail_round();
+      }
+    }
+    break;
+  }
   }
 }
 
@@ -524,7 +784,7 @@ static void gps_start_probe_at_current_baud() {
 
 static void gps_sync_begin() {
   SLog.printf("[GPS] Listening on UART1 RX=%d TX=%d\n", TDECK_GPS_RX, TDECK_GPS_TX);
-  gps_sync_restart();
+  gps_sync_restart(true);
 }
 
 // Returns true once a working baud is locked in.
@@ -644,22 +904,61 @@ void gps_sync_poll() {
 
   uint32_t now = millis();
 
-  // ── Post-fix window: keep reading to collect satellite count from GPGGA ──
-  // The time fix often comes from GPRMC before GPGGA (which carries sat count)
-  // has been parsed. Wait up to GPS_POST_FIX_MS for a satellite reading to arrive.
+  // ── Location hunt: clock is set; keep reading until a real position fix ──
+  // The time fix alone is NOT proof of acquisition: TinyGPSPlus commits RMC
+  // date/time even with status V, which the module emits instantly off its
+  // battery-backed RTC with zero satellites tracked. Location only commits on
+  // status A / GGA quality > 0, so hunt for that (bounded), then standby.
   if (gps_time_fix_valid) {
     if (gps_tinygps.satellites.isValid() && gps_tinygps.satellites.value() > 0) {
       gps_sats_at_fix = gps_tinygps.satellites.value();
       gps_hdop_at_fix = gps_tinygps.hdop.isValid() ? gps_tinygps.hdop.value() : 0;
     }
-    bool sats_ready = gps_sats_at_fix > 0;
-    bool window_expired = (now - gps_fix_acquired_ms >= GPS_POST_FIX_MS);
-    if (sats_ready || window_expired) {
-      if (window_expired && !sats_ready) {
-        SLog.println("[GPS] post-fix window expired; no satellite count received.");
+
+    if (!gps_loc_fixed_this_cycle && gps_tinygps.location.isValid()) {
+      gps_lat_at_fix = gps_tinygps.location.lat();
+      gps_lng_at_fix = gps_tinygps.location.lng();
+      gps_location_valid_at_fix = true;
+      gps_loc_fixed_this_cycle = true;
+      gps_loc_fix_ms = now;
+      // Re-set the RTC: fix-true time beats the RTC-carried guess accepted earlier.
+      if (!gps_manual_time_override
+          && gps_tinygps.date.isValid() && gps_tinygps.time.isValid()) {
+        DateTime utc(gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
+                     gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second());
+        MESH_LOCK();
+        the_mesh->getRTCClock()->setCurrentTime(utc.unixtime());
+        MESH_UNLOCK();
       }
+      SLog.printf("[GPS] location fix after %lus\n",
+                    (unsigned long)((now - gps_sync_start_ms) / 1000UL));
+      SLog.printf("[TZ] captured lat=%.5f lng=%.5f -> auto offset=%d min\n",
+                    gps_lat_at_fix, gps_lng_at_fix, (int)tz_auto_offset_minutes());
+    }
+
+    if (now - gps_last_stats_ms >= GPS_STATS_INTERVAL_MS) {
+      gps_last_stats_ms = now;
+      gps_print_stats("loc-hunt");
+    }
+
+    bool loc_done = gps_loc_fixed_this_cycle
+                    && (gps_sats_at_fix > 0 || now - gps_loc_fix_ms >= GPS_POST_FIX_MS);
+    bool gave_up = !gps_loc_fixed_this_cycle
+                   && (now - gps_fix_acquired_ms >= gps_loc_hunt_ms);
+    if (loc_done || gave_up) {
+      if (gave_up) {
+        SLog.printf("[GPS] no location fix within %lus; standby until next cycle.\n",
+                      (unsigned long)(gps_loc_hunt_ms / 1000UL));
+      }
+      // Persist for the next cold boot: fresh time + best location we have
+      // (this cycle's fix, or the carried-over last known). Outside MESH_LOCK.
+      uint32_t rtc_now;
+      MESH_LOCK();
+      rtc_now = the_mesh->getRTCClock()->getCurrentTime();
+      MESH_UNLOCK();
+      gps_last_save(gps_lat_at_fix, gps_lng_at_fix, gps_location_valid_at_fix, rtc_now);
       gps_print_stats("fix-final");
-      GPSSerial.println("$PMTK161,0*28");
+      GPSSerial.println("$PMTK161,0*28");   // standby — never leave the receiver running
       gps_sync_done = true;
     }
     return;
@@ -690,27 +989,17 @@ void gps_sync_poll() {
     gps_sats_at_fix = gps_tinygps.satellites.isValid() ? gps_tinygps.satellites.value() : 0;
     gps_hdop_at_fix  = gps_tinygps.hdop.isValid()      ? gps_tinygps.hdop.value()       : 0;
 
-    if (gps_tinygps.location.isValid()) {
-      gps_lat_at_fix = gps_tinygps.location.lat();
-      gps_lng_at_fix = gps_tinygps.location.lng();
-      gps_location_valid_at_fix = true;
-      SLog.printf("[TZ] captured lat=%.5f lng=%.5f -> auto offset=%d min\n",
-                    gps_lat_at_fix, gps_lng_at_fix, (int)tz_auto_offset_minutes());
-    } else {
-      SLog.println("[TZ] no location at time-fix; auto-tz falls back to UTC");
-    }
-
-    // Persist this fix as the last-known GPS for the next cold boot (clock seed
-    // + location fallback). Outside MESH_LOCK; runs once per sync cycle.
-    gps_last_save(gps_lat_at_fix, gps_lng_at_fix, gps_location_valid_at_fix, utc.unixtime());
-
-    SLog.println("[GPS] ======== FIX ACQUIRED — entering post-fix window ========");
-    gps_print_stats("fix");
-    SLog.printf("[GPS] RTC set to %u UTC (%04u-%02u-%02u %02u:%02u:%02u) after %lus\n",
+    // This time may be the module's RTC guess (RMC status V), not a satellite
+    // fix — good enough for the clock. The location hunt above takes over from
+    // here: it captures the position and re-sets the RTC if a real fix lands.
+    SLog.println("[GPS] ======== TIME SET — hunting for location fix ========");
+    gps_print_stats("time-fix");
+    SLog.printf("[GPS] RTC set to %u UTC (%04u-%02u-%02u %02u:%02u:%02u) after %lus; loc hunt up to %lus\n",
                   (unsigned)utc.unixtime(),
                   gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                   gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second(),
-                  (unsigned long)((now - gps_sync_start_ms) / 1000UL));
+                  (unsigned long)((now - gps_sync_start_ms) / 1000UL),
+                  (unsigned long)(gps_loc_hunt_ms / 1000UL));
     return;
   }
 
@@ -724,10 +1013,11 @@ void gps_sync_poll() {
   }
 }
 
-// Last known GPS location (captured at the most recent time-fix; held until the
-// next sync restart). Read by the mesh task to stamp messages — see
-// meshpunk_sync.h. Unlocked read of values that change only once per sync cycle;
-// a rare torn read just yields a slightly-off coordinate, acceptable here.
+// Last known GPS location (most recent real fix, or the boot seed; persists
+// across sync cycles until a new fix replaces it). Read by the mesh task to
+// stamp messages — see meshpunk_sync.h. Unlocked read of values that change
+// only once per sync cycle; a rare torn read just yields a slightly-off
+// coordinate, acceptable here.
 bool meshpunk_gps_last_fix(double* lat, double* lon) {
   if (!gps_location_valid_at_fix) return false;
   if (lat) *lat = gps_lat_at_fix;
@@ -735,7 +1025,7 @@ bool meshpunk_gps_last_fix(double* lat, double* lon) {
   return true;
 }
 
-void gps_sync_restart() {
+void gps_sync_restart(bool manual) {
   new (&gps_tinygps) TinyGPSPlus();
   if (gps_serial_active) {
     GPSSerial.write(0xFF);
@@ -748,12 +1038,19 @@ void gps_sync_restart() {
   gps_fix_acquired_ms = 0;
   gps_baud_idx = 0;
   gps_baud_locked = false;
-  gps_location_valid_at_fix = false;
+  // gps_location_valid_at_fix / lat / lng deliberately survive the restart:
+  // they are the last-known position (map, message stamping, auto-tz) until a
+  // new fix replaces them. Only per-cycle state resets here.
   gps_time_fix_valid = false;
+  gps_loc_fixed_this_cycle = false;
+  gps_loc_fix_ms = 0;
   gps_sats_at_fix = 0;
   gps_hdop_at_fix = 0;
-  SLog.printf("[GPS] Restarting sync (auto-baud, timeout=%us)\n",
-                (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
+  gps_loc_hunt_ms = manual ? GPS_LOC_HUNT_MANUAL_MS : GPS_LOC_HUNT_AUTO_MS;
+  SLog.printf("[GPS] Restarting sync (%s, auto-baud, timeout=%us, loc hunt=%us)\n",
+                manual ? "manual" : "auto",
+                (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000),
+                (unsigned)(gps_loc_hunt_ms / 1000));
   gps_start_probe_at_current_baud();
 }
 
@@ -1032,10 +1329,14 @@ String readFile(const char *filename) {
 //   return 1;
 // }
 
-// File handle struct to track which filesystem a file belongs to
+// File handle struct to track which filesystem a file belongs to.
+// is_sd gates the SPI bus lock; is_flash gates the USB flash guard (LittleFS
+// only — SD and USB writes never stall the cache). A U: file has both false.
+// NOTE: sound.cpp carries a duplicate definition — keep them in sync.
 struct LuaFileHandle {
     fs::File* file;
     bool is_sd;
+    bool is_flash;
     bool is_write;   // opened "w"/"a": close/flush can write internal flash
 };
 
@@ -1061,6 +1362,7 @@ static int lua_io_open(lua_State *L) {
   LuaFileHandle *ud = (LuaFileHandle *)lua_newuserdata(L, sizeof(LuaFileHandle));
   ud->file = nullptr;
   ud->is_sd = false;
+  ud->is_flash = false;
   ud->is_write = false;
   luaL_getmetatable(L, "esp32_file");
   lua_setmetatable(L, -2);
@@ -1088,6 +1390,7 @@ static int lua_io_open(lua_State *L) {
   }
   ud->file = file;
   ud->is_sd = mf.is_sd;
+  ud->is_flash = mf.is_flash;
   // "r+" opens for update too — anything but a plain read can write flash.
   ud->is_write = (mode[0] != 'r') || (strchr(mode, '+') != nullptr);
   return 1;
@@ -1434,6 +1737,29 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     }
   }
 
+  // ── Merge USB HID keyboard held keys (usb_task, Core 1 → here, Core 0) ──
+  // Shift/layout already resolved at parse time (usb_manager.cpp); chars OR
+  // into the same level-based state as matrix keys, so LVGL, nav, and the
+  // Lua _kb_* bindings see USB keys identically. Arrows arrive separately
+  // via the trackball counters. Matrix keys win the resolved_key slot.
+  {
+    bool usb_held[128];
+    if (usb_kbd_snapshot(usb_held)) {
+      for (int ch = 1; ch < 128; ch++) {
+        if (!usb_held[ch]) continue;
+        kb_key_state[ch] = true;
+        if (!kb_key_prev[ch]) {
+          kb_key_press_time[ch] = millis();
+        }
+        if (resolved_key == 0) {
+          if (ch == 0x0D)      resolved_key = LV_KEY_ENTER;
+          else if (ch == 0x08) resolved_key = LV_KEY_BACKSPACE;
+          else                 resolved_key = ch;
+        }
+      }
+    }
+  }
+
   bool kb_active = (resolved_key != 0);
 
   // ── WASD intercept — treat as direction, not character (unless typing) ──
@@ -1768,7 +2094,13 @@ static int lua_wifi_connect(lua_State *L) {
   SLog.print("Connecting to WiFi: ");
   SLog.println(network);
 
-  { UsbFlashGuard _g; WiFi.begin(network, pass); }  // WiFi init can write PHY cal to NVS
+  wa_state = WA_IDLE;   // manual join overrides any auto round
+  wa_reconnect_at = 0;
+  {
+    UsbFlashGuard _g;   // WiFi init can write PHY cal to NVS
+    WiFi.mode(WIFI_STA);   // radio may be parked
+    WiFi.begin(network, pass);
+  }
 
   return 0;
 }
@@ -1777,6 +2109,22 @@ static int lua_wifi_connect(lua_State *L) {
 static int lua_wifi_status(lua_State *L) {
   wl_status_t status = WiFi.status();
   const char *status_str = "unknown";
+
+  if (WiFi.getMode() == WIFI_MODE_NULL) {
+    // Radio parked (no known network reachable) — not an error state.
+    lua_pushstring(L, "off");
+    lua_pushstring(L, "");
+    lua_pushstring(L, "");
+    return 3;
+  }
+  if (status != WL_CONNECTED && wa_state == WA_CONNECTING) {
+    // A connect round is joining a known network — report it as one state so
+    // the UI doesn't flicker through disconnected/failed between candidates.
+    lua_pushstring(L, "connecting");
+    lua_pushstring(L, "");
+    lua_pushstring(L, "");
+    return 3;
+  }
 
   switch (status) {
   case WL_CONNECTED:
@@ -1816,6 +2164,9 @@ static int lua_wifi_status(lua_State *L) {
 
 // WiFi disconnect function for Lua
 static int lua_wifi_disconnect(lua_State *L) {
+  wa_state = WA_IDLE;
+  wa_was_connected = false;   // intentional disconnect — no grace round
+  wa_reconnect_at = 0;
   WiFi.disconnect();
   return 0;
 }
@@ -2020,8 +2371,8 @@ static int lua_wifi_download_file(lua_State *L) {
   // LittleFS target: every chunk write below is an internal-flash write, so
   // hold the USB flash guard across the whole body (pausing USB audio for the
   // download beats crashing the host stack; downloads are user-initiated and
-  // rare). SD targets skip it — SPI writes don't stall the cache.
-  UsbFlashGuardIf _dl_guard(!mf.is_sd);
+  // rare). SD and USB targets skip it — neither write stalls the cache.
+  UsbFlashGuardIf _dl_guard(mf.is_flash);
   // Stall detector, not a total-time cap: big files legitimately take longer
   // than any fixed budget, so the deadline resets on every received chunk.
   uint32_t deadline = millis() + 20000;
@@ -2086,7 +2437,21 @@ static int lua_wifi_scan_start(lua_State *L) {
     lua_pushboolean(L, 0);
     return 1;
   }
-  WiFi.scanNetworks(true);
+  {
+    UsbFlashGuard _g;
+    WiFi.mode(WIFI_STA);   // radio may be parked
+    // esp_wifi_scan_start() fails while the STA is mid-connect — this is why
+    // scans "found nothing" whenever a saved network was busy (re)connecting.
+    // Abort the attempt first; the connect round restarts from these results.
+    if (WiFi.status() != WL_CONNECTED) WiFi.disconnect();   // no-op when idle
+    if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) WiFi.scanNetworks(true);
+  }
+  // Fold the user scan into the state machine: it retries starts that failed
+  // (disconnect needs a beat to land) and auto-joins known networks after.
+  wa_state = WA_SCANNING;
+  wa_deadline = millis() + 12000;
+  wa_scan_retries = 0;
+  wa_user_scan = true;
   lua_pushboolean(L, 1);
   return 1;
 }
@@ -2094,6 +2459,13 @@ static int lua_wifi_scan_start(lua_State *L) {
 static int lua_wifi_scan_results(lua_State *L) {
   int n = WiFi.scanComplete();
   if (n == WIFI_SCAN_RUNNING) {
+    lua_pushnil(L);
+    return 1;
+  }
+  if (n == WIFI_SCAN_FAILED && wa_state == WA_SCANNING) {
+    // Scan hasn't started yet (wifi_auto_tick is retrying) — report "still
+    // scanning", not a bogus empty result. Once retries are exhausted the
+    // machine leaves WA_SCANNING and this returns the empty table below.
     lua_pushnil(L);
     return 1;
   }
@@ -2110,7 +2482,11 @@ static int lua_wifi_scan_results(lua_State *L) {
       lua_rawseti(L, -2, i + 1);
     }
   }
-  WiFi.scanDelete();
+  if (n >= 0) {
+    if (wa_state == WA_SCANNING) wifi_auto_on_scan_done(n);
+    WiFi.scanDelete();
+  }
+  wa_user_scan = false;
   return 1;
 }
 
@@ -2127,33 +2503,37 @@ static int lua_wifi_set_enabled(lua_State *L) {
     UsbFlashGuard _g;
     if (wifi_enabled_pref) {
       WiFi.mode(WIFI_STA);
-      if (wifi_saved_ssid.length() > 0) {
-        WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
-      }
     } else {
+      wa_state = WA_IDLE;
+      wa_was_connected = false;
+      wa_reconnect_at = 0;
       WiFi.disconnect();
       WiFi.mode(WIFI_OFF);
     }
   }
+  if (wifi_enabled_pref) wifi_auto_kick();
   firmware_prefs_save();
   return 0;
 }
 
+// Returns the saved-network list: { {ssid=..., has_password=...}, ... }
 static int lua_wifi_get_saved_creds(lua_State *L) {
   lua_newtable(L);
-  lua_pushstring(L, wifi_saved_ssid.c_str());
-  lua_setfield(L, -2, "ssid");
-  lua_pushboolean(L, wifi_saved_pass.length() > 0);
-  lua_setfield(L, -2, "has_password");
+  for (int i = 0; i < wifi_saved_count; i++) {
+    lua_newtable(L);
+    lua_pushstring(L, wifi_saved_ssid[i].c_str());
+    lua_setfield(L, -2, "ssid");
+    lua_pushboolean(L, wifi_saved_pass[i].length() > 0);
+    lua_setfield(L, -2, "has_password");
+    lua_rawseti(L, -2, i + 1);
+  }
   return 1;
 }
 
 static int lua_wifi_save_creds(lua_State *L) {
   const char *ssid = luaL_checkstring(L, 1);
   const char *pass = luaL_optstring(L, 2, "");
-  wifi_saved_ssid = ssid;
-  wifi_saved_pass = pass;
-  wifi_creds_save();
+  wifi_creds_upsert(ssid, pass);
   return 0;
 }
 
@@ -2162,13 +2542,49 @@ static int lua_wifi_clear_creds(lua_State *L) {
   return 0;
 }
 
-static int lua_wifi_auto_connect(lua_State *L) {
-  if (wifi_enabled_pref && wifi_saved_ssid.length() > 0) {
-    { UsbFlashGuard _g; WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str()); }
-    lua_pushboolean(L, 1);
-  } else {
-    lua_pushboolean(L, 0);
+// _wifi_forget_cred(ssid) -> bool. Also drops the link if we're on that net.
+static int lua_wifi_forget_cred(lua_State *L) {
+  const char *ssid = luaL_checkstring(L, 1);
+  bool removed = wifi_creds_forget(ssid);
+  if (removed && WiFi.status() == WL_CONNECTED && WiFi.SSID().equals(ssid)) {
+    wa_state = WA_IDLE;
+    wa_was_connected = false;
+    wa_reconnect_at = 0;
+    WiFi.disconnect();
   }
+  lua_pushboolean(L, removed ? 1 : 0);
+  return 1;
+}
+
+// _wifi_connect_saved(ssid) -> bool. Join a saved network with its stored
+// password (Lua never sees stored passwords, only has_password).
+static int lua_wifi_connect_saved(lua_State *L) {
+  const char *ssid = luaL_checkstring(L, 1);
+  int idx = wifi_creds_find(ssid);
+  if (idx < 0) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  SLog.printf("Connecting to saved WiFi: %s\n", ssid);
+  wa_state = WA_IDLE;   // manual join overrides any auto round
+  wa_reconnect_at = 0;
+  {
+    UsbFlashGuard _g;
+    WiFi.mode(WIFI_STA);   // radio may be parked
+    WiFi.begin(wifi_saved_ssid[idx].c_str(), wifi_saved_pass[idx].c_str());
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+static int lua_wifi_auto_connect(lua_State *L) {
+  if (WiFi.status() == WL_CONNECTED) {
+    lua_pushboolean(L, 1);
+    return 1;
+  }
+  // Async: kicks a connect round; callers poll _wifi_status() for "connected"
+  // (downloader.wifi_wait already does exactly that).
+  lua_pushboolean(L, wifi_auto_kick() ? 1 : 0);
   return 1;
 }
 
@@ -3057,9 +3473,7 @@ static int lua_mesh_get_message_paths(lua_State *L) {
 static int lua_mesh_send_advert(lua_State *L) {
   const char *mode = luaL_optstring(L, 1, "flood");
   MESH_LOCK();
-  auto pkt = the_mesh->createSelfAdvert(the_mesh->_prefs.node_name,
-                                       the_mesh->_prefs.node_lat,
-                                       the_mesh->_prefs.node_lon);
+  auto pkt = the_mesh->buildSelfAdvert();
   if (pkt) {
     if (strcmp(mode, "zerohop") == 0) {
       the_mesh->sendZeroHop(pkt, (uint32_t)0);
@@ -3104,12 +3518,15 @@ static int lua_mesh_set_config(lua_State *L) {
   } else if (strcmp(key, "freq") == 0) {
     the_mesh->_prefs.freq = atof(value);
     the_mesh->savePrefs();
-    SLog.printf("Frequency set to: %.3f (reboot to apply)\n", the_mesh->_prefs.freq);
+    radio_apply_params(the_mesh->_prefs.freq, the_mesh->_prefs.bandwidth,
+                       the_mesh->_prefs.spreading_factor, the_mesh->_prefs.coding_rate);
+    SLog.printf("Frequency set to: %.3f (applied)\n", the_mesh->_prefs.freq);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "tx") == 0) {
     the_mesh->_prefs.tx_power_dbm = atoi(value);
     the_mesh->savePrefs();
-    SLog.printf("TX power set to: %d dBm (reboot to apply)\n", the_mesh->_prefs.tx_power_dbm);
+    radio_apply_tx_power(the_mesh->_prefs.tx_power_dbm);
+    SLog.printf("TX power set to: %d dBm (applied)\n", the_mesh->_prefs.tx_power_dbm);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "lat") == 0) {
     the_mesh->_prefs.node_lat = atof(value);
@@ -3122,17 +3539,23 @@ static int lua_mesh_set_config(lua_State *L) {
   } else if (strcmp(key, "bw") == 0) {
     the_mesh->_prefs.bandwidth = atof(value);
     the_mesh->savePrefs();
-    SLog.printf("Bandwidth set to: %.1f kHz (reboot to apply)\n", the_mesh->_prefs.bandwidth);
+    radio_apply_params(the_mesh->_prefs.freq, the_mesh->_prefs.bandwidth,
+                       the_mesh->_prefs.spreading_factor, the_mesh->_prefs.coding_rate);
+    SLog.printf("Bandwidth set to: %.1f kHz (applied)\n", the_mesh->_prefs.bandwidth);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "sf") == 0) {
     the_mesh->_prefs.spreading_factor = atoi(value);
     the_mesh->savePrefs();
-    SLog.printf("Spreading factor set to: %d (reboot to apply)\n", the_mesh->_prefs.spreading_factor);
+    radio_apply_params(the_mesh->_prefs.freq, the_mesh->_prefs.bandwidth,
+                       the_mesh->_prefs.spreading_factor, the_mesh->_prefs.coding_rate);
+    SLog.printf("Spreading factor set to: %d (applied)\n", the_mesh->_prefs.spreading_factor);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "cr") == 0) {
     the_mesh->_prefs.coding_rate = atoi(value);
     the_mesh->savePrefs();
-    SLog.printf("Coding rate set to: %d (reboot to apply)\n", the_mesh->_prefs.coding_rate);
+    radio_apply_params(the_mesh->_prefs.freq, the_mesh->_prefs.bandwidth,
+                       the_mesh->_prefs.spreading_factor, the_mesh->_prefs.coding_rate);
+    SLog.printf("Coding rate set to: %d (applied)\n", the_mesh->_prefs.coding_rate);
     lua_pushboolean(L, 1);
   } else if (strcmp(key, "contact_overwrite") == 0) {
     the_mesh->_prefs.contact_overwrite = (atoi(value) != 0) ? 1 : 0;
@@ -3877,6 +4300,10 @@ static int lua_storage_get_info(lua_State *L) {
   lua_pushboolean(L, sd_mounted ? 1 : 0);
   lua_setfield(L, -2, "sd_available");
 
+  // Is a USB thumb drive mounted? (fileman.drives() gates the U: root on it)
+  lua_pushboolean(L, usb_fs_mounted() ? 1 : 0);
+  lua_setfield(L, -2, "usb_available");
+
   // Report actual current state so the toggle matches reality
   lua_pushboolean(L, is_sd ? 1 : 0);
   lua_setfield(L, -2, "use_sd");
@@ -4055,6 +4482,27 @@ static bool pack_write_file(const String &path, const uint8_t *stored, uint32_t 
   return ok;
 }
 
+// Deferred first-boot extraction: set at LittleFS mount time in setup(),
+// consumed in setupLuaVGL() once LVGL is up and a splash can be shown.
+// Extraction used to run before display init, and the minutes-long dark
+// screen made users think the boot hung and power-cycle mid-extract.
+static bool s_pack_extract_pending = false;
+
+// Progress label on the unpack splash (non-null only while it is showing).
+// Updated per file with a synchronous repaint so the count visibly advances.
+static lv_obj_t *s_pack_splash_label = nullptr;
+
+static void pack_splash_progress(uint32_t done, uint32_t total) {
+  if (!s_pack_splash_label) return;
+  lv_label_set_text_fmt(s_pack_splash_label,
+      "First-time setup\n\n"
+      "Unpacking filesystem: %u / %u\n\n"
+      "This can take a few minutes.\n"
+      "Do NOT power off or restart.",
+      (unsigned)done, (unsigned)total);
+  lv_refr_now(NULL);
+}
+
 // Extract the embedded pack into LittleFS. The /.pack_version marker (git
 // version, injected by make_data_pack.py) is written last and only after a
 // clean pass: pack_needs_extract() compares it against the pack's copy, so an
@@ -4109,6 +4557,7 @@ static bool extract_data_pack() {
     }
     if (!pack_write_file(path, p + off, stored_size, raw_size, flags)) { ok = false; break; }
     done++;
+    pack_splash_progress(done, count);
   }
   if (ok && have_marker) {
     ok = pack_write_file("/.pack_version", p + marker_off, marker_stored, marker_raw, marker_flags);
@@ -5399,6 +5848,8 @@ void setupLuaVGL() {
   lua_register(L, "_wifi_get_saved_creds", lua_wifi_get_saved_creds);
   lua_register(L, "_wifi_save_creds", lua_wifi_save_creds);
   lua_register(L, "_wifi_clear_creds", lua_wifi_clear_creds);
+  lua_register(L, "_wifi_forget_cred", lua_wifi_forget_cred);
+  lua_register(L, "_wifi_connect_saved", lua_wifi_connect_saved);
   lua_register(L, "_wifi_auto_connect", lua_wifi_auto_connect);
 
   // Register Mesh bridge functions
@@ -5564,6 +6015,26 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // Client repeat ("repeater mode"): re-transmit other nodes' packets. Same
+  // pref the BLE companion app sets via CMD_SET_RADIO_PARAMS.
+  lua_register(L, "_mesh_get_client_repeat", [](lua_State *L) -> int {
+    lua_pushboolean(L, the_mesh && the_mesh->_prefs.client_repeat);
+    return 1;
+  });
+  lua_register(L, "_mesh_set_client_repeat", [](lua_State *L) -> int {
+    bool on = lua_toboolean(L, 1);
+    if (!the_mesh) {
+      lua_pushboolean(L, 0);
+      lua_pushstring(L, "mesh not ready");
+      return 2;
+    }
+    the_mesh->_prefs.client_repeat = on ? 1 : 0;
+    the_mesh->savePrefs();
+    SLog.printf("Client repeat set to: %s\n", on ? "ON" : "OFF");
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
   lua_register(L, "_emoji_preload", lua_emoji_preload);
   lua_register(L, "_emoji_compose", lua_emoji_compose);
   lua_register(L, "_emoji_decompose", lua_emoji_decompose);
@@ -5683,10 +6154,12 @@ void setupLuaVGL() {
     return 1;
   });
 
-  // _gps_sync_status() — returns done:bool, has_location:bool
+  // _gps_sync_status() — returns done:bool, has_location:bool.
+  // has_location reports THIS cycle's outcome; the carried-over last-known
+  // position (which survives failed cycles) is exposed via _gps_info instead.
   lua_register(L, "_gps_sync_status", [](lua_State *L) -> int {
     lua_pushboolean(L, gps_sync_done ? 1 : 0);
-    lua_pushboolean(L, gps_location_valid_at_fix ? 1 : 0);
+    lua_pushboolean(L, gps_loc_fixed_this_cycle ? 1 : 0);
     return 2;
   });
 
@@ -5701,6 +6174,33 @@ void setupLuaVGL() {
     lua_pushinteger(L, (lua_Integer)gps_sats_at_fix);
     lua_pushnumber(L, gps_hdop_at_fix / 100.0);
     return 7;
+  });
+
+  // _gps_state() — live sync-cycle state for the Settings status panel:
+  //   state:int  0=standby  1=probing baud  2=waiting for time
+  //              3=hunting location  4=finishing (fix landed, sat-count grace)
+  //   elapsed_s:int  seconds since this cycle started
+  //   hunt_s:int     seconds since the time fix (location-hunt clock)
+  //   budget_s:int   this cycle's location-hunt budget
+  //   time_fix:bool, loc_fix:bool — THIS cycle's outcomes (last cycle's when
+  //   standby; both reset on cycle restart)
+  // Unlocked cross-core reads, same policy as _gps_info: torn values are
+  // harmless for a 1 Hz status display.
+  lua_register(L, "_gps_state", [](lua_State *L) -> int {
+    int state;
+    if (gps_sync_done)                  state = 0;
+    else if (!gps_baud_locked)          state = 1;
+    else if (!gps_time_fix_valid)       state = 2;
+    else if (!gps_loc_fixed_this_cycle) state = 3;
+    else                                state = 4;
+    uint32_t now = millis();
+    lua_pushinteger(L, state);
+    lua_pushinteger(L, (lua_Integer)((now - gps_sync_start_ms) / 1000UL));
+    lua_pushinteger(L, (lua_Integer)(gps_time_fix_valid ? (now - gps_fix_acquired_ms) / 1000UL : 0));
+    lua_pushinteger(L, (lua_Integer)(gps_loc_hunt_ms / 1000UL));
+    lua_pushboolean(L, gps_time_fix_valid ? 1 : 0);
+    lua_pushboolean(L, gps_loc_fixed_this_cycle ? 1 : 0);
+    return 6;
   });
 
   lua_register(L, "_clock_fmt_get", [](lua_State *L) -> int {
@@ -6447,7 +6947,7 @@ void setupLuaVGL() {
     if (!ud->file) { lua_pushnil(L); lua_pushstring(L, "file closed"); return 2; }
     // LittleFS write = internal-flash write: pause USB audio around it or the
     // cache stall crashes the host stack (no-op when USB is idle / target is SD).
-    UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);
+    UsbFlashGuardIf _g(ud->is_flash && ud->is_write);
     if (ud->is_sd) sd_spi_take();
     // write(buf, len), not print(str): binary-safe past embedded NULs
     size_t written = ud->file->write((const uint8_t *)str, len);
@@ -6488,7 +6988,7 @@ void setupLuaVGL() {
   lua_pushcfunction(L, [](lua_State *L) -> int {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
     if (!ud->file) return 0;
-    UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);   // LittleFS flush writes flash
+    UsbFlashGuardIf _g(ud->is_flash && ud->is_write); // LittleFS flush writes flash
     if (ud->is_sd) sd_spi_take();
     ud->file->flush();
     if (ud->is_sd) sd_spi_release();
@@ -6501,7 +7001,7 @@ void setupLuaVGL() {
     LuaFileHandle *ud = (LuaFileHandle *)luaL_checkudata(L, 1, "esp32_file");
     if (ud->file) {
       // Closing a written LittleFS file commits data/metadata to flash.
-      UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);
+      UsbFlashGuardIf _g(ud->is_flash && ud->is_write);
       if (ud->is_sd) sd_spi_take();
       ud->file->close();
       if (ud->is_sd) sd_spi_release();
@@ -6525,7 +7025,7 @@ void setupLuaVGL() {
       SLog.printf("[FS] GC-close ud=%p f=%p sd=%d\n",
                   (void*)ud, (void*)ud->file, (int)ud->is_sd);
       // Same flash-commit hazard as close() when the file was written.
-      UsbFlashGuardIf _g(!ud->is_sd && ud->is_write);
+      UsbFlashGuardIf _g(ud->is_flash && ud->is_write);
       if (ud->is_sd) sd_spi_take();
       ud->file->close();
       if (ud->is_sd) sd_spi_release();
@@ -6584,6 +7084,48 @@ void setupLuaVGL() {
 
     return;
   }
+
+#ifdef MESHPUNK_EMBED_PACK
+  // Deferred first-boot extraction (flag set at mount time in setup). LVGL is
+  // up, but the backlight normally turns on only after createUI() — force it
+  // on now so the splash is visible. setupLuaVGL() also re-runs when Lua is
+  // rebuilt after an ELF module exits; the flag is only ever set during boot,
+  // so this is a no-op there.
+  if (s_pack_extract_pending) {
+    s_pack_extract_pending = false;
+    pinMode(BOARD_BL_PIN, OUTPUT);
+    setBrightness(display_brightness);
+
+    s_pack_splash_label = lv_label_create(lv_scr_act());
+    lv_obj_set_style_text_align(s_pack_splash_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(s_pack_splash_label);
+    lv_label_set_text(s_pack_splash_label,
+        "First-time setup\n\n"
+        "Unpacking filesystem...\n\n"
+        "This can take a few minutes.\n"
+        "Do NOT power off or restart.");
+    lv_refr_now(NULL);
+
+    bool pack_ok = extract_data_pack();
+
+    if (pack_ok) {
+      // The emoji font's blob open (L:/emojis.bin) ran in setupLvgl, before
+      // the file existed on a fresh filesystem; re-open it now that it does.
+      emoji_font_reload(false);
+    } else {
+      // The marker is written last, so a failed pass retries on the next boot
+      // (see extract_data_pack). Tell the user instead of silently moving on.
+      lv_label_set_text(s_pack_splash_label,
+          "Unpack FAILED\n\n"
+          "It will retry on the next boot.\n"
+          "If this repeats, reflash the firmware.");
+      lv_refr_now(NULL);
+      delay(3000);
+    }
+    lv_obj_delete(s_pack_splash_label);
+    s_pack_splash_label = nullptr;
+  }
+#endif
 
   String scriptPath = String(LUA_PATH) + "main.lua";
   SLog.printf("[LUA] Reading script: %s\n", scriptPath.c_str());
@@ -6830,9 +7372,13 @@ void setup() {
     fs_mounted = true;
     SLog.printf("LittleFS mounted successfully (label: %s)\n", fs_on_spiffs ? "spiffs" : "assets");
 #ifdef MESHPUNK_EMBED_PACK
-    // Fresh/wiped filesystem or a firmware update with new bundled files:
-    // populate it from the pack embedded in this binary.
-    if (pack_needs_extract()) extract_data_pack();
+    // Fresh/wiped filesystem or a firmware update with new bundled files: the
+    // pack embedded in this binary must be extracted. Deferred to setupLuaVGL()
+    // so the display is up and a progress splash shows during the minutes-long
+    // unpack (see s_pack_extract_pending).
+    s_pack_extract_pending = pack_needs_extract();
+    if (s_pack_extract_pending)
+      SLog.println("[PACK] extraction needed - deferred until display is up");
 #endif
 
     SLog.println("LittleFS contents:");
@@ -6943,12 +7489,13 @@ void setup() {
   // later WiFi.begin() calls. (No UsbFlashGuard needed here: USB host is
   // manually started from the launcher, well after this boot code runs.)
   WiFi.persistent(false);
+  // The stack's own auto-reconnect retries an unreachable network forever
+  // (nonstop scan+auth = battery drain, and scans fail while it churns).
+  // All reconnect policy lives in wifi_auto_tick()'s bounded rounds instead.
+  WiFi.setAutoReconnect(false);
   if (wifi_enabled_pref) {
     WiFi.mode(WIFI_STA);
-    if (wifi_saved_ssid.length() > 0) {
-      WiFi.begin(wifi_saved_ssid.c_str(), wifi_saved_pass.c_str());
-      SLog.printf("WiFi auto-connecting to: %s\n", wifi_saved_ssid.c_str());
-    } else {
+    if (!wifi_auto_kick()) {
       SLog.println("WiFi initialized in station mode (no saved network)");
     }
   } else {
@@ -7017,8 +7564,6 @@ void setup() {
   SLog.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
   log_boot_mem("after audio");
 
-  tft.fillScreen(TFT_GREEN);
-
   // Initialize LORA Radio
   SLog.println(F("===== RADIO INIT ====="));
 
@@ -7060,8 +7605,9 @@ void setup() {
   the_mesh->showWelcome();
 
   // Seed the clock + own-position from the last saved GPS fix until live GPS
-  // syncs (or the user manually sets the time). Storage is configured above and
-  // gps_sync_begin() already ran, so this won't be clobbered by a sync restart.
+  // syncs (or the user manually sets the time). Storage is configured above.
+  // The seeded location survives sync restarts (only a new fix replaces it),
+  // so ordering vs. gps_sync_begin()/the gps_task no longer matters.
   gps_last_load();
 
   // Flag a boot catch-up retention sweep; pruneStep runs it incrementally from
@@ -7228,6 +7774,10 @@ void loop() {
   // Incremental message/routing retention sweep (flagged on a new-day record or
   // at boot). One file per iteration; cheap no-op when nothing is due.
   if (the_mesh) the_mesh->pruneStep();
+
+  // Bounded WiFi auto-connect rounds (scan → join known networks → park the
+  // radio when nothing is reachable). Self-rate-limited to 4 Hz.
+  wifi_auto_tick();
 
   // ── Inactivity timeouts ─────────────────────────────────────────────────
   if (screen_timeout_secs > 0 && !screen_timed_out) {

@@ -28,6 +28,7 @@
 #include "meshpunk_fs.h"
 #include "meshpunk_sync.h"
 #include "usb_manager.h"   // UsbFlashGuardIf — pause USB audio around flash writes
+#include "usb_fs.h"        // usb_fs()/usb_fs_mounted()/usb_fs_df() — the U: drive
 
 #include <Arduino.h>
 #include <FS.h>
@@ -46,23 +47,33 @@ extern bool sd_mounted;
 extern void sd_spi_release();
 
 // A resolved path: which filesystem it lives on and the prefix-stripped path.
-// `ok` is false when the path routes to SD but no card is mounted.
+// `ok` is false when the path routes to a drive that isn't mounted. is_sd
+// answers "needs the shared SPI bus lock"; is_flash answers "writes need the
+// USB flash guard" — USB (OTG bus, no cache stalls) answers no to both.
 struct FsTarget {
     fs::FS*     fs;
     const char* path;
+    const char* vfs_base;   // POSIX mount root for opendir/stat
     bool        is_sd;
+    bool        is_flash;
     bool        ok;
 };
 
 static FsTarget fs_resolve(const char* raw) {
-    FsTarget t = { &LittleFS, raw, false, true };
-    bool use_sd = false;
-    t.path = meshpunk_parse_prefix(raw, &use_sd, /*default_sd=*/false);
+    FsTarget t = { &LittleFS, raw, "/littlefs", false, true, true };
+    MpDrive drive;
+    t.path = meshpunk_parse_drive(raw, &drive, /*default_sd=*/false);
     if (t.path[0] == '\0') t.path = "/";
-    t.is_sd = use_sd;
-    if (use_sd) {
+    t.is_sd    = (drive == MP_SD);
+    t.is_flash = (drive == MP_FLASH);
+    if (drive == MP_SD) {
         t.fs = &SD;
+        t.vfs_base = "/sd";
         t.ok = sd_mounted;
+    } else if (drive == MP_USB) {
+        t.fs = &usb_fs();
+        t.vfs_base = "/usb";
+        t.ok = usb_fs_mounted();
     }
     return t;
 }
@@ -90,13 +101,13 @@ static int lua_fs_list(lua_State* L) {
     FsTarget t = fs_resolve(raw);
     if (!t.ok) {
         lua_pushnil(L);
-        lua_pushstring(L, "SD not mounted");
+        lua_pushstring(L, "drive not mounted");
         return 2;
     }
 
-    // VFS-level base path for opendir/stat ("/sd/..." or "/littlefs/...").
+    // VFS-level base path for opendir/stat ("/sd/...", "/littlefs/...", "/usb/...").
     char base[384];
-    snprintf(base, sizeof(base), "%s%s", t.is_sd ? "/sd" : "/littlefs", t.path);
+    snprintf(base, sizeof(base), "%s%s", t.vfs_base, t.path);
     size_t base_len = strlen(base);
 
     if (t.is_sd) sd_spi_take();
@@ -263,7 +274,7 @@ static int lua_fs_mkdir(lua_State* L) {
     // LittleFS directory creation is an internal-flash (metadata) write —
     // pause USB audio around the whole thing (one pause spans the nested
     // meshpunk_mkdirs guard too; the guard is recursive).
-    UsbFlashGuardIf _g(!t.is_sd);
+    UsbFlashGuardIf _g(t.is_flash);
 
     // meshpunk_mkdirs treats the last segment as a file name, so it creates
     // exactly the parents; then we create the directory itself.
@@ -290,7 +301,7 @@ static int lua_fs_remove(lua_State* L) {
     FsTarget t = fs_resolve(raw);
     if (!t.ok) {
         lua_pushboolean(L, 0);
-        lua_pushstring(L, "SD not mounted");
+        lua_pushstring(L, "drive not mounted");
         return 2;
     }
     if (strcmp(t.path, "/") == 0) {
@@ -299,7 +310,7 @@ static int lua_fs_remove(lua_State* L) {
         return 2;
     }
 
-    UsbFlashGuardIf _g(!t.is_sd);   // LittleFS remove/rmdir writes flash metadata
+    UsbFlashGuardIf _g(t.is_flash); // LittleFS remove/rmdir writes flash metadata
     if (t.is_sd) sd_spi_take();
     if (!t.fs->exists(t.path)) {
         if (t.is_sd) sd_spi_release();
@@ -331,16 +342,16 @@ static int lua_fs_rename(lua_State* L) {
     FsTarget d = fs_resolve(raw_dst);
     if (!s.ok || !d.ok) {
         lua_pushboolean(L, 0);
-        lua_pushstring(L, "SD not mounted");
+        lua_pushstring(L, "drive not mounted");
         return 2;
     }
-    if (s.is_sd != d.is_sd) {
+    if (s.fs != d.fs) {
         lua_pushboolean(L, 0);
         lua_pushstring(L, "cross-drive rename (copy + delete instead)");
         return 2;
     }
 
-    UsbFlashGuardIf _g(!s.is_sd);   // LittleFS rename writes flash metadata
+    UsbFlashGuardIf _g(s.is_flash); // LittleFS rename writes flash metadata
     if (s.is_sd) sd_spi_take();
     bool ok = s.fs->rename(s.path, d.path);
     if (s.is_sd) sd_spi_release();
@@ -364,7 +375,7 @@ static int lua_fs_copy(lua_State* L) {
     FsTarget d = fs_resolve(raw_dst);
     if (!s.ok || !d.ok) {
         lua_pushboolean(L, 0);
-        lua_pushstring(L, "SD not mounted");
+        lua_pushstring(L, "drive not mounted");
         return 2;
     }
     if (s.fs == d.fs && strcmp(s.path, d.path) == 0) {
@@ -377,7 +388,8 @@ static int lua_fs_copy(lua_State* L) {
     // LittleFS destination: every chunk write below is an internal-flash
     // write. Hold the guard across the whole copy — pausing USB audio for a
     // user-initiated file copy beats crashing the host stack mid-transfer.
-    UsbFlashGuardIf _g(!d.is_sd);
+    // (MSC I/O is guard-exempt, so a U:→L: copy under this guard is fine.)
+    UsbFlashGuardIf _g(d.is_flash);
 
     if (any_sd) sd_spi_take();
     File fsrc = s.fs->open(s.path, "r");
@@ -441,9 +453,9 @@ static int lua_fs_copy(lua_State* L) {
     return 1;
 }
 
-// _fs_df(drive) -> total, used | nil. drive = "L" or "S".
-// NOTE: the first SD call can take a moment on big cards (FAT free-cluster
-// scan); it is cached by the FS driver afterwards.
+// _fs_df(drive) -> total, used | nil. drive = "L", "S" or "U".
+// NOTE: the first SD/USB call can take a moment on big volumes (FAT
+// free-cluster scan); it is cached by the FS driver afterwards.
 static int lua_fs_df(lua_State* L) {
     const char* drv = luaL_checkstring(L, 1);
     if (drv[0] == 'S' || drv[0] == 's') {
@@ -457,6 +469,16 @@ static int lua_fs_df(lua_State* L) {
         sd_spi_release();
         lua_pushnumber(L, (lua_Number)total);
         lua_pushnumber(L, (lua_Number)used);
+        return 2;
+    }
+    if (drv[0] == 'U' || drv[0] == 'u') {
+        uint64_t total = 0, freeb = 0;
+        if (!usb_fs_df(&total, &freeb)) {
+            lua_pushnil(L);
+            return 1;
+        }
+        lua_pushnumber(L, (lua_Number)total);
+        lua_pushnumber(L, (lua_Number)(total - freeb));
         return 2;
     }
     lua_pushnumber(L, (lua_Number)LittleFS.totalBytes());

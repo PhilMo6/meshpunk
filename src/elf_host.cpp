@@ -132,17 +132,23 @@ static volatile int kq_tail = 0;
 static TaskHandle_t   s_input_task     = nullptr;
 static volatile bool  s_input_task_run = false;
 
-// SPSC ring: producer is the Core 1 input task (kq_push), consumer is the
-// game's scanInput on Core 0 (kq_pop). The barriers make the slot's data
-// writes visible before kq_head advances (and vice-versa on the read side),
-// which matters now that the two ends live on different cores.
+// Key ring: producers are the Core 1 input task (poll_input) and the USB HID
+// keyboard driver (usb_task, also Core 1, via elf_input_inject) — the spinlock
+// serializes them. Consumer is the game's scanInput on Core 0 (kq_pop). The
+// barriers make the slot's data writes visible before kq_head advances (and
+// vice-versa on the read side), which matters with the ends on different cores.
+static portMUX_TYPE s_kq_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static void kq_push(unsigned char key, int pressed) {
+    portENTER_CRITICAL(&s_kq_mux);
     int next = (kq_head + 1) % KEY_QUEUE_SIZE;
-    if (next == kq_tail) return; // full, drop
-    key_queue[kq_head].key = key;
-    key_queue[kq_head].pressed = pressed;
-    __sync_synchronize();       // publish the slot before advancing head
-    kq_head = next;
+    if (next != kq_tail) {      // else full: drop
+        key_queue[kq_head].key = key;
+        key_queue[kq_head].pressed = pressed;
+        __sync_synchronize();   // publish the slot before advancing head
+        kq_head = next;
+    }
+    portEXIT_CRITICAL(&s_kq_mux);
 }
 
 static bool kq_pop(KeyEvent* out) {
@@ -162,6 +168,10 @@ static bool esc_held = false;
 static uint32_t esc_hold_start = 0;
 #define ESC_EXIT_HOLD_MS 1500
 
+// USB keyboard Backspace held (set by elf_input_inject, pre-keymap) — OR'd
+// into the exit-hold check so a USB keyboard can leave a module too.
+static volatile bool s_usb_bs_down = false;
+
 // Raw-delta mode: set by host_trackball_read() (module emulates a mouse and
 // owns the ISR counters); reset before each module run.
 static volatile bool s_trk_raw_mode = false;
@@ -176,8 +186,9 @@ static bool  trk_momentum = true;   // false = legacy one-tick-per-poll
 // ---------------------------------------------------------------------------
 // Data-driven keymap: T-Deck physical key → module keycode.
 // Populated by parse_keymap_arg() when the launcher passes -keymap.
-// Zero = no mapping (printable ASCII will still pass through).
-// Default is passthrough mode (all keys forwarded as raw key codes).
+// PURE REMAPPER: a zero entry means "no remap" and the key passes through
+// unchanged (modules ignore codes they don't know). Only mapped keys are
+// translated. Default is passthrough mode (no table lookup at all).
 // ---------------------------------------------------------------------------
 static uint8_t keymap_table[INPUT_STATE_SIZE];
 static bool keymap_passthrough = true;   // default: all keys pass through as-is
@@ -322,9 +333,9 @@ static void poll_input(bool kb_only = false) {
     }
 
     // Edge detection: generate press/release events for changed keys.
-    // In passthrough mode (default), all keys are pushed as-is.
-    // In keymap mode, keys are translated through keymap_table[]; unmapped
-    // printable ASCII passes through (y/n for quit prompts, etc.)
+    // In passthrough mode (default), all keys are pushed as-is. In keymap
+    // mode the table is a pure remapper: mapped keys translate, everything
+    // else passes through unchanged (unknown codes are ignored by modules).
     for (int i = 0; i < INPUT_STATE_SIZE; i++) {
         if (cur_state[i] != prev_key_state[i]) {
             uint8_t out;
@@ -332,8 +343,7 @@ static void poll_input(bool kb_only = false) {
                 out = (uint8_t)i;  // pass through as-is
             } else {
                 out = keymap_table[i];
-                if (!out && i >= 0x20 && i < 0x7F)
-                    out = (uint8_t)i; // unmapped printable passthrough
+                if (!out) out = (uint8_t)i;   // unmapped: pass through
             }
             if (out)
                 kq_push(out, cur_state[i] ? 1 : 0);
@@ -343,7 +353,9 @@ static void poll_input(bool kb_only = false) {
 
     // Exit hold detection: hold backspace for 1.5s to return to launcher.
     // T-Deck has no physical ESC key; backspace (0x08) is the exit key.
-    if (cur_state[0x08]) {
+    // s_usb_bs_down folds in a USB keyboard's Backspace (this poll runs at
+    // 100Hz and would otherwise clear esc_held from the matrix every tick).
+    if (cur_state[0x08] || s_usb_bs_down) {
         if (!esc_held) { esc_held = true; esc_hold_start = millis(); }
     } else {
         esc_held = false;
@@ -398,6 +410,7 @@ static void elf_input_start() {
     kq_head = kq_tail = 0;
     memset(prev_key_state, 0, INPUT_STATE_SIZE);
     esc_held = false;
+    s_usb_bs_down = false;
     s_input_task_run = true;
     // Priority 5: ABOVE usb_mgr (4), sound_task (3) and elf_blit (3). The
     // keyboard poll is a tiny, latency-critical task (one I2C read every 10ms);
@@ -423,6 +436,23 @@ static void elf_input_stop() {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     s_input_task = nullptr;
+}
+
+// ── Firmware-internal injection (USB HID keyboard; see elf_host.h) ─────────
+
+bool elf_input_active(void) { return s_input_task_run; }
+
+void elf_input_inject(unsigned char key, int pressed) {
+    if (key == 0x08) s_usb_bs_down = (pressed != 0);   // exit-hold, pre-keymap
+    if (!s_input_task_run) return;
+    uint8_t out;
+    if (keymap_passthrough) {
+        out = key;
+    } else {
+        out = keymap_table[key];
+        if (!out) out = key;    // unmapped: pass through (as poll_input)
+    }
+    if (out) kq_push(out, pressed ? 1 : 0);
 }
 
 // ---------------------------------------------------------------------------

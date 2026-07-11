@@ -135,6 +135,16 @@ apps.add_timer { period = 1000, cb = function()
             s = s .. string.format("  %dHz/%dbit%s", d.rate, d.bits,
                                    d.streaming and "  >>USB" or "")
         end
+        if d.kbd then s = s .. "  [kbd]" end
+        if d.msc then
+            if d.msc_mb >= 1024 then
+                s = s .. string.format("  [U: %.1fGB]", d.msc_mb / 1024)
+            else
+                s = s .. string.format("  [U: %dMB]", math.floor(d.msc_mb))
+            end
+        elseif d.msc_mb and d.msc_mb > 0 then
+            s = s .. "  [storage: not mounted]"
+        end
         dev_lbl.text = s
     elseif _usb_running() then
         dev_lbl.text = "Host on. Waiting for device..."

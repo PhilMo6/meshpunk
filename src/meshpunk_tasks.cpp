@@ -96,21 +96,23 @@ void meshpunk_spawn_mesh_task() {
 
 extern void gps_sync_poll();
 extern bool gps_sync_is_done();
-extern void gps_sync_restart();
+extern void gps_sync_restart(bool manual);
 
 static TaskHandle_t s_gps_task_handle = nullptr;
 
 static void gps_task_body(void *param) {
   SLog.printf("[TASK] gps_task starting on core=%d\n", xPortGetCoreID());
+  bool manual = true;  // boot cycle gets the full manual location-hunt budget
   for (;;) {
-    gps_sync_restart();
+    gps_sync_restart(manual);
     while (!gps_sync_is_done()) {
       gps_sync_poll();
       vTaskDelay(pdMS_TO_TICKS(20));
     }
     SLog.println("[TASK] gps_task sync cycle done; sleeping 5 min.");
-    // Sleep 5 minutes, or wake early if notified (manual trigger).
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5 * 60 * 1000));
+    // Sleep 5 minutes, or wake early if notified (manual trigger — manual
+    // cycles get the longer location-hunt budget).
+    manual = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5 * 60 * 1000)) > 0;
     SLog.println("[TASK] gps_task waking for next sync cycle.");
   }
 }

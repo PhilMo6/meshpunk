@@ -16,6 +16,16 @@ void elf_host_register_lua(lua_State* L);
 bool elf_host_pending_take(void);
 int  elf_host_run_pending(void);
 
+// Firmware-internal input injection (NOT module exports). Second producer for
+// the key-event ring the Core-1 input task fills — used by the USB HID
+// keyboard driver (usb_manager.cpp, usb_task on Core 1).
+// elf_input_active(): true while a module owns input (input task alive).
+// elf_input_inject(): queue one press/release edge; applies the module's
+//   -keymap translation exactly like the matrix poll does. No-op when no
+//   module is running.
+bool elf_input_active(void);
+void elf_input_inject(unsigned char key, int pressed);
+
 // ---------------------------------------------------------------------------
 // Host functions exported to loaded ELF modules.
 // These are resolved by name via the elf_loader symbol table.

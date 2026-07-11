@@ -1,6 +1,7 @@
 #include "meshpunk_fs.h"
 #include "meshpunk_sync.h"
 #include "usb_manager.h"   // UsbFlashGuardIf — pause USB audio around flash writes
+#include "usb_fs.h"        // usb_fs()/usb_fs_mounted() — the U: backend
 
 #include <SD.h>
 #include <LittleFS.h>
@@ -10,39 +11,48 @@
 extern bool sd_mounted;
 extern void sd_spi_release();
 
-// Strip S: or L: prefix, set *use_sd accordingly.
-// If no prefix, *use_sd = default_sd.
+// Strip an S:/L:/U: prefix, set *drive accordingly.
+// If no prefix, *drive = default_sd ? MP_SD : MP_FLASH.
 // Also strips leading /sd/ when targeting SD, since SD.open() already
 // operates relative to the SD mount point.
-const char* meshpunk_parse_prefix(const char* path, bool* use_sd, bool default_sd) {
-    *use_sd = default_sd;
+const char* meshpunk_parse_drive(const char* path, MpDrive* drive, bool default_sd) {
+    *drive = default_sd ? MP_SD : MP_FLASH;
     if (path[0] != '\0' && path[1] == ':') {
         if (path[0] == 'S' || path[0] == 's') {
-            *use_sd = true;
+            *drive = MP_SD;
             return path + 2;
         } else if (path[0] == 'L' || path[0] == 'l') {
-            *use_sd = false;
+            *drive = MP_FLASH;
+            return path + 2;
+        } else if (path[0] == 'U' || path[0] == 'u') {
+            *drive = MP_USB;
             return path + 2;
         }
     }
     // Strip /sd/ prefix for SD paths — SD.open() adds the mount point itself
-    if (*use_sd && strncmp(path, "/sd/", 4) == 0) {
+    if (*drive == MP_SD && strncmp(path, "/sd/", 4) == 0) {
         return path + 3; // keep the leading /
     }
     return path;
 }
 
 MeshpunkFile meshpunk_open(const char* path, const char* mode, bool default_sd) {
-    MeshpunkFile mf = { {}, false, false };
+    MeshpunkFile mf = { {}, false, false, false };
 
-    bool use_sd;
-    const char* actual = meshpunk_parse_prefix(path, &use_sd, default_sd);
-    mf.is_sd = use_sd;
+    MpDrive drive;
+    const char* actual = meshpunk_parse_drive(path, &drive, default_sd);
+    mf.is_sd    = (drive == MP_SD);
+    mf.is_flash = (drive == MP_FLASH);
 
-    if (use_sd) {
+    if (drive == MP_SD) {
         if (!sd_mounted) return mf;
         sd_spi_take();
         mf.file = SD.open(actual, mode);
+    } else if (drive == MP_USB) {
+        // USB drive: no SPI lock (it's on the OTG controller, not the shared
+        // SPI bus) and no flash guard (writes never stall the cache).
+        if (!usb_fs_mounted()) return mf;
+        mf.file = usb_fs().open(actual, mode);
     } else {
         // A "w"/"a"/"r+" open of a LittleFS file writes internal flash
         // (truncate / create updates metadata) — that stalls the cache, which
@@ -53,7 +63,7 @@ MeshpunkFile meshpunk_open(const char* path, const char* mode, bool default_sd) 
     }
 
     if (!mf.file) {
-        if (use_sd) sd_spi_release();
+        if (mf.is_sd) sd_spi_release();
         return mf;
     }
 
@@ -69,32 +79,32 @@ void meshpunk_close(MeshpunkFile& mf) {
 }
 
 bool meshpunk_mkdirs(const char* path, bool default_sd) {
-    bool use_sd;
-    const char* actual = meshpunk_parse_prefix(path, &use_sd, default_sd);
-    if (use_sd && !sd_mounted) return false;
+    MpDrive drive;
+    const char* actual = meshpunk_parse_drive(path, &drive, default_sd);
+    if (drive == MP_SD && !sd_mounted) return false;
+    if (drive == MP_USB && !usb_fs_mounted()) return false;
 
     char buf[160];
     size_t n = strlen(actual);
     if (n == 0 || n >= sizeof(buf)) return false;
     memcpy(buf, actual, n + 1);
 
+    fs::FS* f = (drive == MP_SD)  ? (fs::FS*)&SD
+              : (drive == MP_USB) ? &usb_fs()
+                                  : (fs::FS*)&LittleFS;
     bool ok = true;
-    if (use_sd) sd_spi_take();
+    if (drive == MP_SD) sd_spi_take();
     // LittleFS mkdir is an internal-flash (metadata) write — see meshpunk_open.
-    UsbFlashGuardIf _g(!use_sd);
+    UsbFlashGuardIf _g(drive == MP_FLASH);
     // Create each directory prefix; the final segment is the file name and
     // is not created.
     for (char* p = buf + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
-        if (use_sd) {
-            if (!SD.exists(buf)) ok = SD.mkdir(buf) && ok;
-        } else {
-            if (!LittleFS.exists(buf)) ok = LittleFS.mkdir(buf) && ok;
-        }
+        if (!f->exists(buf)) ok = f->mkdir(buf) && ok;
         *p = '/';
     }
-    if (use_sd) sd_spi_release();
+    if (drive == MP_SD) sd_spi_release();
     return ok;
 }
 

@@ -3944,6 +3944,10 @@ local function init_view()
 
     map.cx, map.cy = lat_lon_to_world_px(lat, lon, map.zoom)
 
+    -- Tiles need WiFi and the firmware no longer retries in the background
+    -- (bounded connect rounds): kick one round now — async no-op when already
+    -- connected/disabled — and update_wifi_status flips wifi_ok when it lands.
+    pcall(_wifi_auto_connect)
     local wstatus = _wifi_status()
     map.wifi_ok = (wstatus == "connected")
 

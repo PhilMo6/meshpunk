@@ -64,7 +64,9 @@ local function refresh_wifi_status()
     local st, ip, ssid = _wifi_status()
     if st == "connected" then
         wifi_status_lbl.text = ssid .. " (" .. ip .. ")"
-    elseif st == "idle" or st == "disconnected" then
+    elseif st == "connecting" then
+        wifi_status_lbl.text = "Connecting..."
+    elseif st == "idle" or st == "disconnected" or st == "off" then
         wifi_status_lbl.text = "Not connected"
     else
         wifi_status_lbl.text = "Status: " .. st
@@ -72,30 +74,72 @@ local function refresh_wifi_status()
 end
 refresh_wifi_status()
 
--- Saved network
-local creds = _wifi_get_saved_creds()
-local saved_lbl = content:Label { text = "", w = lvgl.PCT(60), h = 24 }
-local forget_btn = content:Button { w = 55, h = 24 }
+-- Saved networks (multi-slot): tap the list to enter select, click a network
+-- to reveal its Connect/Forget actions.
+content:Label { text = "Saved networks:", w = lvgl.PCT(100), h = 16 }
+
+local saved_container = content:Object {
+    flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    w = lvgl.PCT(100), h = lvgl.SIZE_CONTENT,
+    border_width = 0, pad_all = 0,
+}
+saved_container:clear_flag(lvgl.FLAG.SCROLLABLE)
+local exit_saved_select = nav.list(saved_container)
+
+local saved_sel = ""
+local connect_btn = content:Button { w = 70, h = 24 }
+connect_btn:Label { text = "Connect", align = lvgl.ALIGN.CENTER }
+local forget_btn = content:Button { w = 60, h = 24 }
 forget_btn:Label { text = "Forget", align = lvgl.ALIGN.CENTER }
 
+local function hide_saved_actions()
+    saved_sel = ""
+    connect_btn:add_flag(lvgl.FLAG.HIDDEN)
+    forget_btn:add_flag(lvgl.FLAG.HIDDEN)
+end
+
+local function show_saved_actions(ssid)
+    saved_sel = ssid
+    connect_btn:clear_flag(lvgl.FLAG.HIDDEN)
+    forget_btn:clear_flag(lvgl.FLAG.HIDDEN)
+    status.text = "Selected: " .. ssid
+end
+
+-- Rebuilds the list; only called while the list's nav scope is inactive
+-- (row clicks exit the scope before anything mutates the container).
 local function refresh_saved()
-    creds = _wifi_get_saved_creds()
-    if creds.ssid and #creds.ssid > 0 then
-        saved_lbl.text = "Saved: " .. creds.ssid
-        forget_btn:clear_flag(lvgl.FLAG.HIDDEN)
-    else
-        saved_lbl.text = "No saved network"
-        forget_btn:add_flag(lvgl.FLAG.HIDDEN)
+    hide_saved_actions()
+    saved_container:clean()
+    local creds = _wifi_get_saved_creds()
+    if #creds == 0 then
+        saved_container:Label { text = "No saved networks", w = lvgl.PCT(100), h = 16 }
+        return
+    end
+    for i = 1, #creds do
+        local net = creds[i]
+        local row = saved_container:Button { w = lvgl.PCT(95), h = 26 }
+        row:Label { text = net.ssid, align = lvgl.ALIGN.LEFT_MID }
+        row:onClicked(function()
+            exit_saved_select()
+            show_saved_actions(net.ssid)
+        end)
     end
 end
 refresh_saved()
 
+connect_btn:onClicked(function()
+    if #saved_sel == 0 then return end
+    _wifi_connect_saved(saved_sel)
+    status.text = "Joining " .. saved_sel .. "..."
+    hide_saved_actions()
+end)
+
 forget_btn:onClicked(function()
-    _wifi_clear_creds()
-    _wifi_disconnect()
+    if #saved_sel == 0 then return end
+    _wifi_forget_cred(saved_sel)
+    status.text = "Forgot " .. saved_sel
     refresh_saved()
     refresh_wifi_status()
-    status.text = "Network forgotten"
 end)
 
 -- Password input + Join (direct children, hidden initially)

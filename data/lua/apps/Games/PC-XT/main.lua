@@ -192,9 +192,9 @@ local function load_defaults()
 end
 
 -- Build the -keymap hex string. Returns nil when nothing is bound (then we
--- omit -keymap entirely = full passthrough). When emitting a keymap, append
--- identity entries for the non-printable keys DOS needs (keymap mode only
--- passes unmapped PRINTABLE ASCII through).
+-- omit -keymap entirely = full passthrough). The firmware keymap is a pure
+-- remapper (unmapped codes pass through unchanged), so only the actual
+-- bindings are emitted — no identity entries needed.
 local function build_keymap_string()
     local parts = {}
     for _, a in ipairs(ACTIONS) do
@@ -211,7 +211,6 @@ local function build_keymap_string()
         end
     end
     if #parts == 0 then return nil end
-    parts[#parts + 1] = "0D=0D,08=08,80=80,81=81,82=82,83=83,84=84,85=85"
     return table.concat(parts, ",")
 end
 
@@ -657,7 +656,7 @@ create_controls_screen = function()
         pad_left = 6, pad_right = 6, pad_top = 2, pad_bottom = 2,
         flex = { flex_direction = "column", row_gap = 1 },
     }
-    list:clear_flag(lvgl.FLAG.SCROLLABLE)
+    -- content outgrew one screen with the USB section — let it scroll
 
     local function head(t)
         list:Label{ text = t, text_font = font, text_color = "#55AAFF",
@@ -676,6 +675,9 @@ create_controls_screen = function()
 
     head("Backslash  \\  (DOS paths)")
     body("ALT + / key (the G key).   e.g. cd \\dos")
+
+    head("USB keyboard (Tools/USB host on)")
+    body("Everything is native: arrows, F1-F12,\nCtrl, Alt, Home/End/PgUp/PgDn/Ins/Del,\nCapsLock. NumLock inert: keypad = digits,\narrow keys always navigate.")
 
     head("Quit to launcher")
     body("Hold Backspace about 1.5 seconds.")

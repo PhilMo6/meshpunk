@@ -35,6 +35,28 @@ void usb_manager_register_lua(lua_State* L);      // also runs the PHY boot self
 bool usb_audio_active();
 bool usb_audio_push(const int16_t* pcm, int frames, int src_rate, int channels);
 
+// ── HID boot keyboard (read by keyboard_read_cb in main.cpp) ─────────────────
+// Copies the USB-held key set (ASCII-indexed, shift already applied) into
+// out[128]. Returns false (and touches nothing) when no keyboard is attached
+// or no key is held — callers can skip their merge loop.
+bool usb_kbd_snapshot(bool out[128]);
+
+// ── MSC thumb drive: sector API (consumed by usb_fs.cpp's diskio) ───────────
+// Callable from ANY task; transactions are serialized internally and
+// completions are pumped by usb_task. All return false once the device is
+// gone (ready() flips first). Reads/writes chunk internally; `count` is in
+// device sectors of usb_msc_sector_size() bytes. usb_msc_sync() flushes the
+// device write cache (best-effort — many sticks stub it).
+bool     usb_msc_ready();
+uint32_t usb_msc_sector_count();
+uint32_t usb_msc_sector_size();
+bool     usb_msc_read(uint32_t lba, uint32_t count, uint8_t* buf);
+bool     usb_msc_write(uint32_t lba, uint32_t count, const uint8_t* buf);
+bool     usb_msc_sync();
+
+// Log a line into the USB log ring (drained by Tools/USB via _usb_poll).
+void usb_ulog(const char* fmt, ...);
+
 // ── Flash-write safety ───────────────────────────────────────────────────────
 // Writing INTERNAL flash (LittleFS/NVS) disables the CPU cache and freezes both
 // cores for ms. That stalls the USB host controller past its 1ms isochronous

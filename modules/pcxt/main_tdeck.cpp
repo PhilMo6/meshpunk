@@ -117,15 +117,33 @@ static uint8_t ascii_to_scan(unsigned char c)
         case ' ':  return 0x39;
         case 0x09: case 0x99: return 0x0F; // Tab
         case 0x1B: return 0x01;            // Esc
-        case 0x80: return 0x2A;            // T-Deck shift -> LShift
-        // module extension codes
-        case 0x81: case 0x91: return 0x48; // Up (trackball key mode / bound)
+        case 0x80: return 0x2A;            // T-Deck/USB shift -> LShift
+        // module extension codes (0x9x = launcher binding outputs;
+        // 0x8x/0xAx = firmware USB-keyboard pseudo-codes). Nav lands on the
+        // XT KEYPAD scancodes — Faux86 has no E0 extended support, and a real
+        // XT had no dedicated nav keys. Guest NumLock stays off (we never
+        // send 0x45), so these always act as nav, never digits; USB keypad
+        // digits arrive as ASCII and hit the top-row scancodes above.
+        case 0x81: case 0x91: return 0x48; // Up (trackball key mode / bound / USB)
         case 0x82: case 0x92: return 0x50; // Down
         case 0x83: case 0x93: return 0x4B; // Left
         case 0x84: case 0x94: return 0x4D; // Right
-        case 0x96: return 0x1D;            // Ctrl
-        case 0x97: return 0x38;            // Alt
-        case 0x98: return 0x53;            // Del
+        case 0x8B: case 0x96: return 0x1D; // Ctrl (USB / bound)
+        case 0x8C: case 0x97: return 0x38; // Alt  (USB / bound)
+        case 0x7F: case 0x98: return 0x53; // Del  (USB / bound) — KP.
+        case 0x86: return 0x47;            // Home (KP7)
+        case 0x87: return 0x4F;            // End  (KP1)
+        case 0x88: return 0x49;            // PgUp (KP9)
+        case 0x89: return 0x51;            // PgDn (KP3)
+        case 0x8A: return 0x52;            // Ins  (KP0)
+        case 0x8E: return 0x3A;            // CapsLock (guest owns the state)
+        case 0xA0: return 0x37;            // PrtSc = the XT KP* key
+        case 0xA1: return 0x46;            // ScrollLock
+        // Deliberately unmapped: 0x8D GUI, 0x8F NumLock (would flip the nav
+        // scancodes above into digits), 0xA2 Pause (XT: Ctrl+NumLock, no
+        // single scancode), 0xA3 Menu.
+        case 0xBA: return 0x57;            // F11 (AT code; XT BIOS ignores)
+        case 0xBB: return 0x58;            // F12
         default:
             if (c >= 0xB0 && c <= 0xB9) return (uint8_t)(0x3B + (c - 0xB0)); // F1-F10
             return 0;

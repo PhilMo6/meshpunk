@@ -51,10 +51,10 @@ local M = {}
 
 -- ── Path helpers ─────────────────────────────────────────────────────────────
 
--- "S:/foo" -> "S", "/foo".  No prefix -> "L".
+-- "S:/foo" -> "S", "/foo".  No prefix -> "L".  U: = USB thumb drive.
 function M.split(path)
     path = tostring(path or "")
-    local d, rest = path:match("^([LlSs]):(.*)$")
+    local d, rest = path:match("^([LlSsUu]):(.*)$")
     if d then return d:upper(), rest end
     return "L", path
 end
@@ -99,12 +99,16 @@ end
 -- ── Drives ───────────────────────────────────────────────────────────────────
 
 function M.drives()
-    local sd_ok = false
+    local sd_ok, usb_ok = false, false
     local ok, info = pcall(_storage_get_info)
-    if ok and type(info) == "table" and info.sd_available then sd_ok = true end
+    if ok and type(info) == "table" then
+        sd_ok  = info.sd_available  and true or false
+        usb_ok = info.usb_available and true or false
+    end
     local out = {
-        { id = "L", label = "Internal", root = "L:/", mounted = true },
-        { id = "S", label = "SD card",  root = "S:/", mounted = sd_ok },
+        { id = "L", label = "Internal",  root = "L:/", mounted = true },
+        { id = "S", label = "SD card",   root = "S:/", mounted = sd_ok },
+        { id = "U", label = "USB drive", root = "U:/", mounted = usb_ok },
     }
     for _, d in ipairs(out) do
         if d.mounted then

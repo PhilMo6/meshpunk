@@ -399,4 +399,34 @@ phm_dd:onevent(lvgl.EVENT.VALUE_CHANGED, function()
     end
 end)
 
+-- ── Repeater Mode (client repeat) ──
+content:Label { text = "-- Repeater Mode --", w = lvgl.PCT(100), h = 16 }
+content:Label {
+    text = "Re-transmit other nodes' packets like a repeater.",
+    w = lvgl.PCT(100), h = 30,
+}
+
+local client_repeat_on = (function()
+    local ok_cr, cr = pcall(_mesh_get_client_repeat)
+    return ok_cr and (cr == true)
+end)()
+
+local function get_client_repeat_text()
+    return client_repeat_on and "[x] Repeat others' packets" or "[ ] Repeat others' packets"
+end
+
+local client_repeat_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+local client_repeat_label = client_repeat_btn:Label { text = get_client_repeat_text(), align = lvgl.ALIGN.CENTER }
+client_repeat_btn:onClicked(function()
+    local want = not client_repeat_on
+    local ok_call, ok_set, err = pcall(_mesh_set_client_repeat, want)
+    if ok_call and ok_set then
+        client_repeat_on = want
+        status_label.text = "Repeater mode: " .. (want and "ON" or "OFF")
+    else
+        status_label.text = "Repeat: " .. tostring(err or "failed to save")
+    end
+    client_repeat_label.text = get_client_repeat_text()
+end)
+
 return root

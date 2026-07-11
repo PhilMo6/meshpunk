@@ -122,7 +122,9 @@ function utils.createNotification(parent, message, duration)
         align = lvgl.ALIGN.CENTER,
     }
     
-    -- Animate in from bottom
+    -- Animate in from bottom. The exec_cb is pcall-guarded: the anim is
+    -- untracked, so if the app tears down (go_home/launch deletes the root and
+    -- the toast with it) mid-animation, the cb fires on a dead object.
     notification:set { y = 50 }
     notification:Anim {
         run = true,
@@ -131,15 +133,22 @@ function utils.createNotification(parent, message, duration)
         duration = 300,
         path = "ease_out",
         exec_cb = function(obj, value)
-            obj:set { y = value }
+            pcall(function() obj:set { y = value } end)
         end
     }
     
-    -- Auto-destroy after duration
-    notification.timer = lvgl.Timer.create(function()
-        notification:delete()
-    end, duration, 1)
-    
+    -- Auto-destroy after duration. NOTE: lvgl.Timer is the constructor itself
+    -- (there is no .create) — the old .create call errored, and pcall'd callers
+    -- silently got immortal toasts. The delete is pcall'd because this timer is
+    -- untracked: if the app exits first, root already took the toast with it.
+    lvgl.Timer {
+        period = duration,
+        cb = function(t)
+            t:delete()
+            pcall(function() notification:delete() end)
+        end,
+    }
+
     return notification
 end
 

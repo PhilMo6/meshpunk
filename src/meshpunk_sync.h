@@ -155,10 +155,18 @@ void meshpunk_spawn_gps_task();
 // Wake the GPS task early from its inter-cycle sleep (manual trigger).
 void gps_notify_wake();
 
-// Most recent GPS location fix (the last sync cycle's position; persists until
-// the next cycle restarts). Returns false if no fix is available, leaving
-// lat/lon untouched. Safe to call from the mesh task. Defined in main.cpp.
+// Last-known GPS location (most recent real fix, or the boot seed; persists
+// across sync cycles until a new fix replaces it). Returns false if no fix is
+// available, leaving lat/lon untouched. Safe to call from the mesh task.
+// Defined in main.cpp.
 bool meshpunk_gps_last_fix(double* lat, double* lon);
+
+// Apply LoRa settings to the live radio (defined in main.cpp, where the
+// radio objects live). Mirrors the reference targets' radio_set_params()/
+// radio_set_tx_power(). Safe from either core: the whole sequence runs under
+// SPI_LOCK, and RX is re-armed by the dispatcher's next recvRaw().
+void radio_apply_params(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr);
+void radio_apply_tx_power(int8_t dbm);
 
 // When true, mesh_task pauses its loop body (radio/BLE processing).
 // Currently NOTHING sets it — the mesh keeps running during ELF module

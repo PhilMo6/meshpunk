@@ -46,6 +46,15 @@ public:
   void setRxBoostedGainMode(bool en) override {
     SPI_LOCK(); CustomSX1262Wrapper::setRxBoostedGainMode(en); SPI_UNLOCK();
   }
+
+  // Live param changes: RadioLib set* calls leave the chip in standby while
+  // the wrapper still thinks STATE_RX, so nothing would re-arm the receiver.
+  // This forces the wrapper to STATE_IDLE (protected idle()); the dispatcher's
+  // next recvRaw() then re-arms RX with whatever params were set in between —
+  // the same recovery path used after every TX.
+  void standbyForConfig() {
+    SPI_LOCK(); idle(); SPI_UNLOCK();
+  }
 };
 
 #endif

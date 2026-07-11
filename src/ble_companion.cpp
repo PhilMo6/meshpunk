@@ -196,8 +196,8 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     StrHelper::strzcpy((char*)&out_frame[i], MESHPUNK_FW_VERSION, 20);
     i += 20;
 
-    out_frame[i++] = 0; // client_repeat (not used)
-    out_frame[i++] = _mesh._prefs.path_hash_mode;
+    out_frame[i++] = _mesh._prefs.client_repeat;  // v9+
+    out_frame[i++] = _mesh._prefs.path_hash_mode; // v10+
 
     _serial.writeFrame(out_frame, i);
 
@@ -286,19 +286,27 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_SET_DEVICE_TIME && len >= 5) {
     uint32_t t;
     memcpy(&t, &cmd_frame[1], 4);
-    _mesh.getRTCClock()->setCurrentTime(t);
-    writeOKFrame();
+    // Forward-only, like the reference: our clock is GPS/RX-seeded and the
+    // app pushes phone time — never let that move the device clock backwards.
+    if (t >= _mesh.getRTCClock()->getCurrentTime()) {
+      _mesh.getRTCClock()->setCurrentTime(t);
+      writeOKFrame();
+    } else {
+      writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+    }
 
   } else if (cmd_frame[0] == CMD_GET_BATT_AND_STORAGE && len >= 1) {
+    // Standard layout: [batt_mv 2][used_kb 4][total_kb 4] = 11 bytes.
+    // Storage figures are the internal LittleFS (same role as the
+    // reference's UserData FS); SD is not reported here.
     uint16_t batt_mv = analogReadMilliVolts(PIN_VBAT_READ) * 2;
+    uint32_t used_kb  = LittleFS.usedBytes() / 1024;
+    uint32_t total_kb = LittleFS.totalBytes() / 1024;
     out_frame[0] = RESP_CODE_BATT_AND_STORAGE;
     memcpy(&out_frame[1], &batt_mv, 2);
-    // Storage: total and free in KB (use LittleFS for now)
-    uint32_t total_kb = 0, free_kb = 0;
-    out_frame[3] = 0; // charging state unknown
-    memcpy(&out_frame[4], &total_kb, 4);
-    memcpy(&out_frame[8], &free_kb, 4);
-    _serial.writeFrame(out_frame, 12);
+    memcpy(&out_frame[3], &used_kb, 4);
+    memcpy(&out_frame[7], &total_kb, 4);
+    _serial.writeFrame(out_frame, 11);
 
   } else if (cmd_frame[0] == CMD_SYNC_NEXT_MESSAGE) {
     if (!_msg_sync.active) {
@@ -453,8 +461,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
   // ── Advertisement & identity ────────────────────────────────────
   } else if (cmd_frame[0] == CMD_SEND_SELF_ADVERT) {
-    auto pkt = _mesh.createSelfAdvert(_mesh._prefs.node_name,
-                                       _mesh._prefs.node_lat, _mesh._prefs.node_lon);
+    auto pkt = _mesh.buildSelfAdvert();
     if (pkt) {
       if (len >= 2 && cmd_frame[1] == 1) {
         _mesh.sendFlood(pkt, (uint32_t)0, _mesh.pathHashSize());
@@ -580,8 +587,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
   } else if (cmd_frame[0] == CMD_EXPORT_CONTACT) {
     if (len < 1 + PUB_KEY_SIZE) {
-      auto pkt = _mesh.createSelfAdvert(_mesh._prefs.node_name,
-                                         _mesh._prefs.node_lat, _mesh._prefs.node_lon);
+      auto pkt = _mesh.buildSelfAdvert();
       if (pkt) {
         pkt->header |= ROUTE_TYPE_FLOOD;
         out_frame[0] = RESP_CODE_EXPORT_CONTACT;
@@ -619,14 +625,19 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     memcpy(&bw, &cmd_frame[i], 4); i += 4;
     uint8_t sf = cmd_frame[i++];
     uint8_t cr = cmd_frame[i++];
+    uint8_t repeat = 0;  // client_repeat rides this frame since app ver 9
+    if ((int)len > i) {
+      repeat = cmd_frame[i++];
+    }
     if (freq >= 150000 && freq <= 2500000 && sf >= 5 && sf <= 12
         && cr >= 5 && cr <= 8 && bw >= 7000 && bw <= 500000) {
       _mesh._prefs.freq = (float)freq / 1000.0f;
       _mesh._prefs.bandwidth = (float)bw / 1000.0f;
       _mesh._prefs.spreading_factor = sf;
       _mesh._prefs.coding_rate = cr;
+      _mesh._prefs.client_repeat = repeat;
       _mesh.savePrefs();
-      // TODO: radio_reconfigure() once radio access helper is added
+      radio_apply_params(_mesh._prefs.freq, _mesh._prefs.bandwidth, sf, cr);
       writeOKFrame();
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
@@ -639,7 +650,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     } else {
       _mesh._prefs.tx_power_dbm = power;
       _mesh.savePrefs();
-      // TODO: radio_set_tx_power() once radio access helper is added
+      radio_apply_tx_power(power);
       writeOKFrame();
     }
 
@@ -1421,11 +1432,13 @@ void BleCompanionHandler::pushSendConfirmed(uint32_t ack_crc) {
   for (int j = 0; j < EXPECTED_ACK_TABLE_SIZE; j++) {
     if (expected_ack_table[j].ack == ack_crc && expected_ack_table[j].ack != 0) {
       uint32_t trip_time_ms = millis() - expected_ack_table[j].msg_sent;
-      uint8_t buf[11];
+      // Standard layout: [ack_crc 4][trip_time 4] — the app matches the CRC
+      // against the expected_ack it got in RESP_CODE_SENT.
+      uint8_t buf[9];
       buf[0] = PUSH_CODE_SEND_CONFIRMED;
-      memcpy(&buf[1], expected_ack_table[j].contact->id.pub_key, 6);
-      memcpy(&buf[7], &trip_time_ms, 4);
-      _serial.writeFrame(buf, 11);
+      memcpy(&buf[1], &ack_crc, 4);
+      memcpy(&buf[5], &trip_time_ms, 4);
+      _serial.writeFrame(buf, 9);
       expected_ack_table[j].ack = 0;
       return;
     }
@@ -1435,12 +1448,12 @@ void BleCompanionHandler::pushSendConfirmed(uint32_t ack_crc) {
 void BleCompanionHandler::pushPathUpdated(const ContactInfo& contact) {
   if (!_serial.isConnected()) return;
 
-  uint8_t buf[2 + PUB_KEY_SIZE];
-  int i = 0;
-  buf[i++] = PUSH_CODE_PATH_UPDATED;
-  buf[i++] = contact.out_path_len;
-  memcpy(&buf[i], contact.id.pub_key, 6); i += 6;
-  _serial.writeFrame(buf, i);
+  // Standard layout: full 32-byte pubkey (clients read exactly 32 — the old
+  // 8-byte [out_path_len][pubkey_prefix 6] frame under-ran their parsers).
+  uint8_t buf[1 + PUB_KEY_SIZE];
+  buf[0] = PUSH_CODE_PATH_UPDATED;
+  memcpy(&buf[1], contact.id.pub_key, PUB_KEY_SIZE);
+  _serial.writeFrame(buf, 1 + PUB_KEY_SIZE);
 }
 
 void BleCompanionHandler::pushLogRxData(mesh::Packet* pkt, float snr, float rssi) {

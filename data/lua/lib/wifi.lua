@@ -117,16 +117,29 @@ function wifi.scanResults()
   return _wifi_scan_results()
 end
 
+-- List of saved networks: { {ssid=..., has_password=...}, ... }
 function wifi.getSavedCreds()
   return _wifi_get_saved_creds()
 end
 
+-- Add/update one saved network (up to 8; oldest evicted when full)
 function wifi.saveCreds(network, password)
   _wifi_save_creds(network, password or "")
 end
 
+-- Remove one saved network
+function wifi.forget(network)
+  return _wifi_forget_cred(network)
+end
+
+-- Remove all saved networks
 function wifi.clearCreds()
   _wifi_clear_creds()
+end
+
+-- Join a saved network using its stored password
+function wifi.connectSaved(network)
+  return _wifi_connect_saved(network)
 end
 
 function wifi.autoConnect()

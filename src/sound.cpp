@@ -18,6 +18,7 @@ extern "C" {
 struct LuaFileHandle {   // must match the definition in main.cpp
     fs::File* file;
     bool is_sd;
+    bool is_flash;
     bool is_write;
 };
 

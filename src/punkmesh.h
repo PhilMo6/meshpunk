@@ -58,6 +58,9 @@ struct NodePrefs
   // overwrite-when-full is off, a new contact that can't fit is archived
   // instead of discarded. Defaulted to 1 in begin() (memset would make it 0).
   uint8_t archive_contacts;
+  // Client repeat (matches the MeshCore companion "client_repeat" pref):
+  // 1 = re-transmit other nodes' packets like a repeater. Default 0.
+  uint8_t client_repeat;
 };
 
 struct MeshMessage {

@@ -401,27 +401,85 @@ gps_btn:Label { text = "Get GPS Time", align = lvgl.ALIGN.CENTER }
 gps_btn:onClicked(function()
     local ok, started = pcall(_gps_sync_start)
     if ok and started then
-        gps_info_label.text = "Syncing..."
-        utils.loadingPopUpAdd(nil, "GPS Time", function()
-            local ok2, done, has_loc = pcall(_gps_sync_status)
-            if ok2 and done then
-                if has_loc then
-                    status_label.text = "GPS: time + timezone updated"
-                    gps_info_label.text = "Last sync: got time + location"
-                else
-                    status_label.text = "GPS: time updated (no location)"
-                    gps_info_label.text = "Last sync: got time, no location"
-                end
-                tz_info_label.text = describe_tz()
-                return true
-            end
-            return false
-        end)
+        status_label.text = "GPS sync started"
+        gps_info_label.text = "Syncing - see GPS Status below"
     elseif ok then
         status_label.text = "GPS sync already in progress"
     else
         status_label.text = "GPS sync error"
     end
 end)
+
+-- ── Section: GPS Status ──
+-- Live view of the sync cycle (states from _gps_state; a location hunt can run
+-- up to 2 min, so this refreshes on a managed 1s timer instead of a popup).
+content:Label { text = "-- GPS Status --", w = lvgl.PCT(100), h = 16 }
+
+local gps_state_label = content:Label { text = "...", w = lvgl.PCT(100), h = 16 }
+local gps_loc_label   = content:Label { text = "...", w = lvgl.PCT(100), h = 16 }
+
+local last_gps_state = nil
+
+local function refresh_gps_status()
+    local ok, state, elapsed, hunt_s, budget_s, time_fix, loc_fix = pcall(_gps_state)
+    if not ok then
+        gps_state_label.text = "GPS: status unavailable"
+        gps_loc_label.text = ""
+        return
+    end
+    local ok2, _, _, has_loc, lat, lng, sats = pcall(_gps_info)
+    if not ok2 then has_loc = false; sats = 0 end
+
+    local line
+    if state == 0 then
+        local outcome
+        if loc_fix then
+            outcome = "time + location"
+        elseif time_fix then
+            outcome = "time only"
+        else
+            outcome = "no fix"
+        end
+        line = "Asleep (5 min cycle) - last sync: " .. outcome
+    elseif state == 1 then
+        line = "Syncing: finding baud rate... " .. elapsed .. "s"
+    elseif state == 2 then
+        line = "Syncing: waiting for time... " .. elapsed .. "s"
+    elseif state == 3 then
+        line = "Hunting location fix... " .. hunt_s .. "s/" .. budget_s .. "s"
+        if sats and sats > 0 then
+            line = line .. " (" .. sats .. " sats)"
+        end
+    else
+        line = "Location acquired, finishing..."
+    end
+    gps_state_label.text = line
+
+    if has_loc then
+        local loc_line = string.format("Last loc: %.4f, %.4f", lat, lng)
+        if sats and sats > 0 then
+            loc_line = loc_line .. " - " .. sats .. " sats"
+        end
+        gps_loc_label.text = loc_line
+    else
+        gps_loc_label.text = "No location yet"
+    end
+
+    -- Cycle just finished: refresh the labels the old loading popup used to set.
+    if last_gps_state and last_gps_state ~= 0 and state == 0 then
+        tz_info_label.text = describe_tz()
+        if loc_fix then
+            gps_info_label.text = "Last sync: got time + location"
+        elseif time_fix then
+            gps_info_label.text = "Last sync: got time, no location"
+        else
+            gps_info_label.text = "Last sync: no fix (timeout)"
+        end
+    end
+    last_gps_state = state
+end
+
+refresh_gps_status()
+apps.add_timer { period = 1000, cb = refresh_gps_status }
 
 return root

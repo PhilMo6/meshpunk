@@ -21,7 +21,7 @@
 - Doom! Now with music and sound effects! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
 - Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts. (thanks to https://github.com/mintylinux)
 - GameBoy emulator! you must provide your own .gb/.gbc roms.
-- PC-XT DOS emulator! Boots real DOS from .img disk images — or pick a folder of games on your SD card and it becomes the C: drive
+- PC-XT DOS emulator! Boots real DOS from .img disk images — or pick a folder of games on your SD card and it becomes the C: drive. A copy of freedos can be found in the freedos folder that you can move to your sd card.
 - MP3 music player with a tag-based library, playlists, and auto-organizing by artist/album
 - Background apps — music keeps playing while you use the rest of the device
 - USB host support (experimental): route all device audio to a USB-C audio dongle (Tools > USB)
@@ -45,7 +45,7 @@
 Optional. Download and place doom wad files onto the sd card in either /doom or /lua/apps/Games/Doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
 Pico8 carts go onto the sd card in either /p8carts or /lua/apps/Games/PICO-8 folder.
 Gameboy roms go onto the sd card in either /gb or /lua/apps/Games/GameBoy folder.
-DOS disk images go onto the sd card in /dos. The PC-XT app needs a bootable DOS floppy image (.img) to start; game folders in /dos can then be mounted directly as the C: drive.
+DOS disk images go onto the sd card in /dos. The PC-XT app needs a bootable DOS floppy image (.img) to start; game folders in /dos can then be mounted directly as the C: drive. You can use a copy of freedos found in the Meshpunk github. the freedos40boot.img is modifyed for 40 collom text.
 MP3s go onto the sd card in /Music. The Music app can auto-sort tagged files into /Music/Artist/Album for you, and playlists live in /Music/Playlists.
 
 ## Using with the Launcher (optional)

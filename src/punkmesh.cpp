@@ -3543,7 +3543,7 @@ int PunkMesh::calcRxDelay(float score, uint32_t air_time) const
 
 bool PunkMesh::allowPacketForward(const mesh::Packet *packet)
 {
-    return true;
+    return _prefs.client_repeat != 0;
 }
 
 void PunkMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t *path)
@@ -4848,6 +4848,7 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
     _prefs.coding_rate = LORA_CR;
     _prefs.ble_pin = BLE_PIN_CODE;
     _prefs.path_hash_mode = 0;
+    _prefs.client_repeat = 0;   // never act as a repeater unless opted in
     _prefs.autoadd_config = 0;
     _prefs.autoadd_max_hops = 0;
     _prefs.manual_add_contacts = 0;  // auto-add all advert types (default)
@@ -5004,6 +5005,7 @@ void PunkMesh::begin()
                 else if (strcmp(key, "rx_boost") == 0) _prefs.rx_boost = atoi(val);
                 else if (strcmp(key, "ble_pin") == 0) _prefs.ble_pin = strtoul(val, NULL, 10);
                 else if (strcmp(key, "path_hash_mode") == 0) _prefs.path_hash_mode = atoi(val);
+                else if (strcmp(key, "client_repeat") == 0) _prefs.client_repeat = atoi(val);
                 else if (strcmp(key, "autoadd_config") == 0) _prefs.autoadd_config = atoi(val);
                 else if (strcmp(key, "autoadd_max_hops") == 0) _prefs.autoadd_max_hops = atoi(val);
                 else if (strcmp(key, "manual_add_contacts") == 0) _prefs.manual_add_contacts = atoi(val);
@@ -5104,6 +5106,7 @@ static void writePrefsToFile(fs::FS* fs, const char* path, const NodePrefs& p)
         file.printf("rx_boost=%d\n", p.rx_boost);
         file.printf("ble_pin=%u\n", p.ble_pin);
         file.printf("path_hash_mode=%d\n", p.path_hash_mode);
+        file.printf("client_repeat=%d\n", p.client_repeat);
         file.printf("autoadd_config=%d\n", p.autoadd_config);
         file.printf("autoadd_max_hops=%d\n", p.autoadd_max_hops);
         file.printf("msg_repeat_enabled=%d\n", p.msg_repeat_enabled);
