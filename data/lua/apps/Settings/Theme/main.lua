@@ -204,16 +204,20 @@ local function theme_menu(entry, inst)
                 theme.apply(id)
                 toast("Applied " .. name)
             end)
-            item("Remove", function()
-                confirm('Remove "' .. name .. '"?', function()
-                    -- Removing the active theme would leave lib/theme's cached
-                    -- record pointing at a deleted dir — fall back first.
-                    if theme.current() == id then theme.apply("default") end
-                    dl.run_remove(root, name, inst.dir, {
-                        on_done = done("Removed"),
-                    })
+            -- The default theme is the fallback anchor (theme.apply falls back
+            -- to it on any failure) — updatable, never removable.
+            if id ~= "default" then
+                item("Remove", function()
+                    confirm('Remove "' .. name .. '"?', function()
+                        -- Removing the active theme would leave lib/theme's cached
+                        -- record pointing at a deleted dir — fall back first.
+                        if theme.current() == id then theme.apply("default") end
+                        dl.run_remove(root, name, inst.dir, {
+                            on_done = done("Removed"),
+                        })
+                    end)
                 end)
-            end)
+            end
         end
 
         local cancel_btn = box:Button { w = lvgl.PCT(100), h = 26 }

@@ -167,15 +167,30 @@ end
 -- Store-managed dirs are exactly those with a .version file (3 lines:
 -- version / location / category). Built-in firmware content never has one.
 
+-- .version is positional: line 1 version, 2 location, 3 category (may be
+-- empty for a top-level app), 4 "locked" when the app must not be removable
+-- (e.g. the App Library itself). Split must PRESERVE empty interior lines so
+-- a locked top-level app (empty line 3) still reads its lock on line 4.
 function M.read_version(dir)
     local data = fileman.read(dir .. "/.version")
     if not data then return nil end
-    local lines = {}
-    for line in data:gmatch("[^\r\n]+") do lines[#lines + 1] = line end
+    data = data:gsub("\r", "")
+    local lines, start = {}, 1
+    while true do
+        local nl = data:find("\n", start, true)
+        if nl then
+            lines[#lines + 1] = data:sub(start, nl - 1)
+            start = nl + 1
+        else
+            lines[#lines + 1] = data:sub(start)
+            break
+        end
+    end
     return {
-        version  = lines[1] or "?",
-        location = lines[2] or "?",
-        category = lines[3],
+        version  = (lines[1] ~= "" and lines[1]) or "?",
+        location = (lines[2] ~= "" and lines[2]) or "?",
+        category = (lines[3] ~= "" and lines[3]) or nil,
+        locked   = lines[4] == "locked",
     }
 end
 
@@ -223,16 +238,19 @@ end
 --   kind      "apps" | "themes" — the repo subdir the files download from
 --   loc       "sd" | "internal" — which drive (staging + .version location)
 --   final_dir full drive-prefixed destination dir
---   old_dir   set for an update: staging completes first, then old_dir is
---             removed and staging renamed into its place
+--   old_dir   set for an update: staging completes first, then each staged
+--             file is copied OVER the live dir (manifest files only — user
+--             data living inside the app dir, e.g. saves/configs, survives)
 --   on_done   fn(err) — err nil on success, "cancelled" on user cancel
 --             (failed staging is cleaned up silently either way)
 --
 -- Builds a progress modal over `root`. Runs as a phase machine on a timer:
--- each tick does one bounded unit (one file download, one task_remove step).
--- _wifi_download_file is synchronous, so the UI freezes for one file's
--- duration — the label updates between files (two ticks per file: label
--- renders only after the callback returns, so label and download alternate).
+-- each tick does one bounded unit (one file download, one task_remove step,
+-- one file applied). _wifi_download_file is synchronous, so the UI freezes
+-- for one file's duration — the label updates between files (two ticks per
+-- file: label renders only after the callback returns, so label and download
+-- alternate). Cancel works during download; once the update starts applying,
+-- it runs to completion (a half-applied app is worse than a short wait).
 function M.run_install(root, opts)
     local entry, kind, loc = opts.entry, opts.kind, opts.loc
     local final_dir, old_dir, on_done = opts.final_dir, opts.old_dir, opts.on_done
@@ -276,16 +294,21 @@ function M.run_install(root, opts)
         on_done(err)
     end
 
-    -- Phases: clear (old staging) -> download -> remove_old (update) -> finish
+    -- Phases: clear (old staging) -> download -> then either
+    --   fresh install: finish (atomic same-drive rename), or
+    --   update:        apply (copy staged files over the live dir) -> cleanup
     local phase = "clear"
     local clear_checked = false
     local clear_task = nil
-    local remove_task = nil
+    local cleanup_task = nil
     local file_idx = 0
     local labeled = false   -- label tick / download tick alternation
+    local apply_list = nil  -- files + .version, built when an update applies
+    local apply_idx = 0
 
     apps.add_timer { period = 30, cb = function(t)
-        if cancelled then
+        -- Cancel is only honored before anything touches the live dir.
+        if cancelled and (phase == "clear" or phase == "download") then
             t:delete()
             close("cancelled")
             return
@@ -326,16 +349,21 @@ function M.run_install(root, opts)
                 local fname = files[file_idx]
                 if not fname then
                     -- All files down. Record the install, then swap into place.
+                    -- Line 4 "locked" is carried from the catalog so an update
+                    -- can't silently make a locked app removable.
                     if not fileman.write(staging .. "/.version",
                         tostring(entry.version or "?") .. "\n" .. loc .. "\n"
-                        .. tostring(entry.category or "")) then
+                        .. tostring(entry.category or "")
+                        .. (entry.locked and "\nlocked" or "")) then
                         t:delete()
                         close("Cannot write .version")
                         return
                     end
                     if old_dir then
-                        phase = "remove_old"
-                        remove_task = fileman.task_remove(old_dir)
+                        phase = "apply"
+                        apply_list = {}
+                        for i = 1, #files do apply_list[i] = files[i] end
+                        apply_list[#apply_list + 1] = ".version"   -- committed last
                     else
                         phase = "finish"
                     end
@@ -362,15 +390,37 @@ function M.run_install(root, opts)
             return
         end
 
-        if phase == "remove_old" then
-            local done, err = remove_task.step()
-            if not done then return end
-            if err then
-                t:delete()
-                close("Removing old version failed: " .. tostring(err))
+        if phase == "apply" then
+            -- Update: copy one staged file per tick over the live dir. Only
+            -- manifest files are touched, so saves/configs the app keeps in
+            -- its own dir survive; files dropped between versions linger
+            -- (harmless). .version goes last — the version bump is only
+            -- recorded once every file made it.
+            apply_idx = apply_idx + 1
+            local fname = apply_list[apply_idx]
+            if not fname then
+                phase = "cleanup"
+                cleanup_task = fileman.task_remove(staging)
                 return
             end
-            phase = "finish"
+            cur_lbl.text = fname
+            cnt_lbl.text = "applying " .. apply_idx .. " / " .. #apply_list
+            local ok, err = fileman.copy_file(staging .. "/" .. fname,
+                                              final_dir .. "/" .. fname)
+            if not ok then
+                t:delete()
+                close("Update apply failed (" .. fname .. "): " .. tostring(err))
+                return
+            end
+            return
+        end
+
+        if phase == "cleanup" then
+            local done = cleanup_task.step()
+            if not done then return end
+            -- Leftover staging is non-fatal; the startup sweep gets it.
+            t:delete()
+            close(nil)
             return
         end
 

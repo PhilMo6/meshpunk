@@ -27,6 +27,7 @@
 - USB host support (experimental): route all device audio to a USB-C audio dongle (Tools > USB)
 - Themes! make Meshpunk look the way you want. 15 themes are included!
 - File manager (Tools > Files) for both internal flash and SD
+- App Library — browse and install apps and themes straight from GitHub over WiFi, and update the ones you already have, no reflash needed
 
 
 ## Installation 
@@ -41,8 +42,9 @@
 6. Go to the radio settings and set them to your local default.
 7. Set your extra settings, RX boost, Contact Overwrite, and Message Repeat
 8. Get meshing!
+9. Install apps!
 
-Optional. Download and place doom wad files onto the sd card in either /doom or /lua/apps/Games/Doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
+Optional if installed. Download and place doom wad files onto the sd card in either /doom or /lua/apps/Games/Doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
 Pico8 carts go onto the sd card in either /p8carts or /lua/apps/Games/PICO-8 folder.
 Gameboy roms go onto the sd card in either /gb or /lua/apps/Games/GameBoy folder.
 DOS disk images go onto the sd card in /dos. The PC-XT app needs a bootable DOS floppy image (.img) to start; game folders in /dos can then be mounted directly as the C: drive. You can use a copy of freedos found in the Meshpunk github. the freedos40boot.img is modifyed for 40 collom text.
@@ -93,6 +95,16 @@ Long-press on a contact marker (touchscreen) or center the trackball on one and 
 
 With enough mesh data you can run a meshprint on the sender of a message to try to capture the first and second hop repeaters which will then be used to triangulate the senders general location.
 The more data you have the better your results will be!
+
+## App Library
+
+The App Library (top-level app) installs apps and themes onto your device over WiFi, and updates ones already installed — no firmware reflash required. It reads its catalog from the companion repo:
+
+**[github.com/PhilMo6/meshpunk-apps](https://github.com/PhilMo6/meshpunk-apps)**
+
+Apps are grouped by category; when an installed app is behind the catalog an **Updates** list appears at the top. Themes have their own downloader under Settings > Theme > Get. Every app and theme that ships with the firmware is tracked here too, so even preinstalled ones can be updated OTA. Contributions (your own apps and themes) are welcome via pull request — see that repo's README.
+
+System apps (App Library, Files, Map, Messenger, and the Settings pages) are non-removable, but can still be updated.
 
 ## Project Structure
 
@@ -185,6 +197,9 @@ MIT
 
 ## Credits
 
+- Original MeshPunk firmware, which this project is forked from and builds upon:
+  - Ben Nolan — https://github.com/bnolan
+  - Cameron L — https://github.com/mueslimak3r
 - LuaVGL by XuNeo: https://github.com/XuNeo/luavgl
 - LVGL: https://lvgl.io/
 - LilyGo for the T-Deck hardware

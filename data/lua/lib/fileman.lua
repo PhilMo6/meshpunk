@@ -257,7 +257,7 @@ local PROTECTED = {
     "L:/lua/main.lua",
     "L:/lua/launcher.lua",
     "L:/lua/lib",
-    "L:/lua/themes/default.lua",
+    "L:/lua/themes/default",
     "L:/identity",
     "L:/node_prefs",
     "L:/contacts",

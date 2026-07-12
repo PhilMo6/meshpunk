@@ -1,12 +1,15 @@
 --[[
   Offline Notes App for T-Deck
-  Loads/saves from /lua/data/notes.txt
+  Loads/saves notes.txt from its own app directory (works from internal
+  flash or SD — the launcher passes the install dir as the first argument).
 ]]
 
 local lvgl = require("lvgl")
 local apps = require("lib/apps")
 
-local NOTES_PATH = "/lua/apps/notes/notes.txt"
+local app_dir = ...
+
+local NOTES_PATH = app_dir .. "/notes.txt"
 
 local root = apps.new_root {
     w = lvgl.HOR_RES(),

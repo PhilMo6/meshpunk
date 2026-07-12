@@ -47,7 +47,8 @@ theme.show_background()
 
 local vw = nil
 local cur_cat = nil        -- category page being viewed (nil = category root)
-local show_browse, show_category, refresh_view, start   -- forward declarations
+local cur_updates = false  -- true when the Updates page is showing
+local show_browse, show_category, show_updates, refresh_view, start  -- forward decls
 
 local function toast(msg)
     pcall(utils.createNotification, root, tostring(msg), 2500)
@@ -113,8 +114,9 @@ local function confirm(title, warn, on_yes)
 end
 
 -- ── Installed scan ───────────────────────────────────────────────────────────
--- Store-managed apps are exactly those with a .version file (built-in firmware
--- apps never have one) — see lib/downloader.
+-- Tracked apps are those with a .version file. Every firmware app now ships
+-- one, and store installs write one, so this maps the catalog to what's on
+-- the device — keyed by the folder name (which equals the catalog `name`).
 
 local function scan_installed()
     local installed = {}
@@ -127,12 +129,27 @@ local function scan_installed()
                 version  = v.version,
                 location = v.location,
                 category = v.category,
+                locked   = v.locked,
                 dir      = rec.dir,
                 display  = rec.name,
             }
         end
     end
     store.installed = installed
+end
+
+-- Catalog entries whose installed version differs from the catalog version.
+-- The Updates list on the root page; empty = nothing to show.
+local function pending_updates()
+    local out = {}
+    for _, e in ipairs(store.catalog.apps) do
+        local inst = store.installed[e.name]
+        if inst and tostring(e.version) ~= inst.version then
+            out[#out + 1] = { entry = e, inst = inst }
+        end
+    end
+    table.sort(out, function(a, b) return a.entry.name < b.entry.name end)
+    return out
 end
 
 -- ── Install targets ──────────────────────────────────────────────────────────
@@ -296,7 +313,9 @@ local function do_remove(name, dir)
     end)
 end
 
--- Detail modal for a catalog entry (or an orphaned install when entry is nil).
+-- Detail modal for a catalog entry. `inst` is its installed record (or nil if
+-- not installed). The entry-nil branches are a defensive fallback; every live
+-- caller now passes a catalog entry.
 local function app_menu(entry, inst)
     local name = entry and entry.name or inst.display
     modal({}, function(box, close)
@@ -341,9 +360,13 @@ local function app_menu(entry, inst)
         end
         if inst then
             item("Open", function() open_app(entry and entry.name or inst.name) end)
-            item("Remove", function()
-                do_remove(entry and entry.name or inst.name, inst.dir)
-            end)
+            -- Locked apps (line 4 of .version) hide Remove — e.g. the App
+            -- Library itself, so it can't be uninstalled from inside itself.
+            if not inst.locked then
+                item("Remove", function()
+                    do_remove(entry and entry.name or inst.name, inst.dir)
+                end)
+            end
         end
 
         local cancel_btn = box:Button { w = lvgl.PCT(100), h = 26 }
@@ -409,9 +432,37 @@ local function group_catalog()
     return groups, order
 end
 
+-- One catalog row (name/version/badge + description + state), tapping opens
+-- the detail menu. Shared by the category and updates pages.
+local function catalog_row(content, e)
+    local entry = e
+    local inst = store.installed[e.name]
+    local state
+    if not inst then
+        state = "Install"
+    elseif tostring(e.version) ~= inst.version then
+        state = "Update"
+    else
+        state = "Installed"
+    end
+
+    -- h=52 fits two label lines above/below the button's own padding
+    -- (h=40 squeezed name and description into each other on hw).
+    local row = content:Button { w = lvgl.PCT(100), h = 52 }
+    row:Label {
+        text = e.name .. "  v" .. tostring(e.version) .. "  " .. type_badge(e),
+        align = lvgl.ALIGN.TOP_LEFT,
+    }
+    local desc = e.description or ""
+    if #desc > 30 then desc = desc:sub(1, 29) .. "~" end
+    row:Label { text = desc, align = lvgl.ALIGN.BOTTOM_LEFT }
+    row:Label { text = state, align = lvgl.ALIGN.RIGHT_MID }
+    nav.tap(row, function() app_menu(entry, inst) end)
+end
+
 -- One category's app list (launcher-style sub-page with a Back button).
 show_category = function(cat)
-    cur_cat = cat
+    cur_cat, cur_updates = cat, false
     local groups = group_catalog()
     local entries = groups[cat]
     if not entries then   -- category vanished (e.g. after a Refresh)
@@ -434,40 +485,47 @@ show_category = function(cat)
         back_btn:onClicked(function() show_browse() end)
 
         for _, e in ipairs(entries) do
-            local entry = e
-            local inst = store.installed[e.name]
-            local state
-            if not inst then
-                state = "Install"
-            elseif tostring(e.version) ~= inst.version then
-                state = "Update"
-            else
-                state = "Installed"
-            end
-
-            -- h=52 fits two label lines above/below the button's own padding
-            -- (h=40 squeezed name and description into each other on hw).
-            local row = content:Button { w = lvgl.PCT(100), h = 52 }
-            row:Label {
-                text = e.name .. "  v" .. tostring(e.version) .. "  " .. type_badge(e),
-                align = lvgl.ALIGN.TOP_LEFT,
-            }
-            local desc = e.description or ""
-            if #desc > 30 then desc = desc:sub(1, 29) .. "~" end
-            row:Label { text = desc, align = lvgl.ALIGN.BOTTOM_LEFT }
-            row:Label { text = state, align = lvgl.ALIGN.RIGHT_MID }
-            nav.tap(row, function() app_menu(entry, inst) end)
+            catalog_row(content, e)
         end
     end)
 end
 
--- Category root: one button per category, plus the orphaned-installs section.
+-- Updates page: every catalog app whose installed version is behind. Reached
+-- from the root's "Updates (N)" button; that button only exists when N > 0.
+show_updates = function()
+    cur_cat, cur_updates = nil, true
+    local ups = pending_updates()
+    if #ups == 0 then   -- last update just applied — nothing left to show
+        show_browse()
+        return
+    end
+
+    swap_view(function(v)
+        local content = v:Object {
+            w = W, h = H, x = 0, y = 0,
+            bg_opa = 0, border_width = 0, pad_all = 4,
+            flex = { flex_direction = "row", flex_wrap = "wrap" },
+        }
+        nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
+
+        content:Label { text = "Updates", w = lvgl.PCT(100), h = 18 }
+
+        local back_btn = content:Button { w = lvgl.PCT(100), h = 24 }
+        back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
+        back_btn:onClicked(function() show_browse() end)
+
+        for _, u in ipairs(ups) do
+            catalog_row(content, u.entry)
+        end
+    end)
+end
+
+-- Category root: an "Updates (N)" button when updates are pending, then one
+-- button per category.
 show_browse = function()
-    cur_cat = nil
-    -- Which installed store apps are no longer in the catalog?
-    local in_catalog = {}
-    for _, e in ipairs(store.catalog.apps) do in_catalog[e.name] = true end
+    cur_cat, cur_updates = nil, false
     local _, order = group_catalog()
+    local ups = pending_updates()
 
     swap_view(function(v)
         local content = v:Object {
@@ -491,6 +549,12 @@ show_browse = function()
         tool("Info", 50, show_info)
         tool("Quit", 50, function() apps.go_home() end)
 
+        if #ups > 0 then
+            local b = content:Button { w = lvgl.PCT(100), h = 32 }
+            b:Label { text = "Updates  (" .. #ups .. ")", align = lvgl.ALIGN.LEFT_MID }
+            nav.tap(b, function() show_updates() end)
+        end
+
         for _, cat in ipairs(order) do
             local c = cat
             local b = content:Button { w = lvgl.PCT(100), h = 32 }
@@ -501,33 +565,14 @@ show_browse = function()
         if #store.catalog.apps == 0 then
             content:Label { text = "Catalog is empty", w = lvgl.PCT(100), h = 24 }
         end
-
-        -- Installed apps that fell out of the catalog — still removable.
-        local orphans = {}
-        for name, inst in pairs(store.installed) do
-            if not in_catalog[name] then
-                orphans[#orphans + 1] = { name = name, inst = inst }
-            end
-        end
-        table.sort(orphans, function(a, b) return a.name < b.name end)
-        if #orphans > 0 then
-            content:Label { text = "Installed (not in catalog):", w = lvgl.PCT(100), h = 16 }
-            for _, o in ipairs(orphans) do
-                local inst = o.inst
-                local row = content:Button { w = lvgl.PCT(100), h = 28 }
-                row:Label {
-                    text = o.name .. "  v" .. inst.version,
-                    align = lvgl.ALIGN.LEFT_MID,
-                }
-                nav.tap(row, function() app_menu(nil, inst) end)
-            end
-        end
     end)
 end
 
 -- Rebuild whatever page the user is on (after install/update/remove).
 refresh_view = function()
-    if cur_cat then
+    if cur_updates then
+        show_updates()
+    elseif cur_cat then
         show_category(cur_cat)
     else
         show_browse()
