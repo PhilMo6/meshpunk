@@ -168,6 +168,20 @@ bool meshpunk_gps_last_fix(double* lat, double* lon);
 void radio_apply_params(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr);
 void radio_apply_tx_power(int8_t dbm);
 
+// ── Clock authority tiers ────────────────────────────────────────
+// The T-Deck has no battery-backed RTC; the mesh needs time ASAP, but no
+// source may stomp a better one. Every clock write routes through
+// meshpunk_set_clock() (defined in main.cpp): higher tier wins, equal tier
+// is forward-only (GPS-fix and manual always re-apply), lower is rejected.
+// A stale tier decays one step per 12h so old authority can't block fresh
+// truth forever. See the [CLOCK] log lines.
+#define CLOCK_TIER_SEED    0   // boot seeds: last_gps file, contacts bootstrap
+#define CLOCK_TIER_VTIME   1   // GPS status-V time (module clock, no fix)
+#define CLOCK_TIER_PHONE   2   // companion app via BLE
+#define CLOCK_TIER_GPSFIX  3   // GPS time from a real position fix
+#define CLOCK_TIER_MANUAL  4   // user typed it
+bool meshpunk_set_clock(uint8_t tier, uint32_t epoch, const char* src);
+
 // When true, mesh_task pauses its loop body (radio/BLE processing).
 // Currently NOTHING sets it — the mesh keeps running during ELF module
 // execution (messages are received, persisted, notified and unread-counted

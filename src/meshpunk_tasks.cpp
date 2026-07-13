@@ -58,10 +58,11 @@ static void mesh_task_body(void *param) {
     uint32_t now = millis();
     if (now - last_heap_log > 60000) {
       last_heap_log = now;
-      SLog.printf("[HEAP] internal: %u free, %u largest block | PSRAM: %u free | min ever: %u | lua_spill: %u\n",
+      SLog.printf("[HEAP] internal: %u free, %u largest | PSRAM: %u free, %u largest | min ever: %u | lua_spill: %u\n",
           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
           heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
           heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+          heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
           esp_get_minimum_free_heap_size(),
           (unsigned)g_lua_arena_spill_count);
     }
@@ -97,6 +98,7 @@ void meshpunk_spawn_mesh_task() {
 extern void gps_sync_poll();
 extern bool gps_sync_is_done();
 extern void gps_sync_restart(bool manual);
+extern uint32_t gps_next_cycle_delay_ms();
 
 static TaskHandle_t s_gps_task_handle = nullptr;
 
@@ -109,10 +111,13 @@ static void gps_task_body(void *param) {
       gps_sync_poll();
       vTaskDelay(pdMS_TO_TICKS(20));
     }
-    SLog.println("[TASK] gps_task sync cycle done; sleeping 5 min.");
-    // Sleep 5 minutes, or wake early if notified (manual trigger — manual
-    // cycles get the longer location-hunt budget).
-    manual = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5 * 60 * 1000)) > 0;
+    // Adaptive cadence from the cycle's outcome: fix = 5 min, time-only =
+    // 15 min, no sky / nothing = 10/20/30 min backoff. A manual trigger
+    // (notification) wakes immediately and resets the ladder.
+    uint32_t delay_ms = gps_next_cycle_delay_ms();
+    SLog.printf("[TASK] gps_task sync cycle done; next cycle in %lus.\n",
+                (unsigned long)(delay_ms / 1000UL));
+    manual = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(delay_ms)) > 0;
     SLog.println("[TASK] gps_task waking for next sync cycle.");
   }
 }

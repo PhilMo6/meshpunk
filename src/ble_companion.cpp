@@ -278,15 +278,12 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_SET_DEVICE_TIME && len >= 5) {
     uint32_t t;
     memcpy(&t, &cmd_frame[1], 4);
-    // Forward-only, like the reference: our clock is GPS/RX-seeded and the
-    // app pushes phone time — never let that move the device clock backwards.
-    uint32_t curr = _mesh.getRTCClock()->getCurrentTime();
-    if (t >= curr) {
-      _mesh.getRTCClock()->setCurrentTime(t);
+    // Routed through the clock-authority tiers: phone time beats seeds and
+    // GPS V-time (even backwards — it's truer than module-clock drift) but
+    // never a real GPS fix or a manual set. Rejections log a [CLOCK] line.
+    if (meshpunk_set_clock(CLOCK_TIER_PHONE, t, "ble-phone")) {
       writeOKFrame();
     } else {
-      // Worth one line: the phone tried to drag our GPS/RX-seeded clock back.
-      SLog.printf("[BLE TIME] rejected backwards set app=%u < device=%u\n", t, curr);
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
 

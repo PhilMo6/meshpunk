@@ -135,6 +135,20 @@ void radio_apply_tx_power(int8_t dbm) {
 // One-shot GPS time sync: poll in loop() until first fix, then stop.
 static TinyGPSPlus gps_tinygps;
 static HardwareSerial GPSSerial(1);
+// Satellites-in-view via GSV field 3 per talker (the built-in `satellites`
+// field is GGA sats-USED — zero until a fix exists, useless as a sky signal).
+// NOTE: gps_sync_restart() placement-news gps_tinygps, which wipes custom
+// registrations — each restart must re-begin() these.
+static TinyGPSCustom gps_gsv_inview_gp;
+static TinyGPSCustom gps_gsv_inview_ga;
+static TinyGPSCustom gps_gsv_inview_gb;
+static uint16_t gps_inview_val[3] = {0, 0, 0};
+static uint32_t gps_inview_ms[3]  = {0, 0, 0};
+static uint32_t gps_sky_ok_ms = 0;          // last time >=4 sats were in view
+// Best position candidate this cycle (for the HDOP gate's best-effort path)
+static bool   gps_have_cand = false;
+static double gps_cand_lat = 0.0, gps_cand_lng = 0.0;
+static float  gps_cand_hdop = 99.0f;
 static bool gps_sync_done = false;
 static uint32_t gps_sync_start_ms = 0;
 static uint32_t gps_last_stats_ms = 0;
@@ -144,23 +158,96 @@ static const uint32_t GPS_SYNC_TIMEOUT_MS = 600000;   // 10 min cold-start budge
 static const uint32_t GPS_STATS_INTERVAL_MS = 5000;   // print status every 5s
 static const uint32_t GPS_POST_FIX_MS = 2000;         // grace after a location fix to collect sat count
 // Location-hunt budget after the time fix. RMC time alone can come from the
-// module's battery-backed RTC with zero satellites tracked (status V), so the
-// receiver needs real airtime to acquire a position — but every cycle must
-// still end in standby (PMTK161): the GPS is a big power draw.
+// module's free-running clock with zero satellites tracked (status V), so the
+// receiver needs real airtime to acquire a position. (No standby command is
+// sent at cycle end: hw-verified 2026-07-13 that this module rejects every
+// known standby dialect and the receiver is rail-powered — it never sleeps.)
 static const uint32_t GPS_LOC_HUNT_MANUAL_MS = 120000; // boot / user-triggered sync
-static const uint32_t GPS_LOC_HUNT_AUTO_MS   = 60000;  // 5-min background cycle
+static const uint32_t GPS_LOC_HUNT_AUTO_MS   = 60000;  // background cycle
+// Sky detector: with <4 satellites in view a position fix is impossible.
+// Abort hunts early instead of burning the full budget indoors.
+static const uint32_t GPS_NO_SKY_LOC_ABORT_MS  = 20000;  // during location hunt
+static const uint32_t GPS_NO_SKY_TIME_ABORT_MS = 60000;  // during time hunt (time is mesh-critical, longer leash)
+static const float    GPS_HDOP_ACCEPT = 5.0f;  // accept a fix outright below this
 
 // Timezone state — "auto" uses longitude-from-GPS; otherwise a fixed offset in minutes.
 static bool    gps_location_valid_at_fix = false;
 static double  gps_lng_at_fix = 0.0;
 static double  gps_lat_at_fix = 0.0;
 static bool    gps_time_fix_valid = false;   // true if last cycle got a time fix (not timeout)
-static bool    gps_manual_time_override = false;
+static bool    gps_manual_time_override = false;  // informational for the Settings UI; gating lives in the clock tiers
 static uint32_t gps_sats_at_fix = 0;
 static uint32_t gps_hdop_at_fix = 0;        // HDOP * 100 (TinyGPSPlus integer representation)
 static uint32_t gps_loc_hunt_ms = GPS_LOC_HUNT_MANUAL_MS; // this cycle's hunt budget
 static bool     gps_loc_fixed_this_cycle = false;  // location fix landed THIS cycle
 static uint32_t gps_loc_fix_ms = 0;                // when it landed (for sat-count grace)
+static bool     gps_no_sky_this_cycle = false;     // cycle ended via the sky detector
+static uint8_t  gps_fail_streak = 0;               // consecutive cycles without a location fix
+
+// ── Clock authority tiers (see meshpunk_sync.h for the tier table) ─────────
+// State is guarded by MESH_LOCK inside meshpunk_set_clock(); everything else
+// only reads it for logging.
+static int8_t   clock_cur_tier    = -1;    // -1 = clock never tier-set this boot
+static uint32_t clock_tier_set_ms = 0;
+static uint32_t gps_last_saved_epoch = 0;  // time persisted in last_gps = lower bound on reality
+static const uint32_t CLOCK_TIER_DECAY_MS = 12UL * 3600UL * 1000UL;
+static const uint32_t CLOCK_EPOCH_FLOOR   = 1704067200UL;  // 2024-01-01: anything earlier is garbage
+
+static int8_t clock_effective_tier() {
+  if (clock_cur_tier < 0) return -1;
+  uint32_t steps = (millis() - clock_tier_set_ms) / CLOCK_TIER_DECAY_MS;
+  if (steps > 4) steps = 4;
+  int8_t eff = clock_cur_tier - (int8_t)steps;
+  return eff < 0 ? 0 : eff;
+}
+
+bool meshpunk_set_clock(uint8_t tier, uint32_t epoch, const char* src) {
+  if (!the_mesh) return false;
+  if (epoch < CLOCK_EPOCH_FLOOR) {
+    SLog.printf("[CLOCK] %s tier%u REJECTED: implausible epoch %u\n", src, tier, (unsigned)epoch);
+    return false;
+  }
+
+  MESH_LOCK();
+  uint32_t cur = the_mesh->getRTCClock()->getCurrentTime();
+  int8_t eff = clock_effective_tier();
+  bool accept;
+
+  if ((int8_t)tier > eff) {
+    accept = true;
+    // Seeds are stale by definition: never move an already-plausible clock
+    // backwards (covers the contacts-bootstrap value that lands pre-tier).
+    if (tier == CLOCK_TIER_SEED && cur >= CLOCK_EPOCH_FLOOR && epoch <= cur) accept = false;
+  } else if ((int8_t)tier == eff) {
+    // GPS-fix and manual re-apply freely (continuous refinement / user says
+    // so); phone, V-time and seeds are forward-only with a small slack.
+    accept = (tier >= CLOCK_TIER_GPSFIX) || (epoch + 5 >= cur);
+  } else {
+    accept = false;
+  }
+
+  // V-time garbage gates: the module's free-running clock must not sit below
+  // persisted reality, nor step a running V-time/better clock backwards.
+  if (accept && tier == CLOCK_TIER_VTIME) {
+    if (gps_last_saved_epoch >= CLOCK_EPOCH_FLOOR && epoch + 60 < gps_last_saved_epoch) {
+      accept = false;
+    } else if (eff >= CLOCK_TIER_VTIME && epoch + 5 < cur) {
+      accept = false;
+    }
+  }
+
+  if (accept) {
+    the_mesh->getRTCClock()->setCurrentTime(epoch);
+    clock_cur_tier = (int8_t)tier;
+    clock_tier_set_ms = millis();
+  }
+  MESH_UNLOCK();
+
+  SLog.printf("[CLOCK] %s tier%u %s %u (delta %+lds, eff tier was %d)\n",
+              src, tier, accept ? "set" : "REJECTED", (unsigned)epoch,
+              (long)((int64_t)epoch - (int64_t)cur), (int)eff);
+  return accept;
+}
 static bool    tz_is_auto = true;
 static int32_t tz_manual_minutes = 0;
 static String  tz_setting_str = "auto";
@@ -711,6 +798,13 @@ static bool           gps_baud_locked = false;
 static uint32_t       gps_baud_probe_chars_start = 0;
 static bool           gps_serial_active = false;
 
+// GPS module identity (established by a since-retired boot probe, hw
+// 2026-07-13): Allystar-class L1/L5 dual-band (GPS+GAL+BDS+QZSS, no GLONASS,
+// NMEA 4.1, 38400). It rejects every known text command dialect (PMTK, PCAS,
+// PAIR, PQTM, PDTINFO — each echoed as "$GNTXT,...,<prefix> inv format"), has
+// no standby command we can use, and is rail-powered with no control GPIO:
+// the receiver runs continuously by hardware design.
+
 static void gps_print_stats(const char* tag) {
   uint32_t elapsed = millis() - gps_sync_start_ms;
   uint32_t chars = gps_tinygps.charsProcessed();
@@ -844,6 +938,7 @@ static String gps_last_path() {
 }
 
 static void gps_last_save(double lat, double lon, bool has_loc, uint32_t t) {
+  if (t >= CLOCK_EPOCH_FLOOR) gps_last_saved_epoch = t;   // fresh reality lower bound
   if (!the_mesh || !the_mesh->_storage) return;
   bool is_sd = (the_mesh->_storage != &LittleFS);
   String path = gps_last_path();
@@ -898,11 +993,9 @@ static void gps_last_load() {
   f.close();
   if (is_sd) sd_spi_release();
 
-  if (t > 86400 && !gps_manual_time_override) {  // >1 day past epoch = a real saved time
-    MESH_LOCK();
-    the_mesh->getRTCClock()->setCurrentTime(t);
-    MESH_UNLOCK();
-    SLog.printf("[GPS] Seeded RTC from last_gps: %u UTC\n", (unsigned)t);
+  if (t > 86400) {  // >1 day past epoch = a real saved time
+    gps_last_saved_epoch = t;
+    meshpunk_set_clock(CLOCK_TIER_SEED, t, "last_gps-seed");
   }
   if (has_loc && (lat != 0.0 || lon != 0.0)) {
     gps_lat_at_fix = lat;
@@ -918,11 +1011,22 @@ void gps_sync_poll() {
 
   uint32_t now = millis();
 
+  // Sky detector: freshest satellites-in-view across the GSV talkers.
+  if (gps_gsv_inview_gp.isUpdated()) { gps_inview_val[0] = atoi(gps_gsv_inview_gp.value()); gps_inview_ms[0] = now; }
+  if (gps_gsv_inview_ga.isUpdated()) { gps_inview_val[1] = atoi(gps_gsv_inview_ga.value()); gps_inview_ms[1] = now; }
+  if (gps_gsv_inview_gb.isUpdated()) { gps_inview_val[2] = atoi(gps_gsv_inview_gb.value()); gps_inview_ms[2] = now; }
+  uint16_t sky_inview = 0;
+  for (int i = 0; i < 3; i++) {
+    if (gps_inview_ms[i] && now - gps_inview_ms[i] < 5000 && gps_inview_val[i] > sky_inview)
+      sky_inview = gps_inview_val[i];
+  }
+  if (sky_inview >= 4) gps_sky_ok_ms = now;
+
   // ── Location hunt: clock is set; keep reading until a real position fix ──
   // The time fix alone is NOT proof of acquisition: TinyGPSPlus commits RMC
-  // date/time even with status V, which the module emits instantly off its
-  // battery-backed RTC with zero satellites tracked. Location only commits on
-  // status A / GGA quality > 0, so hunt for that (bounded), then standby.
+  // date/time even with status V (the module's free-running clock, zero sats
+  // tracked). Location only commits on status A / GGA quality > 0, so hunt
+  // for that, bounded by the budget and the sky detector.
   if (gps_time_fix_valid) {
     if (gps_tinygps.satellites.isValid() && gps_tinygps.satellites.value() > 0) {
       gps_sats_at_fix = gps_tinygps.satellites.value();
@@ -930,24 +1034,32 @@ void gps_sync_poll() {
     }
 
     if (!gps_loc_fixed_this_cycle && gps_tinygps.location.isValid()) {
-      gps_lat_at_fix = gps_tinygps.location.lat();
-      gps_lng_at_fix = gps_tinygps.location.lng();
-      gps_location_valid_at_fix = true;
-      gps_loc_fixed_this_cycle = true;
-      gps_loc_fix_ms = now;
-      // Re-set the RTC: fix-true time beats the RTC-carried guess accepted earlier.
-      if (!gps_manual_time_override
-          && gps_tinygps.date.isValid() && gps_tinygps.time.isValid()) {
-        DateTime utc(gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
-                     gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second());
-        MESH_LOCK();
-        the_mesh->getRTCClock()->setCurrentTime(utc.unixtime());
-        MESH_UNLOCK();
+      float hd = gps_tinygps.hdop.isValid() ? gps_tinygps.hdop.hdop() : 99.0f;
+      // Track the best candidate seen; accept outright only below the HDOP
+      // gate so one sloppy first fix can't stamp a bad position.
+      if (!gps_have_cand || hd < gps_cand_hdop) {
+        gps_cand_lat = gps_tinygps.location.lat();
+        gps_cand_lng = gps_tinygps.location.lng();
+        gps_cand_hdop = hd;
+        gps_have_cand = true;
       }
-      SLog.printf("[GPS] location fix after %lus\n",
-                    (unsigned long)((now - gps_sync_start_ms) / 1000UL));
-      SLog.printf("[TZ] captured lat=%.5f lng=%.5f -> auto offset=%d min\n",
-                    gps_lat_at_fix, gps_lng_at_fix, (int)tz_auto_offset_minutes());
+      if (hd < GPS_HDOP_ACCEPT) {
+        gps_lat_at_fix = gps_tinygps.location.lat();
+        gps_lng_at_fix = gps_tinygps.location.lng();
+        gps_location_valid_at_fix = true;
+        gps_loc_fixed_this_cycle = true;
+        gps_loc_fix_ms = now;
+        // Fix-true time upgrades the earlier V-time authority.
+        if (gps_tinygps.date.isValid() && gps_tinygps.time.isValid()) {
+          DateTime utc(gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
+                       gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second());
+          meshpunk_set_clock(CLOCK_TIER_GPSFIX, utc.unixtime(), "gps-fix");
+        }
+        SLog.printf("[GPS] location fix after %lus (hdop=%.2f)\n",
+                      (unsigned long)((now - gps_sync_start_ms) / 1000UL), hd);
+        SLog.printf("[TZ] captured lat=%.5f lng=%.5f -> auto offset=%d min\n",
+                      gps_lat_at_fix, gps_lng_at_fix, (int)tz_auto_offset_minutes());
+      }
     }
 
     if (now - gps_last_stats_ms >= GPS_STATS_INTERVAL_MS) {
@@ -955,14 +1067,28 @@ void gps_sync_poll() {
       gps_print_stats("loc-hunt");
     }
 
+    bool no_sky   = (now - gps_sky_ok_ms >= GPS_NO_SKY_LOC_ABORT_MS);
     bool loc_done = gps_loc_fixed_this_cycle
                     && (gps_sats_at_fix > 0 || now - gps_loc_fix_ms >= GPS_POST_FIX_MS);
-    bool gave_up = !gps_loc_fixed_this_cycle
-                   && (now - gps_fix_acquired_ms >= gps_loc_hunt_ms);
+    bool gave_up  = !gps_loc_fixed_this_cycle
+                    && ((now - gps_fix_acquired_ms >= gps_loc_hunt_ms) || no_sky);
     if (loc_done || gave_up) {
       if (gave_up) {
-        SLog.printf("[GPS] no location fix within %lus; standby until next cycle.\n",
-                      (unsigned long)(gps_loc_hunt_ms / 1000UL));
+        // Salvage the best high-HDOP candidate rather than report nothing.
+        if (gps_have_cand) {
+          gps_lat_at_fix = gps_cand_lat;
+          gps_lng_at_fix = gps_cand_lng;
+          gps_location_valid_at_fix = true;
+          gps_loc_fixed_this_cycle = true;
+          SLog.printf("[GPS] best-effort fix accepted at hunt end (hdop=%.2f)\n", gps_cand_hdop);
+        } else if (no_sky) {
+          gps_no_sky_this_cycle = true;
+          SLog.printf("[GPS] no usable sky for %lus; ending location hunt early.\n",
+                        (unsigned long)(GPS_NO_SKY_LOC_ABORT_MS / 1000UL));
+        } else {
+          SLog.printf("[GPS] no location fix within %lus.\n",
+                        (unsigned long)(gps_loc_hunt_ms / 1000UL));
+        }
       }
       // Persist for the next cold boot: fresh time + best location we have
       // (this cycle's fix, or the carried-over last known). Outside MESH_LOCK.
@@ -972,7 +1098,6 @@ void gps_sync_poll() {
       MESH_UNLOCK();
       gps_last_save(gps_lat_at_fix, gps_lng_at_fix, gps_location_valid_at_fix, rtc_now);
       gps_print_stats("fix-final");
-      GPSSerial.println("$PMTK161,0*28");   // standby — never leave the receiver running
       gps_sync_done = true;
     }
     return;
@@ -990,30 +1115,36 @@ void gps_sync_poll() {
       && gps_tinygps.date.year() >= 2024) {
     DateTime utc(gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                  gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second());
-    if (!gps_manual_time_override) {
-      MESH_LOCK();
-      the_mesh->getRTCClock()->setCurrentTime(utc.unixtime());
-      MESH_UNLOCK();
-    } else {
-      SLog.println("[GPS] Manual time override active; skipping RTC update.");
-    }
+    // This time may be the module's free-running clock (RMC status V), not a
+    // satellite fix — mesh needs time ASAP, so take it, but only at V-time
+    // authority: the tier engine keeps it from stomping phone/fix/manual time
+    // and from stepping the clock backwards. A real fix upgrades it below.
+    meshpunk_set_clock(CLOCK_TIER_VTIME, utc.unixtime(), "gps-vtime");
 
     gps_fix_acquired_ms = now;
     gps_time_fix_valid = true;
     gps_sats_at_fix = gps_tinygps.satellites.isValid() ? gps_tinygps.satellites.value() : 0;
     gps_hdop_at_fix  = gps_tinygps.hdop.isValid()      ? gps_tinygps.hdop.value()       : 0;
 
-    // This time may be the module's RTC guess (RMC status V), not a satellite
-    // fix — good enough for the clock. The location hunt above takes over from
-    // here: it captures the position and re-sets the RTC if a real fix lands.
-    SLog.println("[GPS] ======== TIME SET — hunting for location fix ========");
+    SLog.println("[GPS] ======== TIME ACQUIRED — hunting for location fix ========");
     gps_print_stats("time-fix");
-    SLog.printf("[GPS] RTC set to %u UTC (%04u-%02u-%02u %02u:%02u:%02u) after %lus; loc hunt up to %lus\n",
-                  (unsigned)utc.unixtime(),
+    SLog.printf("[GPS] gps time %04u-%02u-%02u %02u:%02u:%02u after %lus; loc hunt up to %lus\n",
                   gps_tinygps.date.year(), gps_tinygps.date.month(), gps_tinygps.date.day(),
                   gps_tinygps.time.hour(), gps_tinygps.time.minute(), gps_tinygps.time.second(),
                   (unsigned long)((now - gps_sync_start_ms) / 1000UL),
                   (unsigned long)(gps_loc_hunt_ms / 1000UL));
+    return;
+  }
+
+  // No usable sky for a while and still no time → stop wasting the cycle.
+  // (Time needs only one satellite, so this leash is longer than the
+  // location hunt's, but with zero birds in view nothing can decode.)
+  if (now - gps_sky_ok_ms >= GPS_NO_SKY_TIME_ABORT_MS) {
+    SLog.printf("[GPS] no usable sky for %lus and no time — ending cycle early.\n",
+                  (unsigned long)(GPS_NO_SKY_TIME_ABORT_MS / 1000UL));
+    gps_print_stats("no-sky");
+    gps_no_sky_this_cycle = true;
+    gps_sync_done = true;
     return;
   }
 
@@ -1022,7 +1153,6 @@ void gps_sync_poll() {
     gps_print_stats("timeout");
     SLog.printf("[GPS] No fix after %us. Move to open sky for cold start (can take 30s-5min+).\n",
                   (unsigned)(GPS_SYNC_TIMEOUT_MS / 1000));
-    GPSSerial.println("$PMTK161,0*28");
     gps_sync_done = true;
   }
 }
@@ -1039,8 +1169,29 @@ bool meshpunk_gps_last_fix(double* lat, double* lon) {
   return true;
 }
 
+// Next-cycle delay for gps_task, from this cycle's outcome. Since the
+// receiver never sleeps (rail-powered, no standby — hw-verified), cycles
+// cost nothing GPS-side; the backoff is CPU/log hygiene, and it means a
+// device that CAN fix keeps its 5-minute cadence while one buried indoors
+// backs off to half-hourly checks.
+uint32_t gps_next_cycle_delay_ms() {
+  if (gps_loc_fixed_this_cycle) {
+    gps_fail_streak = 0;
+    return 5UL * 60UL * 1000UL;
+  }
+  if (gps_fail_streak < 255) gps_fail_streak++;
+  if (gps_time_fix_valid && !gps_no_sky_this_cycle)
+    return 15UL * 60UL * 1000UL;   // time served, some sky — moderate cadence
+  uint32_t mins = (gps_fail_streak >= 3) ? 30 : (gps_fail_streak == 2 ? 20 : 10);
+  return mins * 60UL * 1000UL;
+}
+
 void gps_sync_restart(bool manual) {
   new (&gps_tinygps) TinyGPSPlus();
+  // Placement-new wiped the custom-field registrations — re-attach them.
+  gps_gsv_inview_gp.begin(gps_tinygps, "GPGSV", 3);
+  gps_gsv_inview_ga.begin(gps_tinygps, "GAGSV", 3);
+  gps_gsv_inview_gb.begin(gps_tinygps, "GBGSV", 3);
   if (gps_serial_active) {
     GPSSerial.write(0xFF);
     GPSSerial.flush(false);
@@ -1052,6 +1203,13 @@ void gps_sync_restart(bool manual) {
   gps_fix_acquired_ms = 0;
   gps_baud_idx = 0;
   gps_baud_locked = false;
+  gps_sky_ok_ms = gps_sync_start_ms;
+  gps_inview_val[0] = gps_inview_val[1] = gps_inview_val[2] = 0;
+  gps_inview_ms[0] = gps_inview_ms[1] = gps_inview_ms[2] = 0;
+  gps_no_sky_this_cycle = false;
+  gps_have_cand = false;
+  gps_cand_hdop = 99.0f;
+  if (manual) gps_fail_streak = 0;   // user asked: reset the backoff ladder
   // gps_location_valid_at_fix / lat / lng deliberately survive the restart:
   // they are the last-known position (map, message stamping, auto-tz) until a
   // new fix replaces them. Only per-cycle state resets here.
@@ -6438,12 +6596,9 @@ void setupLuaVGL() {
       lua_pushboolean(L, 0);
       return 1;
     }
-    MESH_LOCK();
-    the_mesh->getRTCClock()->setCurrentTime((uint32_t)ts);
-    MESH_UNLOCK();
-    gps_manual_time_override = true;
-    SLog.printf("[RTC] Manual time set to %u UTC, GPS override enabled\n", (unsigned)ts);
-    lua_pushboolean(L, 1);
+    bool ok = meshpunk_set_clock(CLOCK_TIER_MANUAL, (uint32_t)ts, "manual");
+    if (ok) gps_manual_time_override = true;   // informational (Settings UI)
+    lua_pushboolean(L, ok ? 1 : 0);
     return 1;
   });
 
@@ -6454,6 +6609,8 @@ void setupLuaVGL() {
 
   lua_register(L, "_rtc_manual_override_clear", [](lua_State *L) -> int {
     gps_manual_time_override = false;
+    // Drop the manual tier so the next source (GPS/phone/seed) wins again.
+    if (clock_cur_tier >= CLOCK_TIER_MANUAL) clock_cur_tier = CLOCK_TIER_SEED;
     SLog.println("[RTC] Manual override cleared; GPS time updates re-enabled.");
     lua_pushboolean(L, 1);
     return 1;
