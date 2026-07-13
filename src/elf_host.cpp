@@ -168,9 +168,10 @@ static bool esc_held = false;
 static uint32_t esc_hold_start = 0;
 #define ESC_EXIT_HOLD_MS 1500
 
-// USB keyboard Backspace held (set by elf_input_inject, pre-keymap) — OR'd
-// into the exit-hold check so a USB keyboard can leave a module too.
-static volatile bool s_usb_bs_down = false;
+// USB keyboard Backspace/Alt held (set by elf_input_inject, pre-keymap) —
+// OR'd into the exit-hold check so a USB keyboard can leave a module too.
+static volatile bool s_usb_bs_down  = false;
+static volatile bool s_usb_alt_down = false;
 
 // Raw-delta mode: set by host_trackball_read() (module emulates a mouse and
 // owns the ISR counters); reset before each module run.
@@ -351,11 +352,13 @@ static void poll_input(bool kb_only = false) {
     }
     memcpy(prev_key_state, cur_state, INPUT_STATE_SIZE);
 
-    // Exit hold detection: hold backspace for 1.5s to return to launcher.
-    // T-Deck has no physical ESC key; backspace (0x08) is the exit key.
-    // s_usb_bs_down folds in a USB keyboard's Backspace (this poll runs at
-    // 100Hz and would otherwise clear esc_held from the matrix every tick).
-    if (cur_state[0x08] || s_usb_bs_down) {
+    // Exit hold detection: hold Alt+Backspace for 1.5s to return to the
+    // launcher. Plain backspace stays an ordinary key (DOS et al. use it for
+    // editing); requiring the Alt chord makes exits deliberate. The timer
+    // starts only once BOTH are down; releasing either resets it. s_usb_*
+    // fold in a USB keyboard's Backspace/Alt (this poll runs at 100Hz and
+    // would otherwise clear esc_held from the matrix every tick).
+    if ((cur_state[0x08] || s_usb_bs_down) && (alt || s_usb_alt_down)) {
         if (!esc_held) { esc_held = true; esc_hold_start = millis(); }
     } else {
         esc_held = false;
@@ -411,6 +414,7 @@ static void elf_input_start() {
     memset(prev_key_state, 0, INPUT_STATE_SIZE);
     esc_held = false;
     s_usb_bs_down = false;
+    s_usb_alt_down = false;
     s_input_task_run = true;
     // Priority 5: ABOVE usb_mgr (4), sound_task (3) and elf_blit (3). The
     // keyboard poll is a tiny, latency-critical task (one I2C read every 10ms);
@@ -443,7 +447,8 @@ static void elf_input_stop() {
 bool elf_input_active(void) { return s_input_task_run; }
 
 void elf_input_inject(unsigned char key, int pressed) {
-    if (key == 0x08) s_usb_bs_down = (pressed != 0);   // exit-hold, pre-keymap
+    if (key == 0x08) s_usb_bs_down  = (pressed != 0);  // exit-hold, pre-keymap
+    if (key == 0x8C) s_usb_alt_down = (pressed != 0);  // exit-hold Alt (USB kbd)
     if (!s_input_task_run) return;
     uint8_t out;
     if (keymap_passthrough) {

@@ -113,7 +113,7 @@ static uint8_t ascii_to_scan(unsigned char c)
         case '/': case '?': return 0x35;
         // control keys
         case 0x0D: return 0x1C; // Enter
-        case 0x08: return 0x0E; // Backspace (short press; exit = 1.5s hold)
+        case 0x08: return 0x0E; // Backspace (exit = Alt+Backspace 1.5s hold)
         case ' ':  return 0x39;
         case 0x09: case 0x99: return 0x0F; // Tab
         case 0x1B: return 0x01;            // Esc
