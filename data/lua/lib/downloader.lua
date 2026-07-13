@@ -8,9 +8,11 @@
   The repo's catalog.toml carries two TOML table-arrays with identical entry
   shape: "apps" and "themes" — id (repo folder), name, version, author,
   description, type, category (apps only), files (relative paths to download
-  from <base_url>/<kind>/<id>/). Entries with path-hostile ids/names/files
-  ("..", "/", "\") are dropped at parse time — a hostile catalog must not be
-  able to write outside its own staging dir.
+  from <base_url>/<kind>/<id>/), min_fw (optional integer: the minimum
+  firmware API level — the _FW_API Lua global — the entry's files need).
+  Entries with path-hostile ids/names/files ("..", "/", "\") are dropped at
+  parse time — a hostile catalog must not be able to write outside its own
+  staging dir.
 
   Install discipline (see the App Library header for the full story):
     * staging dirs live OUTSIDE the apps/themes bases (partial downloads must
@@ -98,6 +100,7 @@ local function sanitize_list(list)
             e.version = tostring(e.version or "?")
             e.author = e.author and tostring(e.author) or nil
             e.description = e.description and tostring(e.description) or nil
+            e.min_fw = tonumber(e.min_fw)   -- nil = no firmware requirement
             kept[#kept + 1] = e
         end
     end
@@ -136,6 +139,48 @@ function M.load_cached_catalog()
     local data = fileman.read(CACHE_PATH)
     if not data then return nil end
     return M.parse_catalog(data)
+end
+
+-- ── Firmware gating ──────────────────────────────────────────────────────────
+-- Catalog entries may carry min_fw (integer): the minimum firmware API level
+-- their files need. The firmware registers _FW_API at Lua boot (version.h);
+-- firmware too old to register it reads as 0, so every gated entry blocks
+-- there — the safe default. NOTE: this lib ships with FIRMWARE (data/lua/lib),
+-- not through the store, so the App Library carries its own fallback copy of
+-- this check — it must gate correctly even where this lib predates min_fw.
+
+function M.fw_api()
+    return tonumber(_FW_API) or 0
+end
+
+-- nil when the entry is installable on this firmware, else the API level it
+-- requires (for the caller's messaging).
+function M.fw_required(entry)
+    local need = tonumber(entry and entry.min_fw)
+    if need and need > M.fw_api() then return need end
+    return nil
+end
+
+-- Ordered version compare: true only when the catalog version is strictly
+-- newer than the installed one — plain inequality offered DOWNGRADES whenever
+-- a device was ahead of the catalog (freshly flashed firmware, repo not
+-- pushed yet). Versions split into numeric segments ("1.0.10" -> 1,0,10;
+-- missing segments = 0); if either side has no digits at all, fall back to
+-- inequality so exotic version strings keep updating. Rollback convention:
+-- republish old content under a HIGHER version. Used by Settings/Theme (in
+-- sync with this lib — both ship with firmware); the App Library carries its
+-- own copy, same reason as the fw gate above.
+function M.version_newer(cat_v, inst_v)
+    cat_v, inst_v = tostring(cat_v or ""), tostring(inst_v or "")
+    local a, b = {}, {}
+    for n in cat_v:gmatch("%d+") do a[#a + 1] = tonumber(n) end
+    for n in inst_v:gmatch("%d+") do b[#b + 1] = tonumber(n) end
+    if #a == 0 or #b == 0 then return cat_v ~= inst_v end
+    for i = 1, math.max(#a, #b) do
+        local x, y = a[i] or 0, b[i] or 0
+        if x ~= y then return x > y end
+    end
+    return false
 end
 
 -- ── WiFi ─────────────────────────────────────────────────────────────────────
@@ -254,6 +299,14 @@ end
 function M.run_install(root, opts)
     local entry, kind, loc = opts.entry, opts.kind, opts.loc
     local final_dir, old_dir, on_done = opts.final_dir, opts.old_dir, opts.on_done
+    -- Firmware gate, last ditch: UIs check first and never offer the action,
+    -- but no caller may install an entry this firmware can't run.
+    local need = M.fw_required(entry)
+    if need then
+        on_done("Needs firmware update (app needs API " .. need
+            .. ", device has " .. M.fw_api() .. ")")
+        return
+    end
     -- Kind-prefixed staging name so an app id can never collide with a theme id.
     local staging = fileman.normalize(M.STAGING[loc] .. "/"
         .. (kind == "themes" and "th_" or "app_") .. entry.id)

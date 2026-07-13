@@ -14,9 +14,9 @@
 class PunkMesh;
 
 // ── Companion protocol version ───────────────────────────────────
-#define MESHPUNK_FW_VER_CODE     11
-#define MESHPUNK_FW_VERSION      "v1.15.0"
-#define MESHPUNK_FW_BUILD_DATE   "16 May 2026"
+// FW_VER_CODE / FW_VERSION / FW_BUILD_DATE live in version.h (single
+// bump site, shared with the Lua _FW_API/_FW_VERSION globals).
+#include "version.h"
 #define MESHPUNK_MODEL_NAME      "MeshPunk T-Deck"
 
 // ── Command codes (app → device) ─────────────────────────────────

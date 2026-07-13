@@ -33,6 +33,45 @@ local H = lvgl.VER_RES()
 
 local WIFI_WAIT_MS = 15000    -- auto-connect patience before giving up
 
+-- ── Firmware gating ──────────────────────────────────────────────────────────
+-- Catalog entries may carry min_fw (integer): the minimum firmware API level
+-- (the _FW_API global, registered at Lua boot; see src/version.h) their files
+-- need. Deliberately NOT delegated to lib/downloader's copy of this check:
+-- this app updates through the store while that lib only ships with firmware,
+-- so the gate must work here even where the on-device downloader predates
+-- min_fw. Old firmware never registers _FW_API — it reads as 0 and every
+-- gated entry blocks, which is exactly right.
+local FW_API = tonumber(_FW_API) or 0
+
+-- nil when installable on this firmware, else the required API level.
+local function fw_required(entry)
+    local need = tonumber(entry and entry.min_fw)
+    if need and need > FW_API then return need end
+    return nil
+end
+
+-- Ordered version compare: true only when the catalog version is strictly
+-- newer than the installed one. Plain inequality offered DOWNGRADES whenever
+-- the device was ahead of the catalog (freshly flashed firmware, repo not
+-- pushed yet). Versions split into numeric segments ("1.0.10" -> 1,0,10;
+-- missing segments = 0); if either side has no digits at all, fall back to
+-- inequality so exotic version strings keep updating. Rollback convention:
+-- republish old content under a HIGHER version — lowering a catalog version
+-- no longer reaches devices. (Self-contained here, like fw_required: the
+-- store-updated app can't rely on the firmware-shipped downloader.)
+local function version_newer(cat_v, inst_v)
+    cat_v, inst_v = tostring(cat_v or ""), tostring(inst_v or "")
+    local a, b = {}, {}
+    for n in cat_v:gmatch("%d+") do a[#a + 1] = tonumber(n) end
+    for n in inst_v:gmatch("%d+") do b[#b + 1] = tonumber(n) end
+    if #a == 0 or #b == 0 then return cat_v ~= inst_v end
+    for i = 1, math.max(#a, #b) do
+        local x, y = a[i] or 0, b[i] or 0
+        if x ~= y then return x > y end
+    end
+    return false
+end
+
 -- ── App state ────────────────────────────────────────────────────────────────
 local store = {
     catalog   = nil,     -- parsed catalog.toml ({ meta=, apps={...} })
@@ -139,12 +178,14 @@ local function scan_installed()
 end
 
 -- Catalog entries whose installed version differs from the catalog version.
--- The Updates list on the root page; empty = nothing to show.
+-- The Updates list on the root page; empty = nothing to show. Firmware-gated
+-- updates are excluded — nothing actionable to offer; their category rows
+-- show "Needs FW" instead.
 local function pending_updates()
     local out = {}
     for _, e in ipairs(store.catalog.apps) do
         local inst = store.installed[e.name]
-        if inst and tostring(e.version) ~= inst.version then
+        if inst and version_newer(e.version, inst.version) and not fw_required(e) then
             out[#out + 1] = { entry = e, inst = inst }
         end
     end
@@ -267,6 +308,12 @@ local function install_done(entry, verb)
 end
 
 local function do_install(entry, inst)
+    -- Firmware gate (the menu never offers the action; this catches the rest).
+    local need = fw_required(entry)
+    if need then
+        toast("Needs firmware update (API " .. need .. ")")
+        return
+    end
     if inst then
         -- Update in place: same location the app already lives in.
         local loc = (fileman.split(inst.dir) == "S") and "sd" or "internal"
@@ -352,9 +399,20 @@ local function app_menu(entry, inst)
             end)
         end
 
-        if entry and not inst then
+        -- Install/Update action — replaced by an explanation when the entry
+        -- needs firmware this device doesn't have yet.
+        local need = entry and fw_required(entry)
+        local actionable = entry
+            and (not inst or version_newer(entry.version, inst.version))
+        if actionable and need then
+            box:Label {
+                text = "Needs a firmware update first\n(app needs API " .. need
+                    .. ", device has " .. FW_API .. ")",
+                text_color = "#ff5555", w = lvgl.PCT(100),
+            }
+        elseif entry and not inst then
             item("Install", function() do_install(entry, nil) end)
-        elseif entry and inst and tostring(entry.version) ~= inst.version then
+        elseif entry and inst and version_newer(entry.version, inst.version) then
             item("Update to v" .. tostring(entry.version),
                  function() do_install(entry, inst) end)
         end
@@ -438,12 +496,14 @@ local function catalog_row(content, e)
     local entry = e
     local inst = store.installed[e.name]
     local state
-    if not inst then
-        state = "Install"
-    elseif tostring(e.version) ~= inst.version then
+    if inst and not version_newer(e.version, inst.version) then
+        state = "Installed"  -- up to date, or ahead of the catalog
+    elseif fw_required(e) then
+        state = "Needs FW"   -- installable/updatable, but firmware is too old
+    elseif inst then
         state = "Update"
     else
-        state = "Installed"
+        state = "Install"
     end
 
     -- h=52 fits two label lines above/below the button's own padding

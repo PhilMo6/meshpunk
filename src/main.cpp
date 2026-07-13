@@ -21,6 +21,7 @@
 #include "sound.h"
 #include "notify.h"
 #include "ble_companion.h"
+#include "version.h"
 #include "elf_host.h"
 #include "meshpunk_fs.h"
 #include "fs_bridge.h"
@@ -6943,6 +6944,13 @@ void setupLuaVGL() {
   lua_setglobal(L, "GRIDNAV_ROLLOVER");
   lua_pushinteger(L, LV_GRIDNAV_CTRL_SCROLL_FIRST);
   lua_setglobal(L, "GRIDNAV_SCROLL_FIRST");
+
+  // Firmware identity for the app store's min_fw gating (see version.h).
+  // Absent on older firmware — Lua reads nil and treats it as API level 0.
+  lua_pushinteger(L, MESHPUNK_FW_API);
+  lua_setglobal(L, "_FW_API");
+  lua_pushstring(L, MESHPUNK_FW_VERSION);
+  lua_setglobal(L, "_FW_VERSION");
 
   // Navigation controller: a stack of navigable scopes (gridnav + touch/trackball
   // switching). _nav_setup replaces the TOP scope (back-compat with the old

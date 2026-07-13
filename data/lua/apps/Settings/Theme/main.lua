@@ -189,7 +189,7 @@ local function theme_menu(entry, inst)
                     on_done = done("Installed"),
                 })
             end)
-        elseif entry and inst and entry.version ~= inst.version then
+        elseif entry and inst and dl.version_newer(entry.version, inst.version) then
             item("Update to v" .. entry.version, function()
                 local loc = (fileman.split(inst.dir) == "S") and "sd" or "internal"
                 dl.run_install(root, {
@@ -295,10 +295,10 @@ build_downloads = function()
             local state
             if not inst then
                 state = "Install"
-            elseif e.version ~= inst.version then
+            elseif dl.version_newer(e.version, inst.version) then
                 state = "Update"
             else
-                state = "Installed"
+                state = "Installed"   -- up to date, or ahead of the catalog
             end
 
             local row = content:Button { w = lvgl.PCT(100), h = 52 }
