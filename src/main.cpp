@@ -14,6 +14,7 @@
 #include <lvgl.h>
 #include "theme/lv_theme_meshpunk.h"
 #include "emoji_font.h"
+#include "theme_font.h"
 #include "tdeck-pins.h"
 #include "meshpunk_sync.h"
 #include "Audio.h"
@@ -265,6 +266,11 @@ void sd_spi_release();
 // Lua; only this id is persisted here.
 static String theme_pref_str = "";
 
+// User-default runtime fonts per role ("" = the bundled Noto Sans). Set from
+// Settings > Fonts; a theme's own set_font overrides these while active.
+static String font_ui_pref = "";
+static String font_text_pref = "";
+
 static void write_firmware_prefs(fs::FS& fs, const char* path) {
   File f = fs.open(path, "w", true);
   if (!f) { SLog.printf("[FW_PREFS] cannot write %s\n", path); return; }
@@ -291,6 +297,8 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
   f.printf("alt_toggle=%d\n", kb_alt_toggle_pref ? 1 : 0);
   f.printf("theme=%s\n", theme_pref_str.c_str());
+  f.printf("font_ui=%s\n", font_ui_pref.c_str());
+  f.printf("font_text=%s\n", font_text_pref.c_str());
   f.printf("topbar_transparant=%d\n", topbar_transparant ? 1 : 0);
   f.printf("sel_solid=%d\n", theme_focus_solid ? 1 : 0);
   f.printf("sel_darken=%d\n", theme_focus_darken ? 1 : 0);
@@ -673,6 +681,12 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "theme") == 0) {
       theme_pref_str = String(val);
       theme_pref_str.trim();
+    } else if (strcmp(key, "font_ui") == 0) {
+      font_ui_pref = String(val);
+      font_ui_pref.trim();
+    } else if (strcmp(key, "font_text") == 0) {
+      font_text_pref = String(val);
+      font_text_pref.trim();
     } else if (strcmp(key, "topbar_transparant") == 0) {
       topbar_transparant = (atoi(val) == 1);
     } else if (strcmp(key, "sel_solid") == 0) {
@@ -1225,6 +1239,11 @@ char last_key = 0;
 // Filesystem variables
 bool fs_mounted = false;
 bool sd_mounted = false;
+// Label LittleFS actually mounted under: "spiffs" on direct/CSV flashes,
+// "assets" on Launcher installs (merge_bin.py declares that label). Internal
+// size queries MUST use this, not the Arduino LittleFS wrapper's stored label
+// (which the LVGL esp-littlefs driver clobbers to "spiffs"). See mp_littlefs_df.
+const char* g_lfs_mount_label = "spiffs";
 
 
 // sd_spi_take() / sd_spi_release() — mutex-based.
@@ -1988,6 +2007,12 @@ void handleWebSerialCommands() {
   }
 }
 
+// The emoji imgfont every style points at; theme_font.cpp swaps its ->fallback
+// to splice runtime TTFs into the chain (emoji -> TTF -> montserrat). NULL
+// until setupLvgl(); may equal &lv_font_montserrat_14 (const — never written)
+// when emoji-font creation failed, which disables the splice.
+lv_font_t *g_ui_font = nullptr;
+
 // Setup LVGL
 void setupLvgl() {
 
@@ -2028,6 +2053,7 @@ void setupLvgl() {
   // S:/emoji/<hex>.png on the SD card.
   static lv_font_t * ui_font = emoji_font_create(16, &lv_font_montserrat_14);
   if (!ui_font) ui_font = (lv_font_t *)&lv_font_montserrat_14;
+  g_ui_font = ui_font;   // theme_font.cpp splices runtime TTFs via ->fallback
 
   lv_theme_t *custom_theme = lv_theme_meshpunk_init(
     disp,
@@ -5815,8 +5841,35 @@ static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
 }
 
 
-// Initialize LuaVGL
+// lvgl.Font(name, size) — luavgl's font-extension hook. "ui" (alias "theme")
+// resolves to the ui role, "text" to the text role — both emoji-wrapped at
+// any size (see theme_font.cpp). Anything else returns NULL so luavgl's
+// builtin resolution raises its normal "cannot create font" error.
+static const lv_font_t *meshpunk_make_font(const char *name, int size, int weight) {
+  (void)weight;
+  if (!name) return NULL;
+  if (strcasecmp(name, "ui") == 0 || strcasecmp(name, "theme") == 0)
+    return theme_font_sized(THEME_FONT_UI, size);
+  if (strcasecmp(name, "text") == 0)
+    return theme_font_sized(THEME_FONT_TEXT, size);
+  return NULL;
+}
+
+// "ui"/"text" role-string parse shared by the font bindings. Returns false on
+// anything else (the binding then reports failure to Lua).
+static bool parse_font_role(const char *s, theme_font_role_t *out) {
+  if (!s) return false;
+  if (strcasecmp(s, "ui") == 0)   { *out = THEME_FONT_UI;   return true; }
+  if (strcasecmp(s, "text") == 0) { *out = THEME_FONT_TEXT; return true; }
+  return false;
+}
+
 void setupLuaVGL() {
+  // Runtime TTF fonts: (re)load the bundled default + user-default prefs and
+  // splice both role chains. Also the post-ELF restore point — luaTearDown
+  // released every font for the module's PSRAM, and this rebuild re-inits.
+  theme_font_init(font_ui_pref.c_str(), font_text_pref.c_str());
+
   // Create Lua state with PSRAM allocator
   L = lua_newstate(lua_psram_alloc, NULL);
   if (!L) {
@@ -5833,6 +5886,7 @@ void setupLuaVGL() {
   // Initialize LuaVGL
   luaL_requiref(L, "lvgl", luaopen_lvgl, 1);
   lua_pop(L, 1);
+  luavgl_set_font_extension(L, meshpunk_make_font, NULL);
 
   // Register WiFi functions
   lua_register(L, "_wifi_connect", lua_wifi_connect);
@@ -6292,6 +6346,59 @@ void setupLuaVGL() {
     bool dark = lua_isnoneornil(L, 7) ? true : (lua_toboolean(L, 7) != 0);
     lv_theme_meshpunk_set_palette(scr, card, text, grey, accent, btn_text, dark);
     lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  // _theme_font_set(role, path, px) -> bool. Theme-supplied runtime TTF for
+  // one role ("ui"/"text"; drive-prefixed path; px 0 = default UI size).
+  // Idempotent per path+size — themes re-apply on every show_background().
+  // Failure keeps the role's current resolution.
+  lua_register(L, "_theme_font_set", [](lua_State *L) -> int {
+    theme_font_role_t role;
+    if (!parse_font_role(luaL_checkstring(L, 1), &role)) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    const char *path = luaL_checkstring(L, 2);
+    int px = (int)luaL_optinteger(L, 3, 0);
+    lua_pushboolean(L, theme_font_set(role, path, px) ? 1 : 0);
+    return 1;
+  });
+  // _theme_font_clear() — drop both theme font roles (back to the user/
+  // bundled defaults). Called by lib/theme before every theme apply.
+  lua_register(L, "_theme_font_clear", [](lua_State *L) -> int {
+    theme_font_clear();
+    return 0;
+  });
+  // _font_default_set(role, path) -> bool. The user's default font for a role
+  // ("" or nil path = revert to the bundled Noto Sans). Persisted; a theme's
+  // own font overrides it while that theme is active.
+  lua_register(L, "_font_default_set", [](lua_State *L) -> int {
+    theme_font_role_t role;
+    if (!parse_font_role(luaL_checkstring(L, 1), &role)) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    const char *path = luaL_optstring(L, 2, "");
+    if (!font_default_set(role, path)) {
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    if (role == THEME_FONT_UI) font_ui_pref = String(path);
+    else                       font_text_pref = String(path);
+    firmware_prefs_save();
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+  // _font_default_get(role) -> path string ("" = bundled default).
+  lua_register(L, "_font_default_get", [](lua_State *L) -> int {
+    theme_font_role_t role;
+    if (!parse_font_role(luaL_checkstring(L, 1), &role)) {
+      lua_pushstring(L, "");
+      return 1;
+    }
+    lua_pushstring(L, role == THEME_FONT_UI ? font_ui_pref.c_str()
+                                            : font_text_pref.c_str());
     return 1;
   });
 
@@ -7131,6 +7238,9 @@ void setupLuaVGL() {
 
     s_pack_splash_label = lv_label_create(lv_scr_act());
     lv_obj_set_style_text_align(s_pack_splash_label, LV_TEXT_ALIGN_CENTER, 0);
+    // Force plain white — the theme's default text color is grey and unreadable
+    // on the black boot screen.
+    lv_obj_set_style_text_color(s_pack_splash_label, lv_color_white(), 0);
     lv_obj_center(s_pack_splash_label);
     lv_label_set_text(s_pack_splash_label,
         "First-time setup\n\n"
@@ -7266,6 +7376,11 @@ void luaTearDown() {
   // Both re-populate on demand when the launcher re-renders. Core-0 only.
   emoji_font_cache_clear();
   lv_image_cache_drop(NULL);
+  // Runtime TTF fonts: buffers + glyph caches are the same class of resident
+  // PSRAM cluster — release them all (chain reverts to montserrat); the
+  // post-ELF luaBringUp() -> setupLuaVGL() -> theme_font_init() reloads the
+  // default, and the theme re-apply in main.lua restores any theme font.
+  theme_font_release_all();
   // Sweep every Lua-created sound object: the handles died with lua_close, and
   // the heavy module wants the contiguous PSRAM their PCM renders occupy. The
   // notify melody sits below the boot mark and survives (alerts during Doom).
@@ -7403,7 +7518,8 @@ void setup() {
   if (!fs_on_spiffs) SLog.println("LittleFS: no \"spiffs\" partition, trying \"assets\" (Launcher install)");
   if (fs_on_spiffs || LittleFS.begin(true, "/littlefs", 10, "assets")) {
     fs_mounted = true;
-    SLog.printf("LittleFS mounted successfully (label: %s)\n", fs_on_spiffs ? "spiffs" : "assets");
+    g_lfs_mount_label = fs_on_spiffs ? "spiffs" : "assets";
+    SLog.printf("LittleFS mounted successfully (label: %s)\n", g_lfs_mount_label);
 #ifdef MESHPUNK_EMBED_PACK
     // Fresh/wiped filesystem or a firmware update with new bundled files: the
     // pack embedded in this binary must be extracted. Deferred to setupLuaVGL()
@@ -7455,6 +7571,7 @@ void setup() {
       "/meshpunk",
       "/meshpunk/apps",
       "/meshpunk/messages",
+      "/meshpunk/fonts",     // user-droppable .ttf files for Settings > Fonts
     };
     for (auto dir : required_dirs) {
       if (!SD.exists(dir)) {

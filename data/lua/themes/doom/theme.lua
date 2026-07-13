@@ -17,6 +17,10 @@ return {
             dark     = true,
         }
 
+        -- DOOM-logo display face (caps-only; lowercase and missing glyphs fall
+        -- back down the font chain). Swapped live; reverts on theme change.
+        t.set_font(t.dir .. "/AmazDooMLeft.ttf")
+
         -- Seed from the clock + a heap address so the flames differ per draw.
         local seed = math.floor(t.now() or 0)
         local addr = tostring({}):match("0x(%x+)")

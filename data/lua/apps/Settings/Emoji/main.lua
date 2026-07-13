@@ -299,6 +299,49 @@ open_picker = function(key)
     -- Fixed pool of PAGE cells, created once; paging only rewrites labels and
     -- the cps[] slots (handlers registered once — never re-bound per page).
     local start = 1
+    local show_page   -- forward decl (search row sits above the cells)
+
+    -- Codepoint search: jump the grid to a hex codepoint (nearest entry at or
+    -- after it). The index is codepoint-sorted, so this doubles as a category
+    -- jump: 1F300 weather, 1F400 animals, 1F600 smileys, E000 sequences.
+    -- Lua-side binary search over _emoji_blob_list — no firmware change.
+    local function blob_lower_bound(cp)
+        local lo, hi = 1, BLOB_TOTAL + 1
+        while lo < hi do
+            local mid = math.floor((lo + hi) / 2)
+            local v = (_emoji_blob_list(mid, 1) or {})[1]
+            if not v then break end
+            if v < cp then lo = mid + 1 else hi = mid end
+        end
+        if lo > BLOB_TOTAL then lo = BLOB_TOTAL end
+        return lo
+    end
+
+    local search_ta = box:Textarea {
+        password_mode = false, one_line = true,
+        placeholder_text = "hex, e.g. 1F600",
+        w = lvgl.PCT(64), h = 28,
+    }
+    search_ta:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local function do_jump()
+        local q = (search_ta.text or ""):gsub("%s+", ""):gsub("^[Uu]%+?", "")
+        local cp = tonumber(q, 16)
+        if not cp or cp <= 0 then
+            page_lbl:set { text = "bad hex" }
+            return
+        end
+        local idx = blob_lower_bound(cp)
+        start = idx - ((idx - 1) % PAGE)   -- align to the page holding it
+        show_page()
+    end
+
+    local go_b = box:Button { w = lvgl.PCT(32), h = 28 }
+    go_b:Label { text = "Go", align = lvgl.ALIGN.CENTER }
+    go_b:onClicked(do_jump)
+    search_ta:onevent(lvgl.EVENT.KEY, function()
+        if lvgl.indev.get_act():get_key() == lvgl.KEY.ENTER then do_jump() end
+    end)
     local cps = {}
     local cells = {}
     for i = 1, PAGE do
@@ -316,7 +359,7 @@ open_picker = function(key)
         end)
     end
 
-    local function show_page()
+    show_page = function()
         local list = _emoji_blob_list(start, PAGE)
         for i = 1, PAGE do
             local cp = list[i]

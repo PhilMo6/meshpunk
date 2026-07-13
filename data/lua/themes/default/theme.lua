@@ -15,6 +15,13 @@ return {
             btn_text = "#ffffff",   -- white button labels
             dark     = true,
         }
+        -- The bundled wide-coverage font (Latin Ext + Cyrillic + Greek).
+        -- A string sets the "ui" role only; the "text" role (chat bubbles
+        -- etc.) is left to the user's Settings > Fonts default. This is what
+        -- every role gets when nothing overrides it; named here explicitly as
+        -- the reference — the C side aliases this exact path to the
+        -- already-loaded bundled slot (no duplicate PSRAM buffer).
+        t.set_font("L:/fonts/NotoSans-Regular.ttf")
         t.background.fill("#202329")
     end,
 }

@@ -6,10 +6,20 @@
 #include <SD.h>
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
+#include <esp_littlefs.h>
 #include <string.h>
 
 extern bool sd_mounted;
 extern void sd_spi_release();
+extern const char* g_lfs_mount_label;   // set in main.cpp at LittleFS mount
+
+bool mp_littlefs_df(size_t* total, size_t* used) {
+    size_t t = 0, u = 0;
+    if (esp_littlefs_info(g_lfs_mount_label, &t, &u) != ESP_OK) return false;
+    if (total) *total = t;
+    if (used)  *used  = u;
+    return true;
+}
 
 // Strip an S:/L:/U: prefix, set *drive accordingly.
 // If no prefix, *drive = default_sd ? MP_SD : MP_FLASH.

@@ -481,8 +481,10 @@ static int lua_fs_df(lua_State* L) {
         lua_pushnumber(L, (lua_Number)(total - freeb));
         return 2;
     }
-    lua_pushnumber(L, (lua_Number)LittleFS.totalBytes());
-    lua_pushnumber(L, (lua_Number)LittleFS.usedBytes());
+    size_t total = 0, used = 0;
+    mp_littlefs_df(&total, &used);   // stays 0/0 if the query fails
+    lua_pushnumber(L, (lua_Number)total);
+    lua_pushnumber(L, (lua_Number)used);
     return 2;
 }
 

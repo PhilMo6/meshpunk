@@ -1071,6 +1071,14 @@ show_chat = function(target)
         border_width = 0, pad_all = 2, bg_opa = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
+    -- Chat content opts into the "text" font role (bubbles inherit from here;
+    -- the rest of the app stays on the ui font). No-op on old firmware.
+    -- Size 16 is REQUIRED: it selects the role's chain head (lvgl.Font
+    -- defaults to 12, which would create a small sized instance instead).
+    local okf, text_font = pcall(lvgl.Font, "text", 16)
+    if okf and text_font then
+        msg_list:set { text_font = text_font }
+    end
     msg_list:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
 
     local in_msg_select = false
@@ -1315,6 +1323,9 @@ show_chat = function(target)
         max_length = max_len,
         w = lvgl.PCT(75), h = 34,
     }
+    if okf and text_font then
+        textArea:set { text_font = text_font }
+    end
 
     local function do_send()
         local text = textArea.text

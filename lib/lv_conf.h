@@ -362,7 +362,15 @@
 #define LV_USE_QRCODE 1
 #define LV_USE_BARCODE 0
 #define LV_USE_FREETYPE 0
-#define LV_USE_TINY_TTF 0
+/* Runtime TTF rendering for theme-supplied fonts (src/theme_font.cpp).
+ * DATA mode only: file mode does raw lv_fs reads during glyph rasterization
+ * in the draw path (no sd_spi_take discipline, heavy seeking) — the whole
+ * TTF is loaded into PSRAM instead. */
+#define LV_USE_TINY_TTF 1
+#if LV_USE_TINY_TTF
+    #define LV_TINY_TTF_FILE_SUPPORT 0
+    #define LV_TINY_TTF_CACHE_GLYPH_CNT 256
+#endif
 #define LV_USE_RLOTTIE 0
 #define LV_USE_VECTOR_GRAPHIC  0
 #define LV_USE_THORVG_INTERNAL 0

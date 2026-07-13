@@ -5,6 +5,7 @@
 #include "punkmesh.h"
 #include "meshpunk_sync.h"
 #include "punk_ble_interface.h"
+#include "meshpunk_fs.h"   // mp_littlefs_df — correct L: size (LittleFS.*Bytes() clobber)
 #include <BLEDevice.h>
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
@@ -299,8 +300,10 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     static uint32_t cached_used_kb = 0, cached_total_kb = 0;
     static uint32_t storage_cache_ms = 0;
     if (cached_total_kb == 0 || millis() - storage_cache_ms > 30000) {
-      cached_used_kb  = LittleFS.usedBytes() / 1024;
-      cached_total_kb = LittleFS.totalBytes() / 1024;
+      size_t total = 0, used = 0;
+      mp_littlefs_df(&total, &used);
+      cached_used_kb  = used  / 1024;
+      cached_total_kb = total / 1024;
       storage_cache_ms = millis();
     }
     uint32_t used_kb = cached_used_kb, total_kb = cached_total_kb;

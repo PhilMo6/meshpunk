@@ -36,7 +36,11 @@ RELEASES_DIR_NAME = "releases"
 # <= 5 MB would get a 1 MB partition, too small for extraction - keep the csv
 # spiffs partition above 5 MB). Launcher >2.7.2 honors the "assets" label and
 # creates it at the exact declared size. The firmware mounts "spiffs" first,
-# then falls back to "assets", covering both generations.
+# then falls back to "assets", covering both generations. NOTE: do NOT relabel
+# this "spiffs" -- that name collides with the Launcher's own reserved spiffs
+# handling and yields a 0-size partition (block_count 0 -> divide-by-zero in
+# lfs_alloc on first write). The df/size mismatch this used to cause is fixed in
+# firmware instead (see _fs_df / g_lfs_mount_label).
 LAUNCHER_FS_THRESHOLD = 0x500000  # Launcher's LAUNCHER_DEFAULT_SPIFFS_THRESHOLD
 
 def build_launcher_partition_table(fs_size):

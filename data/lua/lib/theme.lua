@@ -8,8 +8,23 @@
         apply = function(t)  -- runs ONCE when the theme is selected
           t.set_palette{ scr=.., card=.., text=.., grey=.., accent=.., btn_text=.., dark=true }
           t.background.procedural(function(canvas, w, h) ... end)  -- or .image / .fill
+          t.set_font(t.dir .. "/font.ttf")            -- optional runtime UI font
+          -- or: t.set_font{ file = t.dir .. "/font.ttf", size = 16 }
         end,
       }
+
+  Fonts: two roles. "ui" is the interface font everything inherits; "text" is
+  the reading font used by objects that opted in (text_font =
+  lvgl.Font("text", 16) — e.g. Messenger chat bubbles; 16 = the standard UI
+  size, selecting the role's chain head). set_font with a string
+  sets the ui role only; a table sets either/both: { ui = path, text = path }
+  (each also accepts { file=, size= }). Per role: the theme's font wins while
+  the theme is active; otherwise the user's default from Settings > Fonts
+  applies (factory: bundled Noto Sans, wide Latin/Cyrillic/Greek coverage).
+  Emoji rendering and FontAwesome symbols are unaffected — they sit above/
+  below the TTF in the font chain. .ttf files with glyf outlines ONLY —
+  CFF-flavored .otf is rejected (theme still applies, font stays default).
+  Apps can request role fonts at other sizes: pcall(lvgl.Font, "text", 22).
 
   A theme can live two ways inside a themes folder, both valid:
     * a flat file   <id>.lua
@@ -128,6 +143,27 @@ local function make_toolkit(asset_dir)
                 p.accent or "#ff00aa",
                 p.btn_text or p.text or "#ffffff",
                 p.dark ~= false)   -- default dark unless explicitly dark = false
+        end,
+        -- Optional runtime fonts (TTF), two roles: "ui" (interface chrome —
+        -- what everything inherits) and "text" (reading content — objects
+        -- that opted in with text_font = lvgl.Font("text", 16), e.g. chat
+        -- bubbles). A string sets the ui role only; a table sets either:
+        --   t.set_font(t.dir .. "/font.ttf")                       -- ui only
+        --   t.set_font{ ui = "...ttf", text = { file = "...ttf", size = 16 } }
+        -- Unset roles keep the user/bundled default. Idempotent C-side
+        -- (show_background re-runs apply()); pcall-guarded so themes still
+        -- load on firmware without TTF support. Failure keeps current fonts.
+        set_font = function(spec)
+            if type(spec) == "string" then spec = { ui = spec } end
+            if type(spec) ~= "table" then return end
+            if spec.file then spec = { ui = spec } end   -- old {file=,size=} form
+            local function one(role, v)
+                if type(v) == "string" then v = { file = v } end
+                if type(v) ~= "table" or not v.file then return end
+                pcall(_theme_font_set, role, v.file, v.size or 0)
+            end
+            one("ui", spec.ui)
+            one("text", spec.text)
         end,
         -- One-shot background helpers (lib/background). Draw whenever the theme's
         -- apply() runs — at home, and inside any app that opts in by calling
@@ -271,7 +307,16 @@ end
 function M.apply(id)
     if not id or id == "" then id = DEFAULT_ID end
     local rec = resolve(id)
-    if not rec or not run_rec(rec) then
+    if not rec then
+        if id ~= DEFAULT_ID then return M.apply(DEFAULT_ID) end
+        return false
+    end
+    -- Drop the previous theme's font BEFORE apply so a theme without set_font
+    -- lands on the bundled default. Only here — show_background()'s re-run of
+    -- apply() must NOT clear (set_font is idempotent C-side, so a font theme
+    -- re-applying is a no-op, not a reload).
+    pcall(_theme_font_clear)
+    if not run_rec(rec) then
         if id ~= DEFAULT_ID then return M.apply(DEFAULT_ID) end
         return false
     end
