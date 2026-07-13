@@ -369,7 +369,7 @@
 #define LV_USE_TINY_TTF 1
 #if LV_USE_TINY_TTF
     #define LV_TINY_TTF_FILE_SUPPORT 0
-    #define LV_TINY_TTF_CACHE_GLYPH_CNT 256
+    #define LV_TINY_TTF_CACHE_GLYPH_CNT 128   // per-instance glyph+bitmap cache cap; >Latin working set (~80-110), half the 256 ceiling
 #endif
 #define LV_USE_RLOTTIE 0
 #define LV_USE_VECTOR_GRAPHIC  0

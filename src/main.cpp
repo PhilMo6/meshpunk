@@ -5552,37 +5552,68 @@ static int lua_lvgl_image_cache_drop(lua_State *L) {
   return 0;
 }
 
-// ── Map tile pool (contiguous, fixed) ───────────────────────────────────────
+// ── Map tile pool (16 independent 128KB slots) ──────────────────────────────
 // The map shows a 4x4 = 16 grid. Instead of 16 LVGL Image widgets each loading a
 // .bin FILE (which LVGL decodes into a SCATTERED 128KB image-cache buffer per
-// tile — the prime PSRAM fragmenter), we keep ONE contiguous 16x128KB block and
+// tile — the prime PSRAM fragmenter), we keep 16 fixed 128KB slot buffers and
 // display each tile via an in-memory RGB565 lv_image_dsc that LVGL draws DIRECTLY
 // (use_directly path, lv_bin_decoder.c — no copy, no cache buffer). The 16 grid
 // widgets map 1:1 to slots (slot = grid index). Allocated when the map opens,
 // freed on close (lua_tile_pool_free) once the widgets are hidden.
+// PER-SLOT, NOT ONE CONTIGUOUS 2MB BLOCK (2026-07-13): a single 2MB alloc is
+// the most fragmentation-sensitive demand in the firmware — persistent session
+// churn (TLS, caches, mesh buffers) bisects the big free region, and the
+// re-alloc on a second Map open fails (hw-confirmed: 2047KB hole vs 2048KB
+// need). Each slot only needs 128KB contiguous, which succeeds even on a
+// heavily fragmented heap (worst observed mid-session largest block: 335KB).
 #define TILE_POOL_SLOTS      16
 #define TILE_POOL_SLOT_BYTES (256 * 256 * 2)   // 131072 (RGB565)
-static uint8_t *s_tile_pool = nullptr;
+static uint8_t *s_tile_slots[TILE_POOL_SLOTS] = {nullptr};
 static lv_image_dsc_t s_tile_dsc[TILE_POOL_SLOTS];
 
-// _tile_pool_alloc() -> bool. One contiguous 2MB block; cache-drop + retry once
-// on failure (the canvas-alloc pattern) so it lands even on a tightish heap.
+// Fill any missing slots; true when all 16 are present.
+static bool tile_slots_fill(void) {
+  bool ok = true;
+  for (int i = 0; i < TILE_POOL_SLOTS; i++) {
+    if (!s_tile_slots[i])
+      s_tile_slots[i] = (uint8_t *)heap_caps_malloc(TILE_POOL_SLOT_BYTES,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_tile_slots[i]) ok = false;
+  }
+  return ok;
+}
+
+// _tile_pool_alloc() -> bool. Fill any missing slots; on failure reclaim the
+// emoji glyph cache + image cache (freeable churn) and retry the missing ones.
+// All-or-nothing: a partial set is freed so ~1.9MB is never held uselessly.
 static int lua_tile_pool_alloc(lua_State *L) {
-  if (!s_tile_pool) {
-    size_t need = (size_t)TILE_POOL_SLOTS * TILE_POOL_SLOT_BYTES;
-    SLog.printf("[tile_pool] pre-alloc: psram free=%uKB largest=%uKB (need %uKB)\n",
+  bool complete = true;
+  for (int i = 0; i < TILE_POOL_SLOTS; i++)
+    if (!s_tile_slots[i]) { complete = false; break; }
+  if (!complete) {
+    SLog.printf("[tile_pool] pre-alloc: psram free=%uKB largest=%uKB (need %ux%uKB)\n",
                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
-                (unsigned)(need / 1024));
-    s_tile_pool = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_tile_pool) {
+                (unsigned)TILE_POOL_SLOTS, (unsigned)(TILE_POOL_SLOT_BYTES / 1024));
+    if (!tile_slots_fill()) {
+      // Clear emoji glyphs first (lv_image_cache_drop never touches that
+      // cache), then drop the image cache so no decoder entry dangles at a
+      // freed glyph dsc, then repaint so freed visible glyphs re-decode.
+      emoji_font_cache_clear();
       lv_image_cache_drop(NULL);
-      s_tile_pool = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      lv_obj_invalidate(lv_screen_active());
+      if (!tile_slots_fill()) {
+        for (int i = 0; i < TILE_POOL_SLOTS; i++) {
+          if (s_tile_slots[i]) { heap_caps_free(s_tile_slots[i]); s_tile_slots[i] = nullptr; }
+        }
+        SLog.println("[tile_pool] alloc FAILED");
+        lua_pushboolean(L, 0);
+        return 1;
+      }
     }
-    if (!s_tile_pool) { SLog.println("[tile_pool] alloc FAILED"); lua_pushboolean(L, 0); return 1; }
     lv_memzero(s_tile_dsc, sizeof(s_tile_dsc));
-    SLog.printf("[tile_pool] allocated %uKB; psram now free=%uKB largest=%uKB\n",
-                (unsigned)(need / 1024),
+    SLog.printf("[tile_pool] allocated %ux%uKB; psram now free=%uKB largest=%uKB\n",
+                (unsigned)TILE_POOL_SLOTS, (unsigned)(TILE_POOL_SLOT_BYTES / 1024),
                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
   }
@@ -5591,13 +5622,14 @@ static int lua_tile_pool_alloc(lua_State *L) {
 }
 
 // _tile_pool_free(). Caller MUST hide/clear the tile widgets first so nothing
-// draws from pool memory after it's freed. Drops the image cache (in case a
-// descriptor was cached pointing at pool data) then frees the block.
+// draws from slot memory after it's freed. Drops the image cache (in case a
+// descriptor was cached pointing at slot data) then frees every slot.
 static int lua_tile_pool_free(lua_State *L) {
-  if (s_tile_pool) {
+  if (s_tile_slots[0]) {
     lv_image_cache_drop(NULL);
-    heap_caps_free(s_tile_pool);
-    s_tile_pool = nullptr;
+    for (int i = 0; i < TILE_POOL_SLOTS; i++) {
+      if (s_tile_slots[i]) { heap_caps_free(s_tile_slots[i]); s_tile_slots[i] = nullptr; }
+    }
     lv_memzero(s_tile_dsc, sizeof(s_tile_dsc));
   }
   return 0;
@@ -5613,9 +5645,9 @@ static int lua_tile_show(lua_State *L) {
   lv_obj_t *img = lobj->obj;
   int slot = (int)luaL_checkinteger(L, 2) - 1;     // 1-based Lua -> 0-based
   const char *path = luaL_checkstring(L, 3);
-  if (!s_tile_pool || slot < 0 || slot >= TILE_POOL_SLOTS) { lua_pushboolean(L, 0); return 1; }
+  if (slot < 0 || slot >= TILE_POOL_SLOTS || !s_tile_slots[slot]) { lua_pushboolean(L, 0); return 1; }
 
-  uint8_t *dst = s_tile_pool + (size_t)slot * TILE_POOL_SLOT_BYTES;
+  uint8_t *dst = s_tile_slots[slot];
   lv_image_header_t hdr;
 
   sd_spi_take();
@@ -5865,10 +5897,8 @@ static bool parse_font_role(const char *s, theme_font_role_t *out) {
 }
 
 void setupLuaVGL() {
-  // Runtime TTF fonts: (re)load the bundled default + user-default prefs and
-  // splice both role chains. Also the post-ELF restore point — luaTearDown
-  // released every font for the module's PSRAM, and this rebuild re-inits.
-  theme_font_init(font_ui_pref.c_str(), font_text_pref.c_str());
+  // (Runtime TTF fonts are initialized in luaBringUp(), BEFORE the Lua arena —
+  // the ~430KB buffers must land below the gap, not inside it. See luaBringUp.)
 
   // Create Lua state with PSRAM allocator
   L = lua_newstate(lua_psram_alloc, NULL);
@@ -7393,6 +7423,18 @@ void luaTearDown() {
 // lua_psram_alloc); setupLuaVGL() then builds the state, registers every binding,
 // installs the require searcher, and loads the launcher main.lua at its tail.
 void luaBringUp() {
+  // Runtime TTF fonts FIRST, then the arena. TLSF is good-fit: with the arena
+  // already up, the ~430KB font buffers land in the freshly-made 1MB gap (the
+  // smallest block that fits) and permanently eat ~86% of the churn shield —
+  // session churn then overflows into the reserve above the arena and bisects
+  // it (the root cause of the Map tile-pool failures, hw-confirmed
+  // 2026-07-13). Loading fonts first puts them at the bottom of the pristine
+  // region instead; the gap + arena stack ABOVE them and the gap stays fully
+  // empty for churn. At ELF launch luaTearDown frees fonts + arena together,
+  // so fonts + gap + arena still coalesce into one block for the module.
+  // Also the post-ELF restore point — luaTearDown released every font; this
+  // reloads the defaults and main.lua's theme re-apply restores theme fonts.
+  theme_font_init(font_ui_pref.c_str(), font_text_pref.c_str());
   lua_arena_create();
   setupLuaVGL();
 }
