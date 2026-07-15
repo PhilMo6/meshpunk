@@ -321,6 +321,12 @@ bool    firmware_notify_sound_enabled() { return notify_sound_enabled; }
 uint8_t firmware_kbd_brightness()       { return kbd_brightness; }
 bool    firmware_kbd_timed_out()        { return kbd_timed_out; }
 
+// Timestamp source for notify_post record stamps — the same RTC the _rtc_time
+// binding reads (our clock authority; a sender's timestamp is never used).
+uint32_t firmware_rtc_epoch() {
+  return the_mesh ? the_mesh->getRTCClock()->getCurrentTime() : 0;
+}
+
 // ── Topbar Preferences ─────────────────────────────────────────────
 static bool     topbar_transparant = false;   // can you see the background though the topbar
 
@@ -1277,6 +1283,8 @@ void IRAM_ATTR ISR_trackball_right() { trackball_right++; }
 #define KB_KEY_BS_ROW     3
 #define KB_KEY_SPACE_COL  0
 #define KB_KEY_SPACE_ROW  5
+#define KB_KEY_MIC_COL    0
+#define KB_KEY_MIC_ROW    6
 
 // Normal character layer (col × row) — from stock C3 firmware Keyboard_ESP32C3.ino
 static const char kb_matrix[KB_COLS][KB_ROWS] = {
@@ -1816,6 +1824,11 @@ static int lua_nav_reset(lua_State *L) {
     return 0;
 }
 
+// Input capture for the Gamepad mapping wizard (_input_capture_* bindings):
+// armed by Lua, consumed by the capture block inside keyboard_read_cb.
+static volatile bool     s_input_capture_armed = false;
+static volatile uint32_t s_input_captured      = 0;
+
 // LVGL keyboard read callback
 static bool trackball_btn_pressed = false;
 
@@ -1957,6 +1970,33 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   }
 
   bool kb_active = (resolved_key != 0);
+
+  // ── Input capture (Gamepad app mapping wizard; _input_capture_* below) ──
+  // While armed, the FIRST input this reader resolves is recorded as a
+  // module/driver code (chars as themselves incl. 0x0D/0x08; trackball →
+  // 0x81-0x84, click → 0x85) and ALL input is swallowed — the captured
+  // press must not also navigate the UI. Matrix and USB keys both land in
+  // kb_key_state, so both are capturable.
+  if (s_input_capture_armed) {
+    uint32_t got = 0;
+    for (int ch = 1; ch < 128 && !got; ch++)
+      if (kb_key_state[ch] && !kb_key_prev[ch]) got = ch;
+    if (!got) {
+      if      (trackball_click > 0) got = 0x85;
+      else if (trackball_up > 0)    got = 0x81;
+      else if (trackball_down > 0)  got = 0x82;
+      else if (trackball_left > 0)  got = 0x83;
+      else if (trackball_right > 0) got = 0x84;
+    }
+    if (got) {
+      s_input_captured     = got;
+      s_input_capture_armed = false;
+    }
+    trackball_click = 0;
+    trackball_up = trackball_down = trackball_left = trackball_right = 0;
+    resolved_key = 0;
+    kb_active = false;
+  }
 
   // ── WASD intercept — treat as direction, not character (unless typing) ──
   uint32_t wasd_dir = 0;
@@ -7139,6 +7179,29 @@ void setupLuaVGL() {
   lua_register(L, "_indev_reset", [](lua_State *L) -> int {
     (void)L;
     lv_indev_reset(NULL, NULL);
+    return 0;
+  });
+
+  // Input capture (Gamepad mapping wizard): arm, poll until a code arrives,
+  // stop to disarm. While armed keyboard_read_cb swallows ALL keyboard and
+  // trackball input and reports the first press as a driver code.
+  lua_register(L, "_input_capture_start", [](lua_State *L) -> int {
+    s_input_captured      = 0;
+    s_input_capture_armed = true;
+    return 0;
+  });
+  lua_register(L, "_input_capture_poll", [](lua_State *L) -> int {
+    if (s_input_captured) {
+      lua_pushinteger(L, (lua_Integer)s_input_captured);
+      s_input_captured = 0;
+    } else {
+      lua_pushnil(L);
+    }
+    return 1;
+  });
+  lua_register(L, "_input_capture_stop", [](lua_State *L) -> int {
+    s_input_capture_armed = false;
+    s_input_captured      = 0;
     return 0;
   });
 

@@ -11,7 +11,10 @@
 // safe default. Bump this whenever a release adds/changes anything a store
 // app could require.
 //   1  2026-07-13  first exposure (Alt+Backspace ELF exit chord release)
-#define MESHPUNK_FW_API 1
+//   2  2026-07-13  dynamic USB drivers (_usb_drivers binding, L:/S: driver
+//                  dirs, driver pool) — the Tools/USB app's Drivers manager
+//                  needs this level
+#define MESHPUNK_FW_API 2
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:

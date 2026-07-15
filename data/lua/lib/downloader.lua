@@ -5,11 +5,17 @@
   here so the catalog format, staging discipline and .version bookkeeping
   can never diverge between them.
 
-  The repo's catalog.toml carries two TOML table-arrays with identical entry
-  shape: "apps" and "themes" — id (repo folder), name, version, author,
-  description, type, category (apps only), files (relative paths to download
-  from <base_url>/<kind>/<id>/), min_fw (optional integer: the minimum
-  firmware API level — the _FW_API Lua global — the entry's files need).
+  The repo's catalog.toml carries three TOML table-arrays with identical
+  entry shape: "apps", "themes" and "drivers" (USB .drv.elf modules) — id
+  (repo folder), name, version, author, description, type, category (apps
+  only), files (relative paths to download from <base_url>/<kind>/<id>/),
+  min_fw (optional integer: the minimum firmware API level — the _FW_API Lua
+  global — the entry's files need), drivers (apps only, optional: a list of
+  ids from the drivers table-array that the app depends on; the App Library
+  auto-installs missing ones right after the app, to the app's location).
+  NOTE: never write double-square-bracket TOML names inside this header —
+  it is a Lua long comment and two adjacent closing square brackets in the
+  text terminate it early (that exact bug has now happened twice).
   Entries with path-hostile ids/names/files ("..", "/", "\") are dropped at
   parse time — a hostile catalog must not be able to write outside its own
   staging dir.
@@ -101,6 +107,17 @@ local function sanitize_list(list)
             e.author = e.author and tostring(e.author) or nil
             e.description = e.description and tostring(e.description) or nil
             e.min_fw = tonumber(e.min_fw)   -- nil = no firmware requirement
+            -- Optional USB-driver dependencies: ids from the [[drivers]]
+            -- list. Installed automatically after the app (App Library).
+            if type(e.drivers) == "table" then
+                local ds = {}
+                for _, id in ipairs(e.drivers) do
+                    if safe_segment(id) then ds[#ds + 1] = id end
+                end
+                e.drivers = (#ds > 0) and ds or nil
+            else
+                e.drivers = nil
+            end
             kept[#kept + 1] = e
         end
     end
@@ -115,6 +132,7 @@ function M.parse_catalog(body)
     end
     parsed.apps = sanitize_list(parsed.apps)
     parsed.themes = sanitize_list(parsed.themes)
+    parsed.drivers = sanitize_list(parsed.drivers)   -- [[drivers]]: USB .drv.elf
     return parsed
 end
 
@@ -307,9 +325,11 @@ function M.run_install(root, opts)
             .. ", device has " .. M.fw_api() .. ")")
         return
     end
-    -- Kind-prefixed staging name so an app id can never collide with a theme id.
-    local staging = fileman.normalize(M.STAGING[loc] .. "/"
-        .. (kind == "themes" and "th_" or "app_") .. entry.id)
+    -- Kind-prefixed staging name so ids can never collide across kinds.
+    local prefix = (kind == "themes" and "th_")
+                or (kind == "drivers" and "dr_")
+                or "app_"
+    local staging = fileman.normalize(M.STAGING[loc] .. "/" .. prefix .. entry.id)
     local files = entry.files
 
     local W, H = lvgl.HOR_RES(), lvgl.VER_RES()

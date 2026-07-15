@@ -153,6 +153,12 @@ struct elf_module {
 
     // Host export table (borrowed pointer, not owned)
     const elf_symbol_t* exports;
+
+    // Custom segment allocator (elf_load_ex). NULL free_fn = default
+    // heap_caps_free. Stored so elf_unload returns the block to the right
+    // allocator (e.g. the USB driver pool).
+    elf_free_fn seg_free;
+    void*       seg_ctx;
 };
 
 // ---------------------------------------------------------------------------
@@ -327,6 +333,13 @@ static int process_rela_section(elf_module_t* mod, void* load_base,
 
 elf_module_t* elf_load(const void* data, size_t size,
                        const elf_symbol_t* exports) {
+    return elf_load_ex(data, size, exports, NULL, NULL, NULL);
+}
+
+elf_module_t* elf_load_ex(const void* data, size_t size,
+                          const elf_symbol_t* exports,
+                          elf_alloc_fn seg_alloc, elf_free_fn seg_free,
+                          void* seg_ctx) {
     const uint8_t* raw = (const uint8_t*)data;
 
     // Validate ELF header
@@ -377,7 +390,8 @@ elf_module_t* elf_load(const void* data, size_t size,
     LOG_I("total load size: %u bytes (vaddr 0x%08x..0x%08x)",
           total_size, vaddr_lo, vaddr_hi);
 
-    void* load_base = elf_alloc(total_size, true);
+    void* load_base = seg_alloc ? seg_alloc(total_size, seg_ctx)
+                                : elf_alloc(total_size, true);
     if (!load_base) {
         LOG_E("failed to allocate %u bytes for segments", total_size);
         free(mod);
@@ -387,6 +401,8 @@ elf_module_t* elf_load(const void* data, size_t size,
     mod->seg_mem[0] = load_base;
     mod->seg_count = 1;
     mod->base = (uint32_t)load_base - vaddr_lo;
+    mod->seg_free = seg_free;
+    mod->seg_ctx  = seg_ctx;
 
     LOG_I("load base: %p, bias: 0x%08x", load_base, mod->base);
 
@@ -529,12 +545,23 @@ void* elf_lookup(elf_module_t* mod, const char* name) {
     return NULL;
 }
 
+void elf_text_range(elf_module_t* mod, uint32_t* start, uint32_t* end) {
+    if (!mod) { if (start) *start = 0; if (end) *end = 0; return; }
+    // Report instruction-side addresses when the segment lives in PSRAM
+    // (that's what a fault PC will show).
+    uint32_t s = mod->text_start, e = mod->text_end;
+    if (is_psram_data_addr(s)) { s = psram_data_to_inst(s); e = psram_data_to_inst(e); }
+    if (start) *start = s;
+    if (end)   *end   = e;
+}
+
 void elf_unload(elf_module_t* mod) {
     if (!mod) return;
 
     for (uint32_t i = 0; i < mod->seg_count; i++) {
         if (mod->seg_mem[i]) {
-            heap_caps_free(mod->seg_mem[i]);
+            if (mod->seg_free) mod->seg_free(mod->seg_mem[i], mod->seg_ctx);
+            else               heap_caps_free(mod->seg_mem[i]);
             mod->seg_mem[i] = NULL;
         }
     }

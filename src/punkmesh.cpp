@@ -3983,11 +3983,16 @@ void PunkMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_
         }
     }
 
-    // C-side alert (melody + kbd blink) + unread bump. Both fire from this
-    // mesh-task context so DMs still notify and count while Lua is torn down
-    // for an ELF run. The chat view clears the counter when the thread opens.
+    // C-side alert (melody + kbd blink) + notification record + unread bump.
+    // All fire from this mesh-task context so DMs still notify, log, and count
+    // while Lua is torn down for an ELF run. The chat view clears the counter
+    // when the thread opens; the topbar drop-down shows the logged line.
     unreadBumpDM(from.name);
-    notify_message_alert();
+    {
+        char nbuf[192];
+        snprintf(nbuf, sizeof(nbuf), "From %s: %s", from.name, norm_text);
+        notify_post(nbuf);
+    }
 
 #if BLE_COMPANION_ENABLED
     if (ble_companion) ble_companion->queueReceivedDM(from, pkt, sender_timestamp, text);
@@ -4160,10 +4165,15 @@ void PunkMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, u
         }
     }
 
-    // C-side alert + unread bump, same rationale as DMs (fires from the
-    // mesh task so rooms still notify/count while Lua is torn down).
+    // C-side alert + notification record + unread bump, same rationale as DMs
+    // (fires from the mesh task so rooms still notify/log/count while Lua is
+    // torn down).
     unreadBumpDM(from.name);
-    notify_message_alert();
+    {
+        char nbuf[192];
+        snprintf(nbuf, sizeof(nbuf), "%s/%s: %s", from.name, author, norm_text);
+        notify_post(nbuf);
+    }
 }
 
 void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp, const char *text)
@@ -4248,8 +4258,11 @@ void PunkMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Pac
             notify_name = ncd.name;
         uint8_t nmode = getChannelNotifyMode(notify_name);
         if (nmode == NOTIFY_CHAN_ALL ||
-            (nmode == NOTIFY_CHAN_MENTION && contains_mention(norm_msg, _prefs.node_name)))
-            notify_message_alert();
+            (nmode == NOTIFY_CHAN_MENTION && contains_mention(norm_msg, _prefs.node_name))) {
+            char nbuf[192];
+            snprintf(nbuf, sizeof(nbuf), "#%s %s: %s", notify_name, sender_name, norm_msg);
+            notify_post(nbuf);
+        }
     }
 
 #if BLE_COMPANION_ENABLED

@@ -6,6 +6,7 @@
 #include "tdeck-pins.h"
 #include "ble_companion.h"
 #include "punkmesh.h"
+#include "usb_manager.h"   // usb_pool_alloc/free — dynamic USB driver segments
 
 #include <Arduino.h>
 #include <Ticker.h>
@@ -458,6 +459,76 @@ void elf_input_inject(unsigned char key, int pressed) {
         if (!out) out = key;    // unmapped: pass through (as poll_input)
     }
     if (out) kq_push(out, pressed ? 1 : 0);
+}
+
+// ── Dynamic USB driver modules (loaded by usb_core at device attach) ────────
+// A .drv.elf is event-driven — no main(), no run loop, no game lifecycle. It
+// exports one symbol, `usbdrv_ops` (a const UsbDriverDesc — the function
+// pointers inside are relocation-remapped to instruction-side addresses by
+// the loader, same mechanism as the game modules' C++ vtables). Its segments
+// come from the boot-reserved low-PSRAM pool (usb_pool.cpp) so load/unload
+// at any session time never fragments the region games coalesce.
+//
+// The export table is DELIBERATELY tiny: no malloc (the game allocator's
+// exit-time tracked-free would tear a resident driver's memory out from
+// under it — by construction drivers can't allocate), no stdio, no floats.
+// Everything USB goes through the UsbHostApi vtable the core passes in.
+
+static const elf_symbol_t driver_exports[] = {
+    { "memcpy",    (void*)memcpy },
+    { "memset",    (void*)memset },
+    { "memcmp",    (void*)memcmp },
+    { "memmove",   (void*)memmove },
+    { "strlen",    (void*)strlen },
+    { "strcmp",    (void*)strcmp },
+    { "strncmp",   (void*)strncmp },
+    { "strchr",    (void*)strchr },
+    { "snprintf",  (void*)snprintf },
+    { "vsnprintf", (void*)vsnprintf },
+    ELF_SYMBOL_END
+};
+
+static void* drv_seg_alloc(size_t size, void*) { return usb_pool_alloc(size); }
+static void  drv_seg_free(void* p, void*)      { usb_pool_free(p); }
+
+// Load one driver module from a drive-prefixed path ("L:/usb_drivers/kbd/
+// kbd.drv.elf"). Returns the module handle (NULL on any failure, reason
+// logged to the USB ring) and the exported ops struct via out_ops. usb_task
+// context (called from enumeration).
+void* elf_usb_driver_load(const char* path, const void** out_ops) {
+    *out_ops = NULL;
+    uint32_t size = 0;
+    void* buf = meshpunk_read_all(path, &size);
+    if (!buf) { usb_ulog("drv: read failed: %s", path); return NULL; }
+
+    elf_module_t* mod = elf_load_ex(buf, size, driver_exports,
+                                    drv_seg_alloc, drv_seg_free, NULL);
+    heap_caps_free(buf);
+    if (!mod) {
+        usb_ulog("drv: load failed (%s) — pool free %uB",
+                 path, (unsigned)usb_pool_free_bytes());
+        return NULL;
+    }
+
+    const void* ops = elf_lookup(mod, "usbdrv_ops");
+    if (!ops) {
+        usb_ulog("drv: no usbdrv_ops export: %s", path);
+        elf_unload(mod);
+        return NULL;
+    }
+
+    uint32_t ts = 0, te = 0;
+    elf_text_range(mod, &ts, &te);
+    usb_ulog("drv: loaded %s text %08X-%08X pool %uB free",
+             path, (unsigned)ts, (unsigned)te, (unsigned)usb_pool_free_bytes());
+    *out_ops = ops;
+    return mod;
+}
+
+void elf_usb_driver_unload(void* mod) {
+    if (!mod) return;
+    elf_unload((elf_module_t*)mod);
+    usb_ulog("drv: unloaded (pool %uB free)", (unsigned)usb_pool_free_bytes());
 }
 
 // ---------------------------------------------------------------------------

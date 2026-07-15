@@ -26,6 +26,13 @@ int  elf_host_run_pending(void);
 bool elf_input_active(void);
 void elf_input_inject(unsigned char key, int pressed);
 
+// Dynamic USB driver modules (usb_core.cpp's attach-time loader; see the
+// section comment in elf_host.cpp). out_ops receives the module's exported
+// `usbdrv_ops` (a const UsbDriverDesc*). Segments live in the boot-reserved
+// USB driver pool. usb_task context only.
+void* elf_usb_driver_load(const char* path, const void** out_ops);
+void  elf_usb_driver_unload(void* mod);
+
 // ---------------------------------------------------------------------------
 // Host functions exported to loaded ELF modules.
 // These are resolved by name via the elf_loader symbol table.

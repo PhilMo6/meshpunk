@@ -287,6 +287,54 @@ local function open_app(name)
     end
 end
 
+-- ── USB driver dependencies ─────────────────────────────────────────────────
+-- An app entry may carry drivers = { "<id>", ... } (ids from the catalog's
+-- [[drivers]] list). They install AFTER the app, to the same location, one
+-- run_install modal each. Already-installed ids are skipped (updates stay
+-- explicit in Tools/USB); a failed dep toasts but never rolls back the app;
+-- removal never touches drivers (they're shared between apps).
+local DRV_BASES = { internal = "L:/usb_drivers", sd = "S:/meshpunk/usb_drivers" }
+
+local function driver_installed(id)
+    return fileman.exists("L:/usb_drivers/" .. id)
+        or fileman.exists("S:/meshpunk/usb_drivers/" .. id)
+end
+
+local function install_driver_deps(entry, loc, done)
+    local wants = entry.drivers
+    local cat_drivers = store.catalog and store.catalog.drivers
+    if type(wants) ~= "table" or #wants == 0 then done() return end
+    if type(cat_drivers) ~= "table" then done() return end
+
+    local queue = {}
+    for _, id in ipairs(wants) do
+        if not driver_installed(id) then
+            local found = nil
+            for _, de in ipairs(cat_drivers) do
+                if de.id == id then found = de break end
+            end
+            if found then queue[#queue + 1] = found
+            else toast("Driver '" .. id .. "' not in catalog") end
+        end
+    end
+
+    local i = 0
+    local function next_dep()
+        i = i + 1
+        local de = queue[i]
+        if not de then done() return end
+        dl.run_install(root, {
+            entry = de, kind = "drivers", loc = loc,
+            final_dir = DRV_BASES[loc] .. "/" .. de.id,
+            on_done = function(err)
+                if err then toast("Driver " .. de.id .. ": " .. tostring(err)) end
+                next_dep()
+            end,
+        })
+    end
+    next_dep()
+end
+
 local function install_done(entry, verb)
     return function(err)
         -- Rebuild FIRST, toast LAST: the registry rescan blocks the UI for
@@ -320,7 +368,12 @@ local function do_install(entry, inst)
         dl.run_install(root, {
             entry = entry, kind = "apps", loc = loc,
             final_dir = inst.dir, old_dir = inst.dir,
-            on_done = install_done(entry, "Updated"),
+            on_done = function(err)
+                if err then install_done(entry, "Updated")(err) return end
+                install_driver_deps(entry, loc, function()
+                    install_done(entry, "Updated")(nil)
+                end)
+            end,
         })
         return
     end
@@ -338,7 +391,12 @@ local function do_install(entry, inst)
         dl.run_install(root, {
             entry = entry, kind = "apps", loc = loc,
             final_dir = dir,
-            on_done = install_done(entry, "Installed"),
+            on_done = function(err)
+                if err then install_done(entry, "Installed")(err) return end
+                install_driver_deps(entry, loc, function()
+                    install_done(entry, "Installed")(nil)
+                end)
+            end,
         })
     end)
 end

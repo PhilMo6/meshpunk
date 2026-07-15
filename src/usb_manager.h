@@ -15,6 +15,7 @@
 // channel count). The sink resamples to the dongle rate.
 
 #include <stdint.h>
+#include <stddef.h>   // size_t (the driver-pool API below)
 
 struct lua_State;
 
@@ -56,6 +57,17 @@ bool     usb_msc_sync();
 
 // Log a line into the USB log ring (drained by Tools/USB via _usb_poll).
 void usb_ulog(const char* fmt, ...);
+
+// ── Dynamic driver pool (usb_pool.cpp) ───────────────────────────────────────
+// usb_driver_pool_init(): call ONCE from setup(), BEFORE the first
+// luaBringUp() — the pool must sit below the fonts/gap/arena in PSRAM so
+// drivers loading/unloading mid-session can never fragment the coalescible
+// region ELF games need. The alloc/free pair is consumed by the driver
+// loader (elf_load_ex); free_bytes feeds logs and the Tools/USB UI.
+void   usb_driver_pool_init(void);
+void*  usb_pool_alloc(size_t size);
+void   usb_pool_free(void* p);
+size_t usb_pool_free_bytes(void);
 
 // ── Flash-write safety ───────────────────────────────────────────────────────
 // Writing INTERNAL flash (LittleFS/NVS) disables the CPU cache and freezes both
