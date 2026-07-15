@@ -1712,6 +1712,11 @@ static bool kb_rshift_active = false;
 static bool kb_sym_active = false;
 static bool kb_alt_active = false;
 
+// Bare mic press = notifications shortcut. The keyboard reader (LVGL indev
+// callback) only sets this flag; loop() dispatches it into Lua
+// (topbar.on_shortcut) outside of indev processing.
+static bool s_topbar_shortcut_pending = false;
+
 // Navigation controller state — a STACK of navigable scopes, not a single
 // container. The TOP scope is the interactive one (in the focus group, gridnav
 // armed for trackball); scopes beneath are suspended (a popup over a view, or a
@@ -1869,6 +1874,19 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     kb_sym_latched = false;
   }
   kb_sym_phys_prev = sym_phys;
+
+  // ── Bare mic press (0,6) = notifications shortcut ──
+  // The mic key has no normal-layer character (its bare press is dead in the
+  // matrix scan below), so it's free as a global hotkey: raise the topbar over
+  // a running app / toggle the notification drop-down (topbar.on_shortcut,
+  // dispatched from loop()). Gated on !kb_sym_active so sym+mic still types
+  // '0' through the symbol layer.
+  {
+    bool mic_now  = cur_matrix[KB_KEY_MIC_COL]  & (1 << KB_KEY_MIC_ROW);
+    bool mic_prev = prev_matrix[KB_KEY_MIC_COL] & (1 << KB_KEY_MIC_ROW);
+    if (mic_now && !mic_prev && !kb_sym_active)
+      s_topbar_shortcut_pending = true;
+  }
 
   // ── Snapshot previous key state and clear current ──
   memcpy(kb_key_prev, kb_key_state, 128);
@@ -4456,6 +4474,47 @@ static int lua_mesh_unread_clear_dm(lua_State *L) {
   return 0;
 }
 
+// ── Notification history (C-side generic store, survives Lua teardown) ──
+// Thin wrappers over the notify.cpp ring (its own mutex — no MESH_LOCK).
+// The topbar polls _notify_log_unseen for the bell badge and renders the
+// drop-down list from _notify_log_get.
+
+// Usage: local n = _notify_log_unseen()
+static int lua_notify_log_unseen(lua_State *L) {
+  lua_pushinteger(L, notify_log_unseen());
+  return 1;
+}
+
+// Usage: local list = _notify_log_get()  -- { {text=, ts=}, ... } newest-first
+static int lua_notify_log_get(lua_State *L) {
+  lua_newtable(L);
+  int n = notify_log_count();
+  for (int i = 0; i < n; i++) {
+    uint32_t ts = 0;
+    char buf[192];
+    if (!notify_log_get(i, &ts, buf, sizeof(buf))) break;
+    lua_newtable(L);
+    lua_pushstring(L, buf);
+    lua_setfield(L, -2, "text");
+    lua_pushinteger(L, (lua_Integer)ts);
+    lua_setfield(L, -2, "ts");
+    lua_rawseti(L, -2, i + 1);
+  }
+  return 1;
+}
+
+// Usage: _notify_log_seen()  -- zero the unseen counter, keep the list
+static int lua_notify_log_seen(lua_State *L) {
+  notify_log_seen();
+  return 0;
+}
+
+// Usage: _notify_log_clear()  -- empty the list
+static int lua_notify_log_clear(lua_State *L) {
+  notify_log_clear();
+  return 0;
+}
+
 // Configure the max records retained per message log file.
 // Usage: _mesh_set_max_messages(100)
 static int lua_mesh_set_max_messages(lua_State *L) {
@@ -6241,6 +6300,12 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_unread_clear_channel", lua_mesh_unread_clear_channel);
   lua_register(L, "_mesh_unread_clear_dm", lua_mesh_unread_clear_dm);
 
+  // Notification history (C-side generic store, survives Lua teardown)
+  lua_register(L, "_notify_log_unseen", lua_notify_log_unseen);
+  lua_register(L, "_notify_log_get", lua_notify_log_get);
+  lua_register(L, "_notify_log_seen", lua_notify_log_seen);
+  lua_register(L, "_notify_log_clear", lua_notify_log_clear);
+
   // Identity management
   lua_register(L, "_mesh_export_private_key", lua_mesh_export_private_key);
   lua_register(L, "_mesh_import_private_key", lua_mesh_import_private_key);
@@ -7912,7 +7977,8 @@ void setup() {
   audio->setPinout(TDECK_I2S_BCK, TDECK_I2S_WS, TDECK_I2S_DOUT);
   sound_init(audio, firmware_prefs_save);
   usb_manager_init(firmware_prefs_save);   // USB audio route/speaker prefs persist here
-  notify_init();   // pre-render the notification melody (C-owned, survives lua_close)
+  notify_init();   // pre-render the melody + pre-alloc the notification log
+                   // (both C-owned PSRAM, placed BEFORE the Lua arena, survive lua_close)
   // Boot watermark: every sound id below this is C-owned (the notify melody)
   // and survives every sweep; everything at/above it is Lua-created and gets
   // swept by luaTearDown on ELF launch (Lua handles die with lua_close anyway).
@@ -8009,6 +8075,16 @@ void setup() {
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_make(0x10, 0x10, 0x10), 0);
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
 
+  // Reserve the USB dynamic-driver pool NOW — before the first luaBringUp()
+  // ever runs — so it lands at the bottom of PSRAM below the fonts, the 1MB
+  // gap and the Lua arena. Driver modules then load/unload into the pool at
+  // any session time without fragmenting the block ELF games coalesce (the
+  // same long-lived-before-arena rule the font buffers follow; see
+  // luaBringUp). The arena sizes itself dynamically, so the pool is
+  // absorbed automatically.
+  usb_driver_pool_init();
+  log_boot_mem("after usb driver pool");
+
   SLog.println("===== LUA INIT =====");
 
   // Initialize LuaVGL. luaBringUp() creates the Lua PSRAM arena (+ offset gap) and
@@ -8099,6 +8175,27 @@ static void drain_rx_events() {
   }
 }
 
+// Dispatch the mic-key notifications shortcut into Lua (topbar.on_shortcut).
+// The keyboard reader (LVGL indev callback) only sets the flag; the Lua call
+// happens here, outside indev processing. During ELF runs L is NULL and the
+// press is dropped — the melody/blink already announce notifications
+// mid-module, and the store is reviewed after the run.
+static void dispatch_topbar_shortcut() {
+  if (!s_topbar_shortcut_pending) return;
+  s_topbar_shortcut_pending = false;
+  if (!L) return;
+  lua_getglobal(L, "require");
+  lua_pushstring(L, "lib/topbar");
+  if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "on_shortcut");
+  lua_remove(L, -2);   // drop the module table
+  if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+  if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    SLog.printf("[topbar] on_shortcut error: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 1);
+  }
+}
+
 void loop() {
   // Core 0 (UI domain) — LVGL + Lua + input. The mesh dispatcher runs on
   // Core 1 via mesh_task (see meshpunk_tasks.cpp).
@@ -8127,6 +8224,9 @@ void loop() {
   // Flush mesh RX events into Lua. lua_State is single-threaded — always
   // touched from Core 0.
   drain_rx_events();
+
+  // Mic-key notifications shortcut (flag set by the keyboard reader).
+  dispatch_topbar_shortcut();
 
   // Incremental message/routing retention sweep (flagged on a new-day record or
   // at boot). One file per iteration; cheap no-op when nothing is due.

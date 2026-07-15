@@ -18,6 +18,10 @@
 #include "notify.h"
 
 #include <Arduino.h>
+#include <string.h>
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "sound.h"
 #include "meshpunk_sync.h"
 
@@ -28,6 +32,7 @@ extern bool    firmware_notify_kbd_enabled();
 extern bool    firmware_notify_sound_enabled();
 extern uint8_t firmware_kbd_brightness();
 extern bool    firmware_kbd_timed_out();
+extern uint32_t firmware_rtc_epoch();
 
 // C-owned notification melody (the same C-major arpeggio topbar.lua used to
 // build). Pre-rendered once at boot so the ~148KB PCM buffer lands low in the
@@ -45,7 +50,35 @@ static uint8_t  s_blink_step    = 0;
 static uint32_t s_blink_next_ms = 0;
 static uint8_t  s_blink_restore = 0;
 
+// ── Generic notification store ──────────────────────────────────────────────
+// Ring of pre-formatted single-string records (see notify.h). Pre-allocated in
+// PSRAM by notify_init() — which runs in setup() BEFORE luaBringUp()/
+// lua_arena_create(), same rationale as the melody pre-render above: the block
+// lands low in the PSRAM heap, never fragments the arena gap, and survives
+// every Lua teardown. Guarded by s_log_mutex: writers can be any task (mesh
+// task today, USB/battery/etc. later), readers are the Core-0 Lua bindings.
+
+#define NOTIFY_LOG_CAP       32
+#define NOTIFY_LOG_TEXT_MAX  192
+
+struct NotifyRec {
+    uint32_t ts;                        // our RTC clock at post time
+    char     text[NOTIFY_LOG_TEXT_MAX];
+};
+
+static NotifyRec*        s_log        = nullptr;  // PSRAM, notify_init()
+static uint8_t           s_log_head   = 0;        // next slot to write
+static uint8_t           s_log_count  = 0;        // valid records (<= CAP)
+static uint16_t          s_log_unseen = 0;        // posts since last _seen
+static SemaphoreHandle_t s_log_mutex  = nullptr;
+
 void notify_init() {
+    s_log_mutex = xSemaphoreCreateMutex();
+    s_log = (NotifyRec*)heap_caps_calloc(NOTIFY_LOG_CAP, sizeof(NotifyRec),
+                                         MALLOC_CAP_SPIRAM);
+    if (!s_log)
+        SLog.println("[notify] log alloc failed - notification history disabled");
+
     static const MelodyNote NOTIFY_MELODY[] = {
         { 523, 150}, {0, 30},
         { 659, 150}, {0, 30},
@@ -89,4 +122,69 @@ void notify_tick() {
     }
     setKeyboardBrightness((s_blink_step % 2 == 1) ? 255 : 0);
     s_blink_next_ms = now + BLINK_STEP_MS;
+}
+
+// ── Generic notification store ──────────────────────────────────────────────
+
+void notify_post(const char* text) {
+    if (s_log && s_log_mutex && text && text[0] &&
+        xSemaphoreTake(s_log_mutex, portMAX_DELAY) == pdTRUE) {
+        NotifyRec* rec = &s_log[s_log_head];
+        rec->ts = firmware_rtc_epoch();
+        strncpy(rec->text, text, NOTIFY_LOG_TEXT_MAX - 1);
+        rec->text[NOTIFY_LOG_TEXT_MAX - 1] = '\0';
+        s_log_head = (s_log_head + 1) % NOTIFY_LOG_CAP;
+        if (s_log_count < NOTIFY_LOG_CAP) s_log_count++;
+        if (s_log_unseen < 0xFFFF) s_log_unseen++;
+        xSemaphoreGive(s_log_mutex);
+    }
+    notify_message_alert();   // record even when both delivery prefs are off
+}
+
+int notify_log_count() {
+    if (!s_log_mutex) return 0;
+    xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+    int n = s_log_count;
+    xSemaphoreGive(s_log_mutex);
+    return n;
+}
+
+uint16_t notify_log_unseen() {
+    if (!s_log_mutex) return 0;
+    xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+    uint16_t n = s_log_unseen;
+    xSemaphoreGive(s_log_mutex);
+    return n;
+}
+
+bool notify_log_get(int i, uint32_t* ts, char* buf, size_t buflen) {
+    if (!s_log || !s_log_mutex || i < 0 || !buf || buflen == 0) return false;
+    bool ok = false;
+    xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+    if (i < s_log_count) {
+        // i=0 is the newest record: one slot behind the write head.
+        int slot = (s_log_head - 1 - i + 2 * NOTIFY_LOG_CAP) % NOTIFY_LOG_CAP;
+        if (ts) *ts = s_log[slot].ts;
+        strncpy(buf, s_log[slot].text, buflen - 1);
+        buf[buflen - 1] = '\0';
+        ok = true;
+    }
+    xSemaphoreGive(s_log_mutex);
+    return ok;
+}
+
+void notify_log_seen() {
+    if (!s_log_mutex) return;
+    xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+    s_log_unseen = 0;
+    xSemaphoreGive(s_log_mutex);
+}
+
+void notify_log_clear() {
+    if (!s_log_mutex) return;
+    xSemaphoreTake(s_log_mutex, portMAX_DELAY);
+    s_log_head = 0;
+    s_log_count = 0;
+    s_log_unseen = 0;
+    xSemaphoreGive(s_log_mutex);
 }
