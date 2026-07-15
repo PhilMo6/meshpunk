@@ -284,6 +284,10 @@ open_picker = function(key)
         w = W - 20, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
         bg_color = "#333333", radius = 6,
         border_width = 1, border_color = "#555555", pad_all = 6, pad_row = 2,
+        -- Explicit pad_column packs the 42px cells 6-per-row (theme default
+        -- gave 5); max_height + native scroll is the fallback if a theme font
+        -- ever grows the rows past the screen again.
+        pad_column = 4, max_height = H - 6,
         flex = { flex_direction = "row", flex_wrap = "wrap" },
     }
     nav.push(box)
@@ -293,13 +297,14 @@ open_picker = function(key)
         overlay:delete()
     end
 
-    box:Label { text = "Emoji for [" .. key .. "]", w = lvgl.PCT(70), h = 18 }
-    local page_lbl = box:Label { text = "", w = lvgl.PCT(28), h = 18 }
+    -- Single header row: key + search + Go + page counter. (A separate title
+    -- row pushed the box past the 240px screen once search was added.)
+    box:Label { text = "[" .. key .. "]", w = lvgl.PCT(10), h = 28 }
 
     -- Fixed pool of PAGE cells, created once; paging only rewrites labels and
     -- the cps[] slots (handlers registered once — never re-bound per page).
     local start = 1
-    local show_page   -- forward decl (search row sits above the cells)
+    local show_page   -- forward decl (header row sits above the cells)
 
     -- Codepoint search: jump the grid to a hex codepoint (nearest entry at or
     -- after it). The index is codepoint-sorted, so this doubles as a category
@@ -319,10 +324,15 @@ open_picker = function(key)
 
     local search_ta = box:Textarea {
         password_mode = false, one_line = true,
-        placeholder_text = "hex, e.g. 1F600",
-        w = lvgl.PCT(64), h = 28,
+        placeholder_text = "hex 1F600",
+        w = lvgl.PCT(38), h = 28,
     }
     search_ta:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local go_b = box:Button { w = lvgl.PCT(15), h = 28 }
+    go_b:Label { text = "Go", align = lvgl.ALIGN.CENTER }
+
+    local page_lbl = box:Label { text = "", w = lvgl.PCT(32), h = 28 }
 
     local function do_jump()
         local q = (search_ta.text or ""):gsub("%s+", ""):gsub("^[Uu]%+?", "")
@@ -335,9 +345,6 @@ open_picker = function(key)
         start = idx - ((idx - 1) % PAGE)   -- align to the page holding it
         show_page()
     end
-
-    local go_b = box:Button { w = lvgl.PCT(32), h = 28 }
-    go_b:Label { text = "Go", align = lvgl.ALIGN.CENTER }
     go_b:onClicked(do_jump)
     search_ta:onevent(lvgl.EVENT.KEY, function()
         if lvgl.indev.get_act():get_key() == lvgl.KEY.ENTER then do_jump() end
