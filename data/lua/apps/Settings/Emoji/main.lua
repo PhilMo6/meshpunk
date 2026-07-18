@@ -7,6 +7,7 @@ local lvgl  = require("lvgl")
 local apps  = require("lib/apps")
 local nav   = require("lib/nav")
 local theme = require("lib/theme")
+local emoji_popup = require("lib/emoji_popup")
 
 local root = apps.new_root()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0, bg_opa = 0 }
@@ -42,23 +43,8 @@ end
 
 local BLOB_TOTAL = _emoji_blob_count()
 
--- Manual UTF-8 encode (the sandbox may not expose the utf8 lib). Handles the
--- 3-byte PUA range and 4-byte emoji planes.
-local function ucp(cp)
-    if cp < 0x80 then return string.char(cp) end
-    if cp < 0x800 then
-        return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
-    end
-    if cp < 0x10000 then
-        return string.char(0xE0 + math.floor(cp / 0x1000),
-                           0x80 + math.floor(cp / 0x40) % 0x40,
-                           0x80 + cp % 0x40)
-    end
-    return string.char(0xF0 + math.floor(cp / 0x40000),
-                       0x80 + math.floor(cp / 0x1000) % 0x40,
-                       0x80 + math.floor(cp / 0x40) % 0x40,
-                       0x80 + cp % 0x40)
-end
+-- Manual UTF-8 encode lives in the shared picker lib now.
+local ucp = emoji_popup.ucp
 
 local function key_face(k)
     local cp = _kb_emoji_get(k)
@@ -262,156 +248,32 @@ rm_btn:onClicked(function()
 end)
 
 -- ── Picker popup ────────────────────────────────────────────────────────────
--- Modal overlay (CLICKABLE blocks the page below); box is the nav scope and
--- every focusable is its DIRECT child (gridnav invariant). nav.pop() runs
--- BEFORE overlay:delete() — see the Messenger popups for the same pattern.
-local PAGE = 24
-
+-- Shared picker (lib/emoji_popup) in assign mode: a pick sets the key and
+-- closes; None clears it. The same lib drives the alt+mic insert popup.
 open_picker = function(key)
-    if BLOB_TOTAL == 0 then
-        status.text = "Emoji blob unavailable"
-        return
-    end
-
-    local overlay = root:Object {
-        w = W, h = H, x = 0, y = 0,
-        bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
-    }
-    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
-    overlay:add_flag(lvgl.FLAG.CLICKABLE)
-
-    local box = overlay:Object {
-        w = W - 20, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
-        bg_color = "#333333", radius = 6,
-        border_width = 1, border_color = "#555555", pad_all = 6, pad_row = 2,
-        -- Explicit pad_column packs the 42px cells 6-per-row (theme default
-        -- gave 5); max_height + native scroll is the fallback if a theme font
-        -- ever grows the rows past the screen again.
-        pad_column = 4, max_height = H - 6,
-        flex = { flex_direction = "row", flex_wrap = "wrap" },
-    }
-    nav.push(box)
-
-    local function close()
-        nav.pop()
-        overlay:delete()
-    end
-
-    -- Single header row: key + search + Go + page counter. (A separate title
-    -- row pushed the box past the 240px screen once search was added.)
-    box:Label { text = "[" .. key .. "]", w = lvgl.PCT(10), h = 28 }
-
-    -- Fixed pool of PAGE cells, created once; paging only rewrites labels and
-    -- the cps[] slots (handlers registered once — never re-bound per page).
-    local start = 1
-    local show_page   -- forward decl (header row sits above the cells)
-
-    -- Codepoint search: jump the grid to a hex codepoint (nearest entry at or
-    -- after it). The index is codepoint-sorted, so this doubles as a category
-    -- jump: 1F300 weather, 1F400 animals, 1F600 smileys, E000 sequences.
-    -- Lua-side binary search over _emoji_blob_list — no firmware change.
-    local function blob_lower_bound(cp)
-        local lo, hi = 1, BLOB_TOTAL + 1
-        while lo < hi do
-            local mid = math.floor((lo + hi) / 2)
-            local v = (_emoji_blob_list(mid, 1) or {})[1]
-            if not v then break end
-            if v < cp then lo = mid + 1 else hi = mid end
-        end
-        if lo > BLOB_TOTAL then lo = BLOB_TOTAL end
-        return lo
-    end
-
-    local search_ta = box:Textarea {
-        password_mode = false, one_line = true,
-        placeholder_text = "hex 1F600",
-        w = lvgl.PCT(38), h = 28,
-    }
-    search_ta:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-    local go_b = box:Button { w = lvgl.PCT(15), h = 28 }
-    go_b:Label { text = "Go", align = lvgl.ALIGN.CENTER }
-
-    local page_lbl = box:Label { text = "", w = lvgl.PCT(32), h = 28 }
-
-    local function do_jump()
-        local q = (search_ta.text or ""):gsub("%s+", ""):gsub("^[Uu]%+?", "")
-        local cp = tonumber(q, 16)
-        if not cp or cp <= 0 then
-            page_lbl:set { text = "bad hex" }
-            return
-        end
-        local idx = blob_lower_bound(cp)
-        start = idx - ((idx - 1) % PAGE)   -- align to the page holding it
-        show_page()
-    end
-    go_b:onClicked(do_jump)
-    search_ta:onevent(lvgl.EVENT.KEY, function()
-        if lvgl.indev.get_act():get_key() == lvgl.KEY.ENTER then do_jump() end
-    end)
-    local cps = {}
-    local cells = {}
-    for i = 1, PAGE do
-        local b = box:Button { w = 42, h = 30 }
-        local l = b:Label { text = "", align = lvgl.ALIGN.CENTER }
-        cells[i] = { btn = b, lbl = l }
-        b:onClicked(function()
-            local cp = cps[i]
-            if not cp then return end
-            _kb_emoji_set(key, cp)
-            local kl = key_lbls[key]
-            if kl then kl:set { text = key_face(key) } end
-            status.text = "[" .. key .. "] = " .. ucp(cp)
-            close()
-        end)
-    end
-
-    show_page = function()
-        local list = _emoji_blob_list(start, PAGE)
-        for i = 1, PAGE do
-            local cp = list[i]
-            cps[i] = cp
-            if cp then
-                pcall(_emoji_preload, cp)
-                cells[i].lbl:set { text = ucp(cp) }
-                cells[i].btn:clear_flag(lvgl.FLAG.HIDDEN)
-            else
-                cells[i].btn:add_flag(lvgl.FLAG.HIDDEN)
-            end
-        end
-        local last = math.min(start + PAGE - 1, BLOB_TOTAL)
-        page_lbl:set { text = start .. "-" .. last .. "/" .. BLOB_TOTAL }
-    end
-
-    local prev_b = box:Button { w = lvgl.PCT(23), h = 26 }
-    prev_b:Label { text = "< Prev", align = lvgl.ALIGN.CENTER }
-    prev_b:onClicked(function()
-        start = math.max(1, start - PAGE)
-        show_page()
-    end)
-
-    local next_b = box:Button { w = lvgl.PCT(23), h = 26 }
-    next_b:Label { text = "Next >", align = lvgl.ALIGN.CENTER }
-    next_b:onClicked(function()
-        if start + PAGE <= BLOB_TOTAL then start = start + PAGE end
-        show_page()
-    end)
-
-    local clear_b = box:Button { w = lvgl.PCT(23), h = 26 }
-    clear_b:Label { text = "None", align = lvgl.ALIGN.CENTER }
-    clear_b:onClicked(function()
-        _kb_emoji_set(key, 0)
+    local function refresh(msg)
         local kl = key_lbls[key]
         if kl then kl:set { text = key_face(key) } end
-        status.text = "[" .. key .. "] cleared"
-        close()
-    end)
-
-    local cancel_b = box:Button { w = lvgl.PCT(23), h = 26 }
-    cancel_b:Label { text = "Cancel", align = lvgl.ALIGN.CENTER }
-    cancel_b:onClicked(close)
-
-    show_page()
+        status.text = msg
+    end
+    local opened = emoji_popup.open {
+        parent = root,
+        title = "[" .. key .. "]",
+        close_on_pick = true,
+        close_label = "Cancel",
+        on_pick = function(cp)
+            _kb_emoji_set(key, cp)
+            refresh("[" .. key .. "] = " .. ucp(cp))
+        end,
+        extra = {
+            label = "None",
+            cb = function()
+                _kb_emoji_set(key, 0)
+                refresh("[" .. key .. "] cleared")
+            end,
+        },
+    }
+    if not opened then status.text = "Emoji blob unavailable" end
 end
 
 return root

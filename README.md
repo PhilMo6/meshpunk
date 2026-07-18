@@ -162,6 +162,16 @@ The device supports three input methods for navigating the UI:
 
 Trackball and WASD share a configurable sensitivity setting (Device Settings → Trackball) that controls the minimum time between accepted direction inputs (0–500ms).
 
+### Keyboard shortcuts
+
+- **Mic key** — global notifications shortcut: over a running app it peeks the top bar; on the launcher (or while peeked) it toggles the notification drop-down. `Sym`+`Mic` still types `0`.
+- **Alt + letter (while typing)** — emoji layer: each letter key types its assigned emoji into the focused text field. Assign emojis per key in Settings → Emoji; an optional tap-to-latch mode for `Alt` (Settings → Device → Keyboard) keeps the layer on between taps.
+- **Alt + Mic (while typing)** — emoji search: opens a popup over the whole emoji set (page through it, or jump by hex codepoint — e.g. `1F600` for smileys). Tapping an emoji inserts it into the text field you were typing in; the popup stays open for multiple inserts until Close (or `Alt`+`Mic` again). Use it for emojis you haven't assigned to a key.
+- **Sym (tap-to-latch)** — with the optional latch mode (Settings → Device → Keyboard), a clean tap of `Sym` latches the symbol layer until the next tap; holding `Sym` while typing stays momentary. WASD navigation pauses while latched (the keys resolve to symbols) — tap `Sym` again to resume.
+- **Alt + Backspace (hold ~1.5s)** — quit to home: closes the current app and returns to the launcher home page. The same chord quits a running native game (Doom, GameBoy, PICO-8, PC-XT) back to the launcher — each game launcher's `?` button shows it alongside the game's controls.
+- **`q`** — backs out of selection modes: message selection in a chat, row-select lists, and the Map app.
+- **Enter (in a chat)** — sends the message. Long-press the message input to open the clipboard menu (paste copied contact cards and text).
+
 ## Usage
 
 The example loads the `launcher.lua` script from the filesystem and displays a simple launcher UI. You can edit the Lua scripts in your IDE with proper syntax highlighting and then upload just the filesystem to quickly iterate on your UI design.

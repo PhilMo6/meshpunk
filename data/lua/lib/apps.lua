@@ -475,6 +475,17 @@ function M.go_home()
     end })
 end
 
+-- Alt+Backspace home chord (dispatched from loop() via dispatch_home_shortcut):
+-- close any parentless popups first — they float ABOVE M._screen, so go_home's
+-- teardown would strand them over the rebuilt launcher — then a normal go_home.
+-- Safe anywhere: on the launcher it just rebuilds the home page.
+function M.home_shortcut()
+    local ok, ep = pcall(require, "lib/emoji_popup")
+    if ok and ep and ep.close then pcall(ep.close) end
+    if topbar.closeNotifPanel then pcall(topbar.closeNotifPanel) end
+    M.go_home()
+end
+
 -- Exit to the launcher KEEPING the app's background contract alive: the same
 -- teardown as go_home (nav, UI root, foreground timers, sound sweep) except
 -- the sweep spares the contract's live sound ids and the manager starts the

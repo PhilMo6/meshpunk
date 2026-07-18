@@ -1725,6 +1725,23 @@ static bool kb_alt_active = false;
 // (topbar.on_shortcut) outside of indev processing.
 static bool s_topbar_shortcut_pending = false;
 
+// Alt+mic while typing = emoji search popup (lib/emoji_popup). Same flag/
+// dispatch split as the topbar shortcut; the textarea focused at press time is
+// captured as the insert target for _emoji_popup_insert, which re-validates the
+// pointer before every insert (the app underneath can rebuild its views while
+// the popup is up).
+static bool      s_emoji_popup_pending = false;
+static lv_obj_t *s_emoji_popup_target  = NULL;
+
+// Alt+Backspace held ~1.5s = home shortcut (the Lua-land twin of the ELF exit
+// chord, same hold time): close the current app and return to the launcher
+// home page (apps.home_shortcut via loop()). Physical alt only — a LATCHED
+// alt while holding backspace to delete text must not count.
+#define HOME_CHORD_HOLD_MS 1500
+static uint32_t s_home_chord_start   = 0;      // 0 = chord not held
+static bool     s_home_chord_fired   = false;  // fired once for this hold
+static bool     s_home_shortcut_pending = false;
+
 // Navigation controller state — a STACK of navigable scopes, not a single
 // container. The TOP scope is the interactive one (in the focus group, gridnav
 // armed for trackball); scopes beneath are suspended (a popup over a view, or a
@@ -1893,12 +1910,28 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   // matrix scan below), so it's free as a global hotkey: raise the topbar over
   // a running app / toggle the notification drop-down (topbar.on_shortcut,
   // dispatched from loop()). Gated on !kb_sym_active so sym+mic still types
-  // '0' through the symbol layer.
+  // '0' through the symbol layer. Alt+mic instead opens the emoji search
+  // popup — only while a textarea is focused (dead press otherwise), capturing
+  // that textarea as the insert target.
   {
     bool mic_now  = cur_matrix[KB_KEY_MIC_COL]  & (1 << KB_KEY_MIC_ROW);
     bool mic_prev = prev_matrix[KB_KEY_MIC_COL] & (1 << KB_KEY_MIC_ROW);
-    if (mic_now && !mic_prev && !kb_sym_active)
-      s_topbar_shortcut_pending = true;
+    if (mic_now && !mic_prev && !kb_sym_active) {
+      if (kb_alt_layer_active) {
+        // The mic key never reaches the char scan (normal-layer ch==0), so
+        // mark the alt hold as used here — otherwise a held-alt+mic reads as
+        // a clean alt tap on release and flips the tap-toggle latch.
+        if (alt_phys) kb_alt_used_while_held = true;
+        lv_obj_t *foc = lv_group_get_focused(lv_group_get_default());
+        if (foc && lv_obj_is_valid(foc) &&
+            lv_obj_check_type(foc, &lv_textarea_class)) {
+          s_emoji_popup_target  = foc;
+          s_emoji_popup_pending = true;
+        }
+      } else {
+        s_topbar_shortcut_pending = true;
+      }
+    }
   }
 
   // ── Snapshot previous key state and clear current ──
@@ -1966,6 +1999,26 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
           else                 resolved_key = ch;
         }
       }
+    }
+  }
+
+  // ── Alt+Backspace held = home shortcut ──
+  // Same chord + hold time as the ELF exit chord, applied to Lua apps: close
+  // the current app, land on the launcher home page. Physical alt only (the
+  // ELF chord's rule too) so an alt-LATCH user holding backspace to delete
+  // text can't trigger it. Backspace keeps deleting during the hold — the
+  // same trade-off the ELF chord made. Fires once per hold.
+  {
+    bool chord = alt_phys && kb_key_state[0x08];
+    if (!chord) {
+      s_home_chord_start = 0;
+      s_home_chord_fired = false;
+    } else if (s_home_chord_start == 0) {
+      s_home_chord_start = millis();
+    } else if (!s_home_chord_fired &&
+               millis() - s_home_chord_start >= HOME_CHORD_HOLD_MS) {
+      s_home_chord_fired = true;
+      s_home_shortcut_pending = true;
     }
   }
 
@@ -6959,6 +7012,32 @@ void setupLuaVGL() {
     return 0;
   });
 
+  // _emoji_popup_insert(cp) -> bool. Insert one emoji at the cursor of the
+  // textarea captured at alt+mic time (s_emoji_popup_target). Re-validates the
+  // pointer — the app underneath can rebuild its views while the popup is up —
+  // and gates on emoji_preload like the alt layer, so a stale target or an
+  // unrenderable codepoint returns false instead of emitting tofu.
+  lua_register(L, "_emoji_popup_insert", [](lua_State* L) -> int {
+    uint32_t cp = (uint32_t)luaL_checkinteger(L, 1);
+    lv_obj_t *ta = s_emoji_popup_target;
+    bool ok = cp > 0 && ta && lv_obj_is_valid(ta) &&
+              lv_obj_check_type(ta, &lv_textarea_class) && emoji_preload(cp);
+    if (ok) {
+      uint32_t packed = utf8_pack_key(cp);   // UTF-8 bytes, low byte first
+      char buf[5] = {0};
+      memcpy(buf, &packed, sizeof(packed));
+      lv_textarea_add_text(ta, buf);
+    }
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+  });
+
+  // _emoji_popup_release(): drop the captured insert target (popup closed).
+  lua_register(L, "_emoji_popup_release", [](lua_State* L) -> int {
+    s_emoji_popup_target = NULL;
+    return 0;
+  });
+
   // Top bar transparency: true = the themed wallpaper shows through the status
   // bar, false = a solid (themed card) background. Persisted. Applied live to the
   // running bar by lib/topbar.apply_transparency().
@@ -8259,6 +8338,43 @@ static void dispatch_topbar_shortcut() {
   }
 }
 
+// Dispatch the alt+backspace home chord into Lua (apps.home_shortcut: closes
+// any parentless popups, then go_home). Same deferral as the shortcuts above;
+// during ELF runs L is NULL and the hold is the ELF host's own exit chord.
+static void dispatch_home_shortcut() {
+  if (!s_home_shortcut_pending) return;
+  s_home_shortcut_pending = false;
+  if (!L) return;
+  lua_getglobal(L, "require");
+  lua_pushstring(L, "lib/apps");
+  if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "home_shortcut");
+  lua_remove(L, -2);   // drop the module table
+  if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+  if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    SLog.printf("[home] home_shortcut error: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 1);
+  }
+}
+
+// Dispatch the alt+mic emoji-popup shortcut into Lua (lib/emoji_popup
+// .on_shortcut). Same deferral as dispatch_topbar_shortcut above.
+static void dispatch_emoji_popup() {
+  if (!s_emoji_popup_pending) return;
+  s_emoji_popup_pending = false;
+  if (!L) return;
+  lua_getglobal(L, "require");
+  lua_pushstring(L, "lib/emoji_popup");
+  if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "on_shortcut");
+  lua_remove(L, -2);   // drop the module table
+  if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+  if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    SLog.printf("[emoji_popup] on_shortcut error: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 1);
+  }
+}
+
 void loop() {
   // Core 0 (UI domain) — LVGL + Lua + input. The mesh dispatcher runs on
   // Core 1 via mesh_task (see meshpunk_tasks.cpp).
@@ -8290,6 +8406,12 @@ void loop() {
 
   // Mic-key notifications shortcut (flag set by the keyboard reader).
   dispatch_topbar_shortcut();
+
+  // Alt+mic emoji search popup (same flag pattern).
+  dispatch_emoji_popup();
+
+  // Alt+backspace home chord (same flag pattern).
+  dispatch_home_shortcut();
 
   // Incremental message/routing retention sweep (flagged on a new-day record or
   // at boot). One file per iteration; cheap no-op when nothing is due.

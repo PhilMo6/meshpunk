@@ -199,6 +199,13 @@ function M.toggleNotifPanel()
     if panel_overlay then close_panel() else open_panel() end
 end
 
+-- Close the drop-down if open (no-op otherwise). The panel is parentless, so
+-- an app teardown (apps.home_shortcut) must close it explicitly or it would
+-- linger over the rebuilt launcher.
+function M.closeNotifPanel()
+    if panel_overlay then close_panel() end
+end
+
 -- Mic-key shortcut (dispatched from loop() via dispatch_topbar_shortcut).
 -- Hidden bar (an app owns the screen) -> peek it over the app; peeked -> put
 -- it away; visible on the launcher -> toggle the drop-down directly.
