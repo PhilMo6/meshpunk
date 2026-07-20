@@ -125,7 +125,7 @@ The Music app plays MP3s from /Music on the SD card.
 - Auto-organize sorts tagged files into /Music/Artist/Album for you.
 - Background playback: music keeps playing while you use the rest of the device.
 
-USB audio (experimental): route all device audio to a USB-C audio dongle via Tools > USB.]] },
+USB audio (experimental): route all device audio to a USB-C audio dongle via Tools > USB Host.]] },
 
 { t = "App Library and themes", b = [[
 The App Library installs apps and themes onto the device over WiFi, and updates ones already installed - no firmware reflash required. It reads its catalog from github.com/PhilMo6/meshpunk-apps.
@@ -142,6 +142,15 @@ Contributions (your own apps and themes) are welcome via pull request - see the 
 Tools > Files is the file manager, covering both internal flash and the SD card.
 
 An SD card is highly recommended: it persists your mesh and firmware settings, and holds game files, music, cached map tiles, and the extended emoji set.]] },
+
+{ t = "USB drive mode", b = [[
+Tools > USB Drive shares the SD card with a PC: plug the device into the PC, press Start sharing, and it appears as a removable USB drive (about 1 MB/s - the chip's USB is full-speed).
+
+While sharing, the PC owns the card exclusively: apps lose the SD drive and the mesh radio pauses. Eject the drive on the PC, then press Stop (or just leave the app) - the card remounts and the mesh resumes.
+
+Internal files can be shared by copying them to SD in Tools > Files first.
+
+After a drive session, USB host mode (Tools > USB Host) needs a reboot.]] },
 
 { t = "Firmware updates", b = [[
 Releases are on the MeshPunk GitHub releases page.

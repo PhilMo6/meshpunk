@@ -20,11 +20,11 @@
 - Elf file loader
 - Doom! Now with music and sound effects! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
 - Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts. (thanks to https://github.com/mintylinux)
-- GameBoy emulator! you must provide your own .gb/.gbc roms.
+- GameBoy emulator! you must provide your own .gb/.gbc roms. Link two T-Decks with a USB cable to play 2-player games — one deck runs USB host mode, the other plugs in as the device.
 - PC-XT DOS emulator! Boots real DOS from .img disk images — or pick a folder of games on your SD card and it becomes the C: drive. A copy of freedos can be found in the freedos folder that you can move to your sd card.
 - MP3 music player with a tag-based library, playlists, and auto-organizing by artist/album
 - Background apps — music keeps playing while you use the rest of the device
-- USB host support (experimental): route all device audio to a USB-C audio dongle (Tools > USB)
+- USB host support (Tools > USB Host): plug devices into the T-Deck — a USB-C audio dongle (routes all device audio), a gamepad (map it to controls for any game via the Games > Gamepad app), a mouse (moves focus, click selects), a keyboard, or a thumb drive (browsable as the `U:` drive). Gamepad, mouse and link-cable drivers download automatically from the App Library.
 - Themes! make Meshpunk look the way you want. 15 themes are included!
 - File manager (Tools > Files) for both internal flash and SD
 - App Library — browse and install apps and themes straight from GitHub over WiFi, and update the ones you already have, no reflash needed
@@ -171,6 +171,10 @@ Trackball and WASD share a configurable sensitivity setting (Device Settings →
 - **Alt + Backspace (hold ~1.5s)** — quit to home: closes the current app and returns to the launcher home page. The same chord quits a running native game (Doom, GameBoy, PICO-8, PC-XT) back to the launcher — each game launcher's `?` button shows it alongside the game's controls.
 - **`q`** — backs out of selection modes: message selection in a chat, row-select lists, and the Map app.
 - **Enter (in a chat)** — sends the message. Long-press the message input to open the clipboard menu (paste copied contact cards and text).
+
+### USB drive mode
+
+Tools → USB Drive shares the SD card with a PC: plug the device into the PC, press **Start sharing**, and it appears as a removable USB drive (~1 MB/s — the chip's USB is full-speed). While sharing, the PC owns the card exclusively: apps lose the SD drive and the mesh radio pauses. Eject the drive on the PC, then press **Stop** (or just leave the app) — the card remounts and the mesh resumes. Internal files can be shared by copying them to SD in Tools → Files first. After a drive session, USB **host** mode (Tools → USB Host) needs a reboot.
 
 ## Usage
 

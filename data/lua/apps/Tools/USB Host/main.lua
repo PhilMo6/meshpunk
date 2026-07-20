@@ -1,4 +1,4 @@
--- Tools > USB — USB-OTG host manager.
+-- Tools > USB Host — USB-OTG host manager.
 -- Puts the T-Deck's USB port in host mode to drive a USB device. Today: a
 -- USB-C audio dongle, with all device audio (tones, notifications, music,
 -- game audio) routed to it. The dongle needs external VBUS: power source ->
