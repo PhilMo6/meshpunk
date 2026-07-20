@@ -64,6 +64,14 @@ typedef struct {
     bool     (*sync)(void);
 } UsbBlockOps;
 
+// Peer-link socket: the `tdeck` link driver registers this; the firmware's
+// T-Deck↔T-Deck bridge (src/tdeck_link.cpp) transmits frames through it.
+// send() must deliver one whole frame (<= 64 bytes) and may block briefly
+// (ride pipe_xfer — dual-context). One binding at a time.
+typedef struct {
+    bool (*send)(const uint8_t* d, uint32_t n);
+} UsbLinkOps;
+
 // Host services passed to every driver call. All function pointers valid
 // for the lifetime of the USB session; descriptor pointers valid from
 // probe until the stop(dev_present=false)/detach that follows DEV_GONE.
@@ -152,6 +160,14 @@ typedef struct UsbHostApi {
     // with _usb_drv_read(name) -> blob, seq. Publish CHANGES, not every
     // report — this is a diagnostic/learning feed, not a data path.
     void (*publish)(const void* self, const void* data, uint32_t len);
+
+    // ── T-Deck peer-link socket (mirror of the block socket) ────────────────
+    // link_register in start(), link_unregister in stop(); link_rx feeds the
+    // firmware bridge with received bytes (usb_task context, e.g. from a
+    // bulk-IN resubmit loop's completion callback).
+    bool (*link_register)(const UsbLinkOps* ops);
+    void (*link_unregister)(void);
+    void (*link_rx)(const uint8_t* data, uint32_t len);
 } UsbHostApi;
 
 // A class driver. Built-ins register this via the core; modules export it

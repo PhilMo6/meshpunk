@@ -54,10 +54,18 @@ extern QueueHandle_t gps_event_queue;
 //   * printf + literal print/println are heap-free (stack format / direct copy);
 //     only print(<number>) builds a small temporary.
 // Multi-call log lines: render into one printf instead (see the printHex sites).
+// While a T-Deck peer-link gblink session is active on the DEVICE role, the
+// USB serial *is* the link cable: log lines compete with link frames for the
+// CDC TX buffer, and a squeezed-out frame corrupts a GameBoy transfer. The
+// bridge (tdeck_link.cpp, which owns/defines this flag) mutes logging for
+// the session; frames themselves bypass SerialMux (raw Serial.write under
+// SLOG_LOCK) so they are never muted.
+extern volatile bool g_slog_quiet;
+
 class SerialMux {
   // Atomic + non-blocking: emit the whole buffer iff it fits, else drop it.
   size_t emit(const uint8_t* p, size_t n) {
-    if (!p || n == 0) return 0;
+    if (!p || n == 0 || g_slog_quiet) return 0;
     size_t w = 0;
     SLOG_LOCK();
     if ((size_t)Serial.availableForWrite() >= n) w = Serial.write(p, n);
@@ -79,6 +87,7 @@ public:
   template <typename... A> size_t print(A... a) { String s(a...); return emit((const uint8_t*)s.c_str(), s.length()); }
   size_t println()                   { return emit((const uint8_t*)"\r\n", 2); }
   size_t println(const char* s) {
+    if (g_slog_quiet) return 0;
     size_t sl = s ? strlen(s) : 0;
     size_t w = 0;
     SLOG_LOCK();
@@ -183,9 +192,9 @@ void radio_apply_tx_power(int8_t dbm);
 bool meshpunk_set_clock(uint8_t tier, uint32_t epoch, const char* src);
 
 // When true, mesh_task pauses its loop body (radio/BLE processing).
-// Currently NOTHING sets it — the mesh keeps running during ELF module
-// execution (messages are received, persisted, notified and unread-counted
-// while Lua is torn down). Kept as an escape hatch.
+// Set by tdeck_link.cpp while a GameBoy link session is live (cable session
+// + local game) so the link has the SPI bus and Core 1 to itself; cleared
+// automatically on detach/cable-pull/session death.
 extern volatile bool mesh_task_paused;
 
 #endif

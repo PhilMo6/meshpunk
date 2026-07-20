@@ -33,6 +33,7 @@
 #include "elf_host.h"               // elf_input_inject + elf_usb_driver_load/unload
 #include "usb_fs.h"                 // usb_fs_mounted — Lua bridge status field
 #include "meshpunk_sync.h"          // sd_spi_take — SD-base driver-dir scans
+#include "tdeck_link.h"             // peer-link bridge (link socket backend)
 #include <dirent.h>                 // POSIX dir walk over the driver bases
 #include <sys/stat.h>               // .disabled marker probe
 
@@ -157,7 +158,7 @@ bool usbcore_flash_pause_req(void) { return s_flash_pause_req; }
 // (audio, kbd, msc — the monolith's want-block order). Iteration is always
 // forward, matching the old explicit call order for start/stop/DEV_GONE/
 // teardown alike. Mutations happen pre-task (built-ins) or in usb_task
-// (dynamic drivers, M2); Lua-facing reads snapshot booleans only.
+// (dynamic drivers); Lua-facing reads snapshot booleans only.
 
 #define USB_MAX_DRIVERS 8
 
@@ -740,9 +741,31 @@ bool usb_kbd_snapshot(bool out[128]) {
     return true;
 }
 
+// ── Peer-link socket ─────────────────────────────────────────────────────────
+// One binding, registered by the dynamic `tdeck` driver; routes straight
+// into the T-Deck↔T-Deck bridge (src/tdeck_link.cpp).
+
+static const UsbLinkOps* s_link_ops = NULL;
+
+static bool sock_link_register(const UsbLinkOps* ops) {
+    if (!ops || !ops->send || s_link_ops) return false;
+    s_link_ops = ops;
+    tdeck_link_usb_register(ops->send);
+    return true;
+}
+
+static void sock_link_unregister(void) {
+    tdeck_link_usb_unregister();
+    s_link_ops = NULL;
+}
+
+static void sock_link_rx(const uint8_t* d, uint32_t n) {
+    if (s_link_ops && d && n) tdeck_link_usb_rx(d, n);
+}
+
 // ── Block-device socket ──────────────────────────────────────────────────────
-// One binding. In M1 usb_fs still calls the msc sector API directly; the
-// socket is registered/unregistered by the msc driver so the plumbing is
+// One binding. usb_fs still calls the msc sector API directly; the socket
+// is registered/unregistered by the msc driver so the plumbing is
 // exercised, and becomes load-bearing when storage drivers go dynamic.
 
 static const UsbBlockOps* s_block_ops = NULL;
@@ -835,6 +858,9 @@ static const UsbHostApi s_api = {
     &api_pump,
     &api_config,
     &api_publish,
+    &sock_link_register,
+    &sock_link_unregister,
+    &sock_link_rx,
 };
 
 const UsbHostApi* usbcore_api(void) { return &s_api; }
@@ -1009,11 +1035,14 @@ static void usb_task(void*) {
             s_flash_paused = false;
         }
 
-        if (s_new_addr) {
-            uint8_t addr = s_new_addr;
-            s_new_addr = 0;
-            if (!s_dev) describe_device(addr);
-        }
+        // DEV_GONE strictly BEFORE NEW_DEV: a fast re-enumeration (e.g. a
+        // dongle switching protocol identity, like the 8BitDo D-input <->
+        // XInput toggle) delivers BOTH events in one pump pass. Handling
+        // NEW_DEV first consumed the address while the old device was
+        // still open, orphaning the new device inside the host stack —
+        // the next enumeration then died in usbh. Cleanup first; a pending
+        // address is only consumed once no device is open, so it survives
+        // however many passes the teardown takes.
         if (s_dev_gone) {
             s_dev_gone = false;
             ulog("Device disconnected.");
@@ -1028,6 +1057,11 @@ static void usb_task(void*) {
             if (s_dev) { usb_host_device_close(s_client, s_dev); s_dev = NULL; }
             s_dd = NULL; s_cfg = NULL;
             memset(&s_info, 0, sizeof(s_info));
+        }
+        if (s_new_addr && !s_dev) {
+            uint8_t addr = s_new_addr;
+            s_new_addr = 0;
+            describe_device(addr);
         }
 
         // Per-driver want/start/stop + tick. want() folds in driver prefs

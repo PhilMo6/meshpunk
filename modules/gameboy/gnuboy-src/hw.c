@@ -9,6 +9,14 @@
 gb_cart_t cart;
 gb_t GB;
 
+/* T-Deck link-cable state (outside gb_t: savestate layout untouched). */
+int      gb_link_wait  = 0;
+int      gb_link_slave = 0;
+int      gb_link_rx_active = 0; /* slave receive completing (GB.serial timer) */
+unsigned gb_link_clock = 0;   /* emulated 2MiHz clock — BGB timestamps */
+unsigned gb_link_s1_dc = 0;   /* outstanding SYNC1 (data_ctrl + ts), kept  */
+unsigned gb_link_s1_ts = 0;   /* for retransmit — its ts is the dedup key  */
+
 #define hw GB
 
 static void rtc_latch(byte b)
@@ -542,9 +550,54 @@ void gb_hw_write(unsigned a, byte b)
 				break;
 			case RI_SC:
 				if ((b & 0x81) == 0x81)
-					hw.serial = 1952; // 8 * 122us;
-				else
+				{
+					/* Master (internal clock): arm the transfer timer.
+					 * With a link peer, ship our SB now (SYNC1); completion
+					 * is non-blocking (serial_advance applies the reply at
+					 * its arrival moment). Games don't rewrite SC mid-
+					 * transfer (bit7 = busy); if one ever does, we restart
+					 * and the stale answer costs one wrong byte — log it. */
+					if (gb_link_wait)
+						gb_dlog("ARM master while pending: transfer restarted");
+					hw.serial = gb_link_xfer_cycles(); // transfer duration
+					gb_link_slave = 0;
+					if (gb_link_cable())
+					{
+						/* BGB sync1: data, control (the SC value the game
+						 * wrote), and OUR emulated clock — the peer
+						 * processes the transfer at this timestamp.
+						 * Delivery is the bridge's job (seq/ack layer);
+						 * saved here only so a pair latch mid-wait can
+						 * re-stamp it onto the new epoch. */
+						gb_dlog("ARM master sb=%02x sc=%02x", R_SB, b);
+						gb_link_note_role(1);
+						gb_link_s1_dc = (b << 8) | R_SB;
+						gb_link_s1_ts = gb_link_clock;
+						gb_link_send(3 /*SYNC1*/, gb_link_s1_dc, gb_link_s1_ts);
+						gb_link_wait = 1;
+					}
+					else gb_link_wait = 0;
+				}
+				else if ((b & 0x81) == 0x80)
+				{
+					/* Slave (external clock): real hardware waits for the
+					 * master's clocks — no timer; completion happens when
+					 * SYNC1 arrives (serial_advance polls). */
+					if (gb_link_cable())
+						gb_dlog("ARM slave sb=%02x", R_SB);
+					if (gb_link_cable()) gb_link_note_role(0);
 					hw.serial = 0;
+					gb_link_wait = 0;
+					gb_link_slave = 1;
+				}
+				else
+				{
+					if (gb_link_slave && gb_link_cable())
+						gb_dlog("ARM off sc=%02x", b);
+					hw.serial = 0;
+					gb_link_wait = 0;
+					gb_link_slave = 0;
+				}
 				REG(r) = b; /* & 0x7f; */
 				break;
 			case RI_DIV:

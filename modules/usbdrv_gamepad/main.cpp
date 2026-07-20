@@ -1,9 +1,19 @@
-// Dynamic USB driver: HID GAMEPAD, descriptor-driven (match 03/00/*).
+// Dynamic USB driver: GAMEPAD — HID + Xbox family, descriptor/table driven.
 //
-// At probe the driver fetches the interface's HID REPORT DESCRIPTOR and
-// parses it into an exact field table (buttons / hat switch / axes, each
-// with bit position, size and logical range) — no report-layout guessing
-// anywhere. Pads whose descriptor can't be parsed are REJECTED with the
+// Four protocol backends behind ONE shared engine (fields -> normalization
+// -> semantic events -> rules -> routing); probe picks by interface triple:
+//   HID     03/00/*  report descriptor parsed into the field table
+//                     (generic pads, DS4/DualSense, 8BitDo D-input mode;
+//                     DualShock 3 gets a wake SET_REPORT quirk)
+//   XUSB    FF/5D/01  wired Xbox 360 protocol — genuine pads, most clones,
+//                     8BitDo dongles in XInput mode. No handshake; field
+//                     table FABRICATED from the fixed, documented layout.
+//   XUSB-W  FF/5D/81  Microsoft Xbox 360 wireless receiver, player 1
+//                     (wired frames nested at +4; presence messages).
+//   GIP     FF/47/D0  wired Xbox One / Series — power-on handshake, input
+//                     msg 0x20, guide button via msg 0x07 (+ ack).
+//
+// For HID, pads whose descriptor can't be parsed are REJECTED with the
 // reason logged; there is deliberately no heuristic fallback.
 //
 // Per input report the driver extracts every field, normalizes it (axes ->
@@ -57,20 +67,36 @@ extern "C" const UsbDriverDesc usbdrv_ops;   // self — for config()/publish()
 struct PadProfile {
     bool     valid;
     uint8_t  ifnum;
-    uint8_t  ep;
+    uint8_t  ep;          // interrupt IN
     uint16_t mps;
+    uint8_t  ep_out;      // interrupt OUT (0 = none; LED/handshake/acks)
+    uint16_t mps_out;
 };
 static PadProfile s_prof;
+
+// Protocol backend, chosen by probe from the interface triple.
+enum {
+    MODE_HID = 0,     // report-descriptor driven
+    MODE_XUSB,        // wired Xbox 360 protocol (clones, XInput dongles)
+    MODE_XUSB_W,      // Xbox 360 wireless receiver (player 1)
+    MODE_GIP,         // wired Xbox One / Series
+};
+static uint8_t s_mode = MODE_HID;
+static bool    s_ds3  = false;      // DualShock 3 wake quirk (054C:0268)
 
 // ── Field table (from the HID report descriptor) ─────────────────────────────
 
 enum { FK_BTN = 0, FK_HAT = 1, FK_AXIS = 2 };
+
+#define FLD_INV 0x01    // axis: flip normalized value (Xbox stick Y is up-+)
+#define FLD_EXT 0x02    // state written by a mode handler, not extraction
 
 struct PadField {
     uint8_t  kind;      // FK_*
     uint8_t  rep_id;    // 0 when the pad uses no report IDs
     uint8_t  bit_size;
     uint8_t  id;        // BTN: button number; AXIS: usage 0x30..; HAT: index
+    uint8_t  flags;     // FLD_*
     uint16_t bit_off;   // within the payload (after the ID byte, if any)
     int32_t  lmin, lmax;
 };
@@ -228,6 +254,7 @@ static bool parse_rdesc(const uint8_t* d, uint16_t len, const char** err) {
                             f->bit_off  = cur[ci].bits;
                             f->bit_size = g.rsize;
                             f->id       = id;
+                            f->flags    = 0;
                             f->lmin     = g.lmin;
                             f->lmax     = lmax;
                         }
@@ -251,10 +278,78 @@ static void log_fields(void) {
         const PadField* f = &s_fields[i];
         const char* kn = (f->kind == FK_BTN) ? "btn "
                        : (f->kind == FK_HAT) ? "hat " : "axis";
-        ulog("  %s %02X: rep %u bits %u+%u range %d..%d",
+        ulog("  %s %02X: rep %u bits %u+%u range %d..%d%s",
              kn, f->id, f->rep_id, f->bit_off, f->bit_size,
-             (int)f->lmin, (int)f->lmax);
+             (int)f->lmin, (int)f->lmax,
+             (f->flags & FLD_INV) ? " inv" : (f->flags & FLD_EXT) ? " ext" : "");
     }
+}
+
+// ── Fabricated field tables (Xbox modes) ─────────────────────────────────────
+// Layouts are fixed and documented (Linux xpad lineage) — no descriptor to
+// parse. STABLE button numbering shared by all Xbox modes (confs depend on
+// it): A=1 B=2 X=3 Y=4 LB=5 RB=6 Back/View=7 Start/Menu=8 LStick=9
+// RStick=10 Guide=11 DUp=12 DDown=13 DLeft=14 DRight=15. Dpad = 4 buttons
+// (bits), so diagonals are naturally two-held. Stick axes reuse the GD
+// usages (LX/LY=X/Y, RX/RY=Z/Rz, LT/RT=Rx/Ry) so app naming/defaults work.
+
+static int s_guide_fidx = -1;   // GIP: guide lives in msg 0x07 (FLD_EXT)
+
+static PadField* fab_add(uint8_t kind, uint8_t id, uint16_t bit_off,
+                         uint8_t bit_size, int32_t lmin, int32_t lmax,
+                         uint8_t flags) {
+    if (s_nfields >= MAX_FIELDS) return 0;
+    PadField* f = &s_fields[s_nfields++];
+    f->kind = kind; f->rep_id = 0; f->bit_size = bit_size; f->id = id;
+    f->flags = flags; f->bit_off = bit_off; f->lmin = lmin; f->lmax = lmax;
+    return f;
+}
+static void fab_btn(uint8_t id, uint16_t byte, uint8_t bit) {
+    fab_add(FK_BTN, id, (uint16_t)(byte * 8 + bit), 1, 0, 1, 0);
+}
+static void fab_axis(uint8_t usage, uint16_t byte, uint8_t bits,
+                     int32_t lmin, int32_t lmax, uint8_t flags) {
+    fab_add(FK_AXIS, usage, (uint16_t)(byte * 8), bits, lmin, lmax, flags);
+}
+
+// Wired Xbox 360 input report (msg type 0x00, length 0x14) — identical
+// payload is nested at +4 by the wireless receiver.
+static void fab_xusb(void) {
+    s_nfields = 0; s_has_repid = false; s_guide_fidx = -1;
+    fab_btn(12, 2, 0); fab_btn(13, 2, 1);            // dpad up, down
+    fab_btn(14, 2, 2); fab_btn(15, 2, 3);            // dpad left, right
+    fab_btn( 8, 2, 4); fab_btn( 7, 2, 5);            // start, back
+    fab_btn( 9, 2, 6); fab_btn(10, 2, 7);            // stick clicks
+    fab_btn( 5, 3, 0); fab_btn( 6, 3, 1);            // LB, RB
+    fab_btn(11, 3, 2);                               // guide
+    fab_btn( 1, 3, 4); fab_btn( 2, 3, 5);            // A, B
+    fab_btn( 3, 3, 6); fab_btn( 4, 3, 7);            // X, Y
+    fab_axis(0x33, 4, 8, 0, 255, 0);                 // LT -> Rx
+    fab_axis(0x34, 5, 8, 0, 255, 0);                 // RT -> Ry
+    fab_axis(0x30,  6, 16, -32768, 32767, 0);        // LX -> X
+    fab_axis(0x31,  8, 16, -32768, 32767, FLD_INV);  // LY -> Y (up-positive)
+    fab_axis(0x32, 10, 16, -32768, 32767, 0);        // RX -> Z
+    fab_axis(0x35, 12, 16, -32768, 32767, FLD_INV);  // RY -> Rz
+}
+
+// Xbox One / Series GIP input report (msg type 0x20).
+static void fab_gip(void) {
+    s_nfields = 0; s_has_repid = false;
+    fab_btn( 8, 4, 2); fab_btn( 7, 4, 3);            // menu, view
+    fab_btn( 1, 4, 4); fab_btn( 2, 4, 5);            // A, B
+    fab_btn( 3, 4, 6); fab_btn( 4, 4, 7);            // X, Y
+    fab_btn(12, 5, 0); fab_btn(13, 5, 1);            // dpad up, down
+    fab_btn(14, 5, 2); fab_btn(15, 5, 3);            // dpad left, right
+    fab_btn( 5, 5, 4); fab_btn( 6, 5, 5);            // LB, RB
+    fab_btn( 9, 5, 6); fab_btn(10, 5, 7);            // stick clicks
+    PadField* g = fab_add(FK_BTN, 11, 0, 1, 0, 1, FLD_EXT);   // guide (msg 0x07)
+    s_guide_fidx = g ? (int)(g - s_fields) : -1;
+    fab_axis(0x33,  6, 16, 0, 1023, 0);              // LT -> Rx (10-bit)
+    fab_axis(0x34,  8, 16, 0, 1023, 0);              // RT -> Ry
+    fab_axis(0x30, 10, 16, -32768, 32767, 0);        // LX -> X
+    fab_axis(0x31, 12, 16, -32768, 32767, FLD_INV);  // LY -> Y
+    fab_axis(0x32, 14, 16, -32768, 32767, 0);        // RX -> Z
+    fab_axis(0x35, 16, 16, -32768, 32767, FLD_INV);  // RY -> Rz
 }
 
 // ── Field extraction + normalization ─────────────────────────────────────────
@@ -394,6 +489,10 @@ static void gen_defaults(void) {
         { 0x08, 0x85 },   // Click
         { 0x09, 0x08 },   // Backspace
         { 0x0A, 0x0D },   // Enter
+        { 0x0C, 0x77 },   // 'w'  (Xbox dpad up — buttons 12-15)
+        { 0x0D, 0x73 },   // 's'  (dpad down)
+        { 0x0E, 0x61 },   // 'a'  (dpad left)
+        { 0x0F, 0x64 },   // 'd'  (dpad right)
     };
     for (int i = 0; i < s_nfields; i++) {
         const PadField* f = &s_fields[i];
@@ -482,13 +581,75 @@ static void ev_publish(uint8_t kind, uint8_t id, uint8_t val) {
     s_hapi->publish(&usbdrv_ops, e, 4);
 }
 
+static void pad_all_up(void);   // defined below; XUSB-W disconnect uses it
+
+// One-shot interrupt-OUT send (LED / handshake / acks). Synchronous — the
+// pipe layer self-pumps in usb_task context. Tolerated-fail, logged.
+static UsbPipe* s_pipe_out = 0;
+
+static bool out_send(const uint8_t* d, uint32_t n, const char* what) {
+    if (!s_pipe_out) return false;
+    memcpy(s_hapi->pipe_buf(s_pipe_out), d, n);
+    if (s_hapi->pipe_xfer(s_pipe_out, n, 250) != USB_XFER_OK) {
+        ulog("pad: %s send failed", what);
+        return false;
+    }
+    return true;
+}
+
+// GIP ack for a guide-button message that requested one (xpad lineage) —
+// unacked, some firmwares re-send the message forever.
+static void gip_ack_guide(uint8_t seq) {
+    uint8_t ack[13] = { 0x01, 0x20, seq, 0x09, 0x00, 0x07, 0x20, 0x02,
+                        0x00, 0x00, 0x00, 0x00, 0x00 };
+    out_send(ack, sizeof(ack), "gip ack");
+}
+
 static void pad_report(const uint8_t* r, uint32_t len) {
     if (len > 64) len = 64;
 
+    // ── Mode framing: locate the input payload / handle side messages ──
+    const uint8_t* p    = r;
+    uint32_t      plen  = len;
+    bool          extract = true;
+    if (s_mode == MODE_XUSB) {
+        // Type 0x00 = input; anything else (LED echo etc.) is ignored.
+        if (len < 14 || r[0] != 0x00 || r[1] < 0x13) return;
+    } else if (s_mode == MODE_XUSB_W) {
+        if (len >= 2 && r[0] == 0x08) {               // presence change
+            if (r[1] & 0x80) {
+                ulog("pad: controller connected");
+            } else {
+                ulog("pad: controller disconnected");
+                pad_all_up();
+            }
+            return;
+        }
+        // Wired-format input frame nested at +4 when byte1 bit0 is set.
+        if (len < 18 || r[0] != 0x00 || !(r[1] & 0x01)) return;
+        p = r + 4; plen = len - 4;
+        if (p[0] != 0x00 || p[1] < 0x13) return;
+    } else if (s_mode == MODE_GIP) {
+        if (len >= 5 && r[0] == 0x07) {               // guide button message
+            if (r[1] == 0x30) gip_ack_guide(r[2]);
+            if (s_guide_fidx >= 0) {
+                uint8_t ns = (uint8_t)(r[4] & 1);
+                if (ns != s_fstate[s_guide_fidx]) {
+                    s_fstate[s_guide_fidx] = ns;
+                    ev_publish(FK_BTN, 11, ns);
+                }
+            }
+            extract = false;    // no payload, but re-evaluate rules below
+        } else if (len < 18 || r[0] != 0x20) {
+            return;
+        }
+    }
+
     // Extract every field; publish an event per state change.
-    for (int i = 0; i < s_nfields; i++) {
+    if (extract) for (int i = 0; i < s_nfields; i++) {
         const PadField* f = &s_fields[i];
-        int32_t v = field_val(f, r, len);
+        if (f->flags & FLD_EXT) continue;         // fed by a mode handler
+        int32_t v = field_val(f, p, plen);
         if (v == FIELD_ABSENT) continue;
         uint8_t ns;
         if (f->kind == FK_BTN) {
@@ -500,6 +661,7 @@ static void pad_report(const uint8_t* r, uint32_t len) {
             else ns = (uint8_t)((span == 4) ? dir * 2 : dir);
         } else {
             uint8_t nv = axis_norm(f, v);
+            if (f->flags & FLD_INV) nv = (uint8_t)(255 - nv);
             if (!s_frest_ok[i]) { s_frest[i] = nv; s_frest_ok[i] = true; }
             ns = axis_zone(nv, s_frest[i]);
         }
@@ -575,66 +737,117 @@ static bool pad_probe(const UsbHostApi* api) {
     s_nheld = 0;
     s_arrows = 0;
     s_rdesc_len = 0;
-    if (s_pipe) { api->pipe_close(s_pipe); s_pipe = 0; }
+    s_mode = MODE_HID;
+    s_ds3  = false;
+    s_guide_fidx = -1;
+    if (s_pipe)     { api->pipe_close(s_pipe);     s_pipe = 0; }
+    if (s_pipe_out) { api->pipe_close(s_pipe_out); s_pipe_out = 0; }
 
     const usb_config_desc_t* cfg = (const usb_config_desc_t*)api->config_desc();
     if (!cfg) return false;
 
-    bool     cur_pad   = false;
-    uint8_t  cur_if    = 0;
-    uint16_t cur_rdesc = 0;
+    // Walk the interfaces; the FIRST one that classifies to a backend and
+    // has an interrupt-IN endpoint wins. The same interface's interrupt-OUT
+    // (either side of the IN in declaration order) is kept for LED /
+    // handshake / ack sends.
+    int      cur_mode    = -1;
+    int      sel_mode    = -1;
+    uint8_t  cur_if      = 0;
+    uint16_t cur_rdesc   = 0;
+    uint8_t  cur_out     = 0;
+    uint16_t cur_out_mps = 0;
     const usb_standard_desc_t* d = (const usb_standard_desc_t*)cfg;
     int offset = 0;
     while ((d = usb_parse_next_descriptor(d, cfg->wTotalLength, &offset)) != 0) {
         if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
             const usb_intf_desc_t* i = (const usb_intf_desc_t*)d;
-            // HID, NON-boot subclass (keyboards/mice claim subclass 1).
-            cur_pad = (i->bInterfaceClass == USB_CLASS_HID &&
-                       i->bInterfaceSubClass == 0 &&
-                       i->bAlternateSetting == 0);
+            cur_mode = -1;
+            if (i->bAlternateSetting == 0) {
+                uint8_t c = i->bInterfaceClass;
+                uint8_t s = i->bInterfaceSubClass;
+                uint8_t pr = i->bInterfaceProtocol;
+                // HID, NON-boot subclass (keyboards/mice claim subclass 1).
+                if      (c == USB_CLASS_HID && s == 0)          cur_mode = MODE_HID;
+                else if (c == 0xFF && s == 0x5D && pr == 0x01)  cur_mode = MODE_XUSB;
+                else if (c == 0xFF && s == 0x5D && pr == 0x81)  cur_mode = MODE_XUSB_W;
+                else if (c == 0xFF && s == 0x47 && pr == 0xD0)  cur_mode = MODE_GIP;
+            }
             cur_if = i->bInterfaceNumber;
             cur_rdesc = 0;
-        } else if (d->bDescriptorType == HID_DESC_TYPE && cur_pad) {
+            cur_out = 0;
+            cur_out_mps = 0;
+        } else if (d->bDescriptorType == HID_DESC_TYPE && cur_mode == MODE_HID) {
             // HID class descriptor: [6] = report desc type, [7..8] = length.
             const uint8_t* hb = (const uint8_t*)d;
             if (hb[0] >= 9 && hb[6] == 0x22 && cur_rdesc == 0)
                 cur_rdesc = (uint16_t)(hb[7] | ((uint16_t)hb[8] << 8));
         } else if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
             const usb_ep_desc_t* e = (const usb_ep_desc_t*)d;
-            if (cur_pad && !s_prof.valid &&
-                USB_EP_DESC_GET_XFERTYPE(e) == USB_TRANSFER_TYPE_INTR &&
-                USB_EP_DESC_GET_EP_DIR(e) != 0) {
-                s_prof.valid = true;
-                s_prof.ifnum = cur_if;
-                s_prof.ep    = e->bEndpointAddress;
-                s_prof.mps   = USB_EP_DESC_GET_MPS(e);
-                if (s_prof.mps > 64) s_prof.mps = 64;
-                s_rdesc_len  = cur_rdesc;
-                ulog("  gamepad: IF %u ep %02X mps %u rdesc %u",
-                     cur_if, s_prof.ep, s_prof.mps, s_rdesc_len);
+            if (USB_EP_DESC_GET_XFERTYPE(e) == USB_TRANSFER_TYPE_INTR) {
+                uint16_t mps = USB_EP_DESC_GET_MPS(e);
+                if (mps > 64) mps = 64;
+                if (USB_EP_DESC_GET_EP_DIR(e) != 0) {          // interrupt IN
+                    if (!s_prof.valid && cur_mode >= 0) {
+                        s_prof.valid   = true;
+                        sel_mode       = cur_mode;
+                        s_prof.ifnum   = cur_if;
+                        s_prof.ep      = e->bEndpointAddress;
+                        s_prof.mps     = mps;
+                        s_prof.ep_out  = cur_out;
+                        s_prof.mps_out = cur_out_mps;
+                        s_rdesc_len    = cur_rdesc;
+                    }
+                } else {                                        // interrupt OUT
+                    if (!s_prof.valid) {
+                        cur_out = e->bEndpointAddress;
+                        cur_out_mps = mps;
+                    } else if (cur_if == s_prof.ifnum && !s_prof.ep_out) {
+                        s_prof.ep_out  = e->bEndpointAddress;
+                        s_prof.mps_out = mps;
+                    }
+                }
             }
         }
     }
     if (!s_prof.valid) return false;
+    s_mode = (uint8_t)sel_mode;
 
-    // Descriptor-driven, strictly: no descriptor -> no driver.
-    if (s_rdesc_len == 0 || s_rdesc_len > RDESC_MAX) {
-        ulog("gamepad: REJECTED - report descriptor length %u unusable",
-             s_rdesc_len);
-        s_prof.valid = false;
-        return false;
-    }
-    if (!api->control(0x81, 0x06 /*GET_DESCRIPTOR*/, 0x2200, s_prof.ifnum,
-                      s_rdesc, s_rdesc_len)) {
-        ulog("gamepad: REJECTED - report descriptor fetch failed");
-        s_prof.valid = false;
-        return false;
-    }
-    const char* err = "?";
-    if (!parse_rdesc(s_rdesc, s_rdesc_len, &err)) {
-        ulog("gamepad: REJECTED - descriptor parse: %s", err);
-        s_prof.valid = false;
-        return false;
+    static const char* kModeName[4] = {
+        "HID", "XUSB (Xbox 360 wired)",
+        "XUSB-W (360 wireless receiver)", "GIP (Xbox One/Series)",
+    };
+    ulog("  gamepad: IF %u %s ep %02X mps %u out %02X",
+         s_prof.ifnum, kModeName[s_mode], s_prof.ep, s_prof.mps, s_prof.ep_out);
+
+    if (s_mode == MODE_HID) {
+        // Descriptor-driven, strictly: no descriptor -> no driver.
+        if (s_rdesc_len == 0 || s_rdesc_len > RDESC_MAX) {
+            ulog("gamepad: REJECTED - report descriptor length %u unusable",
+                 s_rdesc_len);
+            s_prof.valid = false;
+            return false;
+        }
+        if (!api->control(0x81, 0x06 /*GET_DESCRIPTOR*/, 0x2200, s_prof.ifnum,
+                          s_rdesc, s_rdesc_len)) {
+            ulog("gamepad: REJECTED - report descriptor fetch failed");
+            s_prof.valid = false;
+            return false;
+        }
+        const char* err = "?";
+        if (!parse_rdesc(s_rdesc, s_rdesc_len, &err)) {
+            ulog("gamepad: REJECTED - descriptor parse: %s", err);
+            s_prof.valid = false;
+            return false;
+        }
+        // DualShock 3: enumerates HID but streams nothing until woken.
+        const usb_device_desc_t* dd =
+            (const usb_device_desc_t*)api->device_desc();
+        s_ds3 = dd && dd->idVendor == 0x054C && dd->idProduct == 0x0268;
+        if (s_ds3) ulog("gamepad: DualShock 3 - wake quirk armed");
+    } else if (s_mode == MODE_GIP) {
+        fab_gip();      // fixed layout — nothing to fetch
+    } else {
+        fab_xusb();     // wired 360 layout (also nested by the receiver)
     }
     log_fields();
 
@@ -672,8 +885,17 @@ static bool pad_start(const UsbHostApi* api) {
         s_prof.valid = false;
         return false;
     }
-    if (!api->control(0x21, 0x0A /*SET_IDLE*/, 0, s_prof.ifnum, 0, 0))
-        ulog("pad SET_IDLE failed (continuing)");
+    if (s_mode == MODE_HID) {
+        if (!api->control(0x21, 0x0A /*SET_IDLE*/, 0, s_prof.ifnum, 0, 0))
+            ulog("pad SET_IDLE failed (continuing)");
+        if (s_ds3) {
+            // Magic SET_REPORT(0xF4): DS3 streams nothing until it arrives.
+            uint8_t wake[4] = { 0x42, 0x0C, 0x00, 0x00 };
+            if (!api->control(0x21, 0x09 /*SET_REPORT*/, 0x03F4,
+                              s_prof.ifnum, wake, 4))
+                ulog("pad: DS3 wake failed");
+        }
+    }
 
     s_pipe = api->pipe_open(s_prof.ep, s_prof.mps, s_prof.mps);
     if (!s_pipe) {
@@ -682,14 +904,34 @@ static bool pad_start(const UsbHostApi* api) {
         s_prof.valid = false;
         return false;
     }
+    if (s_prof.ep_out && s_mode != MODE_HID) {
+        uint16_t m = s_prof.mps_out ? s_prof.mps_out : 32;
+        s_pipe_out = api->pipe_open(s_prof.ep_out, m, m);
+        if (!s_pipe_out) ulog("pad: OUT pipe alloc failed (LED/handshake off)");
+    }
     s_on = true;
     if (!api->pipe_submit(s_pipe, s_prof.mps, pad_pipe_cb, 0)) {
         ulog("pad submit failed");
         s_on = false;
         api->pipe_close(s_pipe); s_pipe = 0;
+        if (s_pipe_out) { api->pipe_close(s_pipe_out); s_pipe_out = 0; }
         api->release_interface(s_prof.ifnum);
         s_prof.valid = false;
         return false;
+    }
+
+    // Mode handshakes — sent AFTER the IN loop is armed so nothing is missed.
+    if (s_mode == MODE_XUSB) {
+        static const uint8_t led[3] = { 0x01, 0x03, 0x06 };   // player-1 steady
+        out_send(led, sizeof(led), "led");
+    } else if (s_mode == MODE_XUSB_W) {
+        // Ask the receiver to announce an already-synced controller.
+        static const uint8_t inq[12] = { 0x08, 0x00, 0x0F, 0xC0 };
+        out_send(inq, sizeof(inq), "presence inquiry");
+    } else if (s_mode == MODE_GIP) {
+        // GIP power-on — the controller is silent until it gets this.
+        static const uint8_t on[5] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
+        out_send(on, sizeof(on), "gip power-on");
     }
     ulog(">>> Gamepad ready.");
     return true;
@@ -697,7 +939,8 @@ static bool pad_start(const UsbHostApi* api) {
 
 static void pad_stop(const UsbHostApi* api, bool) {
     s_on = false;
-    if (s_pipe) { api->pipe_close(s_pipe); s_pipe = 0; }
+    if (s_pipe)     { api->pipe_close(s_pipe);     s_pipe = 0; }
+    if (s_pipe_out) { api->pipe_close(s_pipe_out); s_pipe_out = 0; }
     api->release_interface(s_prof.ifnum);
     pad_all_up();
     ulog("Gamepad stopped.");
@@ -730,8 +973,9 @@ static void pad_tick(const UsbHostApi* api) {
 }
 
 static void pad_status(char* out, uint32_t n) {
-    snprintf(out, n, "%d rules, %d fields%s", s_nrules, s_nfields,
-             s_defaults ? " (default)" : "");
+    static const char* m[4] = { "hid", "x360", "x360w", "gip" };
+    snprintf(out, n, "%d rules, %d fields %s%s", s_nrules, s_nfields,
+             m[s_mode], s_defaults ? " (default)" : "");
 }
 
 extern "C" const UsbDriverDesc usbdrv_ops = {

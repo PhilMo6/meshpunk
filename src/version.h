@@ -10,10 +10,19 @@
 // global reads as 0 on the Lua side, so every gated entry blocks there — the
 // safe default. Bump this whenever a release adds/changes anything a store
 // app could require.
+// Bump at most ONCE per release cycle: check the level the latest release
+// tag shipped (`git show <latest-tag>:src/version.h`) — if the current level
+// hasn't shipped yet, fold new contract changes into it instead of bumping.
 //   1  2026-07-13  first exposure (Alt+Backspace ELF exit chord release)
-//   2  2026-07-13  dynamic USB drivers (_usb_drivers binding, L:/S: driver
-//                  dirs, driver pool) — the Tools/USB app's Drivers manager
-//                  needs this level
+//   2  2026-07-17  everything unreleased since the v0.2.6 tag (which shipped
+//                  level 1): dynamic USB drivers (_usb_drivers binding, L:/S:
+//                  driver dirs, driver pool — Tools/USB Drivers manager),
+//                  T-Deck peer link (tdeck_link bridge, host_link_* ELF
+//                  exports, driver-ABI link socket — tdeck driver +
+//                  link-cable GameBoy), shared emoji picker (lib/emoji_popup
+//                  + _emoji_popup_insert, alt+mic insert popup —
+//                  Settings/Emoji store app), alt+backspace home chord
+//                  (documented by the Read Me store app)
 #define MESHPUNK_FW_API 2
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see

@@ -36,9 +36,17 @@ static void mesh_task_body(void *param) {
     // here. Runs before the paused check so an in-flight blink still finishes.
     notify_tick();
 
-    // Escape hatch (currently never set — the mesh keeps running during ELF
-    // module execution): skip all work but keep yielding to feed the watchdog.
+    // Pause (set by tdeck_link.cpp while a GameBoy link session is live —
+    // cable session + local game): skip all dispatcher work so the link has
+    // the SPI bus and Core 1 to itself. Everything stays in memory; the RTC
+    // still ticks (VolatileRTCClock is delta-based, so a tick here keeps
+    // device time live for GPS/notify stamps instead of catching up in one
+    // jump at resume). The radio idles in RX; a pending IRQ flag is
+    // serviced on the first loop() after resume.
     if (mesh_task_paused) {
+      MESH_LOCK();
+      the_mesh->getRTCClock()->tick();
+      MESH_UNLOCK();
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }

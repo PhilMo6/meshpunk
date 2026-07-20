@@ -27,6 +27,7 @@
 #include "fs_bridge.h"
 #include "usb_manager.h"
 #include "usb_fs.h"
+#include "tdeck_link.h"
 
 // Meshcore
 #include "punkmesh.h"
@@ -6207,6 +6208,15 @@ static bool parse_font_role(const char *s, theme_font_role_t *out) {
   return false;
 }
 
+// _gblink_status() -> int. T-Deck peer-link status for Lua launchers:
+// 0 none, 1 cable session up, 2 session + peer's game attached (low 2 bits);
+// bit 0x4 = this deck is the USB-host side. The GameBoy launcher uses >0 to
+// warn that launching will pause the mesh radio for the linked session.
+static int lua_gblink_status(lua_State *Ls) {
+  lua_pushinteger(Ls, tdeck_link_status());
+  return 1;
+}
+
 void setupLuaVGL() {
   // (Runtime TTF fonts are initialized in luaBringUp(), BEFORE the Lua arena —
   // the ~430KB buffers must land below the gap, not inside it. See luaBringUp.)
@@ -6228,6 +6238,9 @@ void setupLuaVGL() {
   luaL_requiref(L, "lvgl", luaopen_lvgl, 1);
   lua_pop(L, 1);
   luavgl_set_font_extension(L, meshpunk_make_font, NULL);
+
+  // T-Deck peer link (gblink)
+  lua_register(L, "_gblink_status", lua_gblink_status);
 
   // Register WiFi functions
   lua_register(L, "_wifi_connect", lua_wifi_connect);
@@ -7846,8 +7859,15 @@ static void log_boot_mem(const char* stage) {
 void setup() {
   // Enlarge the UART TX buffer so the ISR drains it in the background and SLog's
   // best-effort writes (availableForWrite-gated) almost never have to drop. Must
-  // precede begin(). ~4 KB ≈ 350 ms of backlog at 115200 before any line drops.
-  Serial.setTxBufferSize(4096);
+  // precede begin(). 8 KB gives the tdeck-link device-role TX headroom (its
+  // SYNC2 answers must not drop when the USB host is briefly not draining).
+  // ~8 KB ≈ 700 ms of SLog backlog at 115200 before any line drops.
+  Serial.setTxBufferSize(8192);
+  // RX likewise: as a tdeck-link device role, peer frames arrive here, and the
+  // default 256-byte ring overflowed (dropping bytes MID-FRAME) whenever the
+  // Core-1 link task starved a few hundred ms. 4 KB rides out multi-second
+  // stalls; the link layer's CRC + retransmit covers whatever still drops.
+  Serial.setRxBufferSize(4096);
   Serial.begin(115200);
   SLog.println("Delaying for 50ms...");
   delay(50);
@@ -8226,6 +8246,11 @@ void setup() {
   // absorbed automatically.
   usb_driver_pool_init();
   log_boot_mem("after usb driver pool");
+
+  // T-Deck↔T-Deck peer link bridge (Core-1 pump task; device-role serial +
+  // session timers — the USB-host backend registers later via the tdeck
+  // driver's link socket). See src/tdeck_link.cpp.
+  tdeck_link_init();
 
   SLog.println("===== LUA INIT =====");
 

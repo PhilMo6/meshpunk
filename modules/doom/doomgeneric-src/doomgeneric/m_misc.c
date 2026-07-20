@@ -54,10 +54,23 @@
 
 void M_MakeDirectory(char *path)
 {
+    // FatFs f_mkdir() (ESP-IDF /sd VFS) fails with FR_NO_PATH when the path
+    // ends in a separator: it parses the trailing slash as an extra empty
+    // segment and gives up before creating the final directory. The savegame
+    // dir is intentionally "<configdir>/savegame/" (trailing slash is needed
+    // for filename concatenation elsewhere), so strip it for the mkdir call.
+    char buf[256];
+    size_t n = strlen(path);
+    while (n > 1 && (path[n - 1] == '/' || path[n - 1] == '\\'))
+        n--;
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, path, n);
+    buf[n] = '\0';
+
 #ifdef _WIN32
-    mkdir(path);
+    mkdir(buf);
 #else
-    mkdir(path, 0755);
+    mkdir(buf, 0755);
 #endif
 }
 

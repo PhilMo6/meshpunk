@@ -199,17 +199,225 @@ static inline void timer_advance(int cycles)
 	}
 }
 
+/* T-Deck link: the BGB link protocol (bgb.bircd.org/bgblink.html), whole.
+ * All traffic is timestamped in 2MiHz emulated clocks. The glue (main_tdeck.c)
+ * holds a SYNC1 until our clock reaches its timestamp (ripeness), and — the
+ * RENDEZVOUS rule — when a ripe SYNC1 finds us unarmed mid-exchange, holds it
+ * a little longer so our CPU runs forward to its arm point and answers the
+ * REAL byte, rather than echoing a parked one. The frame loop enforces the
+ * lockstep window (never run more than the window ahead of the peer) but
+ * releases that stall while a SYNC1 is held-for-arm so the CPU can reach it.
+ * The master WAITS for its reply with the emulated clock frozen (real-time
+ * block below) — one transfer outstanding at a time, which is what keeps the
+ * rendezvous single-slot and deadlock-free; release only when the peer goes
+ * away or the exit chord fires. */
+
+/* Answer one pending ripe link event while no master transfer is waiting:
+ * SYNC1 + slave armed -> complete the transfer (SYNC2); SYNC1 + not armed
+ * -> the not-transferring ack. Called from serial_advance and from the
+ * frame loop's lockstep stall (so a stalled emulator still answers).
+ * The transport guarantees exactly-once in-order SYNC delivery (the
+ * bridge's seq/ack layer), so there is no duplicate/replay handling here —
+ * every SYNC1 that arrives is a real, new transfer. */
+/* Byte received by an armed slave, delivered to R_SB when the deferred
+ * transfer completes (serial_advance, GB.serial countdown). */
+static byte gb_link_rx_byte = 0;
+
+void gb_link_service(void)
+{
+	/* Mid-transfer (deferred slave receive completing): answer nothing —
+	 * the master already has our SYNC2, and no new SYNC1 can arrive until
+	 * this transfer's IRQ fires and the game re-arms. */
+	if (gb_link_rx_active) return;
+	int ev = gb_link_poll();
+	if (ev < 0) return;
+	if ((ev >> 16) != 3 /*SYNC1*/)
+	{
+		gb_dlog("SRV skip cmd=%d (nobody waiting)", ev >> 16);
+		return;                              /* stale reply: dropped */
+	}
+	if (gb_link_slave)
+	{
+		/* Send our byte NOW so the waiting master unblocks with no added
+		 * latency — but DEFER our own completion + serial IRQ by the
+		 * transfer's ~976us (GB.serial), exactly like the master's timed
+		 * completion below. Firing the IRQ instantly (0 cycles after arm,
+		 * vs the master's 1952) put gen1's slave receive code in the wrong
+		 * state when it read the byte — the systematic GB-slave-only list
+		 * corruption (hw run 16/17, role-swap-confirmed). R_SB keeps our
+		 * sent byte and SC bit7 stays set until completion (transfer in
+		 * progress), matching hardware. */
+		gb_dlog("SRV xfer rx=%02x tx=%02x ts=%08x",
+		        ev & 0xFF, R_SB, gb_link_last_ts());
+		gb_link_send(4 /*SYNC2*/, (0x80 << 8) | R_SB, gb_link_clock);
+		gb_link_rx_byte  = (byte)(ev & 0xFF);
+		gb_link_rx_active = 1;
+		GB.serial = gb_link_xfer_cycles();   /* transfer duration, matches master arm */
+		gb_link_slave = 0;
+	}
+	else
+	{
+		/* FALLBACK path only. The glue (gb_link_poll) now RENDEZVOUS-holds a
+		 * ripe SYNC1 while we're unarmed mid-exchange, letting the CPU run
+		 * forward to its arm point so the armed branch above answers the
+		 * REAL byte — this reaches us only after the hold times out (~1
+		 * frame), i.e. a genuine idle gap (overworld probe / game left the
+		 * exchange loop). There, real DMG hardware exchanges ANYWAY: the
+		 * master's clocks shift the slave's parked SB regardless of the
+		 * transfer-enable bit, and the master's byte lands in SB silently.
+		 * (Doing this UNCONDITIONALLY — before the hold — was the "corrupted
+		 * battle": the parked SB held the master's PREVIOUS byte, so every
+		 * unarmed transfer echoed it straight back; hw run 14 measured 257
+		 * such echoes.) SYNC3/$FF is reserved for a gameless deck, answered
+		 * by the firmware. */
+		byte parked = R_SB;
+		gb_dlog("SRV shift tx=%02x rx=%02x (unarmed) ts=%08x",
+		        parked, ev & 0xFF, gb_link_last_ts());
+		gb_link_send(4 /*SYNC2*/, (0x80 << 8) | parked, gb_link_clock);
+		R_SB = (byte)(ev & 0xFF);   /* silent bidirectional shift */
+	}
+}
+
 /* cnt - time to emulate, expressed in real clock cycles */
 static inline void serial_advance(int cycles)
 {
+	/* BGB timestamp clock: 2MiHz = machine cycles << 1 (same unit as the
+	 * GB.serial countdown). Wraps; all comparisons are 31-bit deltas. */
+	gb_link_clock += (unsigned)cycles << 1;
+
+	if (!gb_link_wait)
+	{
+		if (gb_link_slave)
+		{
+			/* Armed slave: poll every batch for the master's byte. With no
+			 * cable — or a peer that never clocks us — the transfer simply
+			 * NEVER completes, exactly like real hardware (a slave waits
+			 * for external clocks indefinitely, no side effects; games
+			 * handle that with their own timeouts). An earlier version
+			 * "released" it with 0xFF + IRQ, which became a serial
+			 * interrupt storm the moment a game armed the port at startup
+			 * (Pokemon does on save-load) and froze its input. */
+			gb_link_service();
+		}
+		else
+		{
+			/* Unarmed: still answer ripe SYNC1s (ack) — cheaply gated,
+			 * the poll crosses into the host. Ripeness makes this safe:
+			 * our clock has reached the master's send time, so "unarmed"
+			 * is truth, not a race. */
+			static unsigned idle_div;
+			if ((++idle_div & 63) == 0) gb_link_service();
+		}
+	}
+
 	if (GB.serial > 0)
 	{
 		GB.serial -= cycles << 1;
 		if (GB.serial <= 0)
 		{
-			R_SB = 0xFF;
-			R_SC &= 0x7f;
 			GB.serial = 0;
+			if (gb_link_rx_active)
+			{
+				/* Slave receive completing: the deferred ~976us elapsed,
+				 * so deliver the byte and fire the IRQ now — the game is
+				 * at the same post-arm point real hardware would be. */
+				R_SB = gb_link_rx_byte;
+				gb_link_rx_active = 0;
+			}
+			else if (!gb_link_wait)
+			{
+				R_SB = 0xFF;   /* no peer: original open-cable stub */
+			}
+			else
+			{
+				/* Master: the transfer's 976us of emulated time elapsed.
+				 * HARDWARE INVARIANT: the game must never observe an
+				 * unfinished transfer. Gen1's link menu re-arms SC every
+				 * frame WITHOUT waiting for the serial IRQ — on real
+				 * hardware that's fine because a transfer always finishes
+				 * in ~1ms, long before the next re-arm. A "non-blocking"
+				 * completion let emulated time run past this point, so
+				 * re-arms hit a still-pending transfer and abandoned it —
+				 * while the peer's reliably-delivered answer arrived with
+				 * nobody waiting, pairing every later answer with the
+				 * wrong transfer (hw run 9: hundreds of 'ARM master while
+				 * pending' + stale late=0 consumes; the cable-club menu
+				 * never converged, and the divergence is unfixable at the
+				 * receiver — the peer's game already consumed the aborted
+				 * byte). So complete HERE: with the queued answer if it
+				 * already arrived (the common case on today's transport),
+				 * else stall REAL time — clock frozen — until it comes.
+				 * The blocking era's deadlocks came from layers since
+				 * fixed (lossy transport, the dual-core send race, tdl
+				 * starvation, lease zombies), and the lockstep window
+				 * bounds how far the peer can drift while we're frozen. */
+				int idle_ms = 0;
+				int stalled = 0;
+				for (;;)
+				{
+					int ev = gb_link_poll();
+					if (ev >= 0)
+					{
+						int cmd = ev >> 16;
+						if (cmd == 4 /*SYNC2*/)
+						{
+							gb_dlog("WAIT end SYNC2 rx=%02x %dms",
+							        ev & 0xFF, idle_ms);
+							gb_link_decay_skew();
+							R_SB = (byte)(ev & 0xFF);
+							break;
+						}
+						if (cmd == 5 /*SYNC3*/)
+						{
+							gb_dlog("WAIT end SYNC3 openbus %dms", idle_ms);
+							R_SB = 0xFF;   /* nobody driving the line */
+							break;
+						}
+						if (cmd == 3 /*SYNC1*/)
+						{
+							/* Master/master collision: we're not a
+							 * slave — say so, keep waiting for ours. */
+							gb_dlog("WAIT collision SYNC1 -> SYNC3");
+							gb_link_send(5 /*SYNC3*/, 1, 0);
+						}
+						else
+							gb_dlog("WAIT skip cmd=%d", cmd);
+						continue;          /* stale event: dropped */
+					}
+					if (!stalled)
+					{
+						/* Answer not ready at the boundary — stall. */
+						stalled = 1;
+						gb_dlog("WAIT begin tx=%02x ts=%08x clk=%08x",
+						        gb_link_s1_dc & 0xFF, gb_link_s1_ts,
+						        gb_link_clock);
+					}
+					if (!gb_link_cable() || !gb_link_peer_game())
+					{
+						gb_dlog("WAIT end peer-gone %dms", idle_ms);
+						R_SB = 0xFF;       /* peer/game went away */
+						break;
+					}
+					/* Exit chord: a wedged wait must never brick the deck. */
+					if (gb_link_should_exit())
+					{
+						gb_dlog("WAIT end exit-chord %dms", idle_ms);
+						R_SB = 0xFF;
+						break;
+					}
+					gb_link_idle();        /* 1ms real; clock frozen */
+					++idle_ms;
+					/* Keep reporting our frozen clock while blocked —
+					 * the peer's lockstep needs to keep hearing it. */
+					if ((idle_ms & 31) == 0)
+						gb_link_send(6 /*TSYNC*/, 0, gb_link_clock);
+					/* Log tail on card even if we never leave this loop. */
+					if ((idle_ms & 511) == 0)
+						gb_dlog_flush();
+				}
+				gb_link_wait = 0;
+			}
+			R_SC &= 0x7f;
 			gb_hw_interrupt(IF_SERIAL, 1);
 			gb_hw_interrupt(IF_SERIAL, 0);
 		}

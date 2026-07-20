@@ -30,8 +30,8 @@ void usbcore_note_audio(uint32_t rate, uint8_t bits);
 
 // ── Registry (usb_core.cpp) ──────────────────────────────────────────────────
 // Built-ins register once from usb_manager_init (order = lifecycle order:
-// audio, kbd, msc — preserved from the monolith). Dynamic add/remove arrives
-// with the M2 loader and runs in usb_task only.
+// audio, kbd, msc — preserved from the monolith). Dynamic add/remove (the
+// .drv.elf loader) runs in usb_task only.
 void usb_registry_add_builtin(const UsbDriverDesc* d);
 bool usb_registry_probed(const char* name);          // Lua bridge status
 

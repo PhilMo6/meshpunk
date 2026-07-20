@@ -82,6 +82,16 @@ int host_write_file(const char* path, const void* data, uint32_t size);
 // Debug
 void host_log(const char* msg);
 
+// T-Deck peer link, gblink service (src/tdeck_link.cpp). status: 0 = no
+// channel, 1 = peer session up (cable present), 2 = session + remote GameBoy
+// attached (lockstep window applies). send cmds mirror TDL_GB_*: 1 ATTACH,
+// 2 DETACH, 3 SYNC1, 4 SYNC2, 5 SYNC3(ack), 6 TSYNC; data_ctrl =
+// (control<<8)|data (BGB b3/b2), ts = 2MiHz emulated clock (SYNC1/TSYNC).
+// poll: next event as (cmd<<16)|(ctrl<<8)|data with timestamp in *ts_out.
+int host_link_status(void);
+int host_link_gb_send(int cmd, int data_ctrl, unsigned int ts);
+int host_link_gb_poll(unsigned int* ts_out);
+
 #ifdef __cplusplus
 }
 #endif

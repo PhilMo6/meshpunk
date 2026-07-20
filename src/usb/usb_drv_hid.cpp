@@ -3,8 +3,8 @@
 // Everything goes through the UsbHostApi: control requests (SET_PROTOCOL /
 // SET_IDLE / LED SET_REPORT / CLEAR_FEATURE via pipe_reset), the interrupt-IN
 // report loop (async pipe with resubmit-in-callback), and the three input
-// sockets. This file is the ABI proof for interrupt-class drivers and is the
-// dogfood source for the M2 dynamic-module build (usbdrv_kbd).
+// sockets. This file is also the dogfood source for the dynamic-module
+// build (modules/usbdrv_kbd).
 //
 // INPUT CONTRACT (load-bearing): input_key carries RAW host pseudo-codes,
 // pre-keymap — including modifier edges 0x80/0x8B/0x8C/0x8D. 0x8C (Alt) is
@@ -14,9 +14,9 @@
 
 // DUAL-BUILD: this file compiles (a) into firmware as the built-in driver
 // and (b) unchanged as the dogfood dynamic module (modules/usbdrv_kbd/,
-// -DUSB_DRV_MODULE) — the M2 proof that the ABI carries a real driver. The
-// module build has no Arduino/IDF headers: descriptor structs come from the
-// local usb_shim.h and logging goes through the vtable.
+// -DUSB_DRV_MODULE). The module build has no Arduino/IDF headers:
+// descriptor structs come from the local usb_shim.h and logging goes
+// through the vtable.
 #ifdef USB_DRV_MODULE
   #include <string.h>
   #include <stdio.h>

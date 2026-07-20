@@ -214,7 +214,7 @@ bool usb_msc_sync() {
 }
 
 // Block-device socket ops (registered at start; usb_fs still calls the
-// public sector API directly in M1 — the socket becomes load-bearing when
+// public sector API directly — the socket becomes load-bearing when
 // storage drivers go dynamic).
 static const UsbBlockOps s_block_ops = {
     &usb_msc_ready,

@@ -20,6 +20,8 @@
 #include <esp_heap_caps.h>
 #include <multi_heap.h>
 
+#include "../meshpunk_sync.h"   // SLog
+
 #define USB_DRV_POOL_KB 96
 
 static multi_heap_handle_t s_pool     = nullptr;
@@ -30,13 +32,13 @@ void usb_driver_pool_init(void) {
     s_pool_mem = heap_caps_malloc(USB_DRV_POOL_KB * 1024,
                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_pool_mem) {
-        printf("[usb_pool] reserve FAILED (%uKB) — dynamic USB drivers disabled\n",
-               (unsigned)USB_DRV_POOL_KB);
+        SLog.printf("[usb_pool] reserve FAILED (%uKB) — dynamic USB drivers disabled\n",
+                    (unsigned)USB_DRV_POOL_KB);
         return;
     }
     s_pool = multi_heap_register(s_pool_mem, USB_DRV_POOL_KB * 1024);
-    printf("[usb_pool] %uKB @%p (below fonts/gap/arena) for dynamic USB drivers\n",
-           (unsigned)USB_DRV_POOL_KB, s_pool_mem);
+    SLog.printf("[usb_pool] %uKB @%p (below fonts/gap/arena) for dynamic USB drivers\n",
+                (unsigned)USB_DRV_POOL_KB, s_pool_mem);
 }
 
 void* usb_pool_alloc(size_t size) {

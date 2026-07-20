@@ -32,6 +32,16 @@ $glue_sources = @("main_tdeck.c")
 $obj_dir = "obj"
 if (-not (Test-Path $obj_dir)) { New-Item -ItemType Directory $obj_dir | Out-Null }
 
+# Newest header mtime anywhere under the source tree. Headers are shared
+# (hw.h, gnuboy.h, ...), so a single header edit can affect any object. We do
+# not parse per-file #includes; instead, if ANY header is newer than an
+# object, that object is stale and gets recompiled. Conservative but correct
+# (before this, a hw.h edit left stale .o files still calling removed code).
+$headers = Get-ChildItem -Path $SRC -Filter *.h -Recurse -ErrorAction SilentlyContinue
+$newest_header = if ($headers) {
+    ($headers | Measure-Object -Property LastWriteTime -Maximum).Maximum
+} else { [DateTime]::MinValue }
+
 $objects = @()
 $failed = $false
 
@@ -40,8 +50,10 @@ foreach ($src in ($core_sources + $glue_sources)) {
     $obj = "$obj_dir/$name.o"
     $objects += $obj
 
-    # Only recompile if source is newer than object
-    if ((Test-Path $obj) -and ((Get-Item $src).LastWriteTime -le (Get-Item $obj).LastWriteTime)) {
+    # Recompile if the source OR any header is newer than the object.
+    if ((Test-Path $obj) `
+        -and ((Get-Item $src).LastWriteTime -le (Get-Item $obj).LastWriteTime) `
+        -and ($newest_header -le (Get-Item $obj).LastWriteTime)) {
         continue
     }
 
@@ -80,9 +92,3 @@ Write-Host "Undefined symbols (each must be a host export):"
     if ($sym -and $sym -ne "UND") { Write-Host "  $sym" }
 }
 
-# Copy to LittleFS data dir so it's included in firmware flash
-$dest_dir = "..\..\data\lua\apps\Games\GameBoy"
-if (-not (Test-Path $dest_dir)) { New-Item -ItemType Directory $dest_dir | Out-Null }
-Copy-Item $OUT "$dest_dir\gameboy.app.elf" -Force
-Write-Host ""
-Write-Host "Copied to $dest_dir\gameboy.app.elf"

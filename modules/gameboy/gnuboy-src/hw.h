@@ -275,6 +275,44 @@ void gb_hw_write(unsigned a, byte b);
 byte gb_hw_read(unsigned a);
 void gb_hw_vblank(void);
 
+/* ── T-Deck link cable (glue in main_tdeck.c; state in hw.c) ──────────────
+ * Plain statics OUTSIDE gb_t so savestate layout is untouched. With no peer
+ * attached, serial behaves exactly like the old stub (master reads 0xFF). */
+extern int      gb_link_wait;   /* master transfer awaiting SYNC2/SYNC3    */
+extern int      gb_link_slave;  /* slave armed (SC bit7 set, ext clock)    */
+extern int      gb_link_rx_active; /* slave receive mid-transfer: SYNC2 sent, */
+                                /* IRQ deferred GB.serial cycles (match master)*/
+extern unsigned gb_link_clock;  /* our emulated clock, 2MiHz (BGB units)   */
+extern unsigned gb_link_s1_dc;  /* outstanding SYNC1 payload — kept so the */
+extern unsigned gb_link_s1_ts;  /* pair latch can re-stamp + re-send it    */
+unsigned gb_link_last_ts(void); /* timestamp of the last polled event      */
+int  gb_link_cable(void);          /* 1 = peer session (cable present)     */
+int  gb_link_peer_game(void);      /* 1 = peer's game attached (lockstep)  */
+void gb_link_idle(void);           /* 1ms real-time sleep (completion wait)*/
+int  gb_link_should_exit(void);    /* exit chord: breaks blocking waits    */
+void gb_link_send(int cmd, int data_ctrl, unsigned ts);
+int  gb_link_poll(void);           /* ripe events (cmd<<16)|(ctrl<<8)|data */
+void gb_link_pump_ts(void);        /* feed peer clock during frame stalls  */
+int  gb_link_should_stall(void);   /* lockstep window check (frame loop)   */
+void gb_link_service(void);        /* answer a pending SYNC1 (cpu.c)       */
+int  gb_link_xfer_cycles(void);        /* serial transfer duration in cycles      */
+void gb_link_note_role(int is_master); /* serial-role arm; updates the skew (hw.c)*/
+void gb_link_decay_skew(void);         /* clean SYNC2; decays the skew (cpu.c)     */
+/* Link debug log — SD-backed forensics ring (impl in main_tdeck.c). OFF for
+ * release: the trade+battle work is DONE (2026-07-18), and the per-transfer
+ * snprintf + SD flushes added visible lag under heavy load. When off, every
+ * gb_dlog()/gb_dlog_flush() call site compiles to nothing (args not even
+ * evaluated). Flip GBLINK_DEBUG to 1 to bring the whole subsystem back for a
+ * debugging run — no call-site edits needed. */
+#define GBLINK_DEBUG 0
+#if GBLINK_DEBUG
+void gb_dlog(const char* fmt, ...);/* link debug log (PSRAM ring -> SD)    */
+void gb_dlog_flush(void);          /* drain ring to the log file           */
+#else
+#define gb_dlog(...)    ((void)0)
+#define gb_dlog_flush() ((void)0)
+#endif
+
 
 static inline byte readb(unsigned a)
 {

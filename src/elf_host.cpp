@@ -3,10 +3,12 @@
 #include "meshpunk_fs.h"
 #include "meshpunk_sync.h"
 #include "sound.h"
+#include "notify.h"
 #include "tdeck-pins.h"
 #include "ble_companion.h"
 #include "punkmesh.h"
 #include "usb_manager.h"   // usb_pool_alloc/free — dynamic USB driver segments
+#include "tdeck_link.h"    // peer link: gblink veneers + module-exit detach
 
 #include <Arduino.h>
 #include <Ticker.h>
@@ -1060,6 +1062,26 @@ uint32_t host_psram_largest_free(void) {
     return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 }
 
+// T-Deck peer link, gblink service — thin veneers over src/tdeck_link.cpp.
+// Called from the module's Core-0 task; the bridge's rings make them cheap
+// enough for gnuboy's per-instruction-batch polling.
+int host_link_status(void) {
+    return tdeck_link_status();
+}
+
+int host_link_gb_send(int cmd, int data_ctrl, unsigned int ts) {
+    // data_ctrl = (BGB control byte << 8) | data byte; ts = 2MiHz timestamp.
+    return tdeck_link_gb_send((uint8_t)cmd, (uint16_t)data_ctrl, ts) ? 1 : 0;
+}
+
+int host_link_gb_poll(unsigned int* ts_out) {
+    return tdeck_link_gb_poll(ts_out);
+}
+
+int host_link_gb_wait(unsigned int timeout_ms) {
+    return tdeck_link_gb_wait(timeout_ms);
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1115,10 @@ static const elf_symbol_t host_exports[] = {
     { "host_write_file",    (void*)host_write_file },
     { "host_log",           (void*)host_log },
     { "host_check_heap",    (void*)host_check_heap },
+    { "host_link_status",   (void*)host_link_status },
+    { "host_link_gb_send",  (void*)host_link_gb_send },
+    { "host_link_gb_poll",  (void*)host_link_gb_poll },
+    { "host_link_gb_wait",  (void*)host_link_gb_wait },
 
     // C library: stdio
     { "printf",             (void*)printf },
@@ -1506,6 +1532,15 @@ int elf_host_run_pending(void) {
     void* elf_data = host_read_file(path, &elf_size);
     if (!elf_data) {
         SLog.printf("[elf_host] failed to read ELF file: %s\n", path);
+        // Launch failures are otherwise INVISIBLE (Lua is torn down, the app
+        // "just closes") — surface every one through the notification bell.
+        {
+            const char* base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            char msg[160];   // notify.cpp truncates to its slot size anyway
+            snprintf(msg, sizeof(msg), "App launch failed: can't read %s", base);
+            notify_post(msg);
+        }
         s_elf_running = false;
         return -3;
     }
@@ -1608,11 +1643,6 @@ int elf_host_run_pending(void) {
                       heap_caps_check_integrity(MALLOC_CAP_SPIRAM, false) ? "yes" : "NO!");
         SLog.printf("[elf_host] the_mesh at: 0x%08x\n", (uint32_t)the_mesh);
 
-        // Start the Core 1 keyboard sampler so input stays responsive even
-        // while the module pins Core 0 (see elf_input_task_body). Stopped
-        // below before this call returns and loopTask resumes its own scan.
-        elf_input_start();
-
         // Run the module on a dedicated large-stack task pinned to Core 0
         // (the UI core; LVGL is idle and Lua is torn down, so Core 0 is
         // free). The mesh task keeps running on Core 1 the whole time —
@@ -1627,7 +1657,25 @@ int elf_host_run_pending(void) {
         BaseType_t ok = pdFAIL;
         uint32_t stack_used = 0;
         if (done) {
-            for (uint32_t candidate : ELF_TASK_STACK_CANDIDATES) {
+            // Optional per-app floor: "-stackkb N" (from the app's launcher)
+            // appends one final, smaller rung for THIS launch only. Lets a
+            // known-shallow module (GameBoy) fit beside USB host mode without
+            // handing deep-stack modules (Doom) a rung they'd overflow.
+            uint32_t req_stack = 0;
+            for (int i = 0; i < argc - 1; i++) {
+                if (strcmp(argv[i], "-stackkb") == 0) {
+                    int kb = atoi(argv[i + 1]);
+                    if (kb >= 16 && kb <= 64) req_stack = (uint32_t)kb * 1024;
+                }
+            }
+            uint32_t ladder[5];
+            int nladder = 0;
+            for (uint32_t c : ELF_TASK_STACK_CANDIDATES) ladder[nladder++] = c;
+            if (req_stack && req_stack < ladder[nladder - 1])
+                ladder[nladder++] = req_stack;
+
+            for (int ci = 0; ci < nladder; ci++) {
+                uint32_t candidate = ladder[ci];
                 ok = xTaskCreatePinnedToCore(
                     elf_run_task, "elf_run", candidate,
                     &ctx, 1 /* priority == loopTask */, &task, 0 /* Core 0 */);
@@ -1640,6 +1688,13 @@ int elf_host_run_pending(void) {
             }
         }
         if (ok == pdPASS) {
+            // Start the Core 1 keyboard sampler AFTER the big stack landed:
+            // its own ~4KB stack, allocated first, was exactly the margin
+            // that made the 32KB rung fail beside USB host mode (largest
+            // internal block 35KB). Order big-contiguous-first; if the
+            // sampler can't spawn now, elf_input_start falls back to
+            // per-frame polling (input still works).
+            elf_input_start();
             xSemaphoreTake(done, portMAX_DELAY); // wait for module to return
             result = ctx.result;
             SLog.printf("[elf_host] module returned %d\n", result);
@@ -1653,6 +1708,10 @@ int elf_host_run_pending(void) {
         // further cleanup, so its I2C reads can't overlap loopTask's once the
         // firmware's own keyboard scan resumes.
         elf_input_stop();
+        // Peer-link safety: the gameboy module DETACHes its gblink service
+        // itself, but the exit()-longjmp path can skip that — make sure the
+        // peer never sees a ghost game.
+        tdeck_link_gb_send(TDL_GB_DETACH, 0, 0);
         // The pull callback (and the Audio state it reads) lives in module
         // memory; unregister before any of it is freed. Blocks until the
         // mixer is outside the callback. The module normally does this in
@@ -1699,6 +1758,34 @@ int elf_host_run_pending(void) {
 
     SLog.printf("[elf_host] module session done (loaded=%d result=%d)\n",
                 mod != NULL, result);
+
+    // Surface failures through the notification bell — with Lua torn down
+    // during the run, a failed launch otherwise just drops the user back at
+    // the launcher with zero explanation. notify.cpp's ring survives the
+    // teardown by design, so the bell shows this after Lua returns.
+    if (!mod || result != 0) {
+        const char* base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        char msg[160];
+        if (!mod) {
+            snprintf(msg, sizeof(msg),
+                     "App launch failed: %s didn't load (PSRAM largest %uKB)",
+                     base,
+                     (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+        } else if (result == -2) {
+            snprintf(msg, sizeof(msg),
+                     "App launch failed: not enough internal RAM for %s "
+                     "(largest %uKB). USB host mode uses RAM - try Stop USB.",
+                     base,
+                     (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+        } else if (result == -1) {
+            snprintf(msg, sizeof(msg),
+                     "%s exited early (aborted - missing ROM/file?)", base);
+        } else {
+            snprintf(msg, sizeof(msg), "%s exited with error %d", base, result);
+        }
+        notify_post(msg);
+    }
     s_elf_running = false;
     return result;
 }

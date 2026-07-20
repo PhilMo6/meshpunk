@@ -200,10 +200,13 @@ show_page = function(i)
         tool(content, "Next >", lvgl.PCT(31), function()
             show_page(i < #PAGES and i + 1 or 1)
         end)
-        content:Label {
-            text = i .. "/" .. #PAGES .. "  " .. pg.t,
-            w = lvgl.PCT(100), h = 18,
-        }
+        -- Title on its own themed card (readable over wallpaper). Clear just
+        -- CLICKABLE so gridnav skips it (nav pitfall: default Objects are
+        -- focusable).
+        local trow = content:Object { w = lvgl.PCT(100), h = 26, pad_all = 4 }
+        trow:clear_flag(lvgl.FLAG.SCROLLABLE)
+        trow:clear_flag(lvgl.FLAG.CLICKABLE)
+        trow:Label { text = i .. "/" .. #PAGES .. "  " .. pg.t, w = lvgl.PCT(100) }
         -- Body text lives in its own scrollable, focusable wrapper. Gridnav's
         -- SCROLL_FIRST scrolls the FOCUSED CHILD (never the nav container),
         -- so trackball-scrollable text must itself be a focusable scrollable
@@ -212,9 +215,11 @@ show_page = function(i)
         -- moves back out to the buttons. Keep the default SCROLLABLE +
         -- CLICKABLE flags — they are what make this work. Fixed height =
         -- the viewport left below the button + title rows.
+        -- No bg_opa/border overrides: the theme's default CARD style is the
+        -- readable background over wallpaper (and tracks every theme).
         local body = content:Object {
-            w = lvgl.PCT(100), h = H - 78,
-            bg_opa = 0, border_width = 0, pad_all = 0, radius = 0,
+            w = lvgl.PCT(100), h = H - 86,
+            pad_all = 6,
         }
         body:Label { text = pg.b, w = lvgl.PCT(100) }
     end)
@@ -223,7 +228,10 @@ end
 show_contents = function()
     swap_view(function(v)
         local content = new_content(v)
-        content:Label { text = "MeshPunk Guide", w = lvgl.PCT(70), h = 20 }
+        local trow = content:Object { w = lvgl.PCT(70), h = 24, pad_all = 3 }
+        trow:clear_flag(lvgl.FLAG.SCROLLABLE)
+        trow:clear_flag(lvgl.FLAG.CLICKABLE)
+        trow:Label { text = "MeshPunk Guide", w = lvgl.PCT(100) }
         tool(content, "Home", 60, function() apps.go_home() end)
         for i, pg in ipairs(PAGES) do
             local b = content:Button { w = lvgl.PCT(100), h = 26 }
