@@ -1423,6 +1423,28 @@ void sd_spi_release() {
   SPI_UNLOCK();
 }
 
+// Mount (or remount) the SD card and set sd_mounted. Called at boot and by
+// USB drive mode's stop path (usb_msc_dev.cpp) after the PC releases the
+// card. The SPI bus is shared with the TFT (80 MHz) and SX1262, but every
+// device sets its own per-transaction SPISettings, so this clock only
+// applies to SD transfers. 40 MHz cuts a 131KB map-tile read from ~400ms
+// (4 MHz Arduino default) to ~50ms. Probe descending; 4 MHz floor = old
+// behavior.
+bool meshpunk_sd_mount() {
+  static const uint32_t sd_freqs[] = {40000000U, 25000000U, 4000000U};
+  sd_mounted = false;
+  for (uint32_t freq : sd_freqs) {
+    if (SD.begin(BOARD_SDCARD_CS, SPI, freq)) {
+      sd_mounted = true;
+      SLog.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
+      break;
+    }
+    SD.end();
+    SLog.printf("[SD] Mount failed at %lu Hz\n", (unsigned long)freq);
+  }
+  return sd_mounted;
+}
+
 // List dir helper
 void listDir(fs::FS &fs, const char *dirname, int level = 0) {
   File root = fs.open(dirname);
@@ -6217,6 +6239,34 @@ static int lua_gblink_status(lua_State *Ls) {
   return 1;
 }
 
+// ── USB drive mode bindings (usb_msc_dev.cpp; Tools/"USB Drive" app) ────────
+static int lua_usbdrive_start(lua_State *Ls) {
+  lua_pushboolean(Ls, usbdrive_start() ? 1 : 0);
+  return 1;
+}
+static int lua_usbdrive_stop(lua_State *Ls) {
+  usbdrive_stop();
+  return 0;
+}
+static int lua_usbdrive_ping(lua_State *Ls) {
+  usbdrive_ping();
+  return 0;
+}
+static int lua_usbdrive_status(lua_State *Ls) {
+  UsbDriveStatus st;
+  usbdrive_status(&st);
+  lua_newtable(Ls);
+  lua_pushboolean(Ls, st.active);        lua_setfield(Ls, -2, "active");
+  lua_pushboolean(Ls, st.connected);     lua_setfield(Ls, -2, "connected");
+  lua_pushboolean(Ls, st.ejected);       lua_setfield(Ls, -2, "ejected");
+  lua_pushboolean(Ls, st.host_latched);  lua_setfield(Ls, -2, "host_latched");
+  lua_pushinteger(Ls, (lua_Integer)st.reads);  lua_setfield(Ls, -2, "reads");
+  lua_pushinteger(Ls, (lua_Integer)st.writes); lua_setfield(Ls, -2, "writes");
+  lua_pushnumber(Ls, (lua_Number)st.bytes);    lua_setfield(Ls, -2, "bytes");
+  lua_pushstring(Ls, st.fail ? st.fail : "");  lua_setfield(Ls, -2, "fail");
+  return 1;
+}
+
 void setupLuaVGL() {
   // (Runtime TTF fonts are initialized in luaBringUp(), BEFORE the Lua arena —
   // the ~430KB buffers must land below the gap, not inside it. See luaBringUp.)
@@ -6241,6 +6291,12 @@ void setupLuaVGL() {
 
   // T-Deck peer link (gblink)
   lua_register(L, "_gblink_status", lua_gblink_status);
+
+  // USB drive mode (share the SD card with a PC)
+  lua_register(L, "_usbdrive_start", lua_usbdrive_start);
+  lua_register(L, "_usbdrive_stop", lua_usbdrive_stop);
+  lua_register(L, "_usbdrive_ping", lua_usbdrive_ping);
+  lua_register(L, "_usbdrive_status", lua_usbdrive_status);
 
   // Register WiFi functions
   lua_register(L, "_wifi_connect", lua_wifi_connect);
@@ -7981,21 +8037,7 @@ void setup() {
 
   // Initialize SD card for persistent mesh data (survives LittleFS reflash)
   SLog.println("===== SD CARD INIT =====");
-
-  // The SPI bus is shared with the TFT (80 MHz) and SX1262, but every device
-  // sets its own per-transaction SPISettings, so this clock only applies to SD
-  // transfers. 40 MHz cuts a 131KB map-tile read from ~400ms (4 MHz Arduino
-  // default) to ~50ms. Probe descending; 4 MHz floor = old behavior.
-  static const uint32_t sd_freqs[] = {40000000U, 25000000U, 4000000U};
-  for (uint32_t freq : sd_freqs) {
-    if (SD.begin(BOARD_SDCARD_CS, SPI, freq)) {
-      sd_mounted = true;
-      SLog.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
-      break;
-    }
-    SD.end();
-    SLog.printf("[SD] Mount failed at %lu Hz\n", (unsigned long)freq);
-  }
+  meshpunk_sd_mount();
 
   if (sd_mounted) {
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
@@ -8437,6 +8479,10 @@ void loop() {
 
   // Alt+backspace home chord (same flag pattern).
   dispatch_home_shortcut();
+
+  // USB drive mode watchdog: force-stops a session when the Tools/"USB
+  // Drive" app stops pinging (any teardown path). Cheap no-op when idle.
+  usbdrive_tick();
 
   // Incremental message/routing retention sweep (flagged on a new-day record or
   // at boot). One file per iteration; cheap no-op when nothing is due.

@@ -36,8 +36,8 @@ static void mesh_task_body(void *param) {
     // here. Runs before the paused check so an in-flight blink still finishes.
     notify_tick();
 
-    // Pause (set by tdeck_link.cpp while a GameBoy link session is live —
-    // cable session + local game): skip all dispatcher work so the link has
+    // Pause (set during a GameBoy link session or a USB drive session — see
+    // meshpunk_sync.h): skip all dispatcher work so the owner has
     // the SPI bus and Core 1 to itself. Everything stays in memory; the RTC
     // still ticks (VolatileRTCClock is delta-based, so a tick here keeps
     // device time live for GPS/notify stamps instead of catching up in one

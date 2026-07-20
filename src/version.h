@@ -23,7 +23,11 @@
 //                  + _emoji_popup_insert, alt+mic insert popup —
 //                  Settings/Emoji store app), alt+backspace home chord
 //                  (documented by the Read Me store app)
-#define MESHPUNK_FW_API 2
+//   3  2026-07-19  unreleased since the v0.2.7 tag (which shipped level 2):
+//                  USB drive mode (_usbdrive_* bindings, usb_msc_dev.cpp —
+//                  Tools/"USB Drive" store app) + apps.set_on_close /
+//                  apps.close_all_backgrounds in lib/apps.lua
+#define MESHPUNK_FW_API 3
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:

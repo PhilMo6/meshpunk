@@ -192,9 +192,13 @@ void radio_apply_tx_power(int8_t dbm);
 bool meshpunk_set_clock(uint8_t tier, uint32_t epoch, const char* src);
 
 // When true, mesh_task pauses its loop body (radio/BLE processing).
-// Set by tdeck_link.cpp while a GameBoy link session is live (cable session
-// + local game) so the link has the SPI bus and Core 1 to itself; cleared
-// automatically on detach/cable-pull/session death.
+// Two writers, mutually exclusive by construction (no arbitration needed):
+//   tdeck_link.cpp  while a GameBoy link session is live (cable session +
+//                   local game); cleared on detach/cable-pull/session death.
+//   usb_msc_dev.cpp while the SD card is exposed to a PC over USB MSC. A
+//                   drive session requires the USB Drive app foreground (no
+//                   game running, so no link session), and closing that app
+//                   stops the session before anything else can launch.
 extern volatile bool mesh_task_paused;
 
 #endif

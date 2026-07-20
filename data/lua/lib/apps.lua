@@ -231,6 +231,17 @@ end
 function M.set_root(obj)
     M._screen = obj
     M._timers = {}
+    M._on_close = nil
+end
+
+-- Register a cleanup callback for the CURRENT foreground app. go_home() (and
+-- therefore the home chord) invokes it exactly once, before teardown, then
+-- clears it; set_root also clears it, so a stale callback never outlives its
+-- app. For cleanup that must survive a full Lua teardown (ELF launch), use a
+-- background contract or a C-side mechanism instead — this hook only covers
+-- Lua-side close paths.
+function M.set_on_close(fn)
+    M._on_close = fn
 end
 
 -- Create a screen-owning root, already registered, and hand it back. This is
@@ -375,6 +386,15 @@ function M.close_background(key)
     M._background[key] = nil
 end
 
+-- Close every background contract (used by modes that need exclusive device
+-- ownership, e.g. USB drive mode stopping Music before the SD card is handed
+-- to a PC). Keys are collected first: close_background mutates the registry.
+function M.close_all_backgrounds()
+    local keys = {}
+    for key in pairs(M._background) do keys[#keys + 1] = key end
+    for _, key in ipairs(keys) do M.close_background(key) end
+end
+
 -- ── Teardown + navigation ───────────────────────────────────────────────────
 -- Tear down a (possibly large) view WITHOUT a watchdog-tripping synchronous
 -- delete. A view whose object count scales with data (e.g. a few hundred contact
@@ -447,6 +467,11 @@ end
 function M.go_home()
     if M._busy then return end
     M._busy = true
+    if M._on_close then
+        local fn = M._on_close
+        M._on_close = nil
+        pcall(fn)
+    end
     M.clear_current()
     _nav_clear()
     local scr, timers = M._screen, M._timers

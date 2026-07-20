@@ -397,7 +397,8 @@ static void dyn_scan_and_load(const IfTriple* triples, int ntriples) {
 // ── PHY restore (RTC-domain; survives warm reset) ───────────────────────────
 // Hand-inlined usb_phy_ll_int_jtag_enable() — hal/usb_phy_ll.h can't be
 // included from C++ (an unrelated inline copies a volatile struct).
-static void restore_serial_jtag_phy() {
+// Non-static: usb_msc_dev.cpp calls it when a drive-mode session ends.
+void restore_serial_jtag_phy() {
     USB_SERIAL_JTAG.conf0.phy_sel           = 0;
     USB_SERIAL_JTAG.conf0.pad_pull_override = 0;
     USB_SERIAL_JTAG.conf0.dp_pullup         = 1;
@@ -1131,6 +1132,14 @@ void usb_manager_init(void (*prefs_save_fn)()) {
 
 bool usb_manager_start() {
     if (s_running) return true;
+
+    // The OTG device stack (USB drive mode) has no uninstall in this TinyUSB;
+    // once it has run, the OTG controller can't be handed to the host library
+    // until a reboot. Drive mode refuses while host runs (usb_msc_dev.cpp).
+    if (usbdrive_used_this_boot()) {
+        ulog("host unavailable: USB drive mode was used (restart required)");
+        return false;
+    }
 
     if (!usbaud_session_reset()) {
         ulog("sink alloc failed (no PSRAM)");

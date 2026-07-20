@@ -108,3 +108,35 @@ bool usb_audio_pref_get();                        // route audio to USB (default
 void usb_audio_pref_set(bool on);
 bool usb_speaker_pref_get();                      // speaker stays on while routed (default off)
 void usb_speaker_pref_set(bool on);
+
+// ── USB drive mode: expose the SD card to a PC over MSC (usb_msc_dev.cpp) ────
+// The DEVICE-mode counterpart of everything above: the OTG port becomes a
+// thumb drive backed by the SD card's raw sectors. While a session is active
+// the firmware treats the card as absent (sd_mounted=false gates every FS
+// path) and the mesh is paused (mesh_task_paused) so nothing writes the
+// volume the PC owns. Serial-JTAG is dead for the duration (OTG owns the
+// pins), same as host mode.
+//
+// TinyUSB has no device-stack uninstall: after the first start, host mode is
+// unavailable until reboot (usb_manager_start refuses; see
+// usbdrive_used_this_boot). Sessions after the first reconnect the resident
+// stack. Driven by the Tools/"USB Drive" app through the _usbdrive_* Lua
+// bindings (main.cpp); the app must call usbdrive_ping() while alive —
+// usbdrive_tick() (from loop()) force-stops a session ~3s after pings stop,
+// so a session can't outlive its UI through any teardown path.
+bool usbdrive_start(void);              // false = refused; reason in status
+void usbdrive_stop(void);
+bool usbdrive_active(void);
+bool usbdrive_used_this_boot(void);
+void usbdrive_ping(void);
+void usbdrive_tick(void);
+struct UsbDriveStatus {
+    bool     active;
+    bool     connected;      // enumerated + mounted by a PC right now
+    bool     ejected;        // PC issued a stop/eject since session start
+    bool     host_latched;   // drive mode used: host mode needs a reboot
+    uint32_t reads, writes;  // sector counts this session
+    uint64_t bytes;          // total transferred this session
+    const char* fail;        // last start-refusal reason ("" = none)
+};
+void usbdrive_status(UsbDriveStatus* out);

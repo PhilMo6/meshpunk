@@ -48,3 +48,8 @@ int  usbaud_iso_busy(void);        // in-flight ISO count (guard-begin fallback)
 
 // ── MSC internals the core bridge needs (usb_drv_msc.cpp) ───────────────────
 double usbmsc_capacity_mb(void);   // 0 when no unit is ready
+
+// ── Shared with device-mode drive sessions (usb_msc_dev.cpp) ────────────────
+// Muxes the USB pads back to the Serial-JTAG peripheral (defined in
+// usb_core.cpp; used by both the host-stop path and drive-mode stop).
+void restore_serial_jtag_phy(void);
