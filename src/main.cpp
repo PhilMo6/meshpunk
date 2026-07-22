@@ -1072,7 +1072,7 @@ void gps_sync_poll() {
 
     if (now - gps_last_stats_ms >= GPS_STATS_INTERVAL_MS) {
       gps_last_stats_ms = now;
-      gps_print_stats("loc-hunt");
+      // gps_print_stats("loc-hunt");
     }
 
     bool no_sky   = (now - gps_sky_ok_ms >= GPS_NO_SKY_LOC_ABORT_MS);
@@ -1116,7 +1116,7 @@ void gps_sync_poll() {
 
   if (now - gps_last_stats_ms >= GPS_STATS_INTERVAL_MS) {
     gps_last_stats_ms = now;
-    gps_print_stats("stat");
+    // gps_print_stats("stat");
   }
 
   if (gps_tinygps.date.isValid() && gps_tinygps.time.isValid()
@@ -3111,7 +3111,6 @@ static int lua_mesh_import_private_key(lua_State *L) {
 
 static int lua_mesh_generate_identity(lua_State *L) {
   MESH_LOCK();
-  ((StdRNG*)the_mesh->getRNG())->begin(esp_random());
   the_mesh->self_id = mesh::LocalIdentity(the_mesh->getRNG());
   int count = 0;
   while (count < 10 && (the_mesh->self_id.pub_key[0] == 0x00 || the_mesh->self_id.pub_key[0] == 0xFF)) {
@@ -4481,15 +4480,16 @@ static int lua_mesh_get_repeat_status(lua_State *L) {
 
 // ── Persistent message history bridge ────────────────────────────
 
-// Read all stored messages for a channel slot.
-// Usage: local msgs = _mesh_get_channel_messages(0)
+// Read stored messages for a channel slot.
+// Usage: local msgs = _mesh_get_channel_messages(0 [, max_records])
+// max_records omitted/0 = whole log; N = only the newest N records.
 // Returns array of { from, peer, text, timestamp, hops, snr, rssi, direct, is_dm, channel_idx }
+// No MESH_LOCK here: the pusher locks internally just for its channel-name
+// snapshot; the file read + Lua pushes must run unlocked (see punkmesh.h).
 static int lua_mesh_get_channel_messages(lua_State *L) {
   int ch_idx = luaL_checkinteger(L, 1);
-  MESH_LOCK();
-  int n = the_mesh->pushChannelMessagesToLua(L, ch_idx);
-  MESH_UNLOCK();
-  return n;
+  int max_records = (int)luaL_optinteger(L, 2, 0);
+  return the_mesh->pushChannelMessagesToLua(L, ch_idx, max_records);
 }
 
 // _mesh_routing_query(sender_or_nil, since_ts, until_ts) -> array of
@@ -4511,14 +4511,15 @@ static int lua_mesh_routing_senders(lua_State *L) {
   return the_mesh->pushRoutingSenders(L, query, max);
 }
 
-// Read all stored messages for a DM thread.
-// Usage: local msgs = _mesh_get_dm_messages("alice")
+// Read stored messages for a DM thread.
+// Usage: local msgs = _mesh_get_dm_messages("alice" [, max_records])
+// max_records omitted/0 = whole log; N = only the newest N records.
+// No MESH_LOCK: the DM pusher touches no mesh state and the read + Lua
+// pushes must run unlocked (see punkmesh.h).
 static int lua_mesh_get_dm_messages(lua_State *L) {
   const char *peer = luaL_checkstring(L, 1);
-  MESH_LOCK();
-  int n = the_mesh->pushDMMessagesToLua(L, peer);
-  MESH_UNLOCK();
-  return n;
+  int max_records = (int)luaL_optinteger(L, 2, 0);
+  return the_mesh->pushDMMessagesToLua(L, peer, max_records);
 }
 
 // Enumerate all DM thread peer names that have stored messages.
@@ -8199,6 +8200,16 @@ void setup() {
 
   delay(100);
 
+  SLog.println(F("===== MESHCORE INIT ====="));
+  // fast_rng stays unseeded: StdRNG wraps Arduino ::random(), which reads the
+  // esp_random() hardware TRNG until randomSeed() is called — seeding would
+  // permanently switch every ::random() in the firmware to srand()-based rand().
+  the_mesh->begin();
+  the_mesh->showWelcome();
+
+  // Radio params come from _prefs, which the_mesh->begin() loads from
+  // /node_prefs; configuring the radio before that point programs the
+  // constructor defaults instead of the saved settings.
   float freq = the_mesh->getFreqPref();
   uint8_t tx_pwr = the_mesh->getTxPowerPref();
   float bw = the_mesh->getBandwidthPref();
@@ -8223,13 +8234,15 @@ void setup() {
   state = radio.setOutputPower(tx_pwr);
   SLog.printf("[RADIO] setOutputPower = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
+  if (the_mesh->_prefs.rx_boost) {
+    SPI_LOCK();
+    radio_driver.setRxBoostedGainMode(true);
+    SPI_UNLOCK();
+    SLog.println("[RADIO] RX Boost restored from prefs: ON");
+  }
+
   state = radio.startReceive();
   SLog.printf("[RADIO] startReceive = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
-
-  SLog.println(F("===== MESHCORE INIT ====="));
-  fast_rng.begin(123456); // fixed seed for testing
-  the_mesh->begin();
-  the_mesh->showWelcome();
 
   // Seed the clock + own-position from the last saved GPS fix until live GPS
   // syncs (or the user manually sets the time). Storage is configured above.
@@ -8240,14 +8253,6 @@ void setup() {
   // Flag a boot catch-up retention sweep; pruneStep runs it incrementally from
   // loop() once the clock is valid (seeded above, or after the first GPS fix).
   the_mesh->_prune_due = true;
-
-  // Apply RX boost from prefs (loaded in the_mesh->begin())
-  if (the_mesh->_prefs.rx_boost) {
-    SPI_LOCK();
-    radio_driver.setRxBoostedGainMode(true);
-    SPI_UNLOCK();
-    SLog.println("[RADIO] RX Boost restored from prefs: ON");
-  }
 
   SLog.printf("[MESH] Node name: %s\n", the_mesh->_prefs.node_name);
   SLog.printf("[MESH] Freq pref: %.3f MHz\n", the_mesh->_prefs.freq);
