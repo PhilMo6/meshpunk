@@ -2915,7 +2915,13 @@ static void parse_msg_line(char* line, StoredMsg& m) {
     }
 }
 
-static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath) {
+// max_records 0 = read everything; N > 0 = only the newest N records reach Lua
+// (count-then-skip: pass 1 counts "---" terminators, pass 2 skips the surplus
+// records without parsing). Materializing a whole multi-thousand-record log as
+// Lua tables can exceed the Lua arena and silently spill into the shared PSRAM
+// heap (lua_spill), fragmenting it — the tail window keeps the transient bounded.
+static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath,
+                              int max_records) {
     lua_newtable(L);
     int msgs_idx = lua_gettop(L);
     if (!storage) return 1;
@@ -2929,6 +2935,26 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
     if (!f) {
         if (is_sd) sd_spi_release();
         return 1;
+    }
+
+    // Pass 1 (only when windowing): count complete records, then rewind. Uses
+    // the same terminator test as the parse pass below, so count and skip can
+    // never disagree on what a record boundary is. No parsing, no Lua here.
+    int skip = 0;
+    if (max_records > 0) {
+        int total = 0, clc = 0, clen;
+        char cline[8];   // terminator detection only; longer lines report >3 anyway
+        BlockLineReader cr(&f);
+        while ((clen = cr.next(cline, sizeof(cline))) >= 0) {
+            if (is_sd && ++clc % 100 == 0) {
+                sd_spi_release();
+                vTaskDelay(1);
+                sd_spi_take();
+            }
+            if (clen == 3 && cline[0] == '-' && cline[1] == '-' && cline[2] == '-') total++;
+        }
+        if (total > max_records) skip = total - max_records;
+        f.seek(0);
     }
 
     // Only build the hash-hex -> message lookup (used to join the .paths sidecar
@@ -2948,7 +2974,7 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
     memset(&m, 0, sizeof(m));
     char line[256];
 
-    BlockLineReader lr(&f);
+    BlockLineReader lr(&f);   // fresh reader: pass 1 left its buffer stale
     int len;
     while ((len = lr.next(line, sizeof(line))) >= 0) {
         if (len == 0) continue;
@@ -2958,6 +2984,14 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
             sd_spi_release();
             vTaskDelay(1);
             sd_spi_take();
+        }
+
+        // Tail window: fast-skip the surplus head records (no parsing). The
+        // terminator that takes skip to 0 ends the last skipped record, so
+        // parsing starts at the first line of the first kept record.
+        if (skip > 0) {
+            if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') skip--;
+            continue;
         }
 
         if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
@@ -3025,15 +3059,26 @@ static int read_msg_text_file(lua_State* L, fs::FS* storage, const String& fpath
     return 1;
 }
 
-int PunkMesh::pushChannelMessagesToLua(lua_State* L, int channel_idx) {
+// Takes MESH_LOCK internally ONLY for the channel-name snapshot — call WITHOUT
+// the lock held. The file read + Lua pushes run unlocked: a lua_push longjmp on
+// true OOM must not strand the lock (mesh-task deadlock), and a multi-second
+// read of a large log must not stall the radio.
+int PunkMesh::pushChannelMessagesToLua(lua_State* L, int channel_idx, int max_records) {
     if (channel_idx < 0) { lua_newtable(L); return 1; }
+    MESH_LOCK();
     String ch_name = channel_name_for_idx(*this, channel_idx);
-    return read_msg_text_file(L, _storage, channel_msg_path(_storage_prefix, ch_name.c_str()));
+    MESH_UNLOCK();
+    return read_msg_text_file(L, _storage,
+                              channel_msg_path(_storage_prefix, ch_name.c_str()),
+                              max_records);
 }
 
-int PunkMesh::pushDMMessagesToLua(lua_State* L, const char* peer) {
+// No lock at all: the DM path is pure string work (no mesh state), and the
+// read + pushes must run unlocked for the same reasons as the channel variant.
+int PunkMesh::pushDMMessagesToLua(lua_State* L, const char* peer, int max_records) {
     if (!peer || peer[0] == '\0') { lua_newtable(L); return 1; }
-    return read_msg_text_file(L, _storage, dm_msg_path(_storage_prefix, peer));
+    return read_msg_text_file(L, _storage, dm_msg_path(_storage_prefix, peer),
+                              max_records);
 }
 
 // Enumerate dm_*.log files and return an array of the real peer names
@@ -5170,8 +5215,8 @@ void PunkMesh::begin()
     // If no saved identity, generate a new one
     if (!identity_loaded) {
         SLog.println("[STORAGE] Generating new identity...");
-        ((StdRNG *)getRNG())->begin(esp_random());
-
+        // Key material comes from esp_random() via the unseeded StdRNG;
+        // StdRNG::begin()/randomSeed() would switch ::random() to software rand().
         self_id = mesh::LocalIdentity(getRNG());
         int count = 0;
         while (count < 10 && (self_id.pub_key[0] == 0x00 || self_id.pub_key[0] == 0xFF)) {

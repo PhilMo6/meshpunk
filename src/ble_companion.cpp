@@ -742,7 +742,6 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
   } else if (cmd_frame[0] == CMD_GENERATE_IDENTITY && len >= 9
              && memcmp(&cmd_frame[1], "generate", 8) == 0) {
-    ((StdRNG*)_mesh.getRNG())->begin(esp_random());
     _mesh.self_id = mesh::LocalIdentity(_mesh.getRNG());
     int count = 0;
     while (count < 10 && (_mesh.self_id.pub_key[0] == 0x00 || _mesh.self_id.pub_key[0] == 0xFF)) {

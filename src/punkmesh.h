@@ -406,8 +406,14 @@ public:
   // Read paths. Each pushes a Lua table (array of message tables) and
   // returns 1 (the number of Lua stack values). Safe to call even if
   // the file doesn't exist — you get an empty table.
-  int pushChannelMessagesToLua(lua_State* L, int channel_idx);
-  int pushDMMessagesToLua(lua_State* L, const char* peer);
+  // max_records: 0 = whole log; N = only the newest N records (two-pass
+  // count-then-skip, so a multi-thousand-record log never materializes as a
+  // whole-file Lua transient). Lock contract: pushChannelMessagesToLua takes
+  // MESH_LOCK internally just for the channel-name snapshot and
+  // pushDMMessagesToLua takes none — call both WITHOUT the lock held (the
+  // unlocked read keeps a lua_push OOM longjmp from stranding the mesh task).
+  int pushChannelMessagesToLua(lua_State* L, int channel_idx, int max_records = 0);
+  int pushDMMessagesToLua(lua_State* L, const char* peer, int max_records = 0);
   int pushDMThreadNamesToLua(lua_State* L);
   // One {kind, idx/name, count, last} summary entry per stored conversation
   // (count + last record only — no full histories). Takes MESH_LOCK internally

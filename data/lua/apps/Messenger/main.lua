@@ -946,7 +946,11 @@ show_inbox = function()
 end
 
 -- ── CHAT VIEW ───────────────────────────────────────────────────
-show_chat = function(target)
+-- build_chat builds the chat view: messages:openThread loads the thread from
+-- disk and the recent bubbles render, which blocks LVGL until done. show_chat
+-- (below) shows the loading popup, then runs build_chat on the next timer tick
+-- so the popup is painted before that blocking work starts.
+local function build_chat(target)
     clear_view()
     current_mode = "chat"
     chat_target = target
@@ -1419,6 +1423,19 @@ show_chat = function(target)
     local send_btn = body:Button { w = lvgl.SIZE_CONTENT, h = 34 }
     send_btn:Label { text = "Send", align = lvgl.ALIGN.CENTER }
     send_btn:onevent(lvgl.EVENT.RELEASED, do_send)
+end
+
+-- Entry point for opening any chat (channel, DM, room, repeater). Shows the
+-- loading popup, then runs build_chat one tick later (step 2) so the popup is
+-- painted before build_chat's blocking disk read starts.
+show_chat = function(target)
+    local step = 0
+    utils.loadingPopUpAdd(nil, utils.emojiText((target and target.name) or "chat"), function()
+        step = step + 1
+        if step == 1 then return false end   -- let the popup paint first
+        pcall(build_chat, target)
+        return true
+    end)
 end
 
 -- ── MY NODE CARD ────────────────────────────────────────────────
@@ -1955,6 +1972,10 @@ end
 show_contacts = function()
     clear_view()
     current_mode = "contacts"
+    -- Fresh row map: clear_view already deleted the old rows' LVGL objects;
+    -- dropping the stale userdata refs here lets them GC (entries for names
+    -- filtered out of the new build would otherwise accumulate forever).
+    contact_rows = {}
     set_header("Contacts", "Contacts: " .. _mesh_get_num_contacts())
 
     -- Controls live in the gridnav body; rows live in a CLICK_FOCUSABLE scroll
