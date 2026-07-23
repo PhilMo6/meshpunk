@@ -27,7 +27,11 @@
 //                  USB drive mode (_usbdrive_* bindings, usb_msc_dev.cpp —
 //                  Tools/"USB Drive" store app) + apps.set_on_close /
 //                  apps.close_all_backgrounds in lib/apps.lua
-#define MESHPUNK_FW_API 3
+//   4  2026-07-22  unreleased since the v0.2.8 tag (which shipped level 3):
+//                  module worker tasks (host_spawn_task / host_task_join ELF
+//                  exports, session-cleanup force-delete — NGPC Core-1
+//                  render worker)
+#define MESHPUNK_FW_API 4
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:
