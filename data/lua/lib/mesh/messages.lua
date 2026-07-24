@@ -108,26 +108,17 @@ end
 -- chats keep their historical no-bucket behavior (live view only).
 function M:openThread(target)
     M:closeThread()
-    -- The cap makes C read only the newest records — without it the whole
-    -- days-retained log (thousands of records on a busy channel) materializes
-    -- as Lua tables before trim_list runs, overflowing the arena into the
-    -- shared PSRAM heap. Older firmware ignores the extra argument.
+    -- No in-RAM bucket is loaded: the chat view pages its history straight from
+    -- the log file, windowed and bounded (see the Messenger's build_chat, which
+    -- calls _mesh_chat_page_channel/_dm). A busy thread never materializes as Lua
+    -- tables. The marker only records which thread is open, so live dispatch's
+    -- bucket-append (guarded by `if list then`) stays a no-op while it's up.
     if target.type == "channel" then
-        local ok, list = pcall(_mesh_get_channel_messages, target.idx, HIST_CAP + HIST_SLACK)
-        if ok and type(list) == "table" then
-            trim_list(list)   -- covers records appended mid-read (cap is soft there)
-            M.__channel_history[target.idx] = list
-        end
         M.__open_thread = { kind = "channel", key = target.idx }
     elseif target.type == "dm" or target.type == "room" or target.type == "repeater" then
-        -- Rooms and repeaters persist in the same DM store, keyed by the
-        -- server contact's name (posts carry the author in msg.from; CLI
-        -- replies come from the repeater itself).
-        local ok, list = pcall(_mesh_get_dm_messages, target.name, HIST_CAP + HIST_SLACK)
-        if ok and type(list) == "table" then
-            trim_list(list)
-            M.__dm_threads[target.name] = list
-        end
+        -- Rooms and repeaters persist in the same DM store, keyed by the server
+        -- contact's name (posts carry the author in msg.from; CLI replies come
+        -- from the repeater itself).
         M.__open_thread = { kind = "dm", key = target.name }
     end
 end

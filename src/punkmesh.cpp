@@ -3555,6 +3555,146 @@ int PunkMesh::readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32
     return count;
 }
 
+// ── Chat pager (Messenger sliding-window scroll) ─────────────────────────────
+// Pages a conversation log by BYTE OFFSET so the chat view can hold a bounded
+// window of message bubbles and slide it as the user scrolls — the whole thread
+// never materializes in Lua. Records are variable-length ("key=value\n..\n---\n"),
+// so forward paging is O(1) from an offset but backward paging must locate the
+// start of the Nth record before a cursor via a forward scan (chat_find_back_start).
+#define CHAT_PAGE_MAX 64   // ring/clamp bound for `count` (a page is ~20)
+
+// Start offset of the `count`-th complete record before byte `end_off` (0 = fewer
+// than `count` records precede it, so start at the file head). Scans from 0 with a
+// ring of record-start offsets; same "---" terminator test as the parser.
+static uint32_t chat_find_back_start(File& f, bool is_sd, uint32_t end_off, int count) {
+    if (end_off == 0 || count < 1) return 0;
+    if (count > CHAT_PAGE_MAX) count = CHAT_PAGE_MAX;
+    f.seek(0);
+    CountingLineReader lr(&f, 0);
+    uint32_t ring[CHAT_PAGE_MAX];
+    int rn = 0, rhead = 0;
+    uint32_t rec_start = 0;
+    char line[256];
+    int len, lc = 0;
+    while ((len = lr.next(line, sizeof(line))) >= 0) {
+        if (is_sd && ++lc % 100 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+            uint32_t rec_end = lr.consumed;
+            if (rec_end > end_off) break;         // this record isn't before end_off
+            ring[rhead] = rec_start;
+            rhead = (rhead + 1) % count;
+            if (rn < count) rn++;
+            rec_start = rec_end;                  // next record starts past this "---"
+            if (rec_end >= end_off) break;        // reached the boundary exactly
+        }
+    }
+    if (rn < count) return 0;                     // fewer than count records: read from head
+    return ring[rhead];                           // full ring: rhead is the oldest entry
+}
+
+// Read up to `count` complete records forward from `start_off`, pushing each as a
+// msg table (annotated off0/off1) into the array at stack index `list_idx`. Stops
+// early if a record ends past `limit_off` (0 = read to EOF). *idx is the running
+// 1-based array index. Caller holds the SD lock.
+static void chat_read_forward(lua_State* L, int list_idx, int* idx, File& f, bool is_sd,
+                              uint32_t start_off, int count, uint32_t limit_off) {
+    if (!f.seek(start_off)) return;
+    CountingLineReader lr(&f, start_off);
+    StoredMsg m;
+    memset(&m, 0, sizeof(m));
+    uint32_t rec_start = start_off;
+    char line[256];
+    int len, lc = 0, got = 0;
+    while (got < count && (len = lr.next(line, sizeof(line))) >= 0) {
+        if (is_sd && ++lc % 100 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+            uint32_t rec_end = lr.consumed;
+            if (limit_off && rec_end > limit_off) break;   // past the requested window
+            push_stored_msg_table(L, m);                   // msgtbl on top
+            lua_pushinteger(L, (lua_Integer)rec_start); lua_setfield(L, -2, "off0");
+            lua_pushinteger(L, (lua_Integer)rec_end);   lua_setfield(L, -2, "off1");
+            lua_rawseti(L, list_idx, (*idx)++);
+            memset(&m, 0, sizeof(m));
+            rec_start = rec_end;
+            got++;
+            continue;
+        }
+        parse_msg_line(line, m);
+    }
+}
+
+// mode 0 tail (newest count) / 1 older (count before cursor) / 2 newer (from cursor).
+// Pushes ONE table { list = { <msg w/ off0,off1>, ... }, size = <file bytes> }.
+static int read_chat_page(lua_State* L, fs::FS* storage, const String& fpath,
+                          int mode, uint32_t cursor, int count) {
+    if (count < 1) count = 1;
+    if (count > CHAT_PAGE_MAX) count = CHAT_PAGE_MAX;
+
+    lua_newtable(L);                       // list (filled below, index-stable)
+    int list_idx = lua_gettop(L);
+    int idx = 1;
+    uint32_t fsize = 0;
+
+    if (storage) {
+        bool is_sd = (storage != &LittleFS);
+        if (is_sd) sd_spi_take();
+        if (storage->exists(fpath.c_str())) {
+            File f = storage->open(fpath.c_str(), "r");
+            if (f) {
+                fsize = (uint32_t)f.size();
+                uint32_t start_off = 0, limit_off = 0;
+                bool ok = true;
+                if (mode == 1) {                    // older: `count` records before cursor
+                    if (cursor == 0) ok = false;
+                    else { start_off = chat_find_back_start(f, is_sd, cursor, count); limit_off = cursor; }
+                } else if (mode == 2) {             // newer: forward from cursor
+                    if (cursor >= fsize) ok = false;
+                    else start_off = cursor;
+                } else {                            // tail: newest `count`
+                    start_off = chat_find_back_start(f, is_sd, fsize, count);
+                }
+                if (ok) chat_read_forward(L, list_idx, &idx, f, is_sd, start_off, count, limit_off);
+                f.close();
+            }
+        }
+        if (is_sd) sd_spi_release();
+    }
+
+    lua_newtable(L);                       // result
+    lua_pushvalue(L, list_idx);
+    lua_setfield(L, -2, "list");
+    lua_pushinteger(L, (lua_Integer)fsize);
+    lua_setfield(L, -2, "size");
+    lua_remove(L, list_idx);               // drop the bare list; leave result on top
+    return 1;
+}
+
+static int push_empty_page(lua_State* L) {
+    lua_newtable(L);                       // result
+    lua_newtable(L); lua_setfield(L, -2, "list");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "size");
+    return 1;
+}
+
+// Lock contract mirrors pushChannelMessagesToLua: MESH_LOCK only for the
+// channel-name snapshot; the file read + Lua pushes run unlocked.
+int PunkMesh::pushChatPageChannel(lua_State* L, int channel_idx, int mode,
+                                  uint32_t cursor, int count) {
+    if (channel_idx < 0) return push_empty_page(L);
+    MESH_LOCK();
+    String ch_name = channel_name_for_idx(*this, channel_idx);
+    MESH_UNLOCK();
+    return read_chat_page(L, _storage, channel_msg_path(_storage_prefix, ch_name.c_str()),
+                          mode, cursor, count);
+}
+
+// No lock: the DM path is pure string work.
+int PunkMesh::pushChatPageDM(lua_State* L, const char* peer, int mode,
+                             uint32_t cursor, int count) {
+    if (!peer || peer[0] == '\0') return push_empty_page(L);
+    return read_chat_page(L, _storage, dm_msg_path(_storage_prefix, peer), mode, cursor, count);
+}
+
 int PunkMesh::lookupPersistedPaths(lua_State* L, const char* hash_hex,
                                     int channel_idx, const char* peer) {
     lua_newtable(L);
@@ -5090,10 +5230,14 @@ void PunkMesh::checkPendingRepeats() {
     }
 }
 
-int PunkMesh::getRepeatStatus(const uint8_t* hash) {
+int PunkMesh::getRepeatStatus(const uint8_t* hash, int* remaining, int* total) {
+    if (remaining) *remaining = 0;
+    if (total)     *total     = 0;
     for (int i = 0; i < MAX_PENDING_REPEATS; i++) {
         if (_pending_repeats[i].active &&
             memcmp(_pending_repeats[i].pkt_hash, hash, MAX_HASH_SIZE) == 0) {
+            if (remaining) *remaining = _pending_repeats[i].attempts_remaining;
+            if (total)     *total     = _prefs.msg_repeat_max;
             return 1;
         }
     }

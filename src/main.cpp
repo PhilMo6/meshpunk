@@ -1851,6 +1851,11 @@ static void nav_install(NavScope *s, bool preserve_scroll) {
 // Registered under both _nav_clear (back-compat) and _nav_reset.
 static int lua_nav_reset(lua_State *L) {
     (void)L;
+    // Release the messenger's gridnav edge-lock — a full nav teardown means we're
+    // leaving that scope (view swap or app exit); never let the global flag leak
+    // into another app's gridnav. (See lv_gridnav.c MESHPUNK.)
+    extern bool meshpunk_gridnav_edge_lock;
+    meshpunk_gridnav_edge_lock = false;
     flush_pending_gridnav();
     nav_check_valid();
     for (int i = 0; i < nav_depth; i++) {
@@ -4471,11 +4476,17 @@ static int lua_mesh_get_repeat_status(lua_State *L) {
     char hb[3] = { hex[i*2], hex[i*2+1], 0 };
     hash[i] = (uint8_t)strtoul(hb, NULL, 16);
   }
+  int remaining = 0, total = 0;
   MESH_LOCK();
-  int status = the_mesh->getRepeatStatus(hash);
+  int status = the_mesh->getRepeatStatus(hash, &remaining, &total);
   MESH_UNLOCK();
+  // (status, remaining, total): remaining = re-airs still to go, total =
+  // configured max; both 0 unless status==1 (actively repeating). The Messenger
+  // renders "repeating N/M" from these (N = total - remaining + 1).
   lua_pushinteger(L, status);
-  return 1;
+  lua_pushinteger(L, remaining);
+  lua_pushinteger(L, total);
+  return 3;
 }
 
 // ── Persistent message history bridge ────────────────────────────
@@ -4520,6 +4531,27 @@ static int lua_mesh_get_dm_messages(lua_State *L) {
   const char *peer = luaL_checkstring(L, 1);
   int max_records = (int)luaL_optinteger(L, 2, 0);
   return the_mesh->pushDMMessagesToLua(L, peer, max_records);
+}
+
+// Chat pager for the Messenger's windowed scroll (see punkmesh.h).
+// _mesh_chat_page_channel(idx, mode, cursor, count) -> { list = {...}, size = N }
+// _mesh_chat_page_dm(peer, mode, cursor, count)     -> { list = {...}, size = N }
+// mode: 0 tail (newest count) / 1 older (before byte cursor) / 2 newer (from cursor).
+// No MESH_LOCK here: the pushers lock internally only for the channel-name snapshot.
+static int lua_mesh_chat_page_channel(lua_State *L) {
+  int idx = luaL_checkinteger(L, 1);
+  int mode = (int)luaL_optinteger(L, 2, 0);
+  uint32_t cursor = (uint32_t)luaL_optinteger(L, 3, 0);
+  int count = (int)luaL_optinteger(L, 4, 20);
+  return the_mesh->pushChatPageChannel(L, idx, mode, cursor, count);
+}
+
+static int lua_mesh_chat_page_dm(lua_State *L) {
+  const char *peer = luaL_checkstring(L, 1);
+  int mode = (int)luaL_optinteger(L, 2, 0);
+  uint32_t cursor = (uint32_t)luaL_optinteger(L, 3, 0);
+  int count = (int)luaL_optinteger(L, 4, 20);
+  return the_mesh->pushChatPageDM(L, peer, mode, cursor, count);
 }
 
 // Enumerate all DM thread peer names that have stored messages.
@@ -6452,6 +6484,8 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_routing_query", lua_mesh_routing_query);
   lua_register(L, "_mesh_routing_senders", lua_mesh_routing_senders);
   lua_register(L, "_mesh_get_dm_messages", lua_mesh_get_dm_messages);
+  lua_register(L, "_mesh_chat_page_channel", lua_mesh_chat_page_channel);
+  lua_register(L, "_mesh_chat_page_dm", lua_mesh_chat_page_dm);
   lua_register(L, "_mesh_get_dm_threads", lua_mesh_get_dm_threads);
   lua_register(L, "_mesh_get_msg_summaries", lua_mesh_get_msg_summaries);
   lua_register(L, "_mesh_set_max_messages", lua_mesh_set_max_messages);
@@ -7191,6 +7225,29 @@ void setupLuaVGL() {
     return 0;
   });
 
+  // _gridnav_edge_lock(on): when on, gridnav won't walk focus OUT of the current
+  // container at an edge (skips lv_group_focus_prev/next). The messenger sets it
+  // during chat message-select so the trackball stays on the bubbles at the top/
+  // bottom instead of jumping to the Home/Send buttons. See lv_gridnav.c MESHPUNK.
+  lua_register(L, "_gridnav_edge_lock", [](lua_State *L) -> int {
+    extern bool meshpunk_gridnav_edge_lock;
+    meshpunk_gridnav_edge_lock = lua_toboolean(L, 1);
+    return 0;
+  });
+
+  // _touch_pressed() -> bool: is any pointer (touchscreen) indev currently held
+  // down? The messenger uses it to defer chat paging until the finger lifts — a
+  // window mutation mid-touch turns the held press into a spurious bubble click.
+  lua_register(L, "_touch_pressed", [](lua_State *L) -> int {
+    bool pressed = false;
+    for (lv_indev_t *i = lv_indev_get_next(NULL); i; i = lv_indev_get_next(i)) {
+      if (lv_indev_get_type(i) == LV_INDEV_TYPE_POINTER &&
+          lv_indev_get_state(i) == LV_INDEV_STATE_PRESSED) { pressed = true; break; }
+    }
+    lua_pushboolean(L, pressed);
+    return 1;
+  });
+
   // Gridnav flag constants for Lua
   lua_pushinteger(L, LV_GRIDNAV_CTRL_NONE);
   lua_setglobal(L, "GRIDNAV_NONE");
@@ -7432,6 +7489,48 @@ void setupLuaVGL() {
     luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
     if (!lobj || !lobj->obj) return 0;
     lv_obj_move_to_index(lobj->obj, 0);
+    return 0;
+  });
+
+  // _snapshot_take(obj) -> lightuserdata draw_buf (or nil on failure).
+  // Renders the object + children into an ARGB8888 image via the normal draw
+  // pipeline (lv_snapshot_take). The Messenger bakes each chat bubble once and
+  // shows the result as an Image{ src = <this pointer> } so scrolling blits a
+  // finished bitmap instead of re-drawing the bubble's rects+TTF text per frame.
+  // The caller OWNS the returned buffer — free it with _snapshot_free on prune.
+  lua_register(L, "_snapshot_take", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    if (!lobj || !lobj->obj) { lua_pushnil(L); return 1; }
+    lv_draw_buf_t *buf = lv_snapshot_take(lobj->obj, LV_COLOR_FORMAT_ARGB8888);
+    if (!buf) { lua_pushnil(L); return 1; }
+    lua_pushlightuserdata(L, buf);
+    return 1;
+  });
+
+  // _snapshot_free(ptr) -> nil. Destroy a draw_buf returned by _snapshot_take.
+  // Safe on nil / a non-userdata arg (lua_touserdata yields NULL).
+  lua_register(L, "_snapshot_free", [](lua_State *L) -> int {
+    lv_draw_buf_t *buf = (lv_draw_buf_t *)lua_touserdata(L, 1);
+    if (buf) lv_draw_buf_destroy(buf);
+    return 0;
+  });
+
+  // _snapshot_attach_free(obj, buf): free `buf` when `obj` is deleted, via a
+  // C-LEVEL LV_EVENT_DELETE handler. A Lua obj:onevent(DELETE,..) does NOT work
+  // for this: luavgl's own obj_delete_cb runs first on delete and unrefs every
+  // Lua event handler (obj.c), so the Lua one never fires. A C event_cb is not
+  // touched by that cleanup — same pattern luavgl's canvas.c uses to free its
+  // own draw_buf. Fires on EVERY deletion path (prune, clear_all, view teardown),
+  // so it's the single owner of the buffer's lifetime — no leak, no double-free.
+  lua_register(L, "_snapshot_attach_free", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    lv_draw_buf_t *buf = (lv_draw_buf_t *)lua_touserdata(L, 2);
+    if (lobj && lobj->obj && buf) {
+      lv_obj_add_event_cb(lobj->obj, [](lv_event_t *e) {
+        lv_draw_buf_t *b = (lv_draw_buf_t *)lv_event_get_user_data(e);
+        if (b) lv_draw_buf_destroy(b);
+      }, LV_EVENT_DELETE, buf);
+    }
     return 0;
   });
 

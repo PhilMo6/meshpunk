@@ -31,7 +31,17 @@
 //                  module worker tasks (host_spawn_task / host_task_join ELF
 //                  exports, session-cleanup force-delete — NGPC Core-1
 //                  render worker)
-#define MESHPUNK_FW_API 4
+//   5  2026-07-23  NEXT RELEASE (v0.3.0), unreleased since the v0.2.9 tag
+//                  (which shipped level 4): baked-bubble Messenger chat —
+//                  lv_snapshot render (LV_USE_SNAPSHOT + _snapshot_take /
+//                  _snapshot_free / _snapshot_attach_free), disk-paged chat
+//                  window (_mesh_chat_page_channel / _mesh_chat_page_dm +
+//                  the luavgl obj:update_layout patch), counted channel
+//                  repeat-until-heard indicator (3-value _mesh_get_repeat_status
+//                  = status, remaining, total), gridnav edge-lock (lv_gridnav.c
+//                  meshpunk_gridnav_edge_lock + _gridnav_edge_lock binding),
+//                  and _touch_pressed (defer chat paging until touch release)
+#define MESHPUNK_FW_API 5
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:

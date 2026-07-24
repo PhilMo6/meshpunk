@@ -18,6 +18,13 @@
  *      DEFINES
  *********************/
 
+/* MESHPUNK: when true, gridnav will NOT walk focus out of the current container
+ * at an edge — it skips the lv_group_focus_prev/next "escape" so focus stays on
+ * the edge child instead. The messenger sets this while a chat is in message-
+ * select mode so the trackball stays on the bubbles instead of jumping to the
+ * Home/Send buttons at the top/bottom. Toggled from Lua via _gridnav_edge_lock. */
+bool meshpunk_gridnav_edge_lock = false;
+
 /**********************
  *      TYPEDEFS
  **********************/
@@ -159,7 +166,7 @@ static void gridnav_event_cb(lv_event_t * e)
                         if(guess == NULL) guess = find_first_focusable(obj);
                     }
                     else {
-                        lv_group_focus_next(lv_obj_get_group(obj));
+                        if(!meshpunk_gridnav_edge_lock) lv_group_focus_next(lv_obj_get_group(obj));  /* MESHPUNK: don't escape the container at an edge when locked */
                     }
                 }
             }
@@ -179,7 +186,7 @@ static void gridnav_event_cb(lv_event_t * e)
                         if(guess == NULL) guess = find_last_focusable(obj);
                     }
                     else {
-                        lv_group_focus_prev(lv_obj_get_group(obj));
+                        if(!meshpunk_gridnav_edge_lock) lv_group_focus_prev(lv_obj_get_group(obj));  /* MESHPUNK: don't escape the container at an edge when locked */
                     }
                 }
             }
@@ -198,7 +205,7 @@ static void gridnav_event_cb(lv_event_t * e)
                         guess = find_chid(obj, dsc->focused_obj, FIND_FIRST_ROW);
                     }
                     else {
-                        lv_group_focus_next(lv_obj_get_group(obj));
+                        if(!meshpunk_gridnav_edge_lock) lv_group_focus_next(lv_obj_get_group(obj));  /* MESHPUNK: don't escape the container at an edge when locked */
                     }
                 }
             }
@@ -217,7 +224,7 @@ static void gridnav_event_cb(lv_event_t * e)
                         guess = find_chid(obj, dsc->focused_obj, FIND_LAST_ROW);
                     }
                     else {
-                        lv_group_focus_prev(lv_obj_get_group(obj));
+                        if(!meshpunk_gridnav_edge_lock) lv_group_focus_prev(lv_obj_get_group(obj));  /* MESHPUNK: don't escape the container at an edge when locked */
                     }
                 }
             }

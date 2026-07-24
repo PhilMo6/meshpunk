@@ -96,6 +96,7 @@ end
 
 -- ── Helpers ─────────────────────────────────────────────────────
 local function clear_view()
+    pcall(_gridnav_edge_lock, false)  -- release the gridnav edge-lock on any view exit (safety net)
     nav.reset()   -- drop every nav scope (any open popup's too) before the swap
     -- Drop the open chat's history bucket (the chat view is the only view that
     -- loads one, and every way out of it comes through here).
@@ -153,6 +154,16 @@ local function dm_status_text(status, msg)
             return string.format("retry %d/%d", msg.retry_n, msg.retry_total or 0)
         end
         return "retrying"
+    -- Channel repeat-until-heard (no end-to-end ack on a flood): a counted
+    -- "repeating N/M" while re-airing, then heard/not-heard. Set by the repeat
+    -- poll (see run_repeat_poll); DMs never use these states.
+    elseif status == "repeating" then
+        if msg and msg.repeat_n and msg.repeat_total then
+            return string.format("repeating %d/%d", msg.repeat_n, msg.repeat_total)
+        end
+        return "repeating"
+    elseif status == "repeated" then return "repeated"
+    elseif status == "not_heard" then return "not heard"
     else return "sent" end
 end
 
@@ -955,8 +966,9 @@ local function build_chat(target)
     current_mode = "chat"
     chat_target = target
 
-    -- Load THIS conversation's history from disk — the only bucket resident.
-    -- clear_view -> closeThread drops it again on the way out of the chat.
+    -- Mark this thread open (no in-RAM history load — the windowed view below
+    -- pages message records straight from the log file). closeThread clears the
+    -- marker on the way out via clear_view.
     messages:openThread(target)
 
     -- Clear unread for this thread now that it's open. Rooms and repeaters
@@ -1088,22 +1100,42 @@ local function build_chat(target)
     local in_msg_select = false
     local textArea
     local context_menu_open = false
-    local ack_labels = {}  -- own-DM msg -> its header label, for live ack updates
+    -- Live delivery status for own DM/room bubbles (M2). Baked bubbles are images,
+    -- so a status change can't edit a label — it RE-BAKES the one bubble (delete the
+    -- old image + bake a new one in place; old buffer frees via its delete cb).
+    -- status_entries maps the msg table -> its window entry (so an ack finds the
+    -- baked bubble); rebake_dirty is the pending set, coalesced through run_rebake.
+    -- run_rebake is forward-declared here because the 'q' select-exit handler below
+    -- flushes deferred re-bakes through it.
+    local status_entries, rebake_dirty, rebake_scheduled = {}, {}, false
+    local run_rebake
+    -- Channel repeat-until-heard (channels only): own channel sends have no
+    -- end-to-end ack, so their "repeating N/M → repeated / not heard" status is
+    -- POLLED (`_mesh_get_repeat_status(hash)`) rather than pushed. repeat_track
+    -- maps the live-send msg -> its entry; a lazy poll timer (start_repeat_poll)
+    -- runs while any are pending and re-bakes each through the M2 path on change.
+    local repeat_track, repeat_timer_on = {}, false
+    local start_repeat_poll
 
     -- Scroll-aware taps (same fix as the inbox/contacts lists): a touch DRAG
     -- scrolls the chat instead of arming selection or opening a bubble menu.
-    -- The windowed older-message paging is routed through on_settle, since
-    -- luavgl allows only one SCROLL_END handler per object.
-    local page_load_older  -- assigned below, once history/render_msg exist
+    -- The windowed paging (older near the top, newer near the bottom) is routed
+    -- through this one on_settle, since luavgl allows only one SCROLL_END handler
+    -- per object.
+    local on_scroll_settle  -- assigned below, once the window helpers exist
     local bind_msg = scroll_aware_list(msg_list, function()
-        if page_load_older then page_load_older() end
+        if on_scroll_settle then on_scroll_settle() end
     end)
 
     bind_msg(msg_list, function()
         if context_menu_open then return end
         if in_msg_select then return end
         in_msg_select = true
-        nav.push(msg_list, { preserve = true })
+        -- NONE (not the default ROLLOVER) + edge-lock: at the top/bottom bubble the
+        -- trackball STAYS on the edge bubble — it neither wraps to the far end nor
+        -- (via the gridnav edge-lock) walks focus out to the Home/Send buttons.
+        pcall(_gridnav_edge_lock, true)
+        nav.push(msg_list, { flags = nav.NONE, preserve = true })
     end)
 
     msg_list:onevent(lvgl.EVENT.KEY, function()
@@ -1111,15 +1143,24 @@ local function build_chat(target)
         local key = indev:get_key()
         if key == 113 then -- 'q' exits message selection
             in_msg_select = false
+            pcall(_gridnav_edge_lock, false)
             nav.pop()
+            -- Selection suppressed any status re-bakes (never mutate the window mid-
+            -- select); it's safe now, so run whatever queued up.
+            if run_rebake and next(rebake_dirty) and not rebake_scheduled then
+                rebake_scheduled = true
+                apps.add_timer { period = 1, cb = function(t) t:delete(); run_rebake() end }
+            end
         end
     end)
 
-    -- Build one chat bubble (a focusable direct child of msg_list).
-    local function render_msg(msg)
+    -- Build the live bubble (Object + header + body labels) in `parent`. Pure
+    -- content — no interaction flags/handlers; bake_msg wires those onto the
+    -- final object. The delivery status is baked into the header here; a later
+    -- status change re-bakes the whole bubble (see run_rebake / onAck).
+    local function build_bubble(parent, msg)
         local is_me = (msg.from == me)
-
-        local bubble = msg_list:Object {
+        local bubble = parent:Object {
             w = lvgl.PCT(92), h = lvgl.SIZE_CONTENT,
             bg_color = is_me and COL_ME_BG or COL_THEM_BG,
             bg_opa = 255, radius = 6,
@@ -1129,33 +1170,60 @@ local function build_chat(target)
             flex = { flex_direction = "column", flex_wrap = "nowrap" },
         }
         bubble:clear_flag(lvgl.FLAG.SCROLLABLE)
-        bubble:add_flag(lvgl.FLAG.CLICKABLE)
-        bubble:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
-        bubble:set_style({ border_color = COL_FOCUS }, lvgl.STATE.FOCUS_KEY)
 
-        -- Header line: sender + time. Hop count and signal detail (SNR/RSSI)
-        -- live in the long-press info popup, not the bubble.
         local hdr = is_me and "You" or utils.emojiText(msg.from or "?")
         local meta = utils.clockHM(msg.timestamp)
-        -- Live sends carry msg.status (sent/delivered/failed); persisted/received
-        -- messages don't, so they show no delivery word. Room posts are acked
-        -- by the room server, so they track delivery like DMs.
-        local track_status = is_me and (target.type == "dm" or target.type == "room")
-                                   and msg.status ~= nil
+        -- Show a status word on any own message that has one: DMs/rooms carry an
+        -- ack status ("sent"→"delivered"/…); channels get a repeat-until-heard
+        -- status only once the poll sets it (nil until then → no word).
+        local track_status = is_me and msg.status ~= nil
         local head_text = hdr .. "  " .. meta
         if track_status then head_text = head_text .. "  " .. dm_status_text(msg.status, msg) end
-        local head_lbl = bubble:Label {
-            text = head_text,
-            w = lvgl.PCT(100),
+        bubble:Label {
+            text = head_text, w = lvgl.PCT(100),
             text_color = is_me and COL_META or name_color(msg.from),
         }
-        if track_status then ack_labels[msg] = head_lbl end
-
-        local body_lbl = bubble:Label {
-            text = msg.text or "",
-            w = lvgl.PCT(100),
+        bubble:Label {
+            text = msg.text or "", w = lvgl.PCT(100),
             text_color = is_me and COL_ME_TX or COL_THEM_TX,
         }
+        return bubble
+    end
+
+    -- Bake a message: build the live bubble in msg_list (a real flex child, so it
+    -- lays out with the correct PCT width), snapshot it to an ARGB image, delete
+    -- the bubble, and add the focusable image in its place. Build→snapshot→delete
+    -- is one synchronous timer tick, so the transient bubble never draws. NO
+    -- fallback — a nil snapshot (e.g. OOM) prints and returns nil so the failure
+    -- is loud, never papered over with a live bubble.
+    local function bake_msg(msg)
+        local bubble = build_bubble(msg_list, msg)
+        local ok_s, buf = pcall(_snapshot_take, bubble)   -- lays out the bubble
+        -- Read the laid-out bubble size NOW (snapshot updated its layout) — a
+        -- guaranteed source, unlike decoding the draw_buf header afterwards.
+        local bw, bh
+        local okc, bc = pcall(function() return bubble:get_coords() end)
+        if okc and bc and bc.x2 then bw = bc.x2 - bc.x1 + 1; bh = bc.y2 - bc.y1 + 1 end
+        bubble:delete()
+        if not ok_s or not buf then
+            print("[Messenger] snapshot failed (OOM?) for a chat bubble")
+            return nil
+        end
+        -- Create empty, set the draw_buf src via the method (toimgsrc accepts the
+        -- lightuserdata), then pin the object to the bubble's exact size so the
+        -- flex column stacks it correctly (don't rely on lv_image auto-size).
+        local img = msg_list:Image {}
+        img:set_src(buf)
+        if bw and bh and bw > 0 and bh > 0 then img:set { w = bw, h = bh } end
+        -- We own `buf` (the image doesn't free an external src). Free it via a
+        -- C-LEVEL delete handler tied to the image — a Lua onevent(DELETE) does
+        -- NOT fire (luavgl purges Lua event handlers before it runs). This one
+        -- covers EVERY teardown path (prune, clear_all, clear_view) as the single
+        -- owner: no leak, no double-free.
+        pcall(_snapshot_attach_free, img, buf)
+        img:add_flag(lvgl.FLAG.CLICKABLE)
+        img:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+        img:set_style({ border_width = 1, border_color = COL_FOCUS }, lvgl.STATE.FOCUS_KEY)
 
         local function open_msg_menu()
             if context_menu_open then return end
@@ -1163,154 +1231,424 @@ local function build_chat(target)
             show_msg_info(msg, function(m)
                 textArea.text = "@[" .. (m.from or "?") .. "] "
             end, function()
-                -- show_msg_info already nav.pop()'d back to this chat's scope
-                -- (msg_list if we were row-selecting, else the body); just clear
-                -- the menu guard and re-focus the bubble we acted on.
+                -- show_msg_info already nav.pop()'d back to this chat's scope;
+                -- just clear the menu guard and re-focus the image we acted on.
                 context_menu_open = false
-                if in_msg_select then nav.set_focused(bubble) end
+                if in_msg_select then nav.set_focused(img) end
             end)
         end
-
-        bind_msg(bubble, function()
+        bind_msg(img, function()
             if in_msg_select then open_msg_menu() end
         end)
-        bubble:onevent(lvgl.EVENT.LONG_PRESSED, open_msg_menu)
+        img:onevent(lvgl.EVENT.LONG_PRESSED, open_msg_menu)
 
-        -- Repeat status for zero-hop sends we're echoing into the mesh.
-        if msg.hash and msg.hops == 0 then
-            local ok_rs, rs = pcall(_mesh_get_repeat_status, msg.hash)
-            if ok_rs and rs == 1 then
-                local rep_lbl = msg_list:Label {
-                    text = "repeating...", text_color = COL_META,
-                    w = lvgl.PCT(100), h = 14, pad_bottom = 2,
-                }
-                local poll_hash = msg.hash
-                local timer
-                -- Manager-tracked so exiting the app (go_home) tears it down
-                -- immediately — an untracked one would otherwise tick once more
-                -- after teardown (harmless, self-heals via the ok_poll guard
-                -- below, but a wasted poll + error each session).
-                timer = apps.add_timer {
-                    period = 3000,
-                    cb = function()
-                        local ok_poll = pcall(function()
-                            local ok2, st = pcall(_mesh_get_repeat_status, poll_hash)
-                            if not ok2 or st == 0 then
-                                if timer then timer:delete(); timer = nil end
-                                rep_lbl:delete()
-                                return
-                            end
-                            if st == 2 then
-                                rep_lbl.text = "repeated"
-                                if timer then timer:delete(); timer = nil end
-                            elseif st == 3 then
-                                rep_lbl.text = "no echo"
-                                if timer then timer:delete(); timer = nil end
-                            end
-                        end)
-                        if not ok_poll and timer then timer:delete(); timer = nil end
-                    end,
-                }
+        return img
+    end
+
+    -- ── Windowed disk-paged history ─────────────────────────────────────────
+    -- Bubbles are a bounded sliding window over the log FILE (not an in-RAM
+    -- history). Scrolling up pages the next batch of older records in and prunes
+    -- (fully frees) an equal batch off the bottom; scrolling down does the
+    -- reverse. top_off/bot_off are the byte offsets of the window's first/last
+    -- record; file_size is the known EOF. Backing reads: _mesh_chat_page_channel
+    -- / _mesh_chat_page_dm (punkmesh.cpp). Keeps the LVGL object count flat so a
+    -- huge thread can't lag the UI.
+    local bubbles = {}                 -- { {obj, msg, off0, off1}, ... } oldest→newest
+    local top_off, bot_off, file_size = 0, 0, 0
+    local empty_lbl = nil              -- the "no messages" placeholder, if shown
+    local page_scheduled, live_scheduled, own_echo = false, false, nil
+    -- PAGE = records loaded per cycle (and initially); WIN_MAX = hard bubble cap
+    -- (pruning starts past it); EDGE = px-from-edge that triggers a page. Kept
+    -- small to hold the LVGL object count (and so redraw cost) down.
+    local PAGE, WIN_MAX, EDGE = 10, 30, 40
+    local function following() return bot_off >= file_size end
+    local function clear_empty()
+        if empty_lbl then pcall(function() empty_lbl:delete() end); empty_lbl = nil end
+    end
+
+    local function fetch(mode, cursor)   -- mode 0 tail / 1 older / 2 newer
+        local ok, r
+        if target.type == "channel" then
+            ok, r = pcall(_mesh_chat_page_channel, target.idx, mode, cursor or 0, PAGE)
+        else
+            ok, r = pcall(_mesh_chat_page_dm, target.name, mode, cursor or 0, PAGE)
+        end
+        if ok and type(r) == "table" and type(r.list) == "table" then return r end
+        return { list = {}, size = file_size or 0 }
+    end
+
+    -- Own DM/room bubbles carry a live delivery status; remember the entry so an
+    -- ack can re-bake that exact bubble. Disk-loaded records have status=nil and
+    -- are skipped (status isn't persisted — only in-session sends get the live
+    -- word, same as before baking). Own CHANNEL sends have no ack, so instead we
+    -- register the just-sent one (`m._live_send`, set in on_live) for repeat-until-
+    -- heard polling — disk-loaded channel records lack the flag and stay quiet.
+    local function remember_status(entry)
+        local m = entry.msg
+        if m.from ~= me then return end
+        if (target.type == "dm" or target.type == "room") and m.status ~= nil then
+            status_entries[m] = entry
+        elseif target.type == "channel" and m._live_send
+               and m.hash and m.hash ~= "" then
+            status_entries[m] = entry     -- so run_rebake can find it on a status change
+            repeat_track[m] = entry
+            if start_repeat_poll then start_repeat_poll() end
+        end
+    end
+
+    local function add_bottom_off(rec, o0, o1)
+        clear_empty()
+        local img = bake_msg(rec)
+        if not img then return nil end       -- bake failed (printed); skip, no fallback
+        local entry = { obj = img, msg = rec, off0 = o0, off1 = o1 }
+        bubbles[#bubbles + 1] = entry
+        remember_status(entry)
+        return img
+    end
+    local function add_bottom(rec) return add_bottom_off(rec, rec.off0, rec.off1) end
+    local function add_top(rec)
+        clear_empty()
+        local img = bake_msg(rec)
+        if not img then return end           -- bake failed (printed); skip, no fallback
+        img:move_to_index(0)
+        local entry = { obj = img, msg = rec, off0 = rec.off0, off1 = rec.off1 }
+        table.insert(bubbles, 1, entry)
+        remember_status(entry)
+    end
+
+    local function drop(entry)
+        if not entry then return end
+        status_entries[entry.msg] = nil      -- stop tracking a pruned bubble's status
+        rebake_dirty[entry.msg] = nil
+        repeat_track[entry.msg] = nil        -- stop polling a pruned channel send
+        pcall(function() entry.obj:delete() end)   -- DELETE handler frees the baked buffer
+    end
+    -- Prune the given end down to a target count. The `_to` forms let paging
+    -- prune BEFORE it bakes (free-before-alloc): drop the far end to make room,
+    -- so each new baked buffer is allocated into the PSRAM just freed instead of
+    -- pushing the high-water mark up and fragmenting.
+    local function prune_bottom_to(n)
+        while #bubbles > n do drop(table.remove(bubbles)) end
+        if #bubbles > 0 then bot_off = bubbles[#bubbles].off1 end
+    end
+    local function prune_top_to(n)
+        while #bubbles > n do drop(table.remove(bubbles, 1)) end
+        if #bubbles > 0 then top_off = bubbles[1].off0 end
+    end
+    local function prune_bottom() prune_bottom_to(WIN_MAX) end
+    local function prune_top() prune_top_to(WIN_MAX) end
+
+    -- Hold a surviving bubble at its exact on-screen Y after the list mutated so
+    -- the viewport never jumps. update_layout flushes the (otherwise deferred)
+    -- flex layout so the shift is measurable synchronously; get_scroll_top() is
+    -- px hidden above, so hiding st0 + shift keeps the anchor put (signs verified
+    -- against the LVGL source).
+    local function anchor_y(obj)
+        local ok, c = pcall(function() return obj:get_coords() end)
+        return (ok and c and c.y1) or 0
+    end
+    local function reanchor(obj, yb, st0)
+        pcall(function() msg_list:update_layout() end)
+        pcall(function() msg_list:scroll_to({ y = st0 + (anchor_y(obj) - yb), anim = false }) end)
+    end
+
+    -- Tear the whole window down (freeing every bubble + its msg table), used when
+    -- a send jumps back to the newest from a scrolled-up position.
+    local function clear_all()
+        for _, e in ipairs(bubbles) do
+            status_entries[e.msg] = nil
+            rebake_dirty[e.msg] = nil
+            repeat_track[e.msg] = nil
+            pcall(function() e.obj:delete() end)   -- DELETE handler frees the baked buffer
+        end
+        bubbles = {}
+    end
+    -- (Re)load the newest page at the tail; `scroll` snaps the view to the bottom.
+    local function load_tail(scroll)
+        local r = fetch(0, 0)
+        file_size = r.size or 0
+        for i = 1, #r.list do add_bottom(r.list[i]) end
+        if #bubbles > 0 then
+            top_off = bubbles[1].off0
+            bot_off = bubbles[#bubbles].off1
+            if scroll then pcall(function() bubbles[#bubbles].obj:scroll_to_view(false) end) end
+        else
+            top_off, bot_off = 0, 0
+        end
+    end
+
+    local function page_older()
+        if top_off <= 0 or #bubbles == 0 then return end
+        local a = bubbles[1].obj
+        local yb, st0 = anchor_y(a), msg_list:get_scroll_top()
+        local r = fetch(1, top_off)
+        file_size = r.size or file_size
+        if #r.list == 0 then top_off = 0; return end   -- nothing older on disk
+        -- Free-before-alloc: drop the bottom to leave exactly room for the new
+        -- records, THEN bake them onto the top. `a` (current top) survives the
+        -- bottom prune, so it stays a valid anchor.
+        prune_bottom_to(math.max(0, WIN_MAX - #r.list))
+        for i = #r.list, 1, -1 do add_top(r.list[i]) end
+        top_off = bubbles[1].off0
+        reanchor(a, yb, st0)
+    end
+
+    local function page_newer()
+        if following() or #bubbles == 0 then return end
+        local a = bubbles[#bubbles].obj
+        local yb, st0 = anchor_y(a), msg_list:get_scroll_top()
+        local r = fetch(2, bot_off)
+        file_size = r.size or file_size
+        if #r.list == 0 then return end
+        -- Free-before-alloc: drop the top to leave room, THEN bake the new
+        -- records onto the bottom. `a` (current bottom) survives the top prune.
+        prune_top_to(math.max(0, WIN_MAX - #r.list))
+        for i = 1, #r.list do add_bottom(r.list[i]) end
+        bot_off = bubbles[#bubbles].off1
+        reanchor(a, yb, st0)
+    end
+
+    -- ALL window mutation runs from a one-shot timer, never inside an LVGL event
+    -- callback: forcing layout / scrolling / deleting objects mid-dispatch
+    -- re-enters LVGL and corrupts its state (InstrFetchProhibited crash). The
+    -- deferral is visually correct too — the anchor still measures the post-layout
+    -- shift a tick later, so the content the user sees never jumps. `alive` guards
+    -- a timer that fires after the user already navigated out of this chat.
+    local function alive() return current_mode == "chat" and chat_target == target end
+
+    -- Is this bubble the one the trackball is on? Read the LIVE keyboard-focus state
+    -- gridnav maintains (exactly one child carries LV_STATE_FOCUS_KEY).
+    local FOCUS_KEY = lvgl.STATE.FOCUS_KEY
+    local function is_focused(obj)
+        local ok, st = pcall(function() return obj:get_state() end)
+        return ok and st and (st & FOCUS_KEY) ~= 0
+    end
+
+    local function run_page()
+        page_scheduled = false
+        -- The in_msg_select guard is gone so scroll-based paging fires during select
+        -- too. But paging deletes bubbles, and gridnav's CHILD_DELETED handler resets
+        -- focus to the FIRST child on every prune — so the selection jumps to the new
+        -- top, which sits at the edge and re-triggers a load in a loop. Fix: remember
+        -- the focused bubble before paging and restore it after, so the selection
+        -- stays on the message that triggered the load (it survives — paging prunes
+        -- the FAR end from the scrolled edge).
+        if not alive() then return end
+        -- Wait for the finger to lift before mutating the window: a paging delete/add
+        -- during an active touch turns the held press into a spurious bubble click
+        -- (opens the info popup). Re-check shortly until the touch releases.
+        local ok_tp, pressed = pcall(_touch_pressed)
+        if ok_tp and pressed then
+            page_scheduled = true
+            apps.add_timer { period = 30, cb = function(t) t:delete(); run_page() end }
+            return
+        end
+        local keep
+        if in_msg_select then
+            for _, e in ipairs(bubbles) do
+                if is_focused(e.obj) then keep = e; break end
             end
         end
-
-        return bubble
+        if msg_list:get_scroll_top() <= EDGE then
+            page_older()
+        elseif not following() and msg_list:get_scroll_bottom() <= EDGE then
+            page_newer()
+        end
+        if keep and keep.obj then
+            pcall(function() nav.set_focused(keep.obj) end)   -- restore + scroll it into view
+        end
+    end
+    -- Wired into scroll_aware's single SCROLL_END: only SCHEDULE here (no mutation,
+    -- so re-entry from the anchor scroll is harmless).
+    on_scroll_settle = function()
+        if page_scheduled then return end
+        page_scheduled = true
+        apps.add_timer { period = 1, cb = function(t) t:delete(); run_page() end }
     end
 
-    -- Existing messages: the bucket openThread just loaded. Rooms and
-    -- repeaters persist in the DM store keyed by the server's name.
-    local history = {}
-    if target.type == "channel" then
-        history = messages:getChannelHistory(target.idx)
-    else
-        history = messages:getDMThread(target.name)
+    -- Deferred live-traffic handler. Received messages NEVER move the viewport (the
+    -- old scroll_to_view yank is gone); your OWN sends jump to the bottom. Runs off
+    -- an event handler (own sends fire it from a button/key press).
+    local function run_live()
+        live_scheduled = false
+        local echo = own_echo; own_echo = nil
+        if not alive() then return end
+        if in_msg_select then
+            -- Don't mutate the window while trackball-navigating bubbles (a prune/add
+            -- could disturb the active gridnav scope); just note there's more below.
+            if bot_off >= file_size then file_size = bot_off + 1 end
+            return
+        end
+        if echo then
+            -- Own send: jump to the newest (a deliberate action, not a yank).
+            if following() then
+                -- At the tail: append the echo itself so its live delivery status
+                -- keeps updating (remember_status registers it; onAck re-bakes
+                -- it); advance edges.
+                local r = fetch(2, bot_off)
+                file_size = r.size or file_size
+                add_bottom_off(echo, bot_off, math.max(file_size, bot_off))
+                bot_off = file_size
+                prune_top()
+            else
+                -- Scrolled up: rebuild at the tail so it stays a contiguous run
+                -- (the sent message shows without live status).
+                clear_all()
+                load_tail(false)
+            end
+            local last = bubbles[#bubbles]
+            if last then pcall(function() last.obj:scroll_to_view(false) end) end
+        else
+            -- Received: extend the window only if we're sitting at the bottom, and
+            -- even then WITHOUT scrolling (the new bubble rests below the fold; the
+            -- notify melody + unread badge announce it). Otherwise leave the view
+            -- untouched and mark that there's more below so a scroll-down pages it in.
+            if #bubbles == 0 then return end
+            if following() and msg_list:get_scroll_bottom() <= EDGE then
+                local a = bubbles[#bubbles].obj
+                local yb, st0 = anchor_y(a), msg_list:get_scroll_top()
+                local r = fetch(2, bot_off)
+                file_size = r.size or file_size
+                if #r.list > 0 then
+                    for i = 1, #r.list do add_bottom(r.list[i]) end
+                    prune_top()
+                    bot_off = bubbles[#bubbles].off1
+                    reanchor(a, yb, st0)
+                end
+            elseif bot_off >= file_size then
+                file_size = bot_off + 1            -- there's more below now; unblock page_newer
+            end
+        end
+    end
+    -- Callback entry: capture an own-send echo, then schedule (coalesced).
+    local function on_live(msg)
+        if msg.from == me then own_echo = msg; msg._live_send = true end  -- flag for channel repeat tracking
+        if live_scheduled then return end
+        live_scheduled = true
+        apps.add_timer { period = 1, cb = function(t) t:delete(); run_live() end }
     end
 
-    -- Render only the most recent 20 to keep the UI responsive.
-    local last_lbl
-    local start_idx = math.max(1, #history - 19)
-    for i = start_idx, #history do last_lbl = render_msg(history[i]) end
-    if last_lbl then last_lbl:scroll_to_view(false) end
-
-    if #history == 0 then
-        msg_list:Label {
+    -- Initial window: the newest page, opened at the bottom.
+    load_tail(true)
+    if #bubbles == 0 then
+        empty_lbl = msg_list:Label {
             text = "No messages yet — say hello.",
             text_color = COL_META, w = lvgl.PCT(100),
         }
     end
 
-    -- Auto-load older messages when scrolled to top. Routed through
-    -- scroll_aware_list's single SCROLL_END (page_load_older) so it doesn't
-    -- clobber the scroll-suppression handler.
-    local load_start = start_idx
-    page_load_older = function()
-        if load_start <= 1 then return end
-        if msg_list:get_scroll_top() > 5 then return end
-        local new_start = math.max(1, load_start - 20)
-        for i = load_start - 1, new_start, -1 do
-            local lbl = render_msg(history[i])
-            lbl:move_to_index(0)
-        end
-        load_start = new_start
-    end
-
-    -- Live message listener for the open thread. The thread is on screen, so
-    -- anything arriving for it is already seen — clear its badge counter.
+    -- Register the live listener(s) for this thread; each clears its unread badge
+    -- (the thread is on screen). All rendering routes through on_live.
     if target.type == "channel" then
         messages:onMessage(function(msg)
-            local idx = msg.channel_idx or 0
-            if idx == target.idx then
-                local lbl = render_msg(msg)
-                if lbl then lbl:scroll_to_view(false) end
+            if (msg.channel_idx or 0) == target.idx then
+                on_live(msg)
                 messages:clearUnreadChannel(target.idx)
             end
         end)
     elseif target.type == "dm" then
         messages:onDirectMessage(function(msg)
             if msg.from == target.name or msg.to == target.name then
-                local lbl = render_msg(msg)
-                if lbl then lbl:scroll_to_view(false) end
+                on_live(msg)
                 messages:clearUnreadDM(target.name)
             end
         end)
     elseif target.type == "room" then
-        -- Two live sources: our own posts echo via the DM path (msg.to =
-        -- room), other members' posts arrive as room messages.
+        -- Two live sources: our own posts echo via the DM path (msg.to = room),
+        -- other members' posts arrive as room messages.
         messages:onDirectMessage(function(msg)
-            if msg.to == target.name then
-                local lbl = render_msg(msg)
-                if lbl then lbl:scroll_to_view(false) end
-            end
+            if msg.to == target.name then on_live(msg) end
         end)
         messages:onRoomMessage(function(msg)
             if msg.room == target.name then
-                local lbl = render_msg(msg)
-                if lbl then lbl:scroll_to_view(false) end
+                on_live(msg)
                 messages:clearUnreadDM(target.name)
             end
         end)
     elseif target.type == "repeater" then
         messages:onCliResponse(function(msg)
-            if msg.from == target.name then
-                local lbl = render_msg(msg)
-                if lbl then lbl:scroll_to_view(false) end
-            end
+            if msg.from == target.name then on_live(msg) end
         end)
     end
 
-    -- Live delivery status for our own DMs: update the bubble header when the
-    -- ack (or timeout) for the sent message comes back. Registered for every
-    -- chat (replacing any prior handler); it's a no-op unless the acked message
-    -- has a tracked bubble in this view.
+    -- M2 live delivery status. Baked bubbles are images, so a status change (ack /
+    -- timeout / retry) can't edit a label — re-bake the one bubble: bake a fresh
+    -- image with the new status and swap it in at the same list index, then delete
+    -- the old image (its delete cb frees the old buffer). Status is a single header
+    -- line so the bubble height is unchanged → no reanchor. Never mutates the window
+    -- while in_msg_select (same rule as run_page/run_live); those defer to the 'q' exit.
+    local function rebake_one(m, entry)
+        local pos
+        for k = 1, #bubbles do if bubbles[k] == entry then pos = k; break end end
+        if not pos then return end               -- pruned out of the window already
+        local old = entry.obj
+        local new = bake_msg(m)                  -- appended at the list tail
+        if not new then return end               -- bake failed (printed); keep the old bubble
+        pcall(function() new:move_to_index(pos - 1) end)   -- drop it into the old slot
+        entry.obj = new
+        pcall(function() old:delete() end)       -- delete cb frees the old buffer
+    end
+    run_rebake = function()
+        rebake_scheduled = false
+        if not alive() then rebake_dirty = {}; return end
+        if in_msg_select then return end         -- deferred; the 'q' select-exit re-schedules
+        local dirty = rebake_dirty; rebake_dirty = {}
+        for m in pairs(dirty) do
+            local entry = status_entries[m]
+            if entry and entry.obj then rebake_one(m, entry) end
+        end
+    end
+
+    -- Channel repeat-until-heard poll (channels only). Runs while ≥1 own channel
+    -- send is unresolved: polls each hash, maps the firmware status 1/2/3 →
+    -- repeating (with the N/M count) / repeated / not-heard, and marks changed
+    -- bubbles dirty so run_rebake re-bakes them. Self-deletes when the set empties
+    -- or the chat closes; re-armed by remember_status when a new send is tracked.
+    start_repeat_poll = function()
+        if repeat_timer_on then return end
+        repeat_timer_on = true
+        apps.add_timer { period = 2000, cb = function(t)
+            if not alive() or not next(repeat_track) then
+                t:delete(); repeat_timer_on = false; return
+            end
+            local dirty = false
+            for m, entry in pairs(repeat_track) do
+                local ok, st, remaining, total = pcall(_mesh_get_repeat_status, m.hash)
+                if not ok then st = 0 end
+                local ns, rn, rt                 -- new status / count / total
+                if st == 1 then
+                    ns = "repeating"
+                    if total and total > 0 then
+                        rt = total
+                        rn = total - (remaining or 0) + 1
+                        if rn < 1 then rn = 1 elseif rn > total then rn = total end
+                    end
+                elseif st == 2 then ns = "repeated"
+                elseif st == 3 then ns = "not_heard"
+                end                              -- st == 0 (untracked): ns stays nil → no word
+                if ns ~= m.status or rn ~= m.repeat_n then
+                    m.status, m.repeat_n, m.repeat_total = ns, rn, rt
+                    rebake_dirty[m] = true
+                    dirty = true
+                end
+                if st ~= 1 then repeat_track[m] = nil end   -- terminal / untracked: stop polling it
+            end
+            if dirty and not rebake_scheduled then
+                rebake_scheduled = true            -- run_rebake bails if in_msg_select; 'q' re-flushes
+                apps.add_timer { period = 1, cb = function(tt) tt:delete(); run_rebake() end }
+            end
+        end }
+    end
+    -- Registered for every chat (replacing any prior handler); a no-op unless the
+    -- acked message has a tracked bubble in this view. Deferred + coalesced through
+    -- a one-shot timer — never mutate the window from inside a callback.
     messages:onAck(function(m)
         if current_mode ~= "chat" then return end
-        local lbl = ack_labels[m]
-        if not lbl then return end
-        pcall(function()
-            lbl.text = "You  " .. utils.clockHM(m.timestamp)
-                .. "  " .. dm_status_text(m.status, m)
-            lbl:set { text_color = (m.status == "failed") and "#ff8080" or COL_META }
-        end)
+        if not status_entries[m] then return end
+        rebake_dirty[m] = true
+        if rebake_scheduled then return end
+        rebake_scheduled = true
+        apps.add_timer { period = 1, cb = function(t) t:delete(); run_rebake() end }
     end)
 
     -- Input row. Wire payload caps at 160 chars. Channel messages are sent as
@@ -1341,12 +1679,11 @@ local function build_chat(target)
             messages:sendDirect(target.name, text)
         elseif target.type == "repeater" then
             -- The repeater chat is a CLI console: sends go out as commands
-            -- (needs a logged-in session or the repeater ignores them).
+            -- (needs a logged-in session or the repeater ignores them). The
+            -- command echo doesn't hit a registered listener, so show it via the
+            -- own-message path (renders + jumps to bottom, keeps the window edges).
             local okc, m = messages:sendCommand(target.name, text)
-            if okc and m then
-                local lbl = render_msg(m)
-                if lbl then lbl:scroll_to_view(false) end
-            end
+            if okc and m then on_live(m) end
         end
         textArea.text = ""
     end

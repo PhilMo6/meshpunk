@@ -383,7 +383,7 @@
  * OTHERS
  *==================*/
 
-#define LV_USE_SNAPSHOT 0
+#define LV_USE_SNAPSHOT 1   // Messenger chat bakes each bubble to an image (smooth scroll)
 #define LV_USE_SYSMON   0
 #define LV_USE_PROFILER 0
 #define LV_USE_MONKEY 0

@@ -401,7 +401,12 @@ public:
                              const uint8_t* payload, uint16_t payload_len,
                              const uint8_t* path = nullptr, uint8_t path_len = 0);
   void checkPendingRepeats();
-  int  getRepeatStatus(const uint8_t* hash);
+  // Returns the repeat-until-heard status of a sent packet: 1 = actively
+  // repeating, 2 = echo heard (confirmed), 3 = exhausted (never heard), 0 =
+  // untracked. For an active repeat (1) the optional out-params report the
+  // progress the UI shows as "repeating N/M": *remaining = re-airs still to go,
+  // *total = the configured max (msg_repeat_max); both 0 for other states.
+  int  getRepeatStatus(const uint8_t* hash, int* remaining = nullptr, int* total = nullptr);
 
   // Read paths. Each pushes a Lua table (array of message tables) and
   // returns 1 (the number of Lua stack values). Safe to call even if
@@ -414,6 +419,16 @@ public:
   // unlocked read keeps a lua_push OOM longjmp from stranding the mesh task).
   int pushChannelMessagesToLua(lua_State* L, int channel_idx, int max_records = 0);
   int pushDMMessagesToLua(lua_State* L, const char* peer, int max_records = 0);
+
+  // Chat pager (Messenger sliding-window scroll). Pages a conversation log by
+  // byte offset so the chat holds a bounded bubble window and never loads the
+  // whole thread. mode: 0 = tail (newest `count`), 1 = older (`count` records
+  // before `cursor`), 2 = newer (forward from `cursor`). Pushes ONE table
+  // { list = { <msg + integer off0/off1>, ... }, size = <file bytes> }. Same
+  // lock contract as pushChannelMessagesToLua (channel-name snapshot only; DM
+  // none) — call WITHOUT the lock held.
+  int pushChatPageChannel(lua_State* L, int channel_idx, int mode, uint32_t cursor, int count);
+  int pushChatPageDM(lua_State* L, const char* peer, int mode, uint32_t cursor, int count);
   int pushDMThreadNamesToLua(lua_State* L);
   // One {kind, idx/name, count, last} summary entry per stored conversation
   // (count + last record only — no full histories). Takes MESH_LOCK internally

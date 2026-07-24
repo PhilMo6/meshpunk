@@ -504,6 +504,19 @@ static int luavgl_obj_mark_layout_as_dirty(lua_State *L)
   return 1;
 }
 
+/* MESHPUNK: synchronously flush a pending layout so children's coords/heights
+ * are valid immediately (LVGL otherwise applies layout at the next refresh).
+ * The Messenger's paged chat measures a bubble's post-mutation position in the
+ * same scroll handler to re-anchor the viewport without a one-frame jump. */
+static int luavgl_obj_update_layout(lua_State *L)
+{
+  lv_obj_t *obj = luavgl_to_obj(L, 1);
+  lv_obj_update_layout(obj);
+
+  lua_settop(L, 1);
+  return 1;
+}
+
 static int luavgl_obj_center(lua_State *L)
 {
   lv_obj_t *obj = luavgl_to_obj(L, 1);
@@ -945,6 +958,7 @@ static const rotable_Reg luavgl_obj_methods[] = {
     {"is_group_def",             LUA_TFUNCTION,      {luavgl_obj_is_group_def}            },
     {"is_layout_positioned",     LUA_TFUNCTION,      {luavgl_obj_is_layout_positioned}    },
     {"mark_layout_as_dirty",     LUA_TFUNCTION,      {luavgl_obj_mark_layout_as_dirty}    },
+    {"update_layout",            LUA_TFUNCTION,      {luavgl_obj_update_layout}           },
     {"center",                   LUA_TFUNCTION,      {luavgl_obj_center}                  },
     {"invalidate",               LUA_TFUNCTION,      {luavgl_obj_invalidate}              },
     {"set_flex_flow",            LUA_TFUNCTION,      {luavgl_obj_set_flex_flow}           },
