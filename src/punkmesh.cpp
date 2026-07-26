@@ -3555,6 +3555,69 @@ int PunkMesh::readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32
     return count;
 }
 
+// ── Newest-N locator (BLE companion sync) ───────────────────────────────────
+// A record is a run of "key=value" lines closed by a lone "---", so record
+// starts are only reachable by scanning forward. Both helpers assume the caller
+// holds the SD lock and has seeked; they drop it every 100 lines so a whole-file
+// scan cannot monopolise the bus.
+
+// Below the smallest real record on purpose: the size gate in
+// offsetOfNewestRecords may then scan when it need not, but never skips a trim
+// that was due.
+static const uint32_t MSG_MIN_REC_BYTES = 24;
+
+static int count_records_to_eof(File& f, bool is_sd, uint32_t from) {
+    CountingLineReader lr(&f, from);
+    char line[256];
+    int len, lc = 0, total = 0;
+    while ((len = lr.next(line, sizeof(line))) >= 0) {
+        if (is_sd && ++lc % 100 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') total++;
+    }
+    return total;                                  // complete records only
+}
+
+// Offset just past the `skip`-th record terminator at or after `from`.
+static uint32_t skip_records(File& f, bool is_sd, uint32_t from, int skip) {
+    CountingLineReader lr(&f, from);
+    char line[256];
+    int len, lc = 0, seen = 0;
+    while (seen < skip && (len = lr.next(line, sizeof(line))) >= 0) {
+        if (is_sd && ++lc % 100 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
+        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+            if (++seen >= skip) return lr.consumed;
+        }
+    }
+    return from;                                   // fewer boundaries than asked
+}
+
+uint32_t PunkMesh::offsetOfNewestRecords(const char* path, uint32_t start_offset, int n) {
+    if (!_storage || n < 1) return start_offset;
+    bool is_sd = (_storage != &LittleFS);
+    if (is_sd) sd_spi_take();
+
+    uint32_t res = start_offset;
+    File f = _storage->open(path, "r");
+    if (f) {
+        uint32_t fsize = (uint32_t)f.size();
+        // A span this small cannot hold more than n records, so skip the scan:
+        // keeps the steady-state sync (a few appended records) free of file work.
+        if (fsize > start_offset &&
+            (fsize - start_offset) > (uint32_t)n * MSG_MIN_REC_BYTES) {
+            f.seek(start_offset);
+            int total = count_records_to_eof(f, is_sd, start_offset);
+            if (total > n) {
+                f.seek(start_offset);
+                res = skip_records(f, is_sd, start_offset, total - n);
+            }
+        }
+        f.close();
+    }
+
+    if (is_sd) sd_spi_release();
+    return res;
+}
+
 // ── Chat pager (Messenger sliding-window scroll) ─────────────────────────────
 // Pages a conversation log by BYTE OFFSET so the chat view can hold a bounded
 // window of message bubbles and slide it as the user scrolls — the whole thread

@@ -700,6 +700,94 @@ void host_audio_set_pull(void (*cb)(int16_t* out, int count), int sample_rate) {
     s_audio_last_rate = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Module worker tasks. A module may spawn a small number of helper tasks
+// (e.g. the NGPC Core-1 renderer). Handles are tracked so the session
+// cleanup path can force-delete anything left running — a worker executing
+// module code after the module's memory is freed would fault. Spawn and
+// join are called from the module task only.
+// ---------------------------------------------------------------------------
+#define ELF_MAX_WORKERS 2
+
+struct elf_worker {
+    TaskHandle_t     task;      // nullptr = slot free
+    void           (*fn)(void*);
+    void            *arg;
+    volatile bool    done;
+};
+static elf_worker s_elf_workers[ELF_MAX_WORKERS];
+
+static void elf_worker_tramp(void* p) {
+    elf_worker* w = (elf_worker*)p;
+    w->fn(w->arg);
+    w->done = true;
+    vTaskSuspend(nullptr);   // parked here until join (or cleanup) deletes us
+}
+
+void* host_spawn_task(void (*fn)(void*), void* arg, int core, int prio, int stackkb) {
+    // Function pointers can arrive data-side (0x3C..) from the loader's
+    // relocations — remap to the instruction bus, same as host_audio_set_pull.
+    uint32_t addr = (uint32_t)fn;
+    if (addr >= 0x3C000000 && addr < 0x3E000000)
+        fn = (void (*)(void*))(addr + 0x06000000);
+    if (core < 0 || core > 1) core = 1;
+    if (prio < 1) prio = 1;
+    if (prio > 4) prio = 4;
+    if (stackkb < 2) stackkb = 2;
+    if (stackkb > 16) stackkb = 16;
+    for (int i = 0; i < ELF_MAX_WORKERS; i++) {
+        if (s_elf_workers[i].task) continue;
+        s_elf_workers[i].fn   = fn;
+        s_elf_workers[i].arg  = arg;
+        s_elf_workers[i].done = false;
+        BaseType_t ok = xTaskCreatePinnedToCore(elf_worker_tramp, "elf_worker",
+                                                (uint32_t)stackkb * 1024,
+                                                &s_elf_workers[i], prio,
+                                                &s_elf_workers[i].task, core);
+        if (ok != pdPASS) {
+            s_elf_workers[i].task = nullptr;
+            SLog.printf("[elf_host] worker spawn FAILED (stack=%dKB core=%d)\n",
+                        stackkb, core);
+            return nullptr;
+        }
+        SLog.printf("[elf_host] worker %d spawned (core=%d prio=%d stack=%dKB)\n",
+                    i, core, prio, stackkb);
+        return &s_elf_workers[i];
+    }
+    return nullptr;
+}
+
+// Wait for a worker's fn to return, then delete the task. timeout_ms < 0
+// waits forever. Returns 0 on join, -1 on bad handle or timeout.
+int host_task_join(void* handle, int timeout_ms) {
+    elf_worker* w = (elf_worker*)handle;
+    if (!w || w < s_elf_workers || w >= s_elf_workers + ELF_MAX_WORKERS || !w->task)
+        return -1;
+    uint32_t start = millis();
+    while (!w->done) {
+        if (timeout_ms >= 0 && (int)(millis() - start) > timeout_ms)
+            return -1;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    vTaskDelete(w->task);
+    w->task = nullptr;
+    return 0;
+}
+
+// Session-cleanup safety net for the exit()-longjmp path. Returns how many
+// workers had to be force-deleted.
+static int elf_workers_cleanup(void) {
+    int killed = 0;
+    for (int i = 0; i < ELF_MAX_WORKERS; i++) {
+        if (!s_elf_workers[i].task) continue;
+        SLog.printf("[elf_host] force-deleting leftover worker %d\n", i);
+        vTaskDelete(s_elf_workers[i].task);
+        s_elf_workers[i].task = nullptr;
+        killed++;
+    }
+    return killed;
+}
+
 int host_should_exit(void) {
     return (esc_held && (millis() - esc_hold_start > ESC_EXIT_HOLD_MS)) ? 1 : 0;
 }
@@ -1110,6 +1198,8 @@ static const elf_symbol_t host_exports[] = {
     { "host_trackball_read", (void*)host_trackball_read },
     { "host_audio_push",    (void*)host_audio_push },
     { "host_audio_set_pull", (void*)host_audio_set_pull },
+    { "host_spawn_task",    (void*)host_spawn_task },
+    { "host_task_join",     (void*)host_task_join },
     { "host_should_exit",   (void*)host_should_exit },
     { "host_read_file",     (void*)host_read_file },
     { "host_write_file",    (void*)host_write_file },
@@ -1717,6 +1807,15 @@ int elf_host_run_pending(void) {
         // mixer is outside the callback. The module normally does this in
         // its own cleanup, but the exit()-longjmp path skips that.
         sound_extern_set_pull(NULL, 0);
+        // Force-delete any worker tasks the module left running — they
+        // execute module code, which is about to be freed. The module
+        // normally joins its workers itself; the exit()-longjmp path can
+        // skip that. A worker killed inside host_blit_frame_async can leave
+        // s_blit_idle taken, which would hang blit_drain — give it back in
+        // that case only (a spurious give on a binary semaphore is a no-op),
+        // so the normal path keeps blit_drain's strict wait.
+        if (elf_workers_cleanup() > 0 && s_blit_idle)
+            xSemaphoreGive(s_blit_idle);
         blit_drain();  // an async push may still be reading module BSS
         elf_unload(mod);
     } else {

@@ -219,8 +219,30 @@ void BleMsgSync::tryLoadMore() {
     int idx = pickDirty();
     if (idx < 0) return;              // nothing to sync — zero file opens
     _cur = idx;
-    _cur_next_offset  = _ledger[idx].offset;
-    _batch_tail_offset = _ledger[idx].offset;
+
+    // Backlog cap: serve only this conversation's newest N by moving the ledger
+    // past the older records. Readers run oldest-first from the stored offset,
+    // so without this a weeks-old backlog is streamed a frame per pull before
+    // anything recent arrives. Committed here rather than on delivery — the
+    // skipped records are meant to go whether or not the app pulls them. Left
+    // alone on a rescan, where last_ts already bounds what gets served.
+    uint32_t start = _ledger[idx].offset;
+    uint16_t cap   = _mesh->_ble_sync_max_per_channel;
+    if (cap > 0 && !_ledger[idx].rescan) {
+      uint32_t trimmed = _mesh->offsetOfNewestRecords(
+          fullPath(_ledger[idx].name).c_str(), start, (int)cap);
+      if (trimmed > start) {
+        SLog.printf("[BLE SYNC] %s trimmed to newest %u (off=%u->%u)\n",
+                    _ledger[idx].name, (unsigned)cap, start, trimmed);
+        _ledger[idx].offset = trimmed;
+        start = trimmed;
+        _sidecar_dirty = true;
+        _sidecar_touch_ms = millis();
+      }
+    }
+
+    _cur_next_offset  = start;
+    _batch_tail_offset = start;
     _batch_max_ts      = _ledger[idx].last_ts;
     _cur_exhausted = false;
   }

@@ -58,8 +58,9 @@ end
 
 -- Cap each in-RAM list so a busy mesh can't grow it without bound (it shares the
 -- PSRAM heap with LVGL's draw allocator, which hard-crashes on alloc failure).
--- Mirrors the on-disk _max_messages cap; trims in a SLACK batch so the O(n) shift
--- amortizes to O(1) per message. Bump these if you raise the firmware cap.
+-- In-RAM only: the on-disk logs are bounded by the firmware's days-based
+-- retention, not by this. Trims in a SLACK batch so the O(n) shift amortizes
+-- to O(1) per message.
 local HIST_CAP = 400
 local HIST_SLACK = 100
 local function trim_list(list)
@@ -70,7 +71,8 @@ local function trim_list(list)
     for i = HIST_CAP + 1, n do list[i] = nil end
 end
 
--- Configure the on-disk cap. Delegates to C++ (PunkMesh owns the files).
+-- Sets the firmware's _max_messages. That value no longer bounds the on-disk
+-- logs: the firmware prunes them by retention days, not by a record cap.
 function M:setMaxMessages(n)
     n = tonumber(n)
     if not n or n <= 0 then return end

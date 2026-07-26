@@ -14,8 +14,8 @@ local theme = require("lib/theme")
 
 -- Persistence lives on the C++ PunkMesh side (respects _storage: LittleFS
 -- root or /meshpunk on SD), so any app can access the same message history.
--- The per-file cap is owned by the firmware (_max_messages, default 400) — we
--- deliberately don't shrink it here, so the full stored history is available.
+-- The stored history is bounded by the firmware's retention-days setting, not
+-- by a per-file record cap, and nothing here shrinks it.
 -- Only SUMMARIES load here (one {count, last} entry per conversation, built by
 -- a C-side scan): the inbox never needs more, and materializing every history
 -- (~1.7MB on a busy mesh) overflowed the Lua arena into the shared PSRAM heap,

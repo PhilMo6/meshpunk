@@ -290,6 +290,42 @@ btn_bc:onClicked(function()
     lbl_bc.text = bc_on and "Bond Clear: ON" or "Bond Clear: OFF"
 end)
 
+-- Backlog sync limit: newest messages sent per chat on a fresh connection
+if type(_ble_get_sync_limit) == "function" then
+    content:Label { text = "Sync limit per chat (0 = all):", w = lvgl.PCT(100), h = 16 }
+
+    local sync_limit = (function()
+        local ok_g, n = pcall(_ble_get_sync_limit)
+        return (ok_g and n) or 0
+    end)()
+
+    local limit_input = content:Textarea {
+        one_line = true, text = tostring(sync_limit),
+        accepted_chars = "0123456789", w = lvgl.PCT(40), h = 30,
+    }
+    limit_input:clear_flag(lvgl.FLAG.SCROLLABLE)
+
+    local limit_save_btn = content:Button { w = lvgl.PCT(30), h = 30 }
+    limit_save_btn:Label { text = "Save", align = lvgl.ALIGN.CENTER }
+    limit_save_btn:onClicked(function()
+        local n = tonumber(limit_input.text)
+        if not n or n < 0 then
+            status.text = "Limit: enter 0 or more"
+            return
+        end
+        n = math.floor(n)
+        local ok_s, applied = pcall(_ble_set_sync_limit, n)
+        if ok_s then
+            applied = applied or n
+            limit_input.text = tostring(applied)
+            status.text = (applied == 0) and "Sync: all messages"
+                                          or ("Sync: newest " .. applied .. " per chat")
+        else
+            status.text = "Failed to save sync limit"
+        end
+    end)
+end
+
 -- Connection status
 local lbl_conn = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
 

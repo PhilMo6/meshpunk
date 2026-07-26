@@ -318,10 +318,15 @@ public:
                                 uint8_t* out_hash = nullptr);
 
   // ── Persistent message history ───────────────────────────────
-  // Max records kept per file (channel or DM). Compaction fires at
-  // cap + 100 records and trims back to cap.
+  // Passed to append_msg_text as `cap` and ignored there (trim_msg_text_file
+  // discards it). Message files are bounded by _msg_retain_days via pruneStep,
+  // and by the size-gated backstop in trim_msg_text_file
+  // (MSG_FILE_SAFETY_BYTES / MSG_FILE_SAFETY_KEEP).
   int _max_messages = 400;
   uint16_t _msg_retain_days = 30;  // days of message/routing history kept (0 = unlimited)
+  // BLE companion sync: newest messages served per conversation file on a
+  // backlog (0 = no limit). Read by BleMsgSync when it picks a file to serve.
+  uint16_t _ble_sync_max_per_channel = 0;
   // Incremental retention sweep (driven by pruneStep on the Core-0 loop).
   volatile bool _prune_due = false;        // set on new-day record / boot
   bool     _sweep_active = false;          // cursor below is pruneStep-only (Core 0)
@@ -581,6 +586,11 @@ public:
   int readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32_t min_ts,
                          StoredMsg* out, uint32_t* end_offsets, int max_count,
                          uint32_t* next_offset, uint32_t* file_size);
+  // Byte offset at which the newest `n` records begin, never earlier than
+  // start_offset. Returns start_offset when [start_offset, EOF) holds <= n
+  // records. Readers seek to a stored offset and parse forward (oldest first),
+  // so serving only the newest n means advancing that offset past the rest.
+  uint32_t offsetOfNewestRecords(const char* path, uint32_t start_offset, int n);
   String messagesDirPath();
 
   // Path helpers (used by BLE companion for targeted sync)

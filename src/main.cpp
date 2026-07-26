@@ -260,6 +260,8 @@ static bool   use_sd_pref = true;
 static String clock_fmt_str = "12";
 static bool   ble_enabled_pref = true;
 bool   ble_bond_clear_pref = false;
+// Newest messages the companion sync serves per conversation file (0 = all).
+static uint16_t ble_sync_max_per_channel = 0;
 static bool   wifi_enabled_pref = true;
 // Saved WiFi networks (multi-slot). /wifi_creds holds alternating ssid/pass
 // lines, so the legacy single-network file (2 lines) reads as one entry.
@@ -386,6 +388,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("notify_sound=%d\n", notify_sound_enabled ? 1 : 0);
   f.printf("ble_enabled=%d\n", ble_enabled_pref ? 1 : 0);
   f.printf("ble_bond_clear=%d\n", ble_bond_clear_pref ? 1 : 0);
+  f.printf("ble_sync_max=%d\n", ble_sync_max_per_channel);
   f.printf("wifi_enabled=%d\n", wifi_enabled_pref ? 1 : 0);
   f.printf("trackball_sens=%d\n", trackball_sensitivity_ms);
   f.printf("trackball_roll=%d\n", trackball_roll_ms);
@@ -761,6 +764,9 @@ static void firmware_prefs_load() {
       ble_enabled_pref = (atoi(val) == 1);
     } else if (strcmp(key, "ble_bond_clear") == 0) {
       ble_bond_clear_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "ble_sync_max") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 5000) ble_sync_max_per_channel = (uint16_t)v;
     } else if (strcmp(key, "wifi_enabled") == 0) {
       wifi_enabled_pref = (atoi(val) == 1);
     } else if (strcmp(key, "trackball_sens") == 0) {
@@ -6993,6 +6999,20 @@ void setupLuaVGL() {
     lua_pushboolean(L, ble_bond_clear_pref);
     return 1;
   });
+  lua_register(L, "_ble_get_sync_limit", [](lua_State* L) -> int {
+    lua_pushinteger(L, ble_sync_max_per_channel);
+    return 1;
+  });
+  lua_register(L, "_ble_set_sync_limit", [](lua_State* L) -> int {
+    int v = (int)luaL_checkinteger(L, 1);
+    if (v < 0) v = 0;
+    if (v > 5000) v = 5000;
+    ble_sync_max_per_channel = (uint16_t)v;
+    if (the_mesh) the_mesh->_ble_sync_max_per_channel = ble_sync_max_per_channel;
+    firmware_prefs_save();
+    lua_pushinteger(L, ble_sync_max_per_channel);
+    return 1;
+  });
 #endif
 
   // ── Display backlight ─────────────────────────────────────────────────────
@@ -8206,6 +8226,7 @@ void setup() {
     }
   }
   the_mesh->_msg_retain_days = msg_retain_days;  // routing/message retention window
+  the_mesh->_ble_sync_max_per_channel = ble_sync_max_per_channel;  // BLE backlog cap
 
   wifi_creds_load();
   // Creds live in LittleFS and we always call WiFi.begin() explicitly — stop
