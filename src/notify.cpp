@@ -49,6 +49,7 @@ static bool     s_blink_active  = false;
 static uint8_t  s_blink_step    = 0;
 static uint32_t s_blink_next_ms = 0;
 static uint8_t  s_blink_restore = 0;
+static uint8_t  s_blink_steps   = BLINK_STEPS;   // this run's length
 
 // ── Generic notification store ──────────────────────────────────────────────
 // Ring of pre-formatted single-string records (see notify.h). Pre-allocated in
@@ -105,9 +106,24 @@ void notify_message_alert() {
         // currently timed out (mirror of the old Lua blink).
         s_blink_restore = firmware_kbd_timed_out() ? 0 : firmware_kbd_brightness();
         s_blink_step    = 0;
+        s_blink_steps   = BLINK_STEPS;
         s_blink_next_ms = millis();   // first toggle on the next tick
         s_blink_active  = true;
     }
+}
+
+// Same state machine, one on/off cycle, no sound and no notification pref:
+// UI acknowledgement for an explicit user action (the ELF mode toggles).
+// Reusing this rather than open-coding a second blink matters because
+// notify_tick() is the only place the backlight is driven from, so two
+// blinkers could not fight over the restore value.
+void notify_kbd_blink() {
+    if (s_blink_active) return;
+    s_blink_restore = firmware_kbd_timed_out() ? 0 : firmware_kbd_brightness();
+    s_blink_step    = 0;
+    s_blink_steps   = 2;              // on, off, restore
+    s_blink_next_ms = millis();
+    s_blink_active  = true;
 }
 
 void notify_tick() {
@@ -115,7 +131,7 @@ void notify_tick() {
     uint32_t now = millis();
     if ((int32_t)(now - s_blink_next_ms) < 0) return;
     s_blink_step++;
-    if (s_blink_step > BLINK_STEPS) {
+    if (s_blink_step > s_blink_steps) {
         setKeyboardBrightness(s_blink_restore);
         s_blink_active = false;
         return;

@@ -21,7 +21,7 @@
 - Doom! Now with music and sound effects! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
 - Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts. (thanks to https://github.com/mintylinux)
 - GameBoy emulator! you must provide your own .gb/.gbc roms. Link two T-Decks with a USB cable to play 2-player games — one deck runs USB host mode, the other plugs in as the device.
-- PC-XT DOS emulator! Boots real DOS from .img disk images — or pick a folder of games on your SD card and it becomes the C: drive. A copy of freedos can be found in the freedos folder that you can move to your sd card.
+- DOS emulator! A full 386 PC with VGA, Adlib, Sound Blaster and a PS/2 mouse, running real DOS from .img disk images — or point it at a folder of games on your SD card and it becomes a writable C: drive. No disks yet? The app's **Download DOS** button fetches ready-made FreeDOS boot disks straight to the device over WiFi. The trackball works as a mouse (with a DOS mouse driver loaded) or as arrow keys.
 - MP3 music player with a tag-based library, playlists, and auto-organizing by artist/album
 - Background apps — music keeps playing while you use the rest of the device
 - USB host support (Tools > USB Host): plug devices into the T-Deck — a USB-C audio dongle (routes all device audio), a gamepad (map it to controls for any game via the Games > Gamepad app), a mouse (moves focus, click selects), a keyboard, or a thumb drive (browsable as the `U:` drive). Gamepad, mouse and link-cable drivers download automatically from the App Library.
@@ -47,7 +47,20 @@
 Optional if installed. Download and place doom wad files onto the sd card in either /doom or /lua/apps/Games/Doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
 Pico8 carts go onto the sd card in either /p8carts or /lua/apps/Games/PICO-8 folder.
 Gameboy roms go onto the sd card in either /gb or /lua/apps/Games/GameBoy folder.
-DOS disk images go onto the sd card in /dos. The PC-XT app needs a bootable DOS floppy image (.img) to start; game folders in /dos can then be mounted directly as the C: drive. You can use a copy of freedos found in the Meshpunk github. the freedos40boot.img is modifyed for 40 collom text.
+DOS disk images and game folders go onto the sd card in /dos.
+
+If you have no disks the **Dos** app shows a **Download DOS** button — pick a disk, pick internal or SD storage, and it downloads over WiFi. The same list lives in Settings once you have one. Four disks are offered, all FreeDOS 1.4 with an XMS driver, CTMOUSE and EDIT already set up:
+
+| Disk | Use |
+| --- | --- |
+| `freedos-a.img` | Boot floppy for the A: drive — start here |
+| `freedos-c.img` | Bootable hard disk for C:, leaving A: free for game disks |
+| `freedos-a-nb.img` / `freedos-c-nb.img` | Same two without `SET BLASTER`, for games that misbehave when they find a sound card |
+
+Put a boot disk in A: (or C:), then either add game .img disks in A: or point C: at a folder of games — a folder becomes a real writable C: drive, so DOS installers work and save games persist. The **Boot** button shows every setting the emulator will start with, including whether the trackball is a mouse or arrow keys.
+
+If a game misbehaves: **Audio rate** (the `?` next to it explains) trades pitch for emulation speed and cures crackle — 0.5 is the usual answer; **SB digital** can fake a card fault so a game turns its own digitised audio off; **Timer cap** keeps games alive that pace sound with the system timer. Keyboard: SYM+key for numbers/symbols, ALT+number for F1-F10, ALT+Backspace held to quit, Shift+Backspace for Esc, and ALT+Enter toggles your key bindings (WASD are arrows by default) so you can still type at the DOS prompt.
+
 MP3s go onto the sd card in /Music. The Music app can auto-sort tagged files into /Music/Artist/Album for you, and playlists live in /Music/Playlists.
 
 ## Using with the Launcher (optional)
@@ -168,7 +181,7 @@ Trackball and WASD share a configurable sensitivity setting (Device Settings →
 - **Alt + letter (while typing)** — emoji layer: each letter key types its assigned emoji into the focused text field. Assign emojis per key in Settings → Emoji; an optional tap-to-latch mode for `Alt` (Settings → Device → Keyboard) keeps the layer on between taps.
 - **Alt + Mic (while typing)** — emoji search: opens a popup over the whole emoji set (page through it, or jump by hex codepoint — e.g. `1F600` for smileys). Tapping an emoji inserts it into the text field you were typing in; the popup stays open for multiple inserts until Close (or `Alt`+`Mic` again). Use it for emojis you haven't assigned to a key.
 - **Sym (tap-to-latch)** — with the optional latch mode (Settings → Device → Keyboard), a clean tap of `Sym` latches the symbol layer until the next tap; holding `Sym` while typing stays momentary. WASD navigation pauses while latched (the keys resolve to symbols) — tap `Sym` again to resume.
-- **Alt + Backspace (hold ~1.5s)** — quit to home: closes the current app and returns to the launcher home page. The same chord quits a running native game (Doom, GameBoy, PICO-8, PC-XT) back to the launcher — each game launcher's `?` button shows it alongside the game's controls.
+- **Alt + Backspace (hold ~1.5s)** — quit to home: closes the current app and returns to the launcher home page. The same chord quits a running native game (Doom, GameBoy, PICO-8, DOS) back to the launcher — each game launcher's `?` button shows it alongside the game's controls.
 - **`q`** — backs out of selection modes: message selection in a chat, row-select lists, and the Map app.
 - **Enter (in a chat)** — sends the message. Long-press the message input to open the clipboard menu (paste copied contact cards and text).
 
@@ -224,7 +237,11 @@ MIT
 - Pico8 emulation done with fake08 https://github.com/jtothebell/fake-08
    conversion of fake08 to meshpunk elf done by https://github.com/mintylinux
 - GameBoy emulation via the gnuboy core from retro-go https://github.com/ducalex/retro-go
-- PC-XT emulation via Faux86-remake https://github.com/ArnoldUK/Faux86-remake (lineage: Fake86 by Mike Chambers, Faux86 by James Howard)
+- DOS (386) emulation via tiny386 by Chunhui He https://github.com/hchunhui/tiny386 (BSD-3-Clause)
+   Peripherals ported from QEMU/TinyEMU (MIT); VGA and IDE by Fabrice Bellard
+   Adlib OPL2 via fmopl (LGPL); firmware is SeaBIOS + SeaVGABIOS (LGPL v3)
+   The downloadable boot disks are FreeDOS https://www.freedos.org (GPL),
+   with HIMEMX, CuteMouse (CTMOUSE) and FreeDOS Edit
 
 ## Branch
 This branch of the Meshpunk project focuses on extending functionality.

@@ -101,6 +101,17 @@ static const char kb_map_sym[KB_COLS_N][KB_ROWS_N] = {
   {'+','"','-',  0,   0, '.','\''},
 };
 
+// Alt combo layer for ELF modules, keyed by the key's SYM-layer char (which
+// uniquely names a physical key). Every entry exists because the T-Deck
+// matrix has no such key at all. F1-F10 (Alt + digit-position keys) are a
+// range, handled separately in the scan.
+static const struct { char sym; unsigned char out; } kb_alt_combos[] = {
+    { '/', '\\' },   // Alt+G: backslash -- DOS paths
+    { '(', '<'  },   // Alt+( / Alt+): angle brackets -- DOS redirection
+    { ')', '>'  },
+    { '+', '='  },   // Alt+O: equals -- DOS SET syntax
+};
+
 // Modifier positions in the matrix
 #define MOD_LSHIFT_COL 1
 #define MOD_LSHIFT_ROW 6
@@ -189,6 +200,41 @@ static bool  trk_momentum = true;   // false = legacy one-tick-per-poll
 
 // ---------------------------------------------------------------------------
 // Data-driven keymap: T-Deck physical key → module keycode.
+// Runtime binding-layer switch: ALT+ENTER toggles it while a module runs.
+// A module's -keymap turns T-Deck keys into keys the guest needs (arrows,
+// Ctrl, F-keys), which STEALS those keys from typing -- fine while playing,
+// useless at a DOS prompt. With the layer off the keyboard types normally
+// and the mouse/trackball are unaffected, so "arrows plus mouse plus typing"
+// is a chord away in either direction.
+//
+// OPT-IN per module, via `-kbtoggle N` from its launcher: without the arg
+// the chord does not exist at all and ALT+ENTER stays an ordinary Enter, so
+// modules that never need it cannot lose that keypress. N is the INITIAL
+// layer state -- DOS passes 0 (start typing, toggle on for the game),
+// anything else that opts in passes 1 (start playing).
+static bool s_kb_toggle_enabled = false;
+static bool s_kb_layer_on = true;
+
+// One keyboard-backlight blink = "a toggle just changed state". Deliberately
+// an EVENT, not a state indicator: holding the light off to mean "bindings
+// active" fights the user's own brightness setting and the inactivity
+// dimmer, and says nothing at the moment it matters.
+// This is the NOTIFICATION blink (notify.cpp) -- the proven one, stepped by
+// notify_tick on the mesh task, which keeps running during an ELF module. An
+// earlier open-coded version here drove the backlight from the Core-1 input
+// task and never visibly blinked.
+void host_kb_blink(void) { notify_kbd_blink(); }
+
+// Live matrix modifier levels for modules (bit0 shift, bit1 alt, bit2 sym).
+// Modifiers are consumed here to build the key layers, so they never reach a
+// module as key events -- but a module that wants a modifier+trackball chord
+// (DOS: alt+click toggles mouse latch mode) has no other way to see them.
+static volatile uint8_t s_key_mods = 0;
+#define HOST_MOD_SHIFT 1
+#define HOST_MOD_ALT   2
+#define HOST_MOD_SYM   4
+int host_key_mods(void) { return s_key_mods; }
+
 // Populated by parse_keymap_arg() when the launcher passes -keymap.
 // PURE REMAPPER: a zero entry means "no remap" and the key passes through
 // unchanged (modules ignore codes they don't know). Only mapped keys are
@@ -253,6 +299,10 @@ static void poll_input(bool kb_only = false) {
     bool sym = (matrix[MOD_SYM_COL] & (1 << MOD_SYM_ROW));
     bool alt = (matrix[MOD_ALT_COL] & (1 << MOD_ALT_ROW));
 
+    bool alt_enter = false;
+    s_key_mods = (shift ? HOST_MOD_SHIFT : 0) | (alt ? HOST_MOD_ALT : 0)
+               | (sym ? HOST_MOD_SYM : 0);
+
     // Decode matrix into character states
     for (int c = 0; c < KB_COLS_N; c++) {
         if (matrix[c] == 0) continue;
@@ -265,19 +315,32 @@ static void poll_input(bool kb_only = false) {
             if (c == MOD_ALT_COL && r == MOD_ALT_ROW) continue; // alt
 
             if (c == KEY_ENTER_COL && r == KEY_ENTER_ROW) {
+                // ALT+ENTER is the binding-layer chord where a module opted
+                // in; everywhere else it stays a plain Enter.
+                if (alt && s_kb_toggle_enabled) { alt_enter = true; continue; }
                 cur_state[0x0D] = true;
             } else if (c == KEY_BS_COL && r == KEY_BS_ROW) {
-                cur_state[0x08] = true; // backspace (BS)
+                // Shift+Backspace = Esc: the T-Deck has no Esc key and DOS
+                // tools (FDISK menus etc.) require one. Plain Backspace is
+                // unchanged, and the Alt+Backspace exit chord still sees
+                // 0x08 because shift is not held during it.
+                cur_state[shift ? 0x1B : 0x08] = true;
             } else {
                 // Layer select: Alt + a digit-position key -> F1..F10 (module
                 // maps 0xB0-0xB9); Sym -> number/symbol layer; else base.
                 char ch;
                 if (alt) {
                     char s = kb_map_sym[c][r];
-                    if (s >= '1' && s <= '9')  ch = (char)(0xB0 + (s - '1'));
-                    else if (s == '0')         ch = (char)0xB9; // F10
-                    else if (s == '/')         ch = '\\';       // Alt+/ (G key) -> backslash for DOS paths
-                    else                       ch = kb_map[c][r];
+                    if (s >= '1' && s <= '9') {
+                        ch = (char)(0xB0 + (s - '1'));       // F1-F9
+                    } else if (s == '0') {
+                        ch = (char)0xB9;                     // F10
+                    } else {
+                        ch = kb_map[c][r];
+                        for (auto &m : kb_alt_combos) {
+                            if (m.sym == s) { ch = (char)m.out; break; }
+                        }
+                    }
                 } else if (sym) {
                     ch = kb_map_sym[c][r];
                 } else {
@@ -336,6 +399,35 @@ static void poll_input(bool kb_only = false) {
         for (int i = 0x81; i <= 0x85; i++) cur_state[i] = prev_key_state[i];
     }
 
+    // ALT+ENTER (rising edge) flips the binding layer. Anything held across
+    // the flip is released under the OLD mapping first, or the guest would
+    // get a release for a key it never saw pressed and latch it down; the
+    // edge loop below then re-presses it under the new mapping.
+    // Rising edge, plus a debounce window. The matrix is a polled LEVEL so it
+    // does not suffer the trackball's every-falling-edge problem -- but a key
+    // that bounces across two 10ms polls, or a single dropped I2C matrix read
+    // (which reads as "all keys up" for one poll), still fabricates a second
+    // rising edge, and a toggle that fires twice lands back where it started
+    // while blinking only once. Nobody flips this deliberately inside 300ms.
+    static bool alt_enter_prev = false;
+    static uint32_t alt_enter_last_ms = 0;
+    if (alt_enter && !alt_enter_prev && s_kb_toggle_enabled
+        && !keymap_passthrough
+        && (uint32_t)(millis() - alt_enter_last_ms) >= 300) {
+        alt_enter_last_ms = millis();
+        for (int i = 0; i < INPUT_STATE_SIZE; i++) {
+            if (!prev_key_state[i]) continue;
+            uint8_t out = s_kb_layer_on ? keymap_table[i] : 0;
+            if (!out) out = (uint8_t)i;
+            kq_push(out, 0);
+        }
+        memset(prev_key_state, 0, INPUT_STATE_SIZE);
+        s_kb_layer_on = !s_kb_layer_on;
+        host_kb_blink();        // one blink acknowledges the flip
+        SLog.printf("[elf_host] key bindings %s\n", s_kb_layer_on ? "ON" : "OFF");
+    }
+    alt_enter_prev = alt_enter;
+
     // Edge detection: generate press/release events for changed keys.
     // In passthrough mode (default), all keys are pushed as-is. In keymap
     // mode the table is a pure remapper: mapped keys translate, everything
@@ -343,7 +435,7 @@ static void poll_input(bool kb_only = false) {
     for (int i = 0; i < INPUT_STATE_SIZE; i++) {
         if (cur_state[i] != prev_key_state[i]) {
             uint8_t out;
-            if (keymap_passthrough) {
+            if (keymap_passthrough || !s_kb_layer_on) {
                 out = (uint8_t)i;  // pass through as-is
             } else {
                 out = keymap_table[i];
@@ -366,6 +458,7 @@ static void poll_input(bool kb_only = false) {
     } else {
         esc_held = false;
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +648,22 @@ void host_blit_frame(const uint16_t* rgb565, int w, int h) {
     SPI_UNLOCK();
 }
 
+// Blit a rectangle at absolute screen coordinates. A module that composites
+// in internal RAM pushes finished strips straight to the panel with this,
+// so it needs no PSRAM frame buffer: that removes both the buffer write and
+// the blit task's read-back of it. The bus lock is taken per call, so the
+// radio and SD still get the SPI bus between strips.
+void host_blit_rect(const uint16_t* rgb565, int x, int y, int w, int h) {
+    if (!rgb565 || w <= 0 || h <= 0) return;
+    if (x < 0 || y < 0 || x + w > 320 || y + h > 240) return;
+    SPI_LOCK();
+    tft.startWrite();
+    tft.setAddrWindow(x, y, w, h);
+    tft.pushColors((uint16_t*)rgb565, w * h, false);
+    tft.endWrite();
+    SPI_UNLOCK();
+}
+
 // ── Async blit ───────────────────────────────────────────────────────────────
 // A Core-1 task owns the (blocking) SPI push so the module keeps running on
 // Core 0 during the transfer. The module double-buffers and hands over a
@@ -651,6 +760,14 @@ int host_get_key(int* pressed, unsigned char* key) {
 // consuming the ISR counters and stops emitting 0x81-0x85 pseudo-keys.
 // Subtract-what-was-read (not =0) so ticks landing between the read and the
 // write survive — same tolerance as the input task's own consumption.
+// Live trackball button level (1 = pressed). The click ISR only counts press
+// EDGES, so modules that want real press/release semantics (held mouse
+// buttons, dragging) read the level here each poll instead of inferring a
+// duration from the edge count.
+int host_trackball_button(void) {
+    return digitalRead(TDECK_TRACKBALL_CLICK) == LOW;
+}
+
 void host_trackball_read(int* dx, int* dy, int* click) {
     s_trk_raw_mode = true;
     int up = trackball_up;    trackball_up    -= up;
@@ -1123,6 +1240,24 @@ void* psram_malloc(size_t size) {
     return p;
 }
 
+// Deliberate exception to the PSRAM-only rule above, for the one case where it
+// pays: a SMALL, extremely hot structure that would otherwise fight the
+// module's own multi-MB working set for the 32KB data cache. The DOS module's
+// CPUI386 (~400 bytes) is touched several times by every emulated instruction
+// while a 4MB guest RAM streams past it, so every eviction turns a register
+// read into an 80MHz PSRAM round-trip.
+//
+// Internal RAM is the scarce pool (BLE, WiFi, TLS, task stacks all draw on it),
+// so this is NOT for buffers — callers must keep it to a few hundred bytes and
+// fall back gracefully. Returns NULL if internal RAM cannot satisfy the request;
+// the caller is expected to retry with plain malloc rather than fail.
+// Tracked like every other module allocation, so the leak sweep still frees it.
+void* internal_malloc(size_t size) {
+    void* p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (p) mod_track(p);
+    return p;
+}
+
 void* psram_calloc(size_t nmemb, size_t size) {
     void* p = heap_caps_calloc(nmemb, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     mod_track(p);
@@ -1190,12 +1325,16 @@ static int   stub_atexit(void(*f)(void)) { (void)f; return 0; }
 static const elf_symbol_t host_exports[] = {
     { "host_blit_frame",    (void*)host_blit_frame },
     { "host_blit_frame_async", (void*)host_blit_frame_async },
+    { "host_blit_rect",     (void*)host_blit_rect },
     { "host_clear_screen",  (void*)host_clear_screen },
     { "host_get_ticks_ms",  (void*)host_get_ticks_ms },
     { "host_get_ticks_us",  (void*)host_get_ticks_us },
     { "host_sleep_ms",      (void*)host_sleep_ms },
     { "host_get_key",       (void*)host_get_key },
     { "host_trackball_read", (void*)host_trackball_read },
+    { "host_trackball_button", (void*)host_trackball_button },
+    { "host_key_mods",         (void*)host_key_mods },
+    { "host_kb_blink",         (void*)host_kb_blink },
     { "host_audio_push",    (void*)host_audio_push },
     { "host_audio_set_pull", (void*)host_audio_set_pull },
     { "host_spawn_task",    (void*)host_spawn_task },
@@ -1239,6 +1378,11 @@ static const elf_symbol_t host_exports[] = {
     { "setvbuf",            (void*)setvbuf },
     { "remove",             (void*)remove },
     { "rename",             (void*)rename },
+    // ESP-IDF's FAT VFS implements this; without it a module that has to
+    // shrink a file must copy the part it keeps to a temp file and swap --
+    // which after a big DOS install meant rewriting every file that had
+    // sector padding, on the exit path, with the user watching.
+    { "truncate",           (void*)truncate },
     { "tmpfile",            (void*)stub_tmpfile },
     { "tmpnam",             (void*)stub_tmpnam },
     { "freopen",            (void*)stub_freopen },
@@ -1275,6 +1419,7 @@ static const elf_symbol_t host_exports[] = {
 
     // C library: memory (PSRAM-aware wrappers)
     { "malloc",             (void*)psram_malloc },
+    { "host_malloc_internal", (void*)internal_malloc },
     { "free",               (void*)psram_free },
     { "calloc",             (void*)psram_calloc },
     { "realloc",            (void*)psram_realloc },
@@ -1660,6 +1805,8 @@ int elf_host_run_pending(void) {
     memset(prev_key_state, 0, INPUT_STATE_SIZE);
     kq_head = kq_tail = 0;
     esc_held = false;
+    s_kb_toggle_enabled = false;   // opt-in: set below by -kbtoggle
+    s_kb_layer_on = true;
     s_trk_raw_mode = false; // modules opt in via host_trackball_read()
 
     // Check for -keymap argument; default is passthrough (raw key codes).
@@ -1672,8 +1819,16 @@ int elf_host_run_pending(void) {
             keymap_str = argv[i + 1];
         } else if (strcmp(argv[i], "-trkball") == 0) {
             trkball_str = argv[i + 1];
+        } else if (strcmp(argv[i], "-kbtoggle") == 0) {
+            // Opt in to the ALT+ENTER binding-layer chord; the value is the
+            // layer's initial state (0 = start typing, 1 = start bound).
+            s_kb_toggle_enabled = true;
+            s_kb_layer_on = (atoi(argv[i + 1]) != 0);
         }
     }
+    if (s_kb_toggle_enabled)
+        SLog.printf("[elf_host] ALT+Enter binding toggle enabled (start %s)\n",
+                    s_kb_layer_on ? "bound" : "typing");
     if (keymap_str && strcmp(keymap_str, "passthrough") == 0) {
         keymap_passthrough = true;
         memset(keymap_table, 0, sizeof(keymap_table));

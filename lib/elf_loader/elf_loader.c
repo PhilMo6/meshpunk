@@ -136,6 +136,10 @@ typedef struct {
 
 #define MAX_SEGMENTS 4
 
+// Executable section a module can define to have its hot code run from
+// internal SRAM instead of PSRAM.
+#define HOT_SECTION ".iram.text"
+
 struct elf_module {
     void*       seg_mem[MAX_SEGMENTS]; // allocated memory per PT_LOAD segment
     uint32_t    seg_count;
@@ -145,6 +149,12 @@ struct elf_module {
     // Code segment bounds (data-side addresses) for address translation
     uint32_t    text_start;            // data-side start of executable segment
     uint32_t    text_end;              // data-side end of executable segment
+
+    // Hot code section (.iram.text), relocated into internal SRAM
+    void*       hot_mem;               // internal-RAM copy, NULL if not present
+    uint32_t    hot_lo;                // data-side start of the section in PSRAM
+    uint32_t    hot_hi;                // data-side end of the section in PSRAM
+    int32_t     hot_delta;             // hot_lo-relative addr + delta = SRAM addr
 
     // Dynamic symbol table (points into loaded segment memory)
     Elf32_Sym*  dynsym;
@@ -224,7 +234,12 @@ static void* resolve_symbol(const elf_module_t* mod,
 
 // Remap an address: if it falls in the module's code segment (data-side PSRAM),
 // convert it to the instruction-side address so the CPU can execute it.
+// Addresses inside .iram.text resolve to the internal-SRAM copy instead;
+// internal SRAM is one address space, so no instruction-bus offset applies.
 static uint32_t remap_if_text(const elf_module_t* mod, uint32_t addr) {
+    if (mod->hot_mem && addr >= mod->hot_lo && addr < mod->hot_hi) {
+        return (uint32_t)((int32_t)addr + mod->hot_delta);
+    }
     if (addr >= mod->text_start && addr < mod->text_end &&
         is_psram_data_addr(addr)) {
         return psram_data_to_inst(addr);
@@ -431,6 +446,9 @@ elf_module_t* elf_load_ex(const void* data, size_t size,
     mod->text_end = 0;
     if (ehdr->e_shoff && ehdr->e_shnum) {
         const Elf32_Shdr* shdr = (const Elf32_Shdr*)(raw + ehdr->e_shoff);
+        const char* shstr = NULL;
+        if (ehdr->e_shstrndx < ehdr->e_shnum)
+            shstr = (const char*)(raw + shdr[ehdr->e_shstrndx].sh_offset);
         for (int i = 0; i < ehdr->e_shnum; i++) {
             if (shdr[i].sh_type == SHT_PROGBITS &&
                 (shdr[i].sh_flags & SHF_EXECINSTR)) {
@@ -441,6 +459,34 @@ elf_module_t* elf_load_ex(const void* data, size_t size,
                     mod->text_start = sec_start;
                 if (sec_end > mod->text_end)
                     mod->text_end = sec_end;
+
+                // The ESP32-S3's 16KB instruction cache fronts PSRAM and
+                // flash only and is shared by both cores. Code copied into
+                // internal SRAM is fetched directly: it takes no cache
+                // misses and evicts nothing the other core is using. A
+                // module opts a section in by naming it HOT_SECTION; the
+                // section must be self-contained (literals included, which
+                // needs -mtext-section-literals) because moving it changes
+                // every PC-relative distance to anything outside it.
+                if (shstr && !mod->hot_mem && shdr[i].sh_size &&
+                    strcmp(shstr + shdr[i].sh_name, HOT_SECTION) == 0) {
+                    // Rounded up: the copy below stores whole words, so a
+                    // trailing partial word needs a destination.
+                    void* hot = heap_caps_malloc((shdr[i].sh_size + 3) & ~3u,
+                                                 MALLOC_CAP_EXEC |
+                                                 MALLOC_CAP_INTERNAL);
+                    if (hot) {
+                        mod->hot_mem   = hot;
+                        mod->hot_lo    = sec_start;
+                        mod->hot_hi    = sec_end;
+                        mod->hot_delta = (int32_t)((uint32_t)hot - sec_start);
+                        LOG_I("%s: %u bytes -> internal SRAM at %p",
+                              HOT_SECTION, shdr[i].sh_size, hot);
+                    } else {
+                        LOG_I("%s: %u bytes stays in PSRAM (no internal RAM)",
+                              HOT_SECTION, shdr[i].sh_size);
+                    }
+                }
             }
         }
     }
@@ -508,6 +554,29 @@ elf_module_t* elf_load_ex(const void* data, size_t size,
         return NULL;
     }
 
+    // Copy the hot section after relocation so the SRAM copy carries the
+    // patched literals. Calls into it were already pointed here by
+    // remap_if_text; the PSRAM original is left in place and unreferenced.
+    // Instruction-bus SRAM permits only aligned 32-bit access — a byte or
+    // halfword store there raises LoadStoreError — so this copies whole
+    // words rather than calling memcpy on the destination.
+    if (mod->hot_mem) {
+        const uint8_t* src = (const uint8_t*)mod->hot_lo;
+        uint32_t* dst      = (uint32_t*)mod->hot_mem;
+        uint32_t  sz       = mod->hot_hi - mod->hot_lo;
+        uint32_t  words    = sz >> 2;
+        for (uint32_t k = 0; k < words; k++) {
+            uint32_t w;
+            memcpy(&w, src + k * 4, 4);   // source is PSRAM: byte access is fine
+            dst[k] = w;
+        }
+        if (sz & 3) {
+            uint32_t w = 0;
+            memcpy(&w, src + words * 4, sz & 3);
+            dst[words] = w;
+        }
+    }
+
     // Flush data cache so instruction cache sees the new code.
     // On ESP32-S3 with PSRAM, this is critical for code execution.
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -557,6 +626,13 @@ void elf_text_range(elf_module_t* mod, uint32_t* start, uint32_t* end) {
 
 void elf_unload(elf_module_t* mod) {
     if (!mod) return;
+
+    // Always heap_caps_free: the hot section is allocated here, not by the
+    // caller's segment allocator.
+    if (mod->hot_mem) {
+        heap_caps_free(mod->hot_mem);
+        mod->hot_mem = NULL;
+    }
 
     for (uint32_t i = 0; i < mod->seg_count; i++) {
         if (mod->seg_mem[i]) {

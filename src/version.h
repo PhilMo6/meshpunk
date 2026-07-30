@@ -41,7 +41,17 @@
 //                  = status, remaining, total), gridnav edge-lock (lv_gridnav.c
 //                  meshpunk_gridnav_edge_lock + _gridnav_edge_lock binding),
 //                  and _touch_pressed (defer chat paging until touch release)
-#define MESHPUNK_FW_API 5
+//   6  2026-07-29  unreleased since the v0.3.0 tag (which shipped level 5):
+//                  the Dos (386) emulator's host contract — ELF exports
+//                  host_trackball_button (live trackball button LEVEL, for
+//                  real press/hold/drag), host_key_mods (matrix shift/alt/sym
+//                  levels, which never reach a module as key events),
+//                  host_kb_blink (one notification-style keyboard-backlight
+//                  blink as toggle feedback) and truncate (the FAT VFS's, so
+//                  a module can shrink a file without a copy-and-swap) —
+//                  plus the ALT+Enter binding-layer toggle a module opts into
+//                  with -kbtoggle N and Shift+Backspace = Esc in ELF modules
+#define MESHPUNK_FW_API 6
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:

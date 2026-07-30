@@ -143,6 +143,20 @@ void audio_eof_mp3(const char* name) {
 }
 
 // ── External audio ring buffer (mono → upsampled to 44100 Hz stereo) ──────────
+// 4096 samples = 93ms at 44100. Was doubled to 8192 on 2026-07-27 to see whether
+// a deeper cushion helped the DOS module; hw result was "no real new improvement
+// in quality", so it is back to 4096 and the 8KB of internal .bss with it.
+// Kept in the notes because it IS the hard ceiling on stall absorption:
+// ceiling on how long a stall a pushing module can absorb: the DOS emulator's
+// guest interrupt handler can stall its main loop ~29ms, and the module has to
+// keep both a cushion AND room for a catch-up batch inside this ring or
+// sound_extern_push() silently drops the excess.
+// Cost is 8KB of .bss in INTERNAL RAM. That is the same scarce pool
+// the DOS module allocates its hot state from -- if its startup log starts
+// saying "psram" instead of "internal", this is why, and the fix would be to
+// move this ring to PSRAM (the drain below is a plain task loop, not an ISR,
+// so it can live there).
+// Power of two matters: the % below compiles to an AND.
 #define EXTERN_RING_SIZE 4096
 static int16_t s_extern_ring[EXTERN_RING_SIZE];
 static volatile int s_extern_head = 0;

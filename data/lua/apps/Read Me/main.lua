@@ -61,7 +61,7 @@ Trackball and WASD share a configurable sensitivity setting (Settings > Device >
 
 - Sym (tap-to-latch): with the optional latch mode (Settings > Device > Keyboard), a clean tap of Sym latches the symbol layer until the next tap; holding Sym while typing stays momentary. WASD navigation pauses while latched - tap Sym again to resume.
 
-- Alt + Backspace (hold ~1.5s): quit to home - closes the current app and returns to the launcher home page. The same chord quits a running native game (Doom, GameBoy, PICO-8, PC-XT).
+- Alt + Backspace (hold ~1.5s): quit to home - closes the current app and returns to the launcher home page. The same chord quits a running native game (Doom, GameBoy, PICO-8, DOS).
 
 - q: backs out of selection modes - message selection in a chat, row-select lists, and the Map app.
 
@@ -114,7 +114,10 @@ Emulators install from the App Library; you provide the game files on the SD car
 
 - GameBoy: .gb/.gbc roms in /gb (or the GameBoy app folder).
 
-- PC-XT (DOS): disk images in /dos. The app needs a bootable DOS floppy image (.img) to start; a game folder in /dos can then be mounted directly as the C: drive. A FreeDOS copy is in the MeshPunk GitHub - freedos40boot.img is modified for 40-column text.
+- Dos: disk images and game folders in /dos. A full 386 PC with VGA, Adlib, Sound Blaster and a PS/2 mouse. No disks? The app's Download DOS button fetches ready-made FreeDOS boot disks over WiFi (freedos-a.img is the boot floppy; freedos-c.img boots as a hard disk so A: stays free for game disks; the -nb versions leave out SET BLASTER for games that misbehave when they find a sound card). Point C: at a folder of games and it becomes a real writable C: drive, so installers and save games work. The Boot button lists every setting it will start with, including whether the trackball is a mouse or arrow keys.
+
+  If a game misbehaves: Audio rate (see its ? button) trades pitch for speed and cures crackle - 0.5 is the usual answer; SB digital can fake a card fault so a game disables its own digitised sound; Timer cap keeps games alive that pace sound off the system timer. Keys: SYM+key for numbers and symbols, ALT+number for F1-F10, Shift+Backspace for Esc, and ALT+Enter switches your key bindings off and on (WASD are arrows by default) so the DOS prompt still types normally.
+
 
 Quitting a native game: hold Alt + Backspace for about 1.5 seconds to return to the launcher. Each game launcher's ? button shows this plus the game's controls.]] },
 

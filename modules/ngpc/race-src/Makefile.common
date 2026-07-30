@@ -1,0 +1,57 @@
+LIBRETRO_COMM_DIR  = $(CORE_DIR)/libretro-common
+DEPS_DIR          = $(CORE_DIR)/deps
+
+INCFLAGS = -I$(CORE_DIR)/ \
+           -I$(CORE_DIR)/libretro \
+           -I$(CORE_DIR)/deps/blip \
+           -I$(LIBRETRO_COMM_DIR)/include
+
+ifneq (,$(findstring msvc2003,$(platform)))
+INCFLAGS += -I$(LIBRETRO_COMM_DIR)/include/compat/msvc
+endif
+
+SOURCES_C := \
+	$(CORE_DIR)/tlcs900h.c \
+	$(CORE_DIR)/graphics.c \
+	$(CORE_DIR)/main.c \
+	$(CORE_DIR)/flash.c \
+	$(CORE_DIR)/libretro/libretro.c \
+	$(CORE_DIR)/libretro/log.c \
+	$(CORE_DIR)/race-memory.c \
+	$(CORE_DIR)/ngpBios.c \
+	$(CORE_DIR)/state.c \
+	$(CORE_DIR)/sound.c \
+	$(CORE_DIR)/neopopsound.c \
+	$(CORE_DIR)/neopop_blip.c \
+	$(CORE_DIR)/deps/blip/Blip_Buffer.c
+
+ifeq ($(DRZ80),1)
+	FLAGS += -DDRZ80
+	SOURCES_C   += $(CORE_DIR)/DrZ80_support.c
+	SOURCES_ASM := $(CORE_DIR)/DrZ80.s
+else
+	FLAGS += -DCZ80
+	SOURCES_C   += $(CORE_DIR)/cz80.c \
+						$(CORE_DIR)/cz80_support.c
+endif
+
+ifneq ($(STATIC_LINKING), 1)
+	SOURCES_C += \
+		$(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c \
+		$(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
+		$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+		$(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
+		$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+		$(LIBRETRO_COMM_DIR)/file/file_path.c \
+		$(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+		$(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+		$(LIBRETRO_COMM_DIR)/streams/file_stream_transforms.c \
+		$(LIBRETRO_COMM_DIR)/string/stdstring.c \
+		$(LIBRETRO_COMM_DIR)/time/rtime.c \
+		$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+endif
+
+FLAGS += -D__LIBRETRO__ -D_MAX_PATH=2048
+ifeq (,$(findstring msvc,$(platform)))
+CXXFLAGS += -fpermissive
+endif

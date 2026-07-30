@@ -30,6 +30,11 @@ void notify_message_alert();
 // Step the keyboard-blink state machine. Called from mesh_task_body every loop.
 void notify_tick();
 
+// One on/off keyboard-backlight blink as UI acknowledgement (the ELF mode
+// toggles). Same state machine as the alert, so the two cannot fight over the
+// restore value; no melody, and not gated on the notification pref.
+void notify_kbd_blink();
+
 // ── Generic notification store ───────────────────────────────────────────────
 // A RAM ring of single-string notification records, so the user can review
 // what notified — including everything received while Lua is torn down for an
