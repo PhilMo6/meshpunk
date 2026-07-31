@@ -297,6 +297,17 @@ static bool kb_alt_phys_prev = false;
 static bool kb_alt_used_while_held = false;
 static bool kb_alt_layer_active = false;
 
+// ── Keyboard legacy ASCII mode ──────────────────────────────────────────────
+// Keyboard-MCU firmware older than LilyGo's 250620 build has no raw matrix
+// mode (I2C cmd 0x03 is silently ignored) and only ever sends one final ASCII
+// byte per key press — no release events, no repeat, no modifier visibility
+// (the C3 applies shift/sym itself). In legacy mode we read that single byte
+// and synthesize tap events instead of decoding the 5-byte matrix. Everything
+// built on held-key state (sym/alt latches, emoji layer, chords, hold APIs)
+// is unavailable. Persisted; auto-enabled when the detection heuristic in
+// keyboard_read_cb identifies ASCII bytes arriving on the raw-mode path.
+static bool kb_legacy_mode = false;
+
 // ── Display Backlight ──────────────────────────────────────────────────────
 static uint8_t display_brightness = 16;  // 0–16, persisted
 
@@ -323,6 +334,8 @@ bool    firmware_notify_kbd_enabled()   { return notify_kbd_enabled; }
 bool    firmware_notify_sound_enabled() { return notify_sound_enabled; }
 uint8_t firmware_kbd_brightness()       { return kbd_brightness; }
 bool    firmware_kbd_timed_out()        { return kbd_timed_out; }
+// Read by elf_host.cpp's input poll (extern declaration there).
+bool    firmware_kb_legacy()            { return kb_legacy_mode; }
 
 // Timestamp source for notify_post record stamps — the same RTC the _rtc_time
 // binding reads (our clock authority; a sender's timestamp is never used).
@@ -394,6 +407,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("trackball_roll=%d\n", trackball_roll_ms);
   f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
   f.printf("alt_toggle=%d\n", kb_alt_toggle_pref ? 1 : 0);
+  f.printf("kb_legacy=%d\n", kb_legacy_mode ? 1 : 0);
   f.printf("theme=%s\n", theme_pref_str.c_str());
   f.printf("font_ui=%s\n", font_ui_pref.c_str());
   f.printf("font_text=%s\n", font_text_pref.c_str());
@@ -779,6 +793,8 @@ static void firmware_prefs_load() {
       kb_sym_toggle_pref = (atoi(val) == 1);
     } else if (strcmp(key, "alt_toggle") == 0) {
       kb_alt_toggle_pref = (atoi(val) == 1);
+    } else if (strcmp(key, "kb_legacy") == 0) {
+      kb_legacy_mode = (atoi(val) == 1);
     } else if (strcmp(key, "theme") == 0) {
       theme_pref_str = String(val);
       theme_pref_str.trim();
@@ -1749,6 +1765,53 @@ static bool kb_rshift_active = false;
 static bool kb_sym_active = false;
 static bool kb_alt_active = false;
 
+// ── Legacy ASCII mode runtime state ─────────────────────────────────────────
+// One byte arrives per physical press (no release/repeat), so each byte is
+// synthesized into a press: kb_key_state[ch] stays true for LEGACY_PULSE_MS
+// (feeds the _kb_* polling APIs and input capture), while the LVGL emit is a
+// one-poll edge per byte so double letters register.
+#define LEGACY_PULSE_MS 120
+static uint8_t  kb_legacy_down_ch  = 0;   // char currently pulsed, 0 = none
+static uint32_t kb_legacy_deadline = 0;   // millis() when the pulse releases
+
+// ── Old-keyboard-firmware detection (raw mode only) ─────────────────────────
+// A keyboard MCU without raw-mode support keeps sending single ASCII bytes,
+// which land in cur_matrix[0] with cols 1-4 zero. Lowercase ASCII (0x61-0x7A)
+// as a matrix byte means space+mic+letter pressed simultaneously — a state no
+// real typing produces — while such firmware can never light cols 1-4. The
+// verdict latches on the first decisive input: a col 1-4 byte proves raw
+// firmware and closes detection for the session; three signature events =
+// old firmware, and loop() auto-enables legacy mode. A manual Settings
+// toggle-off also closes detection so the user's choice isn't fought.
+static uint8_t s_kb_suspect_events = 0;
+static bool    s_kb_legacy_autoswitch_pending = false;
+static bool    s_kb_autoswitch_done = false;
+
+// Switch keyboard input mode at runtime. Sends the matching mode command to
+// the keyboard MCU (a no-op on firmware without command support) and drops all
+// key state derived under the previous mode.
+static void kb_set_legacy(bool on, bool save) {
+  kb_legacy_mode = on;
+  if (keyboard_available) {
+    Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
+    Wire.write(on ? LILYGO_KB_MODE_KEY_CMD : LILYGO_KB_MODE_RAW_CMD);
+    Wire.endTransmission();
+  }
+  memset(prev_matrix, 0, sizeof(prev_matrix));
+  memset(kb_key_state, 0, sizeof(kb_key_state));
+  memset(kb_key_prev, 0, sizeof(kb_key_prev));
+  last_key_code = 0;
+  kb_shift_active = kb_lshift_active = kb_rshift_active = false;
+  kb_sym_active = kb_alt_active = kb_alt_layer_active = false;
+  kb_sym_latched = kb_alt_latched = false;
+  kb_sym_phys_prev = kb_alt_phys_prev = false;
+  kb_legacy_down_ch = 0;
+  kb_legacy_deadline = 0;
+  s_kb_suspect_events = 0;
+  if (save) firmware_prefs_save();
+  SLog.printf("[KB] %s mode\n", on ? "legacy ASCII" : "raw matrix");
+}
+
 // Bare mic press = notifications shortcut. The keyboard reader (LVGL indev
 // callback) only sets this flag; loop() dispatches it into Lua
 // (topbar.on_shortcut) outside of indev processing.
@@ -1891,11 +1954,39 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   bool any_new = false;
   bool key_from_trackball = false;
 
-  // ── Read raw keyboard matrix (5 bytes) ──
+  // ── Read raw keyboard matrix (5 bytes) — or one ASCII byte in legacy mode ──
   uint8_t cur_matrix[KB_COLS] = {0};
-  Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, KB_COLS);
-  for (int c = 0; c < KB_COLS && Wire.available(); c++) {
-    cur_matrix[c] = Wire.read();
+  uint8_t legacy_byte = 0;   // legacy mode: char received this poll (one per press)
+  if (kb_legacy_mode) {
+    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
+    if (Wire.available()) legacy_byte = Wire.read();
+    if (legacy_byte >= 128) legacy_byte = 0;   // kb_key_state bounds
+    // cur_matrix stays zero: every matrix-derived block below (modifiers, mic
+    // shortcut, home chord, matrix scan) reads "nothing pressed" and is inert.
+  } else {
+    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, KB_COLS);
+    for (int c = 0; c < KB_COLS && Wire.available(); c++) {
+      cur_matrix[c] = Wire.read();
+    }
+    // Old-keyboard-firmware detection (see s_kb_* above): lowercase ASCII in
+    // col 0 before any col 1-4 byte = the MCU ignored the raw-mode command
+    // and is sending single chars. Either verdict latches s_kb_autoswitch_done
+    // and detection never runs again this session. loop() performs the switch.
+    if (!s_kb_autoswitch_done) {
+      if (cur_matrix[1] | cur_matrix[2] | cur_matrix[3] | cur_matrix[4]) {
+        s_kb_autoswitch_done = true;   // raw firmware proven — detection closed
+        SLog.println("[KB] raw matrix confirmed");
+      } else if (prev_matrix[0] == 0 &&
+                 cur_matrix[0] >= 0x61 && cur_matrix[0] <= 0x7A) {
+        s_kb_suspect_events++;
+        SLog.printf("[KB] ASCII-mode signature 0x%02X (%d/3)\n",
+                    cur_matrix[0], s_kb_suspect_events);
+        if (s_kb_suspect_events >= 3) {
+          s_kb_legacy_autoswitch_pending = true;
+          s_kb_autoswitch_done = true;
+        }
+      }
+    }
   }
 
   // ── Decode modifier key states ──
@@ -1972,6 +2063,24 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   memcpy(kb_key_prev, kb_key_state, 128);
   memset(kb_key_state, 0, 128);
 
+  // ── Legacy mode: synthesize the received byte into key state ──
+  // Each byte is a discrete press (the MCU sends nothing on release), pulsed
+  // in kb_key_state for LEGACY_PULSE_MS so the _kb_* polling APIs and input
+  // capture see it. A re-arrival restarts the pulse as a fresh press.
+  bool legacy_new = false;
+  if (kb_legacy_mode) {
+    if (legacy_byte) {
+      kb_legacy_down_ch  = legacy_byte;
+      kb_legacy_deadline = millis() + LEGACY_PULSE_MS;
+      kb_key_press_time[legacy_byte] = millis();
+      legacy_new = true;
+    } else if (kb_legacy_down_ch &&
+               (int32_t)(millis() - kb_legacy_deadline) >= 0) {
+      kb_legacy_down_ch = 0;
+    }
+    if (kb_legacy_down_ch) kb_key_state[kb_legacy_down_ch] = true;
+  }
+
   // ── Resolve ALL pressed keys from matrix ──
   uint32_t resolved_key = 0;
 
@@ -2011,6 +2120,16 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
         else resolved_key = ch;
       }
     }
+  }
+
+  // ── Legacy mode: the received byte is the resolved key ──
+  // Only on the poll it arrived: the next poll resolves 0, which resets
+  // last_key_code below and reports RELEASED, so LVGL sees one clean press
+  // per byte and a repeated character re-registers.
+  if (kb_legacy_mode && legacy_new) {
+    if      (legacy_byte == 0x0D) resolved_key = LV_KEY_ENTER;
+    else if (legacy_byte == 0x08) resolved_key = LV_KEY_BACKSPACE;
+    else                          resolved_key = legacy_byte;
   }
 
   // ── Merge USB HID keyboard held keys (usb_task, Core 1 → here, Core 0) ──
@@ -7112,6 +7231,22 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // Legacy ASCII keyboard mode (old keyboard-MCU firmware without raw matrix
+  // support). Live-flips the MCU mode command both directions; no reboot
+  // needed. A manual OFF also blocks the auto-switch until the next boot so
+  // detection doesn't fight the user's choice. Persisted.
+  lua_register(L, "_kb_legacy_set", [](lua_State* L) -> int {
+    bool on = lua_toboolean(L, 1);
+    if (!on) s_kb_autoswitch_done = true;
+    kb_set_legacy(on, /*save=*/true);
+    lua_pushboolean(L, kb_legacy_mode ? 1 : 0);
+    return 1;
+  });
+  lua_register(L, "_kb_legacy_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, kb_legacy_mode ? 1 : 0);
+    return 1;
+  });
+
   // Alt emoji layer keymap. Keys are identified by their normal-layer char
   // ("a".."z", "$"); codepoints may be blob singles OR sequence PUAs.
   lua_register(L, "_kb_emoji_get", [](lua_State* L) -> int {
@@ -8288,11 +8423,15 @@ void setup() {
     setKeyboardDefaultBrightness(127);
     setKeyboardBrightness(kbd_brightness);
 
-    // Switch keyboard to raw matrix mode for hold detection
+    // Switch keyboard to raw matrix mode for hold detection — unless legacy
+    // ASCII mode is persisted (old keyboard-MCU firmware without raw-mode
+    // support; the KEY command is a no-op there and forces the single-byte
+    // protocol on newer firmware so both behave identically).
     Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
-    Wire.write(LILYGO_KB_MODE_RAW_CMD);
+    Wire.write(kb_legacy_mode ? LILYGO_KB_MODE_KEY_CMD : LILYGO_KB_MODE_RAW_CMD);
     Wire.endTransmission();
-    SLog.println("Keyboard switched to raw matrix mode");
+    SLog.printf("Keyboard switched to %s mode\n",
+                kb_legacy_mode ? "legacy ASCII" : "raw matrix");
   } else {
     SLog.println("T-Deck keyboard not found!");
   }
@@ -8549,6 +8688,32 @@ static void dispatch_home_shortcut() {
   }
 }
 
+// Auto-enable legacy ASCII keyboard mode when the detection heuristic in
+// keyboard_read_cb flagged old keyboard-MCU firmware. Runs here so the prefs
+// flash write happens outside LVGL indev processing.
+static void dispatch_kb_legacy_autoswitch() {
+  if (!s_kb_legacy_autoswitch_pending) return;
+  s_kb_legacy_autoswitch_pending = false;
+  kb_set_legacy(true, /*save=*/true);
+  notify_post("Old keyboard firmware detected - compatibility mode enabled: "
+              "keys register one at a time, key combos and holds won't work "
+              "(restart device to exit games). Toggle in Settings > Device");
+  SLog.println("[KB] old keyboard firmware detected, legacy ASCII mode auto-enabled");
+  // On-screen toast on top of the bell notification (apps.kb_legacy_popup →
+  // utils.createNotification). Same Lua-call shape as the dispatches above.
+  if (!L) return;
+  lua_getglobal(L, "require");
+  lua_pushstring(L, "lib/apps");
+  if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "kb_legacy_popup");
+  lua_remove(L, -2);   // drop the module table
+  if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+  if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    SLog.printf("[KB] kb_legacy_popup error: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 1);
+  }
+}
+
 // Dispatch the alt+mic emoji-popup shortcut into Lua (lib/emoji_popup
 // .on_shortcut). Same deferral as dispatch_topbar_shortcut above.
 static void dispatch_emoji_popup() {
@@ -8604,6 +8769,9 @@ void loop() {
 
   // Alt+backspace home chord (same flag pattern).
   dispatch_home_shortcut();
+
+  // Old-keyboard-firmware auto-switch (flag set by the keyboard reader).
+  dispatch_kb_legacy_autoswitch();
 
   // USB drive mode watchdog: force-stops a session when the Tools/"USB
   // Drive" app stops pinging (any teardown path). Cheap no-op when idle.

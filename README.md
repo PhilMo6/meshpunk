@@ -185,6 +185,18 @@ Trackball and WASD share a configurable sensitivity setting (Device Settings →
 - **`q`** — backs out of selection modes: message selection in a chat, row-select lists, and the Map app.
 - **Enter (in a chat)** — sends the message. Long-press the message input to open the clipboard menu (paste copied contact cards and text).
 
+### Keyboard firmware compatibility
+
+Full keyboard function requires LilyGo's **250620 or newer** keyboard firmware on the T-Deck's keyboard MCU (the separate ESP32-C3 that scans the keys). Units manufactured before mid-2025 shipped older keyboard firmware without raw-matrix support — on those, Meshpunk detects the mismatch after a few keypresses and automatically switches to a **legacy compatibility mode** (a notification confirms it; manual override in Settings → Device → "Legacy keyboard").
+
+Legacy mode limitations (the old keyboard firmware reports one character per press, with no key-release or modifier information):
+
+- Typing, WASD navigation, Enter/Backspace work — tap-based only, no key holds or repeats
+- Sym/Alt tap-latches, the emoji layer, and all keyboard chords (including **Alt+Backspace quit-to-home**) are unavailable — use each app's on-screen controls, and **restart the device to leave a native game** (a USB keyboard's Alt+Backspace chord still works)
+- On the oldest (2023) keyboard firmware the backlight ignores Meshpunk's brightness setting — toggle it with `Alt`+`B` (handled inside the keyboard itself)
+
+For full function, the keyboard MCU can be reflashed with [LilyGo's keyboard firmware](https://github.com/Xinyuan-LilyGO/T-Deck/tree/master/firmware) (`T-Keyboard_Keyboard_ESP32C3_250620.bin`) via an external USB-TTL adapter on the 6-pin header next to the RST button — then turn legacy mode off in Settings → Device.
+
 ### USB drive mode
 
 Tools → USB Drive shares the SD card with a PC: plug the device into the PC, press **Start sharing**, and it appears as a removable USB drive (~1 MB/s — the chip's USB is full-speed). While sharing, the PC owns the card exclusively: apps lose the SD drive and the mesh radio pauses. Eject the drive on the PC, then press **Stop** (or just leave the app) — the card remounts and the mesh resumes. Internal files can be shared by copying them to SD in Tools → Files first. After a drive session, USB **host** mode (Tools → USB Host) needs a reboot.

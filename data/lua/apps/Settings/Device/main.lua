@@ -249,6 +249,28 @@ if _kb_alt_toggle_get then
     end)
 end
 
+-- Legacy keyboard: old keyboard-MCU firmware (pre-250620) has no raw matrix
+-- mode and sends one character per press. Auto-enabled when the firmware
+-- detects it; this is the manual override. In legacy mode key holds, the
+-- sym/alt toggles above and keyboard chords do not work. Guarded so the page
+-- still loads on firmware without the bindings.
+if _kb_legacy_get then
+    local legacy_on = _kb_legacy_get()
+    local function legacy_text()
+        return (legacy_on and "[x]" or "[ ]") .. " Legacy keyboard (old kb firmware)"
+    end
+    local legacy_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+    local legacy_lbl = legacy_btn:Label { text = legacy_text(), align = lvgl.ALIGN.LEFT_MID }
+
+    legacy_btn:onClicked(function()
+        legacy_on = not legacy_on
+        _kb_legacy_set(legacy_on)
+        legacy_lbl:set({ text = legacy_text() })
+        status.text = legacy_on and "Keyboard: legacy single-key mode"
+                                or "Keyboard: raw matrix mode"
+    end)
+end
+
 -- ── Trackball Sensitivity ────────────────────────────────────────────────────
 content:Label { text = "-- Trackball --", w = lvgl.PCT(100), h = 16 }
 

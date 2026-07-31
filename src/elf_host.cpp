@@ -77,6 +77,10 @@ extern volatile int trackball_down;
 extern volatile int trackball_left;
 extern volatile int trackball_right;
 
+// Legacy ASCII keyboard mode (from main.cpp): the keyboard MCU sends one
+// final ASCII byte per press instead of the 5-byte raw matrix.
+extern bool firmware_kb_legacy();
+
 // Keyboard constants (mirrored from main.cpp)
 #define KB_SLAVE_ADDR  0x55
 #define KB_COLS_N      5
@@ -284,14 +288,40 @@ static void parse_keymap_arg(const char* str) {
 // spurious trackball edge is generated). Used by the high-rate keyboard
 // pump in host_sleep_ms — the trackball momentum model is tuned for the
 // once-per-frame poll rate and must not be advanced ~200 times a second.
+// Legacy ASCII mode pulse: each received byte is a discrete press with no
+// matching release, so it is held in cur_state for a fixed window (re-arrival
+// extends it) and the edge loop emits the down/up pair to the module.
+#define LEGACY_ELF_PULSE_MS 120
+static uint8_t  s_legacy_down_ch    = 0;
+static uint32_t s_legacy_release_at = 0;
+
 static void poll_input(bool kb_only = false) {
     bool cur_state[INPUT_STATE_SIZE] = {0};
 
-    // Read keyboard matrix via I2C
+    // Read keyboard matrix via I2C — or one ASCII byte in legacy mode (old
+    // keyboard-MCU firmware: no release/repeat/modifier info, so the alt
+    // combos, F-keys, Shift+Backspace-Esc, ALT+ENTER layer chord and the
+    // Alt+Backspace exit chord cannot fire; a USB keyboard's chord still
+    // exits, otherwise leaving a module takes a device restart).
     uint8_t matrix[KB_COLS_N] = {0};
-    Wire.requestFrom(KB_SLAVE_ADDR, KB_COLS_N);
-    for (int c = 0; c < KB_COLS_N && Wire.available(); c++) {
-        matrix[c] = Wire.read();
+    if (firmware_kb_legacy()) {
+        uint8_t v = 0;
+        Wire.requestFrom(KB_SLAVE_ADDR, 1);
+        if (Wire.available()) v = Wire.read();
+        if (v) {
+            s_legacy_down_ch    = v;
+            s_legacy_release_at = millis() + LEGACY_ELF_PULSE_MS;
+        } else if (s_legacy_down_ch &&
+                   (int32_t)(millis() - s_legacy_release_at) >= 0) {
+            s_legacy_down_ch = 0;
+        }
+        if (s_legacy_down_ch) cur_state[s_legacy_down_ch] = true;
+        // matrix stays zero: the modifier bools and decode loop below are inert.
+    } else {
+        Wire.requestFrom(KB_SLAVE_ADDR, KB_COLS_N);
+        for (int c = 0; c < KB_COLS_N && Wire.available(); c++) {
+            matrix[c] = Wire.read();
+        }
     }
 
     bool shift = (matrix[MOD_LSHIFT_COL] & (1 << MOD_LSHIFT_ROW)) ||
@@ -511,6 +541,8 @@ static void elf_input_start() {
     esc_held = false;
     s_usb_bs_down = false;
     s_usb_alt_down = false;
+    s_legacy_down_ch = 0;
+    s_legacy_release_at = 0;
     s_input_task_run = true;
     // Priority 5: ABOVE usb_mgr (4), sound_task (3) and elf_blit (3). The
     // keyboard poll is a tiny, latency-critical task (one I2C read every 10ms);

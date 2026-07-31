@@ -51,7 +51,14 @@
 //                  a module can shrink a file without a copy-and-swap) —
 //                  plus the ALT+Enter binding-layer toggle a module opts into
 //                  with -kbtoggle N and Shift+Backspace = Esc in ELF modules
-#define MESHPUNK_FW_API 6
+//   7  2026-07-30  unreleased since the v0.3.1 tag (which shipped level 6):
+//                  legacy ASCII keyboard mode for pre-250620 keyboard-MCU
+//                  firmware — _kb_legacy_get / _kb_legacy_set bindings
+//                  (Settings/Device toggle), old-firmware auto-detection +
+//                  auto-switch with notification + toast, single-byte input in
+//                  both the LVGL reader and the ELF host (no exit chord in
+//                  legacy mode — restart the device to leave a module)
+#define MESHPUNK_FW_API 7
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:

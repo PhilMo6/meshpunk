@@ -511,6 +511,17 @@ function M.home_shortcut()
     M.go_home()
 end
 
+-- Legacy-keyboard auto-switch toast (dispatched from loop() via
+-- dispatch_kb_legacy_autoswitch, right after the C side enabled compatibility
+-- mode and posted the bell notification). Parented to the active screen, so
+-- an app teardown inside the display window takes the toast down with it —
+-- utils.createNotification's anim/timer callbacks are pcall-guarded for
+-- exactly that.
+function M.kb_legacy_popup()
+    utils.createNotification(lvgl.disp.get_scr_act(),
+        "Old keyboard firmware detected\nCompatibility mode enabled", 6000)
+end
+
 -- Exit to the launcher KEEPING the app's background contract alive: the same
 -- teardown as go_home (nav, UI root, foreground timers, sound sweep) except
 -- the sweep spares the contract's live sound ids and the manager starts the
