@@ -186,6 +186,16 @@ static bool esc_held = false;
 static uint32_t esc_hold_start = 0;
 #define ESC_EXIT_HOLD_MS 1500
 
+// Bindable quit: a keymap entry whose OUTPUT is this code exits the module
+// instead of reaching it. A launcher binds it from its Controls screen like any
+// other action, so one tap replaces the Alt+Backspace hold — the only exit
+// reachable in legacy ASCII mode, which reports no modifiers and no holds.
+// 0xFF sits above every code in use (ASCII, 0x80 shift, 0x81-0x85 trackball,
+// 0x8C USB alt, 0x91-0x99 Dos extensions, 0xB0-0xB9 F-keys) and is never an
+// input code, so it can only ever arrive as a keymap output.
+#define HOST_KEY_QUIT 0xFF
+static volatile bool s_quit_requested = false;
+
 // USB keyboard Backspace/Alt held (set by elf_input_inject, pre-keymap) —
 // OR'd into the exit-hold check so a USB keyboard can leave a module too.
 static volatile bool s_usb_bs_down  = false;
@@ -295,14 +305,25 @@ static void parse_keymap_arg(const char* str) {
 static uint8_t  s_legacy_down_ch    = 0;
 static uint32_t s_legacy_release_at = 0;
 
+// Legacy binding-layer sequence: 'p', Backspace, Enter as the last three
+// presses, in that order, with nothing between them. The legacy twin of the
+// ALT+ENTER chord, which needs a modifier level legacy mode never reports.
+// Deliberately untimed — the keys are recorded whenever they arrive.
+#define LEGACY_SEQ_1 'p'
+#define LEGACY_SEQ_2 0x08
+#define LEGACY_SEQ_3 0x0D
+static uint8_t s_legacy_hist[3]  = {0, 0, 0};
+static bool    s_legacy_flip_req = false;
+
 static void poll_input(bool kb_only = false) {
     bool cur_state[INPUT_STATE_SIZE] = {0};
 
     // Read keyboard matrix via I2C — or one ASCII byte in legacy mode (old
     // keyboard-MCU firmware: no release/repeat/modifier info, so the alt
     // combos, F-keys, Shift+Backspace-Esc, ALT+ENTER layer chord and the
-    // Alt+Backspace exit chord cannot fire; a USB keyboard's chord still
-    // exits, otherwise leaving a module takes a device restart).
+    // Alt+Backspace exit chord cannot fire. A legacy user leaves a module with
+    // a bound quit key, reaching the binding layer via the sequence below where
+    // a module opted into -kbtoggle; a USB keyboard's chord still exits too.
     uint8_t matrix[KB_COLS_N] = {0};
     if (firmware_kb_legacy()) {
         uint8_t v = 0;
@@ -311,6 +332,18 @@ static void poll_input(bool kb_only = false) {
         if (v) {
             s_legacy_down_ch    = v;
             s_legacy_release_at = millis() + LEGACY_ELF_PULSE_MS;
+            // Each byte is exactly one physical press (this firmware has no
+            // repeat). Recorded RAW, before any keymap lookup, so binding one
+            // of the three keys to a game action cannot break the sequence.
+            s_legacy_hist[0] = s_legacy_hist[1];
+            s_legacy_hist[1] = s_legacy_hist[2];
+            s_legacy_hist[2] = v;
+            if (s_legacy_hist[0] == LEGACY_SEQ_1 &&
+                s_legacy_hist[1] == LEGACY_SEQ_2 &&
+                s_legacy_hist[2] == LEGACY_SEQ_3) {
+                s_legacy_flip_req = true;
+                s_legacy_hist[0] = s_legacy_hist[1] = s_legacy_hist[2] = 0;
+            }
         } else if (s_legacy_down_ch &&
                    (int32_t)(millis() - s_legacy_release_at) >= 0) {
             s_legacy_down_ch = 0;
@@ -441,7 +474,11 @@ static void poll_input(bool kb_only = false) {
     // while blinking only once. Nobody flips this deliberately inside 300ms.
     static bool alt_enter_prev = false;
     static uint32_t alt_enter_last_ms = 0;
-    if (alt_enter && !alt_enter_prev && s_kb_toggle_enabled
+    // The legacy sequence asks for the same flip. Consume the request even when
+    // the module has not opted in, so it can never fire later out of context.
+    bool flip_req = (alt_enter && !alt_enter_prev) || s_legacy_flip_req;
+    s_legacy_flip_req = false;
+    if (flip_req && s_kb_toggle_enabled
         && !keymap_passthrough
         && (uint32_t)(millis() - alt_enter_last_ms) >= 300) {
         alt_enter_last_ms = millis();
@@ -470,6 +507,14 @@ static void poll_input(bool kb_only = false) {
             } else {
                 out = keymap_table[i];
                 if (!out) out = (uint8_t)i;   // unmapped: pass through
+            }
+            // Quit binding: swallowed on BOTH edges, so no module ever sees a
+            // 0xFF it does not know or a release without a press. Reachable
+            // only while the table is consulted, which is why the bound key
+            // still types normally with the binding layer off.
+            if (out == HOST_KEY_QUIT) {
+                if (cur_state[i]) s_quit_requested = true;
+                continue;
             }
             if (out)
                 kq_push(out, cur_state[i] ? 1 : 0);
@@ -543,6 +588,9 @@ static void elf_input_start() {
     s_usb_alt_down = false;
     s_legacy_down_ch = 0;
     s_legacy_release_at = 0;
+    s_legacy_hist[0] = s_legacy_hist[1] = s_legacy_hist[2] = 0;
+    s_legacy_flip_req = false;
+    s_quit_requested = false;
     s_input_task_run = true;
     // Priority 5: ABOVE usb_mgr (4), sound_task (3) and elf_blit (3). The
     // keyboard poll is a tiny, latency-critical task (one I2C read every 10ms);
@@ -579,11 +627,18 @@ void elf_input_inject(unsigned char key, int pressed) {
     if (key == 0x8C) s_usb_alt_down = (pressed != 0);  // exit-hold Alt (USB kbd)
     if (!s_input_task_run) return;
     uint8_t out;
-    if (keymap_passthrough) {
+    // !s_kb_layer_on mirrors poll_input: with the binding layer off a USB
+    // keyboard types raw too, so a bound key (quit included) cannot fire while
+    // the user is at a prompt.
+    if (keymap_passthrough || !s_kb_layer_on) {
         out = key;
     } else {
         out = keymap_table[key];
         if (!out) out = key;    // unmapped: pass through (as poll_input)
+    }
+    if (out == HOST_KEY_QUIT) {
+        if (pressed) s_quit_requested = true;
+        return;
     }
     if (out) kq_push(out, pressed ? 1 : 0);
 }
@@ -938,6 +993,7 @@ static int elf_workers_cleanup(void) {
 }
 
 int host_should_exit(void) {
+    if (s_quit_requested) return 1;
     return (esc_held && (millis() - esc_hold_start > ESC_EXIT_HOLD_MS)) ? 1 : 0;
 }
 

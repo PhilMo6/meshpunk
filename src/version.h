@@ -58,7 +58,17 @@
 //                  auto-switch with notification + toast, single-byte input in
 //                  both the LVGL reader and the ELF host (no exit chord in
 //                  legacy mode — restart the device to leave a module)
-#define MESHPUNK_FW_API 7
+//   8  2026-07-31  unreleased since the v0.3.2 tag (which shipped level 7):
+//                  lib/keybind.lua — the shared binding system every ELF
+//                  launcher now requires (key table, Controls + picker +
+//                  trackball Input screens, config lines, -keymap/-trkball
+//                  strings, Detect-a-keypress capture); a bindable QUIT
+//                  (keymap output 0xFF, swallowed host-side, exits through
+//                  host_should_exit) which replaces "restart the device" as
+//                  the legacy-keyboard exit; and the legacy binding-layer
+//                  sequence 'p', Backspace, Enter — the twin of ALT+Enter for
+//                  keyboards that report no modifiers, same -kbtoggle opt-in
+#define MESHPUNK_FW_API 8
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:
