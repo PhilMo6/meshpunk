@@ -2944,8 +2944,13 @@ static int lua_wifi_get_enabled(lua_State *L) {
   return 1;
 }
 
+// _wifi_set_enabled(on [, persist])
+// persist defaults to true. With persist = false the live radio and the
+// in-RAM pref both change but nothing is written, so the next boot restores
+// the saved state. Used to free internal SRAM for one ELF module run.
 static int lua_wifi_set_enabled(lua_State *L) {
   wifi_enabled_pref = lua_toboolean(L, 1);
+  bool persist = lua_isnoneornil(L, 2) ? true : (bool)lua_toboolean(L, 2);
   {
     // WiFi mode/connect can write PHY calibration to NVS (internal flash) —
     // pause any USB audio stream around it so the cache stall can't crash it.
@@ -2961,7 +2966,7 @@ static int lua_wifi_set_enabled(lua_State *L) {
     }
   }
   if (wifi_enabled_pref) wifi_auto_kick();
-  firmware_prefs_save();
+  if (persist) firmware_prefs_save();
   return 0;
 }
 
@@ -7089,8 +7094,13 @@ void setupLuaVGL() {
     lua_pushboolean(L, ble_enabled_pref);
     return 1;
   });
+  // _ble_set_enabled(on [, persist]) — persist defaults to true. With
+  // persist = false the companion stops (BLEDevice::deinit frees the stack)
+  // and the in-RAM pref changes, but nothing is written: the next boot
+  // restores the saved state. Used to free internal SRAM for one module run.
   lua_register(L, "_ble_set_enabled", [](lua_State* L) -> int {
     bool v = lua_toboolean(L, 1);
+    bool persist = lua_isnoneornil(L, 2) ? true : (bool)lua_toboolean(L, 2);
     ble_enabled_pref = v;
     MESH_LOCK();
     if (v && !ble_serial) {
@@ -7100,7 +7110,7 @@ void setupLuaVGL() {
       ble_companion_stop();
     }
     MESH_UNLOCK();
-    firmware_prefs_save();
+    if (persist) firmware_prefs_save();
     lua_pushboolean(L, ble_enabled_pref);
     return 1;
   });
