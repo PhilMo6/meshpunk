@@ -176,6 +176,29 @@ struct RepeatOutcome {
   uint8_t status; // 2=confirmed, 3=exhausted
 };
 
+// ── Raw packet capture (Packets monitor app) ──────────────────────
+// One wire frame as the Dispatcher log hooks saw it. Filled on the radio
+// core, drained on the UI core by _mesh_pkt_poll().
+#define PKT_CAP_RING_SIZE  48
+
+#define PKT_CAP_DIR_RX      0
+#define PKT_CAP_DIR_TX      1
+#define PKT_CAP_DIR_TX_FAIL 2
+
+struct PktCapture {
+  uint32_t seq;        // monotonic; a gap in Lua means the ring dropped
+  uint32_t ts;         // device RTC epoch seconds
+  uint32_t ms;         // millis(), for sub-second ordering
+  int16_t  snr_q4;     // SNR * 4
+  int16_t  rssi;
+  int16_t  score_q10;  // score * 1000; -1 when the hook had no score
+  uint8_t  dir;        // PKT_CAP_DIR_*
+  uint8_t  parsed;     // RX: 1 once logRx confirmed tryParsePacket succeeded
+  uint8_t  len;
+  uint8_t  hash[MAX_HASH_SIZE];   // set when parsed
+  uint8_t  raw[MAX_TRANS_UNIT];
+};
+
 // Class declaration
 class PunkMesh : public BaseChatMesh, ContactVisitor
 {
@@ -193,6 +216,25 @@ public:
   // Last received packet radio info (updated in logRx)
   float last_rx_snr = 0;
   float last_rx_rssi = 0;
+
+  // ── Packet capture ring ──────────────────────────────────────
+  // Allocated in PSRAM only while the monitor app arms capture, freed when
+  // it disarms, so the feature costs nothing when nothing is watching.
+  // Written from the four Dispatcher log hooks on the radio core and drained
+  // from the UI core; both sides run under MESH_LOCK (mesh_task_body wraps
+  // the_mesh->loop(), the Lua bindings take it directly), so the ring needs
+  // no lock of its own. Full ring overwrites the OLDEST entry — a burst can
+  // never stall the radio loop.
+  PktCapture* _pkt_ring = NULL;
+  uint16_t    _pkt_head = 0;      // next write slot
+  uint16_t    _pkt_count = 0;     // unread entries held
+  uint32_t    _pkt_seq = 0;       // next seq to hand out
+  uint32_t    _pkt_dropped = 0;   // overwritten-before-read, since last poll
+  volatile bool _pkt_capture = false;
+
+  bool pktCaptureStart();
+  void pktCaptureStop();
+  PktCapture* pktCapturePush(uint8_t dir);   // NULL when capture is off
 
   // Bumped on every contact mutation — they all funnel through
   // saveContacts(). Lets the Lua _mesh_get_contacts binding cache its
@@ -653,6 +695,11 @@ protected:
   void sendFloodWithScope(mesh::Packet* pkt, uint32_t delay_millis,
                           const uint8_t* key_override = nullptr);
   void logRx(mesh::Packet *pkt, int len, float score) override;
+  // Every frame the radio hands up, before parsing — so the monitor also sees
+  // frames tryParsePacket rejects and frames dropped for an empty packet pool.
+  void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
+  void logTx(mesh::Packet *pkt, int len) override;
+  void logTxFail(mesh::Packet *pkt, int len) override;
   float getAirtimeBudgetFactor() const override;
   int calcRxDelay(float score, uint32_t air_time) const override;
   bool allowPacketForward(const mesh::Packet *packet) override;

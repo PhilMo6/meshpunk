@@ -5544,6 +5544,90 @@ void PunkMesh::begin()
     _public_deleted = (publicChannelIdx() < 0);
 }
 
+// ── Packet capture ring ──────────────────────────────────────────────
+// See the header for the locking argument: every function here runs under
+// MESH_LOCK, either via mesh_task_body's wrapper around the_mesh->loop()
+// (the log hooks) or because the Lua binding took it (start/stop/drain).
+
+bool PunkMesh::pktCaptureStart() {
+    if (_pkt_ring) { _pkt_capture = true; return true; }
+    _pkt_ring = (PktCapture*)heap_caps_malloc(sizeof(PktCapture) * PKT_CAP_RING_SIZE,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!_pkt_ring) {
+        SLog.println("[PKTCAP] ERROR: ring alloc failed");
+        return false;
+    }
+    _pkt_head = _pkt_count = 0;
+    _pkt_seq = 0;
+    _pkt_dropped = 0;
+    _pkt_capture = true;
+    SLog.printf("[PKTCAP] capture on (%u entries, %u bytes)\n",
+        (unsigned)PKT_CAP_RING_SIZE, (unsigned)(sizeof(PktCapture) * PKT_CAP_RING_SIZE));
+    return true;
+}
+
+void PunkMesh::pktCaptureStop() {
+    _pkt_capture = false;      // hooks bail before the free below
+    if (_pkt_ring) {
+        heap_caps_free(_pkt_ring);
+        _pkt_ring = NULL;
+        SLog.println("[PKTCAP] capture off");
+    }
+    _pkt_head = _pkt_count = 0;
+}
+
+// Claim the next slot, stamped and zeroed of frame data. The caller fills
+// len/raw (and score/hash where it has them).
+PktCapture* PunkMesh::pktCapturePush(uint8_t dir) {
+    if (!_pkt_capture || !_pkt_ring) return NULL;
+
+    PktCapture* e = &_pkt_ring[_pkt_head];
+    _pkt_head = (_pkt_head + 1) % PKT_CAP_RING_SIZE;
+    if (_pkt_count < PKT_CAP_RING_SIZE) {
+        _pkt_count++;
+    } else {
+        _pkt_dropped++;        // just overwrote an unread entry
+    }
+
+    e->seq       = _pkt_seq++;
+    e->ts        = getRTCClock()->getCurrentTime();
+    e->ms        = millis();
+    e->snr_q4    = 0;
+    e->rssi      = 0;
+    e->score_q10 = -1;
+    e->dir       = dir;
+    e->parsed    = 0;
+    e->len       = 0;
+    memset(e->hash, 0, MAX_HASH_SIZE);
+    return e;
+}
+
+void PunkMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+    PktCapture* e = pktCapturePush(PKT_CAP_DIR_RX);
+    if (!e) return;
+    if (len > MAX_TRANS_UNIT) len = MAX_TRANS_UNIT;
+    e->snr_q4 = (int16_t)(snr * 4.0f);
+    e->rssi   = (int16_t)rssi;
+    e->len    = (uint8_t)len;
+    memcpy(e->raw, raw, len);
+}
+
+void PunkMesh::logTx(mesh::Packet* pkt, int len) {
+    PktCapture* e = pktCapturePush(PKT_CAP_DIR_TX);
+    if (!e) return;
+    e->parsed = 1;
+    e->len    = pkt->writeTo(e->raw);
+    pkt->calculatePacketHash(e->hash);
+}
+
+void PunkMesh::logTxFail(mesh::Packet* pkt, int len) {
+    PktCapture* e = pktCapturePush(PKT_CAP_DIR_TX_FAIL);
+    if (!e) return;
+    e->parsed = 1;
+    e->len    = pkt->writeTo(e->raw);
+    pkt->calculatePacketHash(e->hash);
+}
+
 void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {
     last_rx_snr = _radio->getLastSNR();
     last_rx_rssi = _radio->getLastRSSI();
@@ -5567,6 +5651,20 @@ void PunkMesh::logRx(mesh::Packet* pkt, int len, float score) {
         pkt->isRouteDirect() ? "DIRECT" : "FLOOD",
         pkt->payload_len,
         (int)last_rx_snr, (int)last_rx_rssi, (int)(score * 1000));
+
+    // Complete this frame's capture entry. checkRecv() calls logRxRaw() then
+    // logRx() for the SAME frame inside one MESH_LOCK section, so the newest
+    // ring entry is this packet's — an unparsed RX entry it left behind.
+    // Frames that never reach here stay parsed=0, which is how the monitor
+    // shows rejected/dropped ones.
+    if (_pkt_capture && _pkt_ring && _pkt_count > 0) {
+        PktCapture* e = &_pkt_ring[(_pkt_head + PKT_CAP_RING_SIZE - 1) % PKT_CAP_RING_SIZE];
+        if (e->dir == PKT_CAP_DIR_RX && !e->parsed) {
+            e->parsed    = 1;
+            e->score_q10 = (int16_t)(score * 1000);
+            memcpy(e->hash, _last_pkt_hash, MAX_HASH_SIZE);
+        }
+    }
 
 #if BLE_COMPANION_ENABLED
     if (ble_companion) ble_companion->pushLogRxData(pkt, last_rx_snr, last_rx_rssi);

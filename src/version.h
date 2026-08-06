@@ -67,7 +67,37 @@
 //                  host_should_exit) which replaces "restart the device" as
 //                  the legacy-keyboard exit; and the legacy binding-layer
 //                  sequence 'p', Backspace, Enter — the twin of ALT+Enter for
-//                  keyboards that report no modifiers, same -kbtoggle opt-in
+//                  keyboards that report no modifiers, same -kbtoggle opt-in;
+//                  a launcher's -stackkb N as a CEILING on the module task
+//                  stack, then descending through the built-in rungs below it
+//                  (it previously appended one rung UNDER the fixed
+//                  64/48/32KB ladder, so a module that declared its depth was
+//                  still handed the larger stack whenever one fit), which
+//                  leaves internal SRAM for a module's own worker tasks; and
+//                  an optional second argument on _wifi_set_enabled /
+//                  _ble_set_enabled, persist (default true) — false applies
+//                  the change to the live radio and the in-RAM pref but skips
+//                  firmware_prefs_save(), so the next boot restores the saved
+//                  state (the Snes launcher uses both to fit the Speed
+//                  renderer's Core-1 worker into internal SRAM); and the raw
+//                  packet capture ring — _mesh_pkt_capture(on) arms/frees it
+//                  (48 entries in PSRAM, allocated only while armed) and
+//                  _mesh_pkt_poll(max) -> frames, dropped drains it oldest
+//                  first, each frame { seq, ts, ms, dir, parsed, snr, rssi,
+//                  score, len, hash, raw } with dir "rx"/"tx"/"txfail" and
+//                  raw the full wire frame as hex (Tools/Packets store app);
+//                  and two NEW ELF host_exports for band renderers —
+//                  host_blit_rect_async(buf,x,y,w,h) (the async form of
+//                  host_blit_rect: the Core-1 push task now carries an x/y
+//                  rect, so a module can hand over one finished band and
+//                  rasterise the next into a second buffer while this one
+//                  goes out; one-deep back-pressure, it returns when the
+//                  PREVIOUS push completed, so two alternating buffers are
+//                  enough) and host_blit_wait() (block until no push is in
+//                  flight — a module MUST call it before freeing a buffer
+//                  the push task may still be reading). A module importing
+//                  either fails to LOAD on level 7 with an unresolved
+//                  symbol, so min_fw=8 is mandatory for it (Jet 3D)
 #define MESHPUNK_FW_API 8
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see

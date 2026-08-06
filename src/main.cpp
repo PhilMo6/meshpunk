@@ -4509,6 +4509,83 @@ static int lua_mesh_get_rx_info(lua_State *L) {
   return 1;
 }
 
+// ── Raw packet capture (Packets monitor app) ─────────────────────────
+// Arm/disarm the capture ring. Allocating on arm and freeing on disarm keeps
+// the ~14KB out of PSRAM whenever nothing is watching.
+// Usage: local ok = _mesh_pkt_capture(true)
+static int lua_mesh_pkt_capture(lua_State *L) {
+  bool on = lua_toboolean(L, 1);
+  MESH_LOCK();
+  bool ok = true;
+  if (on) ok = the_mesh->pktCaptureStart(); else the_mesh->pktCaptureStop();
+  MESH_UNLOCK();
+  lua_pushboolean(L, ok);
+  return 1;
+}
+
+// Drain up to `max` captured frames, oldest first.
+// Usage: local pkts, dropped = _mesh_pkt_poll(32)
+// Each entry: { seq, ts, ms, dir, parsed, snr, rssi, score, len, hash, raw }
+// dir is "rx" / "tx" / "txfail"; score is nil when the hook had none; hash is
+// nil on an unparsed frame; raw is the full wire frame as a hex string.
+static int lua_mesh_pkt_poll(lua_State *L) {
+  int max = (int)luaL_optinteger(L, 1, 32);
+  if (max < 1) max = 1;
+  if (max > PKT_CAP_RING_SIZE) max = PKT_CAP_RING_SIZE;
+
+  lua_newtable(L);
+  int out = 0;
+  uint32_t dropped = 0;
+
+  MESH_LOCK();
+  dropped = the_mesh->_pkt_dropped;
+  the_mesh->_pkt_dropped = 0;
+
+  while (out < max && the_mesh->_pkt_count > 0 && the_mesh->_pkt_ring) {
+    uint16_t tail = (the_mesh->_pkt_head + PKT_CAP_RING_SIZE - the_mesh->_pkt_count)
+                    % PKT_CAP_RING_SIZE;
+    // Copy out of the ring before touching Lua: a lua_* call can longjmp on
+    // OOM, and the radio core must never find a half-consumed ring.
+    PktCapture e = the_mesh->_pkt_ring[tail];
+    the_mesh->_pkt_count--;
+    MESH_UNLOCK();
+
+    char raw_hex[MAX_TRANS_UNIT * 2 + 1];
+    mesh::Utils::toHex(raw_hex, e.raw, e.len);   // toHex null-terminates
+
+    lua_newtable(L);
+    lua_pushinteger(L, e.seq);           lua_setfield(L, -2, "seq");
+    lua_pushinteger(L, e.ts);            lua_setfield(L, -2, "ts");
+    lua_pushinteger(L, e.ms);            lua_setfield(L, -2, "ms");
+    lua_pushstring(L, e.dir == PKT_CAP_DIR_TX ? "tx"
+                    : e.dir == PKT_CAP_DIR_TX_FAIL ? "txfail" : "rx");
+                                         lua_setfield(L, -2, "dir");
+    lua_pushboolean(L, e.parsed);        lua_setfield(L, -2, "parsed");
+    lua_pushinteger(L, e.len);           lua_setfield(L, -2, "len");
+    lua_pushstring(L, raw_hex);          lua_setfield(L, -2, "raw");
+
+    if (e.dir == PKT_CAP_DIR_RX) {
+      lua_pushnumber(L, e.snr_q4 / 4.0f); lua_setfield(L, -2, "snr");
+      lua_pushinteger(L, e.rssi);         lua_setfield(L, -2, "rssi");
+    }
+    if (e.score_q10 >= 0) {
+      lua_pushnumber(L, e.score_q10 / 1000.0f); lua_setfield(L, -2, "score");
+    }
+    if (e.parsed) {
+      char hash_hex[MAX_HASH_SIZE * 2 + 1];
+      mesh::Utils::toHex(hash_hex, e.hash, MAX_HASH_SIZE);
+      lua_pushstring(L, hash_hex);        lua_setfield(L, -2, "hash");
+    }
+
+    lua_rawseti(L, -2, ++out);
+    MESH_LOCK();
+  }
+  MESH_UNLOCK();
+
+  lua_pushinteger(L, dropped);
+  return 2;
+}
+
 // Usage: local enabled = _mesh_get_rx_boost()
 static int lua_mesh_get_rx_boost(lua_State *L) {
   SPI_LOCK();
@@ -6515,6 +6592,8 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_send_command", lua_mesh_send_command);
   lua_register(L, "_mesh_send_request", lua_mesh_send_request);
   lua_register(L, "_mesh_get_rx_info", lua_mesh_get_rx_info);
+  lua_register(L, "_mesh_pkt_capture", lua_mesh_pkt_capture);
+  lua_register(L, "_mesh_pkt_poll", lua_mesh_pkt_poll);
   lua_register(L, "_mesh_get_rx_boost", lua_mesh_get_rx_boost);
   lua_register(L, "_mesh_set_rx_boost", lua_mesh_set_rx_boost);
   lua_register(L, "_mesh_get_autoadd", lua_mesh_get_autoadd);
@@ -8101,7 +8180,14 @@ void luaTearDown() {
   if (!L) return;
   lua_State *dead = L;
   L = NULL;                                   // drain_rx_events() now bails
-  if (the_mesh) the_mesh->lua_runtime = NULL; // drop the stale-state handle
+  if (the_mesh) {
+    the_mesh->lua_runtime = NULL;             // drop the stale-state handle
+    // The only reader of the capture ring dies with Lua; free it here so an
+    // armed capture can't hold ~14KB of PSRAM through the ELF run.
+    MESH_LOCK();
+    the_mesh->pktCaptureStop();
+    MESH_UNLOCK();
+  }
   lua_close(dead);                            // GCs luavgl widgets -> lv_obj_del
   // Free the non-Lua global caches that survive lua_close and otherwise leave a
   // persistent mid-heap cluster capping the largest contiguous block:

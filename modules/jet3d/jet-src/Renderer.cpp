@@ -1,0 +1,2416 @@
+#include "Renderer.hpp"
+#include <algorithm>
+#include <cmath>
+#include "TrigLUT.hpp"
+#include "FastMath.hpp"
+
+#if defined(CHECKERBOARD_MODE) && CHECKERBOARD_MODE && defined(FIELD_BUFFERS) && FIELD_BUFFERS
+#error "CHECKERBOARD_MODE and FIELD_BUFFERS (interlaced) cannot both be enabled. Each would render only one quarter of pixels per frame and interact destructively. Pick one."
+#endif
+
+// JET_FAST_SIMPLE_SPANS: private to this TU. When the rasterizer is
+// configured without any per-pixel machinery (z-buffer, lighting,
+// brightness, debug overdraw, tile tagging, perspective textures) the inner
+// pixel loop degenerates to "maybe write a constant color, gated by a
+// triangle-constant dither mask". The scanline-range solver above the inner
+// loop already computes the exact [xStart, xEnd] range where the triangle
+// is inside, so the per-pixel edge-accumulate/test is pure dead weight.
+// Under SCREEN_DOOR_ALPHA the dither threshold reduces to two per-row
+// booleans (HALF_WIDTH only steps through x%4 ∈ {0, 2}). That unlocks a
+// tight fill loop that the compiler can unroll and the CPU can pipeline.
+// Automatic - nothing to turn on in Config.hpp; this simply kicks in when
+// none of the heavy features are enabled. Non-qualifying builds fall
+// through to the full general-purpose inner loop unchanged.
+//
+// NOTE: TEXTURE_MAPPING is intentionally NOT in this set. When texture
+// mapping is compiled in, untextured triangles still take the fast path
+// (decided per-triangle via the runtime `useFastSimpleSpan` flag); only
+// triangles that actually carry a diffuse map fall through to the
+// general per-pixel loop. This means enabling TEXTURE_MAPPING globally
+// no longer penalises scenes that mostly draw flat-shaded geometry.
+#define JET_FAST_SIMPLE_SPANS                                             \
+    (HALF_WIDTH_BUFFERS && !Z_BUFFERING &&                                   \
+     !LIGHTING && !Z_BRIGHTNESS && !DEBUG_OVERDRAW &&                        \
+     !RENDER_TILE_BUFFER && FAST_Z && !PERSPECTIVE_CORRECT_TEXTURES)
+
+// Standard "over" alpha blend in RGB565. Used when SCREEN_DOOR_ALPHA is
+// disabled — the renderer still has to honour material->alpha and the
+// per-object fade, just by lerping channels into the framebuffer instead of
+// stippling. Uses (256-a) and >>8 (vs (255-a)/255) for a single shift per
+// channel; the off-by-one bias is invisible at 5/6-bit channel widths.
+static inline uint16_t blendRGB565(uint16_t dst, uint16_t src, uint8_t alpha)
+{
+    const uint32_t a   = alpha;
+    const uint32_t inv = 256u - a;
+    const uint32_t sr = (src >> 11) & 0x1F;
+    const uint32_t sg = (src >> 5)  & 0x3F;
+    const uint32_t sb =  src        & 0x1F;
+    const uint32_t dr = (dst >> 11) & 0x1F;
+    const uint32_t dg = (dst >> 5)  & 0x3F;
+    const uint32_t db =  dst        & 0x1F;
+    const uint32_t r = (sr * a + dr * inv) >> 8;
+    const uint32_t g = (sg * a + dg * inv) >> 8;
+    const uint32_t b = (sb * a + db * inv) >> 8;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Saturating-add blend in RGB565.  Each source channel is scaled by
+// alpha/256 (using a=alpha+1 so a>>8 is exact at alpha=255, giving full
+// source intensity) then added to the corresponding destination channel and
+// clamped at the channel maximum (0x1F for R/B, 0x3F for G).
+// Use for neon glows, lamp coronas, explosion halos, and faked dynamic lights.
+static inline uint16_t addBlendRGB565(uint16_t dst, uint16_t src, uint8_t alpha)
+{
+    const uint32_t a  = (uint32_t)alpha + 1u;
+    const uint32_t sr = (((src >> 11) & 0x1Fu) * a) >> 8;
+    const uint32_t sg = (((src >>  5) & 0x3Fu) * a) >> 8;
+    const uint32_t sb = (( src        & 0x1Fu) * a) >> 8;
+    const uint32_t dr =  (dst >> 11) & 0x1Fu;
+    const uint32_t dg =  (dst >>  5) & 0x3Fu;
+    const uint32_t db =   dst        & 0x1Fu;
+    uint32_t r = dr + sr; if (r > 0x1Fu) r = 0x1Fu;
+    uint32_t g = dg + sg; if (g > 0x3Fu) g = 0x3Fu;
+    uint32_t b = db + sb; if (b > 0x1Fu) b = 0x1Fu;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// MESHPUNK: diagnostic pixel counters.
+//
+// Every cycles-per-pixel figure in this investigation was built on an ESTIMATE
+// of how many pixels a frame writes, derived from screen area and a guess at
+// overdraw. That estimate is the one number underneath all of it and it had
+// never been measured. These split the two paths that matter: spans filled by
+// fillRGB565Span (the cheap path untextured geometry takes) versus pixels
+// written by the general per-pixel loop.
+// Defined in the namespace the header declares them in; fillRGB565Span below
+// sits above the main `namespace Renderer` block, so it qualifies explicitly.
+namespace Renderer {
+    uint32_t g_jetPxSpan = 0;
+    uint32_t g_jetPxLoop = 0;
+}
+
+static inline void fillRGB565Span(uint16_t* framebuffer, int32_t bufferIndex, int32_t count, uint16_t color)
+{
+    if (count <= 0) return;
+    Renderer::g_jetPxSpan += (uint32_t)count;
+
+    int32_t idx = bufferIndex;
+    int32_t remaining = count;
+    if (idx & 1) {
+        framebuffer[idx++] = color;
+        --remaining;
+    }
+
+    const uint32_t color32 = ((uint32_t)color << 16) | color;
+    int32_t pairs = remaining >> 1;
+    uint32_t* out = reinterpret_cast<uint32_t*>(&framebuffer[idx]);
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    if (pairs >= 8) {
+        while (pairs > 0 && (((uintptr_t)out & 0x0F) != 0)) {
+            *out++ = color32;
+            --pairs;
+        }
+
+        const int32_t quads = pairs >> 2;
+        if (quads > 0) {
+            __asm__ volatile (
+                "ee.movi.32.q q0, %[v], 0\n\t"
+                "ee.movi.32.q q0, %[v], 1\n\t"
+                "ee.movi.32.q q0, %[v], 2\n\t"
+                "ee.movi.32.q q0, %[v], 3\n\t"
+                : : [v] "r"(color32)
+            );
+            const int stride = 16;
+            // 4x-unrolled: one loop iteration retires 64 bytes. The asm
+            // blocks are volatile with a memory clobber, so GCC can't
+            // unroll them itself — do it by hand to amortise the branch.
+            for (int32_t i = quads >> 2; i > 0; --i) {
+                __asm__ volatile (
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    : [p] "+r"(out) : [s] "r"(stride) : "memory"
+                );
+            }
+            for (int32_t i = quads & 3; i > 0; --i) {
+                __asm__ volatile (
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    : [p] "+r"(out) : [s] "r"(stride) : "memory"
+                );
+            }
+            pairs -= quads << 2;
+        }
+    }
+#endif
+
+    for (int32_t i = 0; i < pairs; ++i) {
+        *out++ = color32;
+    }
+    if (remaining & 1) {
+        *reinterpret_cast<uint16_t*>(out) = color;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Directional lighting (lit-only contribution).
+//
+// Returns the directional + view-facing-specular term as a scalar in
+// [0, 255 + specularCoef]. The ambient component is intentionally NOT folded
+// in here: ambient is a per-channel tint applied during colour modulation,
+// so that an `AmbientLight({160, 164, 180})` actually produces a cool-blue
+// shadow rather than the same neutral grey it would as a scalar floor.
+//
+// Inputs are integer view-space vectors with nominal magnitude
+// FIXED_POINT_SCALE (1024). The dot product therefore lives in
+// [-FPS², +FPS²] == [-1,048,576, +1,048,576].
+//
+// Sign convention: `L` points FROM the surface TOWARD the light source (this
+// is what DirectionalLight::calculateLightDirection() produces from its
+// azimuth/elevation pair). When N and L are aligned (N·L = +|N||L|) the
+// surface fully faces the light; when opposed (N·L = -|N||L|) the surface
+// faces away and the directional contribution is zero.
+//
+// View-facing "specular": rather than a true Blinn-Phong H·N evaluation
+// (which needs a normalise and a power per pixel), the renderer cheats with
+// the fact that in view space the camera looks down +Z, so the vector from
+// the surface back toward the camera is V = (0, 0, -1). A surface facing
+// the camera has N.z < 0, and (-N.z)/FPS is the cosine of the angle to V.
+// Squaring it tightens the falloff so the result reads more like a specular
+// lobe than a flat fresnel term, and it's gated on the Lambert factor so
+// the highlight only appears on the lit hemisphere.
+// -----------------------------------------------------------------------------
+static inline uint16_t jetShadeBrightness(const Vector3& N, const Vector3& L,
+                                          uint16_t lightIntensity,
+                                          uint8_t diffuseCoef,
+                                          uint8_t specularCoef,
+                                          uint16_t lambertGainQ8 = 256)
+{
+    if (lightIntensity > 255) lightIntensity = 255;
+    const uint32_t maxBrightness = 255u + specularCoef;
+
+    // Lambertian diffuse term. L points toward the light source, so a
+    // positive dot product means the surface faces the light.
+    int64_t lit = Vector3::dotProduct(N, L);
+    if (lit <= 0) return 0;
+
+    // Map [0, FPS²] → [0, 255]. With FPS=1024, FPS²=1,048,576, so >>12
+    // gives [0, 256]; clamp the top end.
+    uint32_t lambert = (uint32_t)(lit >> 12);
+    if (lambert > 255) lambert = 255;
+
+    // Falloff exaggeration. Square the Lambert term to bend the cosine
+    // curve down into the midtones: a face that's 70% facing the light
+    // would naturally return 0.70 brightness but now returns 0.49, and
+    // 50% drops to 0.25. Faces directly under the sun (1.0) are
+    // unchanged at 1.0, so peaks aren't blown — only the falloff is
+    // amplified. This makes a rotating object darken visibly as it
+    // turns away from the sun, rather than the gentle linear tint that
+    // raw Lambert produces. (lambert * lambert + 128) >> 8 keeps the
+    // result in [0, 255] with one rounding bit of headroom.
+    lambert = (lambert * lambert + 128) >> 8;
+
+    // Optional lambert gain (Q8). Default 256 (1.0×) preserves the
+    // physically-plausible cosine response used by GOURAUD and PHONG,
+    // which interpolate brightness across the triangle and benefit from
+    // smooth midtones. FLAT shades the whole face from a single averaged
+    // normal, so the response is constant across a polygon and a 1.0×
+    // gain reads as a gentle tint rather than "this face is in the sun".
+    // The FLAT call site passes a value >256 to push lit faces past
+    // 100% base colour into the per-material specular headroom
+    // (maxBrightness = 255 + specular), producing the strong lit/shadow
+    // split typical of early-hardware flat-shaded scenes.
+    if (lambertGainQ8 != 256)
+    {
+        lambert = (lambert * lambertGainQ8) >> 8;
+        if (lambert > maxBrightness) lambert = maxBrightness;
+    }
+    lambert = (lambert * lightIntensity) >> 8;
+    uint32_t diffuseTerm = (lambert * diffuseCoef) >> 8;
+    if (diffuseTerm > maxBrightness) diffuseTerm = maxBrightness;
+
+    uint32_t specularTerm = 0;
+    if (specularCoef && N.z < 0 && lambert > 0)
+    {
+        uint32_t viewFacing = (uint32_t)(-N.z);
+        if (viewFacing > FIXED_POINT_SCALE) viewFacing = FIXED_POINT_SCALE;
+        uint32_t vf8 = viewFacing >> 2;
+        if (vf8 > 255) vf8 = 255;
+        uint32_t vf2 = (vf8 * vf8) >> 8;
+        vf2 = (vf2 * lambert) >> 8;
+        vf2 = (vf2 * lightIntensity) >> 8;
+        specularTerm = (vf2 * specularCoef) >> 8;
+    }
+
+    uint32_t total = diffuseTerm + specularTerm;
+    if (total > maxBrightness) total = maxBrightness;
+    return (uint16_t)total;
+}
+
+// Per-channel coloured modulation.
+//
+// Combines a triangle-constant ambient tint (per-channel 0..255) with a
+// per-pixel scalar directional/specular brightness contribution. The lit
+// scalar is added to each channel-specific ambient level before the
+// base-colour scaling, so a cool ambient under a warm sun produces visibly
+// warm lit faces and cool shadowed faces from a single neutral material.
+//
+// Each channel is handled independently; channels that overshoot 255 lerp
+// toward their max value (31/63/31), giving the blowout-to-white headroom
+// that `material->specular` opts into.
+// Per-channel coloured modulation.
+//
+// Lighting model (per channel, independently):
+//   scale_c = ambient_c + brightness                    (saturating)
+//   final_c = base_c × scale_c / 255                    (+ blow-out to max
+//                                                         above 255)
+//
+// `brightness` carries the directional + view-facing-specular contribution
+// in [0 .. 255 + specularCoef]; the band above 255 lerps the channel
+// toward its maximum (the headroom `material->specular` opts into).
+// `ambR/G/B` is the ambient light colour (0..255 per channel) added to the
+// modulation factor BEFORE the base multiply — i.e. ambient tints the
+// material rather than replacing it. A brown cliff facing away from the
+// sun is still recognisably brown (just dimmer and tinted by the ambient
+// hue) rather than going pure ambient-colour as it would with an additive
+// post-multiply ambient.
+//
+// Inputs are RGB565 base, 16-bit `brightness` (post-clamp by caller), 8-bit
+// per-channel ambient. Output is RGB565.
+// MESHPUNK: 4x4 ordered-dither thresholds for the RGB565 channel quantisation.
+//
+// A lit gradient is computed at 8-bit precision and stored to 5/6/5. Red and
+// blue therefore resolve ~26 levels across a full ramp while green resolves
+// ~51, and the two cross their quantisation boundaries at different
+// brightnesses, so a neutral surface alternates green- and magenta-biased
+// bands every few pixels. Measured on a grey(200,200,200) sphere: r/g pairs ran
+// 11,23 / 12,25 / 13,26 / 14,27 — g/2 swinging either side of r.
+//
+// These are the standard Bayer values scaled to the 8-bit fraction being
+// discarded, ((2*M)+1)*8 for M in the 4x4 matrix. They sum to 2048, so the mean
+// is exactly 128 and replacing the old +128 rounding term preserves overall
+// brightness while spreading each band edge into a 4x4 checker.
+static const uint8_t jetDither4[16] = {
+      8, 136,  40, 168,
+    200,  72, 232, 104,
+     56, 184,  24, 152,
+    248, 120, 216,  88
+};
+
+static inline uint16_t jetModulateRGB565(uint16_t color,
+                                         uint16_t brightness,
+                                         uint8_t ambR, uint8_t ambG, uint8_t ambB,
+                                         uint16_t maxBrightness)
+{
+    const uint32_t base_r = (color >> 11) & 0x1F;
+    const uint32_t base_g = (color >>  5) & 0x3F;
+    const uint32_t base_b =  color        & 0x1F;
+
+    uint32_t tR = (uint32_t)brightness + ambR;
+    uint32_t tG = (uint32_t)brightness + ambG;
+    uint32_t tB = (uint32_t)brightness + ambB;
+    if (tR > maxBrightness) tR = maxBrightness;
+    if (tG > maxBrightness) tG = maxBrightness;
+    if (tB > maxBrightness) tB = maxBrightness;
+
+    auto channel5 = [](uint32_t base5, uint32_t t) -> uint32_t {
+        if (t > 255) {
+            const uint32_t blow = t - 255;
+            return base5 + ((31u - base5) * blow) / 256u;
+        }
+        const uint32_t v = base5 * t;
+        return (v + 128u + (v >> 8)) >> 8;
+    };
+    auto channel6 = [](uint32_t base6, uint32_t t) -> uint32_t {
+        if (t > 255) {
+            const uint32_t blow = t - 255;
+            return base6 + ((63u - base6) * blow) / 256u;
+        }
+        const uint32_t v = base6 * t;
+        return (v + 128u + (v >> 8)) >> 8;
+    };
+
+    const uint32_t r = channel5(base_r, tR);
+    const uint32_t g = channel6(base_g, tG);
+    const uint32_t b = channel5(base_b, tB);
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+namespace Renderer
+{    
+    inline bool Rasterizer::shouldDrawPixel(int x, int y, uint8_t alpha)
+    {
+        #if NOISE_ALPHA
+            //Generate a random number between 0 and 255 using a simple LCG
+            uint8_t random = (251 * lastRandom + randomSeed);
+            lastRandom = random;
+            //If the random number is greater than the alpha value, don't draw the pixel
+            return (random & 0xFF) <= alpha;
+        #endif
+        if (alpha > 240)
+        {
+            return true; // Draw all pixels
+        }
+        
+        // Precomputed threshold matrix flattened into a 1D array for faster access
+        constexpr uint8_t thresholdMatrix[16] = {
+            15, 135, 45, 165,
+            195, 75, 225, 105,
+            60, 180, 30, 150,
+            240, 120, 210, 90};
+
+        // Determine the position within the threshold matrix
+        uint8_t threshold = thresholdMatrix[(x & 3) | ((y & 3) << 2)];
+
+        // Compare alpha to the threshold to determine if the pixel should be drawn
+        return alpha >= threshold;
+    }
+
+    uint16_t Rasterizer::grayscaleToRGB565(uint8_t grayscale)
+    {
+        // Convert the 8-bit grayscale value to 5-bit (for R and B) and 6-bit (for G).
+        uint8_t r = grayscale >> 3; // Convert 8-bit to 5-bit
+        uint8_t g = grayscale >> 2; // Convert 8-bit to 6-bit
+        uint8_t b = grayscale >> 3; // Convert 8-bit to 5-bit
+
+        // Pack RGB into RGB565 format
+        uint16_t rgb565 = (r << 11) | (g << 5) | b;
+
+        return rgb565;
+    }
+
+    // JET_HOT places the frame's dominant cost — this one fully-inlined
+    // ~12KB function — in .iram.text, which the ELF loader copies into
+    // internal SRAM (MALLOC_CAP_EXEC) at load and remaps relocations into.
+    // Internal fetch takes no cache misses and, with both cores running
+    // drawTriangle under dual-core band rendering, removes their contention
+    // on the shared 16KB PSRAM instruction cache. Requires this TU to build
+    // with -mtext-section-literals (see build.ps1, which also audits that
+    // every l32r literal landed inside the section). If internal SRAM is
+    // too fragmented at load, the loader logs and leaves it in PSRAM — the
+    // attribute can never make things worse.
+    #define JET_HOT __attribute__((section(".iram.text")))
+    bool JET_HOT PERF_CRITICAL Rasterizer::drawTriangle(
+        const RenderVertex &v1,
+        const RenderVertex &v2,
+        const RenderVertex &v3,
+        Material *material,
+        DirectionalLight *directionalLight,
+        AmbientLight *ambientLight,
+        bool renderEvenLines,
+        bool ignoreZBuffer,
+        bool noWriteZBuffer,
+        int zBias,
+        uint8_t objAlpha,
+        bool brightnessPrecomputed,
+        int32_t avgZHint,
+        int32_t bakedColorOverride)
+    {
+        // Fold per-object fade alpha into the material alpha up front so
+        // every downstream alpha decision (early-out, depth fog, stipple
+        // under SCREEN_DOOR_ALPHA, traditional blend without it) sees the
+        // combined value. (objAlpha defaults to 255 for objects that don't
+        // use the per-object distance fade.)
+        uint8_t alpha = (objAlpha == 255)
+                            ? material->alpha
+                            : (uint8_t)(((uint16_t)material->alpha * objAlpha) / 255);
+
+        if (alpha == 0) // Don't render fully-transparent triangles
+        {
+            return false;
+        }
+
+        (void)avgZHint; // Only consumed on the FAST_Z && !LAZY_Z path.
+
+#if TEXTURE_MAPPING
+        Texture *diffuseMap = material->diffuseMap;
+#endif
+        const bool isWaterReflect = (material->shadingMode == ShadingMode::WATER_REFLECT);
+        const bool isAdditive     = (material->shadingMode == ShadingMode::ADDITIVE);
+        // Parallel-band ordering guards (see Renderer.hpp skipWaterReflect /
+        // waterReflectOnly).  skipWaterReflect is set on all parallel-band
+        // copies so SSR-reading triangles are deferred; waterReflectOnly is
+        // set on the subsequent serial full-frame pass that draws only water
+        // after all geometry is committed to the framebuffer.
+        if (skipWaterReflect && isWaterReflect)  return false;
+        if (waterReflectOnly && !isWaterReflect) return false;
+#if LIGHTING
+        bool emissive = material->emissive
+                     || (material->shadingMode == ShadingMode::UNLIT)
+                     || isWaterReflect
+                     || isAdditive;  // additive glows never receive directional light
+#endif
+
+#if JET_FAST_SIMPLE_SPANS
+    #if TEXTURE_MAPPING
+        // Per-triangle decision: untextured triangles take the fast simple
+        // span path even in builds with TEXTURE_MAPPING enabled. Only
+        // triangles that actually have a diffuse map pay for the general
+        // per-pixel loop. Non-const because the texture-LOD pass below may
+        // promote a fully-flat-LOD textured triangle back onto the fast
+        // path (texture is dropped entirely past textureLodFar).
+        bool useFastSimpleSpan = (diffuseMap == nullptr);
+    #else
+        // No textures compiled in the fast path is unconditional and
+        // this constexpr lets the optimiser fold the runtime branch out.
+        constexpr bool useFastSimpleSpan = true;
+    #endif
+#endif
+        int32_t nearPlane = camera->nearPlane;
+        int32_t farPlane = camera->farPlane;
+
+        // Compute bounding box of the triangle.
+        // MESHPUNK: positions are Q4 sub-pixel; the loops below index whole
+        // pixels, so the box is converted here and ONLY here. Arithmetic shift
+        // floors, so the box can only grow — never clip a covered pixel away.
+        // MIN FLOORS, MAX CEILS. The old form masked BOTH ends with `& ~1`,
+        // which rounds the max DOWN to an even pixel and so never scans the
+        // last one or two columns/rows a triangle actually covers. With whole-
+        // pixel vertices that lost sliver was usually hidden; with sub-pixel
+        // edges the true edge lands mid-pixel and the dropped column shows as a
+        // one-pixel crack along shared tile seams — sky through the ground,
+        // flickering as the edge slides across pixel boundaries.
+        //
+        // `& ~1` is kept on the min only, where it costs nothing (the edge test
+        // rejects any pixel it lets in early) and keeps the start aligned for
+        // the xStep == 2 half-width path.
+        const int32_t spMask = MESHPUNK_SUBPIXEL_ONE - 1;
+        int32_t minX = (std::min({v1.position.x, v2.position.x, v3.position.x}) >> MESHPUNK_SUBPIXEL_BITS) & ~1;
+        int32_t maxX = (std::max({v1.position.x, v2.position.x, v3.position.x}) + spMask) >> MESHPUNK_SUBPIXEL_BITS;
+        int32_t minY = (std::min({v1.position.y, v2.position.y, v3.position.y}) >> MESHPUNK_SUBPIXEL_BITS) & ~1;
+        int32_t maxY = (std::max({v1.position.y, v2.position.y, v3.position.y}) + spMask) >> MESHPUNK_SUBPIXEL_BITS;
+
+        // If the triangle has no area, skip it
+        #if SKIP_ZERO_AREA_TRIANGLES
+        if (minX == maxX || minY == maxY)
+        {
+            return false;
+        }
+        #endif
+
+#if FAST_Z
+#if LAZY_Z
+        // LAZY_Z needs the max Z, not the average — the caller's avgZ hint
+        // doesn't apply here.
+        int32_t z = std::max({v1.position.z, v2.position.z, v3.position.z});
+        if (z < nearPlane || z > farPlane)
+        {
+            return false;
+        }
+#else
+        int32_t z;
+        if (avgZHint != INT32_MIN)
+        {
+            // Scene::emitTri computed this exact average at queue time and
+            // already culled against near/far — trust it and skip both.
+            z = avgZHint;
+        }
+        else
+        {
+            z = (v1.position.z + v2.position.z + v3.position.z) / 3;
+            if (z < nearPlane || z > farPlane)
+            {
+                return false;
+            }
+        }
+#endif
+        #if Z_BUFFERING
+        // Z buffer stores raw int32_t z, narrowed to uint16_t. The project's
+        // farPlane (~4096) fits comfortably; we clamp to UINT16_MAX so any
+        // future absurdly-far geometry saturates rather than wrapping.
+        // Per-object zBias pulls the surface toward the camera in real
+        // depth units (no longer divided by 4) so a small bias really is
+        // a small distance — 1 unit of bias = 1 unit of world depth.
+        int32_t zbRaw = z - zBias;
+        if (zbRaw < 0)     zbRaw = 0;
+        if (zbRaw > 65535) zbRaw = 65535;
+        uint16_t zb = (uint16_t)zbRaw;
+        #endif
+#endif
+
+        // Clamp to screen bounds
+        minX = std::max(minX, static_cast<int32_t>(0));
+        maxX = std::min(maxX, static_cast<int32_t>(screenWidth - 1));
+        minY = std::max(minY, static_cast<int32_t>(yBandMin));
+        maxY = std::min(maxY, static_cast<int32_t>(std::min(yBandMax - 1, screenHeight - 1)));
+        if (minY > maxY) return false;
+
+#if LIGHTING
+        Vector3 normal = {0, 0, 0};
+        uint16_t vertexBrightness[3] = {0, 0, 0};
+
+        // Per-channel ambient tint. The ambient light contributes a constant
+        // offset that is added to each colour channel independently during
+        // the final modulation step, so a cool-toned AmbientLight actually
+        // casts a cool tint into shadowed areas rather than just dimming
+        // them by a single scalar.
+        const uint8_t ambR = ambientLight ? ambientLight->color.r : 0;
+        const uint8_t ambG = ambientLight ? ambientLight->color.g : 0;
+        const uint8_t ambB = ambientLight ? ambientLight->color.b : 0;
+        const uint16_t lightIntensity = directionalLight ? directionalLight->intensity : 0;
+
+        if (directionalLight)
+        {
+            if (material->shadingMode == ShadingMode::FLAT)
+            {
+                // For FLAT shading we expect per-face vertex duplication
+                // (computeFlatNormals stamps the same face normal onto all
+                // three verts of each triangle). Pick the first vertex's
+                // normal directly — it already has unit magnitude FPS, no
+                // averaging or sqrt-normalize required. This is the per-
+                // triangle hot path on the ESP32-S3 where FLAT lighting
+                // was costing nearly 2x the no-lighting frame time; the
+                // sqrt+divide that lived here was the bulk of that cost.
+                //
+                // For meshes where vertex normals genuinely differ across
+                // a face (i.e. smooth-shaded geometry erroneously assigned
+                // FLAT), the result is identical to picking ANY one of the
+                // three normals — which is acceptable because FLAT shading
+                // is not the right pipeline for that geometry anyway.
+                normal = v1.normal;
+            }
+            else if (material->shadingMode == ShadingMode::GOURAUD)
+            {
+                // Per-vertex Lambertian + view-facing specular. The triangle
+                // body of the rasterizer interpolates vertexBrightness[]
+                // linearly across the face (plane-equation incremental form
+                // in the inner loops below).
+                if (brightnessPrecomputed)
+                {
+                    // Object-local-light path: Scene.cpp has already
+                    // evaluated diffuse Lambert per-vertex in mesh-local
+                    // space; just read it back. Saves three dot/clamp/
+                    // square-falloff sequences per triangle.
+                    vertexBrightness[0] = v1.lambertBrightness;
+                    vertexBrightness[1] = v2.lambertBrightness;
+                    vertexBrightness[2] = v3.lambertBrightness;
+                }
+                else
+                {
+                    const RenderVertex* verts[3] = { &v1, &v2, &v3 };
+                    for (int i = 0; i < 3; i++)
+                    {
+                        vertexBrightness[i] = jetShadeBrightness(
+                            verts[i]->normal,
+                            directionalLight->lightDir,
+                            lightIntensity,
+                            material->diffuse,
+                            material->specular);
+                    }
+                }
+            }
+        }
+#endif
+
+    #if TEXTURE_MAPPING
+        uint16_t color = material->getColor({0, 0});
+    #else
+        uint16_t color = material->color;
+    #endif
+        // MESHPUNK: a pre-baked triangle carries its own colour (see the
+        // declaration in Renderer.hpp). Applied here, before `baseColor` is
+        // taken, so every downstream path — modulation, the flat span fill,
+        // the emissive short-circuit — sees the right colour. The material
+        // pointer still supplies the constant fields (emissive, alpha,
+        // shading mode), which are shared correctly.
+        if (bakedColorOverride >= 0) color = (uint16_t)bakedColorOverride;
+        // Untextured triangles use this single material colour as the
+        // per-pixel modulation input. Keeping the unmodulated base in a
+        // separate variable is critical: previously the per-pixel
+        // modulation wrote back into `color`, so each subsequent pixel
+        // on the scanline modulated an already-modulated colour and the
+        // result converged toward black across the span — the entire
+        // reason untextured surfaces (clouds, walls) were rendering as
+        // solid black bands. Textured triangles re-sample `color` from
+        // the diffuse map each pixel and don't read `baseColor`. FLAT
+        // materials short-circuit via `flatColorPrecomputed` and bake
+        // the modulation into `color` once at triangle setup — they
+        // intentionally skip per-pixel modulation entirely.
+        const uint16_t baseColor = color;
+
+#if TEXTURE_MAPPING
+        // Distance-based texture LOD. textureLodFade goes from 255 (full
+        // texture) at textureLodNear down to 0 (fully flat) at
+        // textureLodFar. Past textureLodFar we drop the texture entirely:
+        // the local `color` is overwritten with material->color and the
+        // triangle is promoted onto the fast simple-span path (in builds
+        // where it's compiled in), which is the actual perf win - distant
+        // scenery falls out of the per-pixel textured loop and into the
+        // paired-32-bit fill loop. The fade band still pays the textured
+        // loop cost, but composites the texel toward material->color
+        // using whichever blend method the build is configured with
+        // (stipple under SCREEN_DOOR_ALPHA, alpha lerp otherwise).
+        // Triangle-constant: lodZ is taken from the same source as the
+        // FAST_Z depth (or the triangle average when FAST_Z is off).
+        uint8_t textureLodFade = 255;
+        // MESHPUNK: EMISSIVE IS EXEMPT.
+        //
+        // texlod is a scene-wide distance, so anything past textureLodFar loses
+        // its texture and renders as flat material->color. That is right for
+        // ground detail, whose texel stops being legible with distance, and
+        // completely wrong for a BAKED BACKDROP — a horizon panorama sits far
+        // beyond any sane textureLodFar, so the whole baked image was being
+        // discarded and replaced with one flat colour.
+        //
+        // Emissive already means "this colour is final, do not modulate it".
+        // Extending that to "do not drop it with distance" is the same
+        // statement: such a texture is not detail that distance can erase, it
+        // IS the object. Nothing else in a scene is emissive AND textured AND
+        // far enough for this to change behaviour.
+        if (textureLodEnabled && diffuseMap && !emissive
+            && textureLodFar > textureLodNear)
+        {
+            // MESHPUNK: key on the NEAREST vertex, not the farthest.
+            //
+            // FAST_Z's `z` is max(v1,v2,v3) — the far corner. texlod is a
+            // per-triangle, all-or-nothing switch whose fallback is flat
+            // material colour, so on a tile spanning 62,000 to 300,000 the far
+            // corner alone crossed textureLodFar and the ENTIRE tile went flat
+            // brown, including the part right beside the camera. It popped in
+            // and out as the camera turned and that corner crossed the line.
+            //
+            // The nearest vertex is the correct conservative choice: a triangle
+            // keeps its texture while ANY of it is close, and only drops it
+            // once all of it is past the cutoff. Triangles straddling the line
+            // now stay textured, and their far end is handled by the mip
+            // selection — which samples a small level and is cache-friendly.
+            int32_t lodZ = v1.position.z;
+            if (v2.position.z < lodZ) lodZ = v2.position.z;
+            if (v3.position.z < lodZ) lodZ = v3.position.z;
+            if (lodZ >= textureLodFar)
+            {
+                textureLodFade = 0;
+                color = material->color; // Flat fallback for the fast path.
+            #if JET_FAST_SIMPLE_SPANS
+                useFastSimpleSpan = true;
+            #endif
+            }
+            else if (lodZ > textureLodNear)
+            {
+                textureLodFade = (uint8_t)(255 - ((lodZ - textureLodNear) * 255)
+                                                  / (textureLodFar - textureLodNear));
+            }
+        }
+#endif
+
+#if TEXTURE_MAPPING || !FAST_Z || LIGHTING
+        // Edge-function denominator. Computed in int64 (vertex projected
+        // x/y near the camera can blow well past int32 range), then
+        // narrowed to int32 for the per-pixel divides. Previously this
+        // path had an `if (denom64 > INT32_MAX) return false;` bail-out
+        // which silently dropped near-camera triangles at high resolutions
+        // / large WORLD_SCALE (triangles popping out of existence as you
+        // closed in). We now accept the truncation: the triangle is huge
+        // and near-camera so any per-pixel interpolation error is bounded
+        // and far less objectionable than the triangle disappearing.
+        int64_t denom64 = (int64_t)(v2.position.y - v3.position.y) * (v1.position.x - v3.position.x) +
+                          (int64_t)(v3.position.x - v2.position.x) * (v1.position.y - v3.position.y);
+
+        if (denom64 == 0)
+            return false; // Degenerate triangle
+        // MESHPUNK: NORMALISE rather than truncate.
+        //
+        // Edge functions are Q8 now (a product of two Q4 positions), so denom64
+        // is 256x what it was and the old `(int32_t)denom64` cast would lose
+        // the high bits far more often — and truncating a determinant does not
+        // degrade a result, it corrupts it. Only the RATIO w/denom is ever
+        // consumed, so shifting numerator and denominator by the SAME amount is
+        // exact in meaning and costs only low bits. For any normally-sized
+        // on-screen triangle the shift is 0 and nothing changes.
+        int denomShift = 0;
+        {
+            int64_t d = denom64 < 0 ? -denom64 : denom64;
+            while ((d >> denomShift) > 0x3FFFFFFF) ++denomShift;
+        }
+        int32_t denom = (int32_t)(denom64 >> denomShift);
+        if (denom == 0)
+            return false; // Landed on zero; treat as degenerate
+#if LIGHTING
+        // Precompute FPU reciprocal once per triangle. Replaces two int64
+        // __divdi3 calls (per-triangle Gouraud step + per-row brightness
+        // init) with float multiplies — ~70 cy → ~5 cy each on Xtensa LX7.
+        const float invDenom64f = 1.0f / (float)denom64;
+#endif
+
+        Vector2 uv = {0, 0};
+#endif
+
+#if LIGHTING || Z_BRIGHTNESS
+        uint16_t brightness = 0;
+#endif
+
+#if LIGHTING
+        if (!directionalLight && !ambientLight)
+        {
+            brightness = 255;
+        }
+        else if (material->shadingMode == ShadingMode::FLAT)
+        {
+            if (directionalLight)
+            {
+                // FLAT shading uses the natural Lambertian response.
+                // The speedup from picking v1.normal directly (no sqrt-
+                // normalize) turned out to give plenty of perceived
+                // contrast on its own — the previous artificial lambert
+                // gain + extra specular headroom blew everything out.
+                if (brightnessPrecomputed)
+                {
+                    // Object-local-light path: v1.lambertBrightness was
+                    // precomputed by Scene.cpp using the mesh-local
+                    // normal + object-local light dir. computeFlatNormals
+                    // stamps identical normals on all three verts of a
+                    // FLAT face, so any vertex's cached value is the
+                    // face brightness.
+                    brightness = v1.lambertBrightness;
+                }
+                else
+                {
+                    brightness = jetShadeBrightness(
+                        normal,
+                        directionalLight->lightDir,
+                        lightIntensity,
+                        material->diffuse,
+                        material->specular);
+                }
+            }
+            else
+            {
+                // Ambient-only: the per-channel ambient tint is applied in
+                // the modulation step, so the lit-scalar contribution is
+                // zero here.
+                brightness = 0;
+            }
+        }
+#endif
+
+#if Z_BRIGHTNESS && FAST_Z
+        brightness = 255 - ((z - zBrightNear) * zBrightScale) / (zBrightFar - zBrightNear);
+        brightness = std::min(brightness, static_cast<uint16_t>(255));
+#endif
+
+#if LIGHTING
+        // Per-triangle hoist of the channel modulation. For FLAT-shaded
+        // (or unlit) materials with no diffuse texture, both `color` and
+        // `brightness` are triangle-constants, so the per-pixel multiply +
+        // shift dance below is pure repeated work. Pre-modulating once
+        // here and skipping the per-pixel block recovers the bulk of the
+        // perf cost of enabling LIGHTING.
+        bool flatColorPrecomputed = false;
+        const bool flatShaded =
+            (!directionalLight && !ambientLight) ||
+            material->shadingMode == ShadingMode::FLAT;
+        const bool diffuseMapSamples =
+#if TEXTURE_MAPPING
+            (material->diffuseMap != nullptr);
+#else
+            false;
+#endif
+        if (flatShaded && !emissive && !diffuseMapSamples)
+        {
+            const uint16_t maxBrightness = (uint16_t)(255u + material->specular);
+            color = jetModulateRGB565(color, brightness, ambR, ambG, ambB, maxBrightness);
+            flatColorPrecomputed = true;
+        }
+
+        // For untextured non-flat (GOURAUD / PHONG) triangles the base
+        // colour is triangle-constant; only `brightness` varies per pixel.
+        // Hoist the RGB565 channel extract and the saturating maxBrightness
+        // here so the inner loop becomes "build per-channel t from brightness +
+        // const ambient, multiply, pack" — no function call, no re-extract.
+        // This is the dominant rasterization cost in the scene (most
+        // triangles are flat-coloured GOURAUD), so saving the per-pixel
+        // function-call + channel extract is the single biggest LIGHTING
+        // perf knob.
+        // MESHPUNK: atmospheric perspective. Applied to triangles whose colour
+        // is already triangle-constant — precomputed-flat and emissive (which
+        // is what baked terrain is) — because those are the ones that take the
+        // span fill, and they are the far field where haze matters. The
+        // triangle stays fully OPAQUE, so unlike the alpha fog above it keeps
+        // that fast path. Near geometry sits below atmosNear and pays nothing
+        // but one compare.
+        if (atmosEnabled && !diffuseMapSamples && z > atmosNear
+            && atmosFar > atmosNear && (flatColorPrecomputed || emissive))
+        {
+            int32_t k = ((int64_t)(z - atmosNear) * 255) / (atmosFar - atmosNear);
+            if (k > (int32_t)atmosMax) k = atmosMax;
+            if (k > 0)
+            {
+                uint16_t sky = atmosColor;
+                if (atmosGradient && atmosGradientRows > 0)
+                {
+                    // Sample the sky at the triangle's own centre row, so it
+                    // fades into the exact colour behind it rather than a
+                    // single flat fog tint.
+                    int row = (int)((minY + maxY) >> 1);
+                    // Never sample above the horizon: ground fades toward the
+                    // pale band AT the horizon, not toward the zenith. Only
+                    // bites for geometry standing above the horizon line, which
+                    // is exactly the case that was disappearing.
+                    if (row < atmosHorizonRow) row = atmosHorizonRow;
+                    if (row < 0) row = 0;
+                    if (row >= atmosGradientRows) row = atmosGradientRows - 1;
+                    sky = atmosGradient[row];
+                }
+                // blendRGB565(dst, src, a) = src*a + dst*(1-a).
+                color = blendRGB565(sky, color, (uint8_t)(255 - k));
+            }
+        }
+
+        const bool litPerPixelUntextured =
+            !flatColorPrecomputed && !emissive && !diffuseMapSamples;
+        uint32_t litBaseR5 = 0, litBaseG6 = 0, litBaseB5 = 0;
+        uint16_t litMaxBrightness = 255;
+        if (litPerPixelUntextured)
+        {
+            litBaseR5 = (baseColor >> 11) & 0x1F;
+            litBaseG6 = (baseColor >>  5) & 0x3F;
+            litBaseB5 =  baseColor        & 0x1F;
+            litMaxBrightness = (uint16_t)(255u + material->specular);
+        }
+#endif
+
+#if DEPTH_ALPHA_BLEND && FAST_Z
+        // Triangle-level depth fog. With FAST_Z the z used here is constant
+        // for the whole triangle (it's the triangle average or max), so
+        // there is no point re-evaluating this per pixel the way the older
+        // path did. We hoist the computation out; the per-pixel version
+        // below remains only for the !FAST_Z path where z actually varies.
+        // Compose with the existing alpha (material*objAlpha) by taking
+        // the minimum, so per-object distance fades and translucent
+        // materials are preserved through fog.
+        {
+            if (z >= fogFar) {
+                alpha = 0;
+            } else if (z > fogNear) {
+                uint8_t fogA = (uint8_t)(255 - ((z - fogNear) * 255) / (fogFar - fogNear));
+                if (fogA < alpha) alpha = fogA;
+            }
+            if (alpha == 0) return false; // Fully-transparent triangle: nothing to draw.
+        }
+#endif
+
+        const bool plainOpaqueReplace = (alpha == 255 && !isWaterReflect && !isAdditive);
+
+        // MESHPUNK: eligibility for the flat span fill in the row loop below.
+        //
+        // Jet's own JET_FAST_SIMPLE_SPANS requires !LIGHTING, so on a lit build
+        // every pixel goes through the general per-pixel loop — even when the
+        // colour is triangle-constant and the loop's own modulation block is
+        // being skipped anyway. That leaves the inner loop stepping three int64
+        // edge accumulators, ORing them, stepping the Gouraud accumulator and
+        // testing a stipple threshold, all to store one unchanging value.
+        //
+        // A triangle qualifies when nothing downstream can vary the stored
+        // colour or reject an individual pixel:
+        //   - no per-pixel modulation: either the FLAT hoist already baked the
+        //     lit colour into `color`, or the material is emissive and skips
+        //     modulation outright (same condition the loop tests at the
+        //     "!emissive && !flatColorPrecomputed" gate).
+        //   - plainOpaqueReplace: alpha 255, so SCREEN_DOOR_ALPHA's stipple
+        //     always passes and there is no blend to do; also excludes the
+        //     water and additive paths, which read the framebuffer back.
+        //   - untextured: a diffuse map varies the colour per pixel and can
+        //     also punch holes via its alpha key.
+        //
+        // checkerboardMode is deliberately NOT a disqualifier. That mode skips
+        // pixels by (x^y) parity so the skipped ones can be rebuilt from their
+        // horizontal neighbours, but here every pixel in the span is the same
+        // colour, so the rebuilt value equals the value a full fill writes.
+        // Filling the whole run is therefore exactly correct AND cheaper than
+        // a strided one: the run fill uses 128-bit stores that a stride of two
+        // would break up. Keeping the sky and the flat terrain shells on this
+        // path is what stops checkerboard from costing more than it saves.
+        //
+        // Z_BUFFERING, DEBUG_OVERDRAW and the !FAST_Z per-pixel depth test are
+        // all compiled out in this configuration; the static_assert-style
+        // guards below keep the fast path from silently outliving them.
+#if !Z_BUFFERING && !DEBUG_OVERDRAW && FAST_Z && !HALF_WIDTH_BUFFERS
+        const bool meshpunkFlatSpan =
+            plainOpaqueReplace
+    #if LIGHTING
+            && (flatColorPrecomputed || emissive)
+    #endif
+    #if TEXTURE_MAPPING
+            && (diffuseMap == nullptr)
+    #endif
+            ;
+#else
+        constexpr bool meshpunkFlatSpan = false;
+#endif
+
+#if PERSPECTIVE_CORRECT_TEXTURES
+        int32_t oneOverZ1 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v1.position.z;
+        int32_t oneOverZ2 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v2.position.z;
+        int32_t oneOverZ3 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v3.position.z;
+
+#if TEXTURE_MAPPING
+        // Precompute u_over_z and v_over_z at each vertex. Only with
+        // TEXTURE_MAPPING: RenderVertex carries uv only in textured builds.
+        // (PERSPECTIVE_CORRECT_TEXTURES without TEXTURE_MAPPING is still a
+        // valid config — it drives perspective-correct PHONG normals.)
+        int32_t uOverZ1 = (v1.uv.x * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t vOverZ1 = (v1.uv.y * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t uOverZ2 = (v2.uv.x * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t vOverZ2 = (v2.uv.y * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t uOverZ3 = (v3.uv.x * oneOverZ3) / FIXED_POINT_SCALE;
+        int32_t vOverZ3 = (v3.uv.y * oneOverZ3) / FIXED_POINT_SCALE;
+#endif // TEXTURE_MAPPING
+
+#if LIGHTING
+        // Precompute normal_component / z at each vertex so Phong shading
+        // can use the same perspective-correct reconstruction as UVs.
+        // Same fixed-point scale as uOverZ: n/z * FPS, range ≈ ±FPS.
+        int32_t nxOverZ1 = (v1.normal.x * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t nyOverZ1 = (v1.normal.y * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t nzOverZ1 = (v1.normal.z * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t nxOverZ2 = (v2.normal.x * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t nyOverZ2 = (v2.normal.y * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t nzOverZ2 = (v2.normal.z * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t nxOverZ3 = (v3.normal.x * oneOverZ3) / FIXED_POINT_SCALE;
+        int32_t nyOverZ3 = (v3.normal.y * oneOverZ3) / FIXED_POINT_SCALE;
+        int32_t nzOverZ3 = (v3.normal.z * oneOverZ3) / FIXED_POINT_SCALE;
+#endif // LIGHTING
+#endif // PERSPECTIVE_CORRECT_TEXTURES
+
+#if MESHPUNK_SEGMENTED_PERSPECTIVE && TEXTURE_MAPPING \
+    && !PERSPECTIVE_CORRECT_TEXTURES && !HALF_WIDTH_BUFFERS
+        // MESHPUNK: per-triangle setup for segmented perspective-correct UVs.
+        // See MESHPUNK_SEGMENTED_PERSPECTIVE in JetConfig.hpp.
+        //
+        // Only triangles that sample a diffuse map by interpolated UV qualify:
+        // screenSpace and reflectionMap derive their coordinates from x/y/z
+        // instead, and untextured triangles never reach the sampler at all.
+        bool    pcOn = false;
+        int32_t pcOneOverZ[3] = { 0, 0, 0 };
+        int32_t pcUOverZ[3]   = { 0, 0, 0 };
+        int32_t pcVOverZ[3]   = { 0, 0, 0 };
+        if (diffuseMap && !diffuseMap->screenSpace && !diffuseMap->reflectionMap
+            && v1.position.z > 0 && v2.position.z > 0 && v3.position.z > 0)
+        {
+            int32_t zMin = v1.position.z;
+            if (v2.position.z < zMin) zMin = v2.position.z;
+            if (v3.position.z < zMin) zMin = v3.position.z;
+
+            // Reciprocal shift from THIS triangle's nearest depth, so 1/zMin
+            // lands just under 2^14 whatever the world scale is. This is the
+            // whole reason the stock path fails here: it hardcodes 2^20/z.
+            //
+            // 2^14, NOT 2^20. The larger target forced the barycentrics to be
+            // shifted down to fit int64, and that shift was the bug: on a big
+            // triangle `denom` is large, the shift reached several bits, and
+            // near an edge all three shifted weights truncated to ZERO. The
+            // solver then fell through to its degenerate branch and held UV
+            // CONSTANT for the segment — runs of pixels sampling one texel,
+            // which reads as diagonal combing across part of a triangle and
+            // re-registers whenever the camera turns.
+            //
+            // At 2^14 the weights need no shift at all. Verified numerically
+            // over the whole zMin range: worst 1/zMin is exactly 16384, so with
+            // |w| <= |denom| < 2^31 the depth sum peaks at 1.06e14, and the u/v
+            // numerator at 3.5e18 against an int64 ceiling of 9.22e18 — UVs
+            // cannot exceed +/-32767 because rebaseUV in jm_createHeightfield
+            // clamps them to int16.
+            //
+            // Caveat this trades for: 1/z underflows to zero once a single
+            // triangle spans more than ~1e5x in depth. Terrain quads are
+            // nowhere near that, but a skybox-scale triangle could be.
+            int rs = 45 - __builtin_clz((uint32_t)zMin);
+            if (rs > 40) rs = 40;
+            if (rs < 1)  rs = 1;
+            const int64_t one = (int64_t)1 << rs;
+
+            pcOneOverZ[0] = (int32_t)(one / v1.position.z);
+            pcOneOverZ[1] = (int32_t)(one / v2.position.z);
+            pcOneOverZ[2] = (int32_t)(one / v3.position.z);
+            // Divide rather than shift: uv may be negative on other meshes,
+            // and a right shift of a negative value is not the same operation.
+            pcUOverZ[0] = (int32_t)(((int64_t)v1.uv.x * pcOneOverZ[0]) / 1024);
+            pcUOverZ[1] = (int32_t)(((int64_t)v2.uv.x * pcOneOverZ[1]) / 1024);
+            pcUOverZ[2] = (int32_t)(((int64_t)v3.uv.x * pcOneOverZ[2]) / 1024);
+            pcVOverZ[0] = (int32_t)(((int64_t)v1.uv.y * pcOneOverZ[0]) / 1024);
+            pcVOverZ[1] = (int32_t)(((int64_t)v2.uv.y * pcOneOverZ[1]) / 1024);
+            pcVOverZ[2] = (int32_t)(((int64_t)v3.uv.y * pcOneOverZ[2]) / 1024);
+            pcOn = true;
+        }
+#endif // MESHPUNK_SEGMENTED_PERSPECTIVE
+
+        const int inc = interlacedMode ? 2 : 1;
+
+        // Checkerboard: precompute which (x+y) parity to render this frame.
+        // renderEvenLines==true  (even frame) → render where (x+y) is even (parity 0).
+        // renderEvenLines==false (odd  frame) → render where (x+y) is odd  (parity 1).
+        // Only meaningful when checkerboardMode is true; otherwise unused.
+        const int cbFrameParity = renderEvenLines ? 0 : 1;
+
+        // -- Incremental edge function setup --
+        // The edge function w_i(x, y) is linear in x and y, so rather than
+        // recomputing it from scratch per pixel (which would need int64 to
+        // stay safe against huge projected coords near the near plane, and
+        // is slow on 32-bit targets), we:
+        //   1. Precompute the partial derivatives dw_i/dx and dw_i/dy.
+        //      These are just differences of projected vertex coords and
+        //      comfortably fit in int32 even when the coords themselves
+        //      are huge.
+        //   2. Compute the w values at the first pixel of each row once
+        //      in int64 (per-triangle setup cost; a few multiplies).
+        //   3. In the hot inner loop, just ADD the int32 delta. Running
+        //      accumulator is int64 so overflow is impossible, but the
+        //      per-pixel work is a few 64-bit adds — much cheaper than
+        //      either int64 multiplies or risking int32 overflow.
+        const int32_t dw0_dx = v2.position.y - v3.position.y;
+        const int32_t dw1_dx = v3.position.y - v1.position.y;
+        const int32_t dw2_dx = v1.position.y - v2.position.y;
+        const int32_t dw0_dy = v3.position.x - v2.position.x;
+        const int32_t dw1_dy = v1.position.x - v3.position.x;
+        const int32_t dw2_dy = v2.position.x - v1.position.x;
+
+#if HALF_WIDTH_BUFFERS
+        constexpr int xStep = 2;
+#else
+        constexpr int xStep = 1;
+#endif
+        // MESHPUNK: dw_d* are per SUB-PIXEL unit (they are differences of Q4
+        // positions), while the loops advance whole pixels — so one step is
+        // MESHPUNK_SUBPIXEL_ONE of them.
+        const int32_t dw0_dx_step = dw0_dx * xStep * MESHPUNK_SUBPIXEL_ONE;
+        const int32_t dw1_dx_step = dw1_dx * xStep * MESHPUNK_SUBPIXEL_ONE;
+        const int32_t dw2_dx_step = dw2_dx * xStep * MESHPUNK_SUBPIXEL_ONE;
+        const int32_t dw0_dy_step = dw0_dy * inc   * MESHPUNK_SUBPIXEL_ONE;
+        const int32_t dw1_dy_step = dw1_dy * inc   * MESHPUNK_SUBPIXEL_ONE;
+        const int32_t dw2_dy_step = dw2_dy * inc   * MESHPUNK_SUBPIXEL_ONE;
+
+#if TEXTURE_MAPPING
+        // MESHPUNK: pick the mip level, once per triangle.
+        //
+        // A pixel covering N texels can only sample ONE of them, so which one
+        // it picks flips with sub-pixel camera motion and the surface crawls
+        // and beats into moiré. Measured on this terrain before mips existed:
+        // 1.8 texels/pixel at 60,000 units out, 9.2 at 300,000. That is the
+        // artefact that survived every interpolation fix, because interpolation
+        // error was already down at 0.12 texels — two orders below the
+        // sampling error.
+        //
+        // The rate comes from the AFFINE UV gradient: du/dx = (sum uv_i *
+        // dwi_dx) / denom, in UV units per screen pixel, scaled to texels by
+        // width/FIXED_POINT_SCALE. Affine is a per-triangle average rather than
+        // per-pixel, which is the same granularity texlod already works at.
+        //
+        // SELECTED PER SEGMENT, NOT PER TRIANGLE. Only the vertical half of the
+        // rate is triangle-constant and computed here; the horizontal half is
+        // taken from pcDU/pcDV at each 4-pixel segment boundary, which already
+        // ARE the perspective-correct UV change per pixel.
+        //
+        // Per-triangle selection was measurably wrong for this scene: the
+        // frame sidecar reports `rasterised 13`, i.e. thirteen triangles cover
+        // the entire screen, so one level per triangle paints quarter-screen
+        // blocks of differing sharpness with a hard seam along every shared
+        // edge — and the seam sweeps across the surface as the camera turns.
+        // A large ground triangle spanning near to far genuinely needs several
+        // levels across its own span.
+        //
+        // Rates are Q8 texels-per-pixel; 256 == exactly one texel per pixel.
+        // ANISOTROPY RATIO, not an absolute vertical rate.
+        //
+        // The vertical rate is triangle-constant, and on a ground triangle
+        // spanning near to far it is dominated by the FAR end — feeding it
+        // straight into max() over-blurred the near end, so the bottom of the
+        // screen (the closest, most detailed ground) dropped to the smallest
+        // mip. Level 3 of a 64-texel tile is 8x8, i.e. near-flat brown, which
+        // is exactly what that looked like.
+        //
+        // What IS roughly constant over a triangle is the RATIO of the vertical
+        // rate to the horizontal one — the surface's anisotropy. Multiplying
+        // the per-segment horizontal rate (which is perspective-correct and so
+        // already falls off correctly toward the camera) by that ratio gives a
+        // vertical estimate that tracks depth, for one multiply per segment.
+        // Nothing triangle-wide is computed for the mip any more — see the
+        // vertical-rate solve at the segment boundary below. Two earlier
+        // attempts derived it from affine gradients averaged over the whole
+        // triangle, and both over-blurred the near end of anything spanning a
+        // large depth range.
+        int mipLevel = 0;
+
+        // MESHPUNK: hoist the texture's metadata out of the pixel loop.
+        //
+        // The Texture object is heap-allocated, i.e. it lives in PSRAM. The
+        // sampler read screenSpace, reflectionMap, hasAlpha, alphaColor,
+        // addressMode, mipCount, mipW[], mipH[], mipData[] and palette — about
+        // ten PSRAM loads PER PIXEL for values that cannot change within a
+        // triangle. On top of that Texture::getPixel lives in another
+        // translation unit, so it could not inline and the compiler had to
+        // assume every field might alias.
+        //
+        // texFast marks the ordinary case (UV-sampled, non-paletted); anything
+        // else still goes through material->getColor.
+        const uint16_t* texData = nullptr;
+        int  texW = 0, texH = 0;
+        bool texFast = false;
+        bool texWrap = false, texHasAlpha = false;
+        uint16_t texAlphaCol = 0;
+        if (diffuseMap) {
+            texFast = !diffuseMap->screenSpace && !diffuseMap->reflectionMap
+                      && !diffuseMap->palette;
+            texWrap = (diffuseMap->addressMode == WRAP);
+            texHasAlpha = diffuseMap->hasAlpha;
+            texAlphaCol = diffuseMap->alphaColor;
+            texData = diffuseMap->mipData[0];
+            texW    = diffuseMap->mipW[0];
+            texH    = diffuseMap->mipH[0];
+        }
+#endif
+
+#if LIGHTING
+        // Plane-equation incremental Gouraud brightness. Brightness is
+        // linear in (x,y) across the triangle, so the per-pixel and per-row
+        // step values are constants. Replacing the original per-pixel
+        // (b0*w0 + b1*w1 + b2*w2) / denom with a single int32 add per pixel
+        // is roughly 30x cheaper on Xtensa (no divide, no multi-multiply).
+        // brightness is tracked in Q16 fixed-point so per-pixel deltas
+        // smaller than 1 don't quantise to zero across a wide row.
+        //
+        // int64 throughout the setup: vertexBrightness peaks at 255+specular
+        // (= 510 worst case) and dw_dx_step can be in the millions for
+        // huge near-camera triangles, so the int32 product overflowed and
+        // produced wildly-wrong row slopes (the "track flashes random
+        // colours" artefact). Per-pixel cost is unchanged — the inner loop
+        // still steps an int32 accumulator.
+        int32_t brightness_dx_step_q16 = 0;
+        const bool useIncrementalGouraud =
+            directionalLight && material->shadingMode == ShadingMode::GOURAUD;
+        if (useIncrementalGouraud)
+        {
+            const int64_t bDx = (int64_t)vertexBrightness[0] * dw0_dx_step
+                              + (int64_t)vertexBrightness[1] * dw1_dx_step
+                              + (int64_t)vertexBrightness[2] * dw2_dx_step;
+            // denom is divided in int64 here. Using the int32-narrowed
+            // `denom` produced randomly-dark/flashing triangles when the
+            // camera got close enough that the projected vertex coords
+            // pushed denom64 past INT32_MAX (the rasterizer accepts that
+            // truncation for per-pixel edge math, but the lighting
+            // divides are highly sensitive to denom sign/magnitude).
+            brightness_dx_step_q16 = (int32_t)((float)bDx * 65536.0f * invDenom64f);
+        }
+#endif
+
+#if !HALF_WIDTH_BUFFERS
+        // MESHPUNK: iteration increments for the general pixel loop, sized for
+        // checkerboard. In checkerboard mode the loop STRIDES by two over the
+        // drawn parity instead of visiting every pixel and rejecting half — the
+        // old reject sat after the edge stepping and inside test, so a skipped
+        // pixel still paid roughly two thirds of a drawn one (hw-measured:
+        // ~210 of ~600 cycles saved per skipped pixel). The per-row start
+        // alignment lives just above the loop.
+        // int32 like the originals on purpose: dw_dx_step peaks in the
+        // millions (see the Gouraud setup note), so doubling cannot overflow,
+        // and wider increments would add register pressure to a loop that is
+        // already the hottest code in the module.
+        const int32_t cbXInc   = checkerboardMode ? 2 : 1;
+        const int32_t cbEw0Inc = dw0_dx_step * cbXInc;
+        const int32_t cbEw1Inc = dw1_dx_step * cbXInc;
+        const int32_t cbEw2Inc = dw2_dx_step * cbXInc;
+#if LIGHTING
+        const int32_t cbLitInc = brightness_dx_step_q16 * cbXInc;
+#endif
+#endif
+
+        // Interlaced mode uses renderEvenLines as a row-start offset; checkerboard
+        // mode draws every row (the column stride/skip happens inside the x-loop).
+        const int yStart = interlacedMode ? (minY + (int)renderEvenLines) : minY;
+        // MESHPUNK: minX/yStart are whole pixels, the vertex positions are Q4.
+        // Evaluate the edge functions at the pixel CENTRE — (p << BITS) + half
+        // — which is both the correct sample point and what keeps the coverage
+        // rule consistent now that a vertex can sit part-way across a pixel.
+        const int32_t halfPx = MESHPUNK_SUBPIXEL_ONE / 2;
+        const int32_t minX_sp   = (minX   << MESHPUNK_SUBPIXEL_BITS) + halfPx;
+        const int32_t yStart_sp = (yStart << MESHPUNK_SUBPIXEL_BITS) + halfPx;
+        int64_t w0_row = (int64_t)dw0_dx * (minX_sp - v3.position.x)
+                       + (int64_t)dw0_dy * (yStart_sp - v3.position.y);
+        int64_t w1_row = (int64_t)dw1_dx * (minX_sp - v1.position.x)
+                       + (int64_t)dw1_dy * (yStart_sp - v1.position.y);
+        int64_t w2_row = (int64_t)dw2_dx * (minX_sp - v2.position.x)
+                       + (int64_t)dw2_dy * (yStart_sp - v2.position.y);
+
+        // Max number of xStep-sized pixel slots in this row.
+        // Bounded by screenWidth/xStep (≤240) so int32 is sufficient.
+        const int32_t iMaxRow = (maxX - minX) / xStep;
+
+        for (int y = yStart; y <= maxY;
+             y += inc, w0_row += dw0_dy_step, w1_row += dw1_dy_step, w2_row += dw2_dy_step)
+        {
+            // --- Scanline range: find first and last x inside the triangle.
+            //
+            // The edge function is linear in x with known int32 slope per
+            // xStep, so we can solve for the x-range where all three
+            // edges are non-negative without iterating pixel-by-pixel.
+            //
+            // For each edge with value ew_j at x=minX and slope d_j per
+            // xStep:
+            //   d_j > 0 : ew_j + i*d_j >= 0 iff i >= ceil(-ew_j / d_j)
+            //   d_j < 0 : ew_j + i*d_j >= 0 iff i <= floor(ew_j / -d_j)
+            //   d_j == 0: ew_j < 0 kills the whole row; else no constraint
+            //
+            // iStart/iEnd are bounded by iMaxRow (≤240): int32 is fine.
+            // The EW accumulators are int64 (near-camera vertices can push
+            // them out of int32 range), but the skip-check below guarantees
+            // EW fits in int32 by the time we actually divide — so we can
+            // use the Xtensa hardware 32-bit divider instead of the ~70-cycle
+            // soft 64-bit __divdi3/__moddi3 routines.
+            int32_t iStart = 0;
+            int32_t iEnd   = iMaxRow;
+            bool skipRow = false;
+
+            // ceil(num/D) > iEnd  iff  num > D*iEnd  (D, iEnd both int32,
+            // product ≤ max_D * 240 which stays well inside int32).
+            // floor(EW/negD) > iEnd  iff  EW > negD*iEnd  (same bounds).
+            // When the skip condition is false, EW (or num) ≤ D*iEnd fits
+            // in int32, so the division below uses 32-bit hardware arithmetic.
+            #define JET_EDGE_RANGE(EW, D)                                                       \
+                do {                                                                              \
+                    if ((D) > 0) {                                                                \
+                        if ((EW) < 0) {                                                           \
+                            int64_t num = -(EW);                                                  \
+                            if (num > (int64_t)(D) * iEnd) {                                      \
+                                /* req > iEnd → row is empty */                                   \
+                                skipRow = true;                                                   \
+                            } else {                                                              \
+                                /* MESHPUNK: edge values are Q8 and D is 16x larger since        \
+                                 * positions went sub-pixel, so D*iEnd reaches ~8e9 on the        \
+                                 * large terrain triangles and the old unconditional             \
+                                 * (int32_t)num cast overflowed — garbage iStart, whole           \
+                                 * spans dropped, giant holes. Keep the 32-bit divide for         \
+                                 * the common case and widen only when it cannot hold. */         \
+                                int32_t req = (num <= (int64_t)0x3FFFFFFF)                        \
+                                    ? (((int32_t)num + (D) - 1) / (D))                            \
+                                    : (int32_t)((num + (int64_t)(D) - 1) / (int64_t)(D));         \
+                                if (req > iStart) iStart = req;                                   \
+                            }                                                                     \
+                        }                                                                         \
+                    } else if ((D) < 0) {                                                         \
+                        if ((EW) < 0) { skipRow = true; }                                         \
+                        else {                                                                    \
+                            int32_t negD = -(D);                                                  \
+                            if ((EW) > (int64_t)negD * iEnd) {                                    \
+                                /* floor(EW/negD) > iEnd → no tightening needed, skip divide */  \
+                            } else {                                                              \
+                                /* MESHPUNK: same widening as the D>0 branch above. */            \
+                                int32_t req = ((EW) <= (int64_t)0x3FFFFFFF)                       \
+                                    ? ((int32_t)(EW) / negD)                                      \
+                                    : (int32_t)((EW) / (int64_t)negD);                            \
+                                if (req < iEnd) iEnd = req;                                       \
+                            }                                                                     \
+                        }                                                                         \
+                    } else { /* D == 0 */                                                         \
+                        if ((EW) < 0) skipRow = true;                                             \
+                    }                                                                             \
+                } while (0)
+
+            JET_EDGE_RANGE(w0_row, dw0_dx_step);
+            if (!skipRow) JET_EDGE_RANGE(w1_row, dw1_dx_step);
+            if (!skipRow) JET_EDGE_RANGE(w2_row, dw2_dx_step);
+            #undef JET_EDGE_RANGE
+
+            if (skipRow || iStart > iEnd) continue;
+
+            // Advance ew accumulators to the first inside x.
+            int64_t ew0 = w0_row + (int64_t)dw0_dx_step * iStart;
+            int64_t ew1 = w1_row + (int64_t)dw1_dx_step * iStart;
+            int64_t ew2 = w2_row + (int64_t)dw2_dx_step * iStart;
+
+            const int xStart = minX + iStart * xStep;
+            const int xEnd   = minX + iEnd   * xStep;
+
+            // Wireframe / outline mode. The per-row solver above already
+            // gave us the leftmost and rightmost x for this scanline of
+            // the triangle; plotting just those two pixels (one when the
+            // row is a single pixel wide, e.g. at the top/bottom apex)
+            // traces the triangle's silhouette. We skip the entire span
+            // body — no z-buffer, no lighting, no texturing, no dither —
+            // which is what the production fill path was eating cycles
+            // on for huge near-camera triangles in the previous
+            // Bresenham-edge implementation. The fill is replaced with
+            // at most two stores per scanline.
+            if (wireframeMode)
+            {
+                const uint16_t wireColor = material->color;
+                auto plotWire = [this, wireColor](int px, int py) {
+#if HALF_WIDTH_BUFFERS
+    #if FIELD_BUFFERS
+                    framebuffer[(py >> 1) * (screenWidth / 2) + (px >> 1)] = wireColor;
+    #else
+                    framebuffer[py * (screenWidth / 2) + (px >> 1)] = wireColor;
+    #endif
+#else
+    #if FIELD_BUFFERS
+                    framebuffer[(py >> 1) * screenWidth + px] = wireColor;
+    #else
+                    framebuffer[py * screenWidth + px] = wireColor;
+    #endif
+#endif
+                };
+                plotWire(xStart, y);
+                if (xEnd != xStart) plotWire(xEnd, y);
+                continue;
+            }
+
+#if MAX_PICK_QUERIES > 0
+            // Per-row screen-space pick test. Cheap (MAX_PICK_QUERIES is
+            // tiny and compile-time bounded) and sees every triangle that
+            // covers the queried pixel regardless of which fast/slow
+            // span path the rasterizer takes below. We don't try to
+            // emulate per-pixel screen-door stipple or texture-key holes
+            // picking semantics here are "which surface intersects
+            // this screen-space ray", which is what the host actually
+            // wants for mouse-over / cursor selection. Z arbitration is
+            // strictly closer-wins so the result matches the visible
+            // painter-sorted / Z-buffered scene.
+            if (pickQueries && pickResults && pickQueryCount > 0)
+            {
+                // Triangle-effective Z. With FAST_Z this is already
+                // the constant `z` set up at the top of drawTriangle;
+                // without FAST_Z we don't have per-pixel Z here yet (it
+                // would need a barycentric eval per query) so fall back
+                // to the triangle average - still good enough for
+                // ordering since hit triangles are typically small.
+                int32_t pickZ;
+            #if FAST_Z
+                pickZ = z;
+            #else
+                pickZ = (v1.position.z + v2.position.z + v3.position.z) / 3;
+            #endif
+                for (int p = 0; p < pickQueryCount; ++p)
+                {
+                    const PickQuery& q = pickQueries[p];
+                    if (q.x < 0 || q.y < 0) continue;          // disabled slot
+                    if (q.y != y) continue;                    // wrong row
+                    // HALF_WIDTH_BUFFERS rasterises in 2-pixel xStep; snap
+                    // the query x to the same 2-pixel grid before the
+                    // range check so an odd query x still hits the cell
+                    // the rasterizer actually wrote.
+                #if HALF_WIDTH_BUFFERS
+                    const int qx = q.x & ~1;
+                #else
+                    const int qx = q.x;
+                #endif
+                    if (qx < xStart || qx > xEnd) continue;
+                    PickResult& r = pickResults[p];
+                    if (!r.hit || pickZ < r.depth)
+                    {
+                        r.hit           = true;
+                        r.object        = currentPickObject;
+                        r.triangleIndex = currentPickTriangleIndex;
+                        r.depth         = pickZ;
+                        r.x             = (int16_t)qx;
+                        r.y             = (int16_t)y;
+                    }
+                }
+            }
+#endif // MAX_PICK_QUERIES > 0
+
+#if LIGHTING
+            // Per-row Gouraud brightness init. Computed in int64 because
+            // the numerator can be up to 1533 * |denom| and we shift left
+            // by 16 for Q16 precision; divided once per row instead of
+            // once per pixel.
+            int32_t brightness_q16 = 0;
+            if (useIncrementalGouraud)
+            {
+                const int64_t bRowNum = (int64_t)vertexBrightness[0] * ew0
+                                      + (int64_t)vertexBrightness[1] * ew1
+                                      + (int64_t)vertexBrightness[2] * ew2;
+                // See note at brightness_dx_step_q16 setup: divide by
+                // the full-precision int64 denom or super-near triangles
+                // flash dark when denom64 overflows int32.
+                brightness_q16 = (int32_t)((float)bRowNum * 65536.0f * invDenom64f);
+            }
+#endif
+
+            // WATER_REFLECT: precompute the framebuffer row-base for the
+            // mirror scanline (screenH-1-y ± ripple).  clearBuffers() has
+            // already filled every row with the sky gradient, so upper rows
+            // contain sky even before any geometry is drawn.  Anything
+            // rendered before this water object (rocks, hills, etc.) is
+            // also present — giving true screen-space reflections for free.
+            // Colour is set per-pixel in the fast-span and general paths.
+            // Intentionally outside #if LIGHTING — works with LIGHTING=0.
+            int32_t waterMirrorBufBase = 0;
+            uint8_t waterReflectAlpha = material->alpha;
+            bool waterSkyFallback = false;
+            if (isWaterReflect)
+            {
+                // `specular` expresses ripple amplitude in pixels at a
+                // canonical 800-pixel reference height.  Scaling by
+                // screenHeight/800 keeps the visual ripple consistent
+                // across resolutions: 28 → 28 px on 800p desktop,
+                // 28 → ~8 px on 240p ESP32.
+                const int amp    = (int)material->specular * screenHeight / 2400; // /3 of original
+                // Perspective-correct wave density: waves should appear compressed
+                // (denser) near the horizon where geometry is far away, and stretched
+                // (sparser) near the camera.  (screenHeight - y) is large at the top of
+                // the screen (horizon side) and approaches 0 at the very bottom (camera
+                // side), so squaring it produces the right quadratic phase accumulation —
+                // many wave cycles near the waterline, fewer toward the viewer.
+                // Cost: one extra multiply and a divide versus the old linear y*5.
+                const int perspY = screenHeight - y;
+                const int angle  = ((perspY * perspY * 20 / screenHeight + (int)(waterTime * 240.0f)) % 360 + 360) % 360;
+                //const int angle = ((y * 5 + (int)(waterTime * 240.0f)) % 360 + 360) % 360; //MB: This version doesn't take perspective into account, so waves look the same near and far, which is less realistic but more performant.
+                const int ripple = (lookupSinI(angle) * amp) >> 10; // Q10 → pixels
+                // Use the camera-pitch-correct waterline as the mirror axis:
+                // mirrorY = 2*waterlineY - y gives geometrically accurate
+                // reflections for objects at any distance. Falls back to
+                // screen-centre (screenHeight/2) if waterlineY wasn't set.
+                const int wl    = (waterlineY > 0) ? waterlineY : (screenHeight / 2);
+                // waterYBias nudges the sampled row downward (larger mirrorY =
+                // lower on screen) to fine-tune the apparent reflection height.
+                int mirrorY = 2 * wl - y + ripple + (int)material->waterYBias;
+                // Sky fallback: when the reflection would sample off the top of
+                // the screen, use gradientColors[0] (the topmost sky colour)
+                // as the reflected pixel so the blend picks up the right sky hue
+                // instead of repeating framebuffer row 0.
+                waterSkyFallback = mirrorY < 0 &&
+                                   gradientColors != nullptr &&
+                                   gradientSize > 0;
+                if (mirrorY < 0)             mirrorY = 0;
+                if (mirrorY >= screenHeight) mirrorY = screenHeight - 1;
+                constexpr int kSsrTopFadePx = 32;
+                if (mirrorY < kSsrTopFadePx) {
+                    waterReflectAlpha = (uint8_t)(((uint16_t)material->alpha * mirrorY) / kSsrTopFadePx);
+                }
+#if HALF_WIDTH_BUFFERS
+  #if FIELD_BUFFERS
+                waterMirrorBufBase = (mirrorY >> 1) * (screenWidth / 2);
+  #else
+                waterMirrorBufBase = mirrorY * (screenWidth / 2);
+  #endif
+#else
+  #if FIELD_BUFFERS
+                waterMirrorBufBase = (mirrorY >> 1) * screenWidth;
+  #else
+                waterMirrorBufBase = mirrorY * screenWidth;
+  #endif
+#endif
+            }
+
+#if JET_FAST_SIMPLE_SPANS
+#if TEXTURE_MAPPING
+            // Untextured triangles take the fast simple-span path even in
+            // builds where TEXTURE_MAPPING is compiled in. Textured ones
+            // fall through to the general per-pixel loop below.
+            if (useFastSimpleSpan)
+#endif
+            {
+            // Fast simple-span path. See JET_FAST_SIMPLE_SPANS comment at
+            // the top of the TU. Skips per-pixel edge accumulate/test (the
+            // solver above already bounded x to the inside range) and the
+            // per-pixel dither lookup (alpha is triangle-constant in this
+            // config, so the mask reduces to two per-row booleans).
+            (void)ew0; (void)ew1; (void)ew2;  // Unused in this path.
+#if FIELD_BUFFERS
+            int32_t bufferIndex = (y >> 1) * (screenWidth / 2) + (xStart / 2);
+#else
+            int32_t bufferIndex = y * (screenWidth / 2) + (xStart / 2);
+#endif
+#if SCREEN_DOOR_ALPHA
+            bool drawP0, drawP2;
+            if (alpha > 240) {
+                drawP0 = drawP2 = true;
+            } else {
+                // Same 4x4 Bayer matrix as shouldDrawPixel, but we only
+                // need the two phases that HALF_WIDTH actually steps
+                // through (x%4 \u2208 {0, 2} when xStart is 2-aligned).
+                constexpr uint8_t thresholdMatrix[16] = {
+                    15, 135, 45, 165,
+                    195, 75, 225, 105,
+                    60, 180, 30, 150,
+                    240, 120, 210, 90};
+                const int yRow = (y & 3) << 2;
+                drawP0 = alpha >= thresholdMatrix[0 | yRow];
+                drawP2 = alpha >= thresholdMatrix[2 | yRow];
+            }
+            if (!drawP0 && !drawP2) continue;  // whole row dithered out
+
+            if (drawP0 && drawP2) {
+                // Solid fill: pair adjacent uint16 stores into 32-bit
+                // writes when alignment permits. Halves the store count on
+                // the hot path - this is where most of the per-frame time
+                // goes for near-opaque geometry.
+                fillRGB565Span(framebuffer, bufferIndex, ((xEnd - xStart) >> 1) + 1, color);
+            } else {
+                // Alternating fill: only one of the two phases draws. Pick
+                // the matching phase bool and stride by 4 pixels (2 slots).
+                const bool startIsP0 = ((xStart & 3) == 0);
+                const bool drawFirst = startIsP0 ? drawP0 : drawP2;
+                int x = xStart;
+                if (!drawFirst) { x += 2; bufferIndex++; }
+                for (; x <= xEnd; x += 4, bufferIndex += 2) {
+                    framebuffer[bufferIndex] = color;
+                }
+            }
+#else  // !SCREEN_DOOR_ALPHA
+            // Traditional alpha-blend path. For fully-opaque triangles we
+            // still emit the paired 32-bit fast stores; sub-opaque ones
+            // fall through to a per-pixel "over" blend against the
+            // existing framebuffer contents.
+            if (plainOpaqueReplace) {
+                fillRGB565Span(framebuffer, bufferIndex, ((xEnd - xStart) >> 1) + 1, color);
+            } else if (isWaterReflect) {
+                // Screen-space reflection: read each pixel from the mirror
+                // row already written in the framebuffer (sky gradient +
+                // any geometry drawn before this water object).
+                // When reflectBuffer is set (SSR_FIELD_REFLECT), read from
+                // the previous field instead — depth-independent, fully
+                // committed prior frame.
+                // mirrorIdx steps in x-lockstep with bufferIndex.
+                const uint16_t* srcBuf = reflectBuffer ? reflectBuffer : framebuffer;
+                int32_t mirrorIdx = waterMirrorBufBase + xStart / 2;
+                const uint16_t skyCol = waterSkyFallback ? gradientColors[0] : 0;
+                for (int x = xStart; x <= xEnd; x += 2, bufferIndex++, mirrorIdx++) {
+                    const uint16_t reflPx = waterSkyFallback ? skyCol : srcBuf[mirrorIdx];
+                    framebuffer[bufferIndex] = blendRGB565(material->color,
+                                                           reflPx,
+                                                           waterReflectAlpha);
+                }
+            } else if (isAdditive) {
+                // Saturating-add: source scaled by alpha then added to destination.
+                // alpha==255 fast path skips the per-channel multiply.
+                if (alpha == 255) {
+                    for (int x = xStart; x <= xEnd; x += 2, bufferIndex++) {
+                        const uint16_t d = framebuffer[bufferIndex];
+                        uint32_t r = ((d >> 11) & 0x1Fu) + ((color >> 11) & 0x1Fu); if (r > 0x1Fu) r = 0x1Fu;
+                        uint32_t g = ((d >>  5) & 0x3Fu) + ((color >>  5) & 0x3Fu); if (g > 0x3Fu) g = 0x3Fu;
+                        uint32_t b = ( d        & 0x1Fu) + ( color        & 0x1Fu); if (b > 0x1Fu) b = 0x1Fu;
+                        framebuffer[bufferIndex] = (uint16_t)((r << 11) | (g << 5) | b);
+                    }
+                } else {
+                    for (int x = xStart; x <= xEnd; x += 2, bufferIndex++) {
+                        framebuffer[bufferIndex] = addBlendRGB565(framebuffer[bufferIndex], color, alpha);
+                    }
+                }
+            } else {
+                for (int x = xStart; x <= xEnd; x += 2, bufferIndex++) {
+                    framebuffer[bufferIndex] = blendRGB565(framebuffer[bufferIndex], color, alpha);
+                }
+            }
+#endif // SCREEN_DOOR_ALPHA
+            }  // close fast simple-span block
+#if TEXTURE_MAPPING
+            else
+#endif
+#endif // JET_FAST_SIMPLE_SPANS
+
+#if !JET_FAST_SIMPLE_SPANS || TEXTURE_MAPPING
+            {  // General per-pixel path. Runs as the textured `else` when
+               // the fast path is also compiled (TEXTURE_MAPPING build),
+               // or unconditionally when JET_FAST_SIMPLE_SPANS is
+               // false (any of the heavy features enabled).
+// Per-pixel brightness step appended to the for-loop header below. The
+// step has to happen unconditionally per pixel (continues elsewhere in
+// the loop body would otherwise desync the running value), so it lives
+// in the increment list rather than the body.
+#if LIGHTING
+#define JET_LIT_STEP , brightness_q16 += brightness_dx_step_q16
+// Checkerboard-aware variant for the general (full-width) loop: rowLitInc is
+// the same step scaled by the ROW's stride, so the running brightness stays
+// in lockstep with x whether the row strides by 1 or 2.
+#define JET_LIT_STEP_CB , brightness_q16 += rowLitInc
+#else
+#define JET_LIT_STEP
+#define JET_LIT_STEP_CB
+#endif
+
+#if MESHPUNK_SEGMENTED_PERSPECTIVE && TEXTURE_MAPPING \
+    && !PERSPECTIVE_CORRECT_TEXTURES && !HALF_WIDTH_BUFFERS
+            // MESHPUNK: UV segment state, reset for every scanline. Held here
+            // rather than stepped in the loop increment because the body has
+            // several `continue`s above the sampler; anchoring the segment to x
+            // makes a skipped pixel unable to shear the rest of the span.
+            int32_t pcSegX = xStart, pcNextX = xStart;
+            int32_t pcU = 0, pcV = 0, pcDU = 0, pcDV = 0;
+            int32_t mipNextX = xStart;   // mip runs on its own coarser cadence
+#endif
+
+#if HALF_WIDTH_BUFFERS
+#if FIELD_BUFFERS
+            int32_t bufferIndex = (y >> 1) * (screenWidth / 2) + (xStart / 2);
+#else
+            int32_t bufferIndex = y * (screenWidth / 2) + (xStart / 2);
+#endif
+        for (int x = xStart; x <= xEnd;
+             x += 2, ew0 += dw0_dx_step, ew1 += dw1_dx_step, ew2 += dw2_dx_step, bufferIndex++ JET_LIT_STEP)
+            {
+#else
+#if FIELD_BUFFERS
+            int32_t bufferIndex = (y >> 1) * screenWidth + xStart;
+#else
+            int32_t bufferIndex = y * screenWidth + xStart;
+#endif
+
+            // MESHPUNK: flat span fill. See meshpunkFlatSpan at triangle setup
+            // for why the per-pixel body is redundant for these triangles.
+            //
+            // The per-row solver above gives the exact [iStart, iEnd] where all
+            // three edge functions are non-negative, but its comment warns that
+            // integer ceil/floor can leave a shoulder, which is why the loop
+            // keeps a per-pixel inside test. Rather than trust that, verify it:
+            // each edge function is LINEAR in i, so a linear function that is
+            // non-negative at both ends of an interval is non-negative across
+            // the whole interval. Testing the three edges at iStart and at iEnd
+            // therefore PROVES every pixel between them is inside — six
+            // comparisons per row instead of three per pixel. If any end fails
+            // we fall through to the general loop and lose nothing.
+            if (meshpunkFlatSpan) {
+                const int32_t nSpan = iEnd - iStart;
+                const int64_t e0End = ew0 + (int64_t)dw0_dx_step * nSpan;
+                const int64_t e1End = ew1 + (int64_t)dw1_dx_step * nSpan;
+                const int64_t e2End = ew2 + (int64_t)dw2_dx_step * nSpan;
+                // Sign-bit fold: the OR is negative iff any operand is.
+                if (((ew0 | ew1 | ew2 | e0End | e1End | e2End) >= 0)) {
+                    fillRGB565Span(framebuffer, bufferIndex, nSpan + 1, color);
+                    continue;
+                }
+            }
+
+            // MESHPUNK: checkerboard start alignment. Drawn pixels satisfy
+            // ((x ^ y) & 1) == cbFrameParity, i.e. (x & 1) == cbFrameParity ^
+            // (y & 1). If the row starts on the other parity, advance every
+            // accumulator by exactly one ordinary step so the stride-2 loop
+            // below lands only on drawn pixels. UV and mip segment state need
+            // no adjustment: both are anchored positionally to x
+            // (sp = x - pcSegX), not stepped per iteration.
+            // Per-ROW stride. Checkerboard normally strides 2 over the drawn
+            // parity, but rows of at most THREE candidate pixels run at
+            // stride 1 with no parity skip. Those are the seam slivers: the
+            // row solver's range can carry a one-pixel rounding shoulder on
+            // either side, so a 2-3 candidate row may hold a SINGLE true
+            // inside pixel — and when the drawn parity lands on a shoulder,
+            // the inside test rejects it, the inside pixel is off-parity,
+            // nothing draws, no mask bit is set, and reconstruction rightly
+            // leaves the pixel showing the sky clear: a white dot blinking
+            // with the frame parity at triangle seams (hw 2026-08-03, twice —
+            // once for the bbox-empty case alone, which was not sufficient).
+            // Off-parity writes are safe: they never touch the drawn-parity
+            // mask bits reconstruction keys on. Cost: <=3 px of overdraw on
+            // exactly the rows too small to be worth skipping.
+            int xCb = xStart;
+            int32_t rowInc    = cbXInc;
+            int32_t rowEw0Inc = cbEw0Inc;
+            int32_t rowEw1Inc = cbEw1Inc;
+            int32_t rowEw2Inc = cbEw2Inc;
+#if LIGHTING
+            int32_t rowLitInc = cbLitInc;
+#endif
+            if (cbXInc == 2) {
+                if (xEnd - xStart <= 2) {
+                    rowInc    = 1;
+                    rowEw0Inc = dw0_dx_step;
+                    rowEw1Inc = dw1_dx_step;
+                    rowEw2Inc = dw2_dx_step;
+#if LIGHTING
+                    rowLitInc = brightness_dx_step_q16;
+#endif
+                } else {
+                    const int wantParity = (cbFrameParity ^ y) & 1;
+                    if ((xCb & 1) != wantParity) {
+                        ++xCb;
+                        ++bufferIndex;
+                        ew0 += dw0_dx_step;
+                        ew1 += dw1_dx_step;
+                        ew2 += dw2_dx_step;
+#if LIGHTING
+                        brightness_q16 += brightness_dx_step_q16;
+#endif
+                    }
+                }
+            }
+
+        for (int x = xCb; x <= xEnd;
+             x += rowInc, ew0 += rowEw0Inc, ew1 += rowEw1Inc, ew2 += rowEw2Inc, bufferIndex += rowInc JET_LIT_STEP_CB)
+            {
+#endif
+            // Z-buffer index. Stride matches the configured depth-buffer
+            // layout: half-width (one cell per two output pixels) when
+            // HALF_WIDTH_BUFFERS is on, otherwise per-pixel (same stride
+            // as the colour buffer). Set per-row.
+            #if Z_BUFFERING
+            int32_t zBufferIndex = y * ZBUFFER_STRIDE(screenWidth);
+            #endif
+
+                #if Z_BUFFERING
+                // If the z-buffer position is at its maximum for this pixel (as close to the camera as is possible), skip this pixel
+                // since it can't possibly be any closer.
+                if (zBuffer[zBufferIndex] == 0 && !ignoreZBuffer)
+                {
+                    continue;
+                }
+                #endif
+
+                // Inside test on the incrementally-stepped edge function.
+                // Comparing int64 with 0 only examines the high word, so
+                // this is cheap. The scanline range above already trimmed
+                // the iteration to (mostly) inside-only pixels, but a
+                // small shoulder can still be outside due to the integer
+                // ceil/floor rounding - keep the test as a safety net.
+                if ((ew0 | ew1 | ew2) < 0)
+                {
+                    continue;
+                }
+
+                // Checkerboard needs no per-pixel parity test here: the loop
+                // start is aligned to the drawn parity and the stride is 2
+                // (cbXInc), so every pixel this loop visits is a drawn one.
+
+                // For any inside pixel, |ew_i| <= |denom|. If any downstream
+                // code needs int32 barycentric weights (interpolation paths)
+                // they're safe to narrow here. The compiler DCEs these on
+                // the FAST_Z / no-texture / no-lighting fast path.
+                // MESHPUNK: same shift `denom` took, so w/denom is unchanged.
+                int32_t w0 = (int32_t)(ew0 >> denomShift);
+                int32_t w1 = (int32_t)(ew1 >> denomShift);
+                int32_t w2 = (int32_t)(ew2 >> denomShift);
+
+// Pixel is inside the triangle - render it
+// Interpolate z, u, v
+#if !FAST_Z
+                int32_t z = (v1.position.z * w0 + v2.position.z * w1 + v3.position.z * w2) / denom;
+
+                if (z < nearPlane || z > farPlane)
+                {
+                    continue;
+                }
+
+#if Z_BUFFERING
+                // Per-pixel Z bias in real depth units. Clamp to uint16
+                // for storage (matches the FAST_Z setup path).
+                int32_t zbRaw = z - zBias;
+                if (zbRaw < 0)     zbRaw = 0;
+                if (zbRaw > 65535) zbRaw = 65535;
+                uint32_t zb = (uint32_t)zbRaw;
+#endif
+
+#if Z_BRIGHTNESS
+                brightness = 255 - ((z - nearPlane) * 127) / (farPlane - nearPlane);
+                brightness = std::min(brightness, static_cast<uint16_t>(255));
+#endif
+#endif
+
+#if DEPTH_ALPHA_BLEND && !FAST_Z
+                // Per-pixel depth fog. Only used on the !FAST_Z path where
+                // z genuinely varies per pixel; on the FAST_Z path this is
+                // hoisted to the triangle setup above. Compose with the
+                // existing alpha (material*objAlpha) by taking the
+                // minimum into a per-pixel local — important: must NOT
+                // mutate `alpha`, which is shared across all pixels of
+                // this triangle, or each pixel's fade would compound on
+                // the previous one's.
+                uint8_t pixAlpha = alpha;
+                if (z > fogNear && z < fogFar)
+                {
+                    uint8_t fogA = (uint8_t)(255 - ((z - fogNear) * 255) / (fogFar - fogNear));
+                    if (fogA < pixAlpha) pixAlpha = fogA;
+                }
+                else if (z >= fogFar)
+                {
+                    pixAlpha = 0;
+                }
+#else
+                uint8_t pixAlpha = alpha;
+#endif
+
+#if SCREEN_DOOR_ALPHA
+                // Stippling based on alpha value
+                if (!shouldDrawPixel(x, y, pixAlpha))
+                {
+                    continue;
+                }
+#endif
+
+#if Z_BUFFERING
+                if (!ignoreZBuffer && zb > zBuffer[zBufferIndex])
+                {
+                    continue;
+                }
+#endif
+
+#if TEXTURE_MAPPING
+                if (diffuseMap)
+                {
+                    if (diffuseMap->screenSpace)
+                    {
+                        // **Screen-space texture mapping**
+                        uv.x = x * diffuseMap->width / screenWidth;
+                        uv.y = y * diffuseMap->height / screenHeight;
+                    }
+                    else if (diffuseMap->reflectionMap)
+                    {
+                        uv.x = x + z;
+                        uv.y = y + z;
+                    }
+                    else
+                    {
+#if PERSPECTIVE_CORRECT_TEXTURES
+                        // Interpolate 1/z, u/z, and v/z at the current pixel
+                        int32_t interpolatedOneOverZ = (oneOverZ1 * w0 + oneOverZ2 * w1 + oneOverZ3 * w2) / denom;
+                        int32_t interpolatedUOverZ = (uOverZ1 * w0 + uOverZ2 * w1 + uOverZ3 * w2) / denom;
+                        int32_t interpolatedVOverZ = (vOverZ1 * w0 + vOverZ2 * w1 + vOverZ3 * w2) / denom;
+
+                        // Avoid division by zero
+                        if (interpolatedOneOverZ == 0)
+                            continue;
+
+                        // Compute final texture coordinates
+                        uv.x = (interpolatedUOverZ * FIXED_POINT_SCALE) / interpolatedOneOverZ;
+                        uv.y = (interpolatedVOverZ * FIXED_POINT_SCALE) / interpolatedOneOverZ;
+#elif MESHPUNK_SEGMENTED_PERSPECTIVE && !HALF_WIDTH_BUFFERS
+                        // MESHPUNK: segmented perspective correction.
+                        if (pcOn)
+                        {
+                            if (x >= pcNextX)
+                            {
+                                // Solve exactly here and one segment ahead; the
+                                // span between is linear to within a fraction of
+                                // a texel. Note the barycentric sums are used as
+                                // ratios, so the /denom that the stock path
+                                // forms three times cancels and is never taken.
+                                // Weights are used at FULL precision — see the
+                                // 2^14 note in the setup for why they must be.
+                                const int64_t A0 = (int64_t)pcOneOverZ[0] * w0
+                                                 + (int64_t)pcOneOverZ[1] * w1
+                                                 + (int64_t)pcOneOverZ[2] * w2;
+                                // Segment boundaries are locked to a FIXED
+                                // screen grid, not measured from each row's
+                                // own xStart. Rows start at different x, so
+                                // per-row phase put the mid-segment error peak
+                                // at a different place on every scanline —
+                                // which is what turns a smooth residual into
+                                // visible horizontal banding. Aligned, the
+                                // residual is vertically coherent instead.
+                                static_assert((MESHPUNK_PERSPECTIVE_SEGMENT &
+                                               (MESHPUNK_PERSPECTIVE_SEGMENT - 1)) == 0,
+                                              "segment length must be a power of two");
+                                int32_t segEnd =
+                                    (x & ~(MESHPUNK_PERSPECTIVE_SEGMENT - 1))
+                                    + MESHPUNK_PERSPECTIVE_SEGMENT;
+                                if (segEnd > xEnd) segEnd = xEnd;
+                                int32_t adv = segEnd - x;
+
+                                // FLOAT DIVIDE, and the affine fallback is
+                                // computed ONLY when it is needed.
+                                //
+                                // Every one of these was an int64/int64 divide,
+                                // which Xtensa LX7 has no instruction for —
+                                // readelf confirms __divdi3 linked into the
+                                // module. At four of them per 4-pixel segment
+                                // that is about one ~300-cycle software divide
+                                // PER PIXEL, against ~30 for the hardware
+                                // 32-bit divide the old affine path used. It is
+                                // why texturing costs 10x the whole rest of the
+                                // frame (20.3 fps untextured vs 1.9 textured on
+                                // identical geometry).
+                                //
+                                // The S3 has a single-precision FPU, so a float
+                                // divide is ~15 cycles. Precision is ample: the
+                                // result is a UV under 32767 and float carries
+                                // 24 mantissa bits, giving ~0.002 units of
+                                // error — three orders below one texel.
+                                //
+                                // The affine values used to be computed
+                                // unconditionally as the fallback base, costing
+                                // two more int64 divides every segment for a
+                                // branch that almost never runs.
+                                if (A0 > 0)
+                                {
+                                    const float invA0 = 1024.0f / (float)A0;
+                                    pcU = (int32_t)((float)((int64_t)pcUOverZ[0] * w0
+                                                          + (int64_t)pcUOverZ[1] * w1
+                                                          + (int64_t)pcUOverZ[2] * w2) * invA0);
+                                    pcV = (int32_t)((float)((int64_t)pcVOverZ[0] * w0
+                                                          + (int64_t)pcVOverZ[1] * w1
+                                                          + (int64_t)pcVOverZ[2] * w2) * invA0);
+                                }
+                                else
+                                {
+                                    // Degenerate depth: affine, never a zero
+                                    // slope — that holds UV constant across the
+                                    // segment and combs the surface.
+                                    const float invD = 1.0f / (float)denom;
+                                    pcU = (int32_t)((float)((int64_t)v1.uv.x * w0
+                                                          + (int64_t)v2.uv.x * w1
+                                                          + (int64_t)v3.uv.x * w2) * invD);
+                                    pcV = (int32_t)((float)((int64_t)v1.uv.y * w0
+                                                          + (int64_t)v2.uv.y * w1
+                                                          + (int64_t)v3.uv.y * w2) * invD);
+                                }
+
+                                pcDU = 0;
+                                pcDV = 0;
+                                if (adv > 0)
+                                {
+                                    // Shifted to match `denom` and w0/w1/w2 —
+                                    // the affine fallback below divides by
+                                    // denom, so an unshifted numerator would
+                                    // be wrong by 2^denomShift.
+                                    const int64_t e0 = (ew0 + (int64_t)dw0_dx_step * adv) >> denomShift;
+                                    const int64_t e1 = (ew1 + (int64_t)dw1_dx_step * adv) >> denomShift;
+                                    const int64_t e2 = (ew2 + (int64_t)dw2_dx_step * adv) >> denomShift;
+                                    const int64_t A1 = (int64_t)pcOneOverZ[0] * e0
+                                                     + (int64_t)pcOneOverZ[1] * e1
+                                                     + (int64_t)pcOneOverZ[2] * e2;
+                                    int32_t uEnd, vEnd;
+                                    if (A1 > 0)
+                                    {
+                                        const float invA1 = 1024.0f / (float)A1;
+                                        uEnd = (int32_t)((float)((int64_t)pcUOverZ[0] * e0
+                                                               + (int64_t)pcUOverZ[1] * e1
+                                                               + (int64_t)pcUOverZ[2] * e2) * invA1);
+                                        vEnd = (int32_t)((float)((int64_t)pcVOverZ[0] * e0
+                                                               + (int64_t)pcVOverZ[1] * e1
+                                                               + (int64_t)pcVOverZ[2] * e2) * invA1);
+                                    }
+                                    else
+                                    {
+                                        // The lookahead landed outside the
+                                        // triangle (normal on the last segment
+                                        // of a span). Take the affine endpoint
+                                        // so the slope stays real.
+                                        const float invD = 1.0f / (float)denom;
+                                        uEnd = (int32_t)((float)((int64_t)v1.uv.x * e0
+                                                               + (int64_t)v2.uv.x * e1
+                                                               + (int64_t)v3.uv.x * e2) * invD);
+                                        vEnd = (int32_t)((float)((int64_t)v1.uv.y * e0
+                                                               + (int64_t)v2.uv.y * e1
+                                                               + (int64_t)v3.uv.y * e2) * invD);
+                                    }
+                                    // Q8 so a sub-unit slope survives. int32 is
+                                    // safe here: both ends are UVs under 32767.
+                                    pcDU = ((uEnd - pcU) << 8) / adv;
+                                    pcDV = ((vEnd - pcV) << 8) / adv;
+                                }
+
+                                pcSegX  = x;
+                                pcNextX = x + (adv > 0 ? adv : 1);
+                            }
+
+                            // Mip level, on its own coarser cadence. pcDU/pcDV
+                            // are already Q8 UV units per pixel, so scaling by
+                            // texture dimension / FIXED_POINT_SCALE turns them
+                            // into Q8 texels per pixel at no extra cost — the
+                            // perspective solve above paid for them.
+                            if (x >= mipNextX)
+                            {
+                                {
+                                    // Horizontal rate: pcDU/pcDV are already Q8
+                                    // UV per pixel, perspective-correct.
+                                    const int32_t au = pcDU < 0 ? -pcDU : pcDU;
+                                    const int32_t av = pcDV < 0 ? -pcDV : pcDV;
+                                    int64_t rate =
+                                        ((int64_t)au * diffuseMap->width) / FIXED_POINT_SCALE;
+                                    int64_t r2 =
+                                        ((int64_t)av * diffuseMap->height) / FIXED_POINT_SCALE;
+                                    if (r2 > rate) rate = r2;
+
+                                    // VERTICAL rate, SOLVED HERE rather than
+                                    // estimated from a triangle-wide average.
+                                    //
+                                    // Both previous attempts approximated this
+                                    // — first an absolute vertical rate, then a
+                                    // vertical/horizontal ratio — and both were
+                                    // computed from AFFINE gradients across the
+                                    // whole triangle, so both were dominated by
+                                    // its far end. On a tile spanning near to
+                                    // far that pushed the near end to the
+                                    // smallest mip: ground right beside the
+                                    // camera going flat.
+                                    //
+                                    // One screen row down is simply a
+                                    // dw_dy_step on each edge function, so the
+                                    // exact local rate costs one more solve of
+                                    // the same shape as the horizontal
+                                    // lookahead above.
+                                    const int64_t y0 = (ew0 + dw0_dy_step) >> denomShift;
+                                    const int64_t y1 = (ew1 + dw1_dy_step) >> denomShift;
+                                    const int64_t y2 = (ew2 + dw2_dy_step) >> denomShift;
+                                    const int64_t Ay = (int64_t)pcOneOverZ[0] * y0
+                                                     + (int64_t)pcOneOverZ[1] * y1
+                                                     + (int64_t)pcOneOverZ[2] * y2;
+                                    if (Ay > 0) {
+                                        const float invAy = 1024.0f / (float)Ay;
+                                        const int32_t uY = (int32_t)((float)((int64_t)pcUOverZ[0] * y0
+                                                                           + (int64_t)pcUOverZ[1] * y1
+                                                                           + (int64_t)pcUOverZ[2] * y2) * invAy);
+                                        const int32_t vY = (int32_t)((float)((int64_t)pcVOverZ[0] * y0
+                                                                           + (int64_t)pcVOverZ[1] * y1
+                                                                           + (int64_t)pcVOverZ[2] * y2) * invAy);
+                                        int64_t du = (int64_t)uY - pcU; if (du < 0) du = -du;
+                                        int64_t dv = (int64_t)vY - pcV; if (dv < 0) dv = -dv;
+                                        r2 = (du * 256 * diffuseMap->width)  / FIXED_POINT_SCALE;
+                                        if (r2 > rate) rate = r2;
+                                        r2 = (dv * 256 * diffuseMap->height) / FIXED_POINT_SCALE;
+                                        if (r2 > rate) rate = r2;
+                                    }
+
+                                    mipLevel = 0;
+                                    while (rate > 256 && mipLevel < diffuseMap->mipCount - 1) {
+                                        rate >>= 1;
+                                        ++mipLevel;
+                                    }
+                                    // Re-hoist the chosen level's pointer and
+                                    // dimensions so the pixel loop never
+                                    // touches the Texture object again.
+                                    texData = diffuseMap->mipData[mipLevel];
+                                    texW    = diffuseMap->mipW[mipLevel];
+                                    texH    = diffuseMap->mipH[mipLevel];
+                                }
+                                mipNextX = x + MESHPUNK_MIP_SEGMENT;
+                            }
+                            const int32_t sp = x - pcSegX;
+                            uv.x = pcU + ((pcDU * sp) >> 8);
+                            uv.y = pcV + ((pcDV * sp) >> 8);
+                        }
+                        else
+                        {
+                            // int64: see the uAff note — denom is Q8 now.
+                            uv.x = (int32_t)(((int64_t)v1.uv.x * w0 + (int64_t)v2.uv.x * w1
+                                            + (int64_t)v3.uv.x * w2) / denom);
+                            uv.y = (int32_t)(((int64_t)v1.uv.y * w0 + (int64_t)v2.uv.y * w1
+                                            + (int64_t)v3.uv.y * w2) / denom);
+                        }
+#else // Affine texture mapping
+                        // int64: denom is Q8 since positions went sub-pixel.
+                        uv.x = (int32_t)(((int64_t)v1.uv.x * w0 + (int64_t)v2.uv.x * w1
+                                        + (int64_t)v3.uv.x * w2) / denom);
+                        uv.y = (int32_t)(((int64_t)v1.uv.y * w0 + (int64_t)v2.uv.y * w1
+                                        + (int64_t)v3.uv.y * w2) / denom);
+#endif
+                    }
+
+                    // Sample color from material
+                    // MESHPUNK: inline sample off the hoisted pointer. Same
+                    // arithmetic Texture::getPixel does, but with no PSRAM
+                    // metadata loads and no cross-TU call.
+                    if (texFast)
+                    {
+                        int su = uv.x, sv = uv.y;
+                        if (texWrap) {
+                            su &= (FIXED_POINT_SCALE - 1);
+                            sv &= (FIXED_POINT_SCALE - 1);
+                        } else {
+                            if (su < 0) su = 0; else if (su > FIXED_POINT_SCALE - 1) su = FIXED_POINT_SCALE - 1;
+                            if (sv < 0) sv = 0; else if (sv > FIXED_POINT_SCALE - 1) sv = FIXED_POINT_SCALE - 1;
+                        }
+                        su = (int)(((uint32_t)su * (uint32_t)texW) / (uint32_t)FIXED_POINT_SCALE);
+                        sv = (int)(((uint32_t)sv * (uint32_t)texH) / (uint32_t)FIXED_POINT_SCALE);
+                        color = texData[sv * texW + su];
+                    }
+                    else
+                    {
+                        color = material->getColor(uv, mipLevel);
+                    }
+
+                    // If the material diffuse map has a transparent color and that's what we got, skip drawing this pixel
+                    if (texHasAlpha && color == texAlphaCol)
+                    {
+                        continue;
+                    }
+
+                    // Distance-based texture LOD cross-fade. textureLodFade
+                    // is triangle-constant; outside the fade band it is
+                    // 255 (no work). Inside the band, swap or blend the
+                    // sampled texel toward material->color using whichever
+                    // composite method the build is configured for.
+                    if (textureLodFade < 255)
+                    {
+                    #if SCREEN_DOOR_ALPHA
+                        // Stipple between texel (drawn) and flat (drawn).
+                        // The same Bayer matrix as material alpha so the
+                        // two stipples don't beat against each other in
+                        // unpleasant ways.
+                        if (!shouldDrawPixel(x, y, textureLodFade))
+                            color = material->color;
+                    #else
+                        // dst = flat, src = texel. blendRGB565 returns
+                        // src*alpha + dst*(1-alpha), so alpha=textureLodFade
+                        // gives full texel at 255 and full flat at 0.
+                        color = blendRGB565(material->color, color, textureLodFade);
+                    #endif
+                    }
+                }
+#endif
+
+#if Z_BUFFERING
+                if (!noWriteZBuffer)
+                {
+                    zBuffer[zBufferIndex] = static_cast<uint16_t>(zb);
+                }
+#endif
+
+#if DEBUG_OVERDRAW
+                // Orange color in RGB565 format (0xFDA0)
+                color = 0xFDA0;
+                // Apply 25% blend
+                uint8_t r = ((color >> 11) & 0x1F) / 4;
+                uint8_t g = ((color >> 5) & 0x3F) / 4;
+                uint8_t b = (color & 0x1F) / 4;
+                
+                // Get existing color and blend
+                uint16_t existing = framebuffer[bufferIndex];
+                uint8_t existingR = (existing >> 11) & 0x1F;
+                uint8_t existingG = (existing >> 5) & 0x3F;
+                uint8_t existingB = existing & 0x1F;
+                
+                // Add the colors
+                r = std::min(static_cast<uint8_t>(31), static_cast<uint8_t>(existingR + r));
+                g = std::min(static_cast<uint8_t>(63), static_cast<uint8_t>(existingG + g));
+                b = std::min(static_cast<uint8_t>(31), static_cast<uint8_t>(existingB + b));
+                
+                color = (r << 11) | (g << 5) | b;
+                
+                #if HALF_WIDTH_BUFFERS
+                framebuffer[bufferIndex] = color;
+                #else
+                uint32_t combinedColor = (static_cast<uint32_t>(color) << 16) | color;
+                reinterpret_cast<uint32_t *>(framebuffer)[bufferIndex / 2] = combinedColor;
+                #endif                
+                continue;
+#else
+#if LIGHTING || Z_BRIGHTNESS
+                if (directionalLight)
+                {
+                    if (material->shadingMode == ShadingMode::GOURAUD)
+                    {
+                        // Plane-equation incremental Gouraud brightness:
+                        // brightness_q16 was set at the row start and is
+                        // stepped by brightness_dx_step_q16 in the for-loop
+                        // header below. Mathematically equivalent to the
+                        // original (b0*w0 + b1*w1 + b2*w2)/denom but trades
+                        // a per-pixel divide + 3 multiplies for a single
+                        // int32 add per pixel.
+                        //
+                        // Clamp into the legitimate brightness band
+                        // [0, 255 + specular]. Without this cap any minor
+                        // overshoot from incremental rounding (or a near-
+                        // camera triangle where the q16 slope is large)
+                        // landed in the deep "blowout" range and the
+                        // per-pixel modulation pushed channels far past
+                        // full-white into wrap-around territory — the
+                        // bright random-colour flashes the user was seeing.
+                        int32_t b = brightness_q16 >> 16;
+                        const int32_t bMax = 255 + material->specular;
+                        if (b < 0) b = 0;
+                        if (b > bMax) b = bMax;
+                        brightness = (uint16_t)b;
+                    }
+                    else if (material->shadingMode == ShadingMode::PHONG)
+                    {
+                        // Interpolate normals and shade per pixel. The shared
+                        // helper handles Lambert + view-facing specular and
+                        // the brightness cap; PHONG just pays the per-pixel
+                        // normal renormalisation cost on top of GOURAUD.
+                        Vector3 pixelNormal;
+#if PERSPECTIVE_CORRECT_TEXTURES
+                        // Perspective-correct normal interpolation: interpolate
+                        // n/z at each vertex then divide by the interpolated
+                        // 1/z — same reconstruction as UV perspective correction.
+                        // Avoids the affine "pinching" visible on oblique faces.
+                        int32_t pctOneOverZ = (oneOverZ1 * w0 + oneOverZ2 * w1 + oneOverZ3 * w2) / denom;
+                        if (pctOneOverZ != 0)
+                        {
+                            int32_t nxOZ = (nxOverZ1 * w0 + nxOverZ2 * w1 + nxOverZ3 * w2) / denom;
+                            int32_t nyOZ = (nyOverZ1 * w0 + nyOverZ2 * w1 + nyOverZ3 * w2) / denom;
+                            int32_t nzOZ = (nzOverZ1 * w0 + nzOverZ2 * w1 + nzOverZ3 * w2) / denom;
+                            pixelNormal.x = (nxOZ * FIXED_POINT_SCALE) / pctOneOverZ;
+                            pixelNormal.y = (nyOZ * FIXED_POINT_SCALE) / pctOneOverZ;
+                            pixelNormal.z = (nzOZ * FIXED_POINT_SCALE) / pctOneOverZ;
+                        }
+                        else
+                        {
+                            pixelNormal = { 0, 0, -(int32_t)FIXED_POINT_SCALE };
+                        }
+#else
+                        // Affine interpolation (no perspective correction).
+                        pixelNormal.x = (v1.normal.x * w0 + v2.normal.x * w1 + v3.normal.x * w2) / denom;
+                        pixelNormal.y = (v1.normal.y * w0 + v2.normal.y * w1 + v3.normal.y * w2) / denom;
+                        pixelNormal.z = (v1.normal.z * w0 + v2.normal.z * w1 + v3.normal.z * w2) / denom;
+#endif
+
+                        auto normalLength = pixelNormal.length();
+                        if (normalLength > 0)
+                        {
+                            pixelNormal = (pixelNormal * static_cast<int32_t>(FIXED_POINT_SCALE)) / normalLength;
+                        }
+
+                        brightness = jetShadeBrightness(
+                            pixelNormal,
+                            directionalLight->lightDir,
+                            lightIntensity,
+                            material->diffuse,
+                            material->specular);
+                    }
+                }
+#endif
+
+#if LIGHTING || Z_BRIGHTNESS
+                // If POSTFX_CELLSHADING is enabled, kill off the bottom N bits of the brightness value to create a cell shading effect
+                if (POSTFX_CELLSHADING)
+                {
+                    brightness = brightness >> CELLSHADING_CELL_BITS << CELLSHADING_CELL_BITS;
+                }
+
+                // The triangle-setup hoist above already computed the lit
+                // color for FLAT/unlit triangles without a diffuse texture
+                // - skip the per-pixel modulation in that case. (Z_BRIGHTNESS
+                // without LIGHTING never hoists, so guard the flag access
+                // behind the same #if it was declared under.)
+#if LIGHTING
+                if (!emissive && !flatColorPrecomputed)
+#else
+                if (!emissive)
+#endif
+                {
+#if LIGHTING
+                    // Per-pixel modulation. Two paths:
+                    //   1) Untextured (litPerPixelUntextured): base channels
+                    //      were extracted once at triangle setup; inline the
+                    //      add+saturate+multiply directly so the inner loop
+                    //      has no function call and no re-extract.
+                    //   2) Textured: `color` is the freshly-sampled texel,
+                    //      so we need the general per-channel helper.
+                    if (litPerPixelUntextured)
+                    {
+                        uint32_t tR = (uint32_t)brightness + ambR;
+                        uint32_t tG = (uint32_t)brightness + ambG;
+                        uint32_t tB = (uint32_t)brightness + ambB;
+                        if (tR > litMaxBrightness) tR = litMaxBrightness;
+                        if (tG > litMaxBrightness) tG = litMaxBrightness;
+                        if (tB > litMaxBrightness) tB = litMaxBrightness;
+
+                        // MESHPUNK: the +128 rounding term becomes a per-pixel
+                        // Bayer threshold so the 5/6/5 band edges dither
+                        // instead of forming hard contours. One table read
+                        // shared by all three channels; the blow-out branches
+                        // are already above full scale and have nothing to
+                        // quantise, so they keep the plain arithmetic.
+                        const uint32_t dth = jetDither4[((y & 3) << 2) | (x & 3)];
+                        uint32_t r, g, b;
+                        if (tR > 255) { uint32_t blow = tR - 255; r = litBaseR5 + ((31u - litBaseR5) * blow) / 256u; }
+                        else          { uint32_t v = litBaseR5 * tR; r = (v + dth + (v >> 8)) >> 8; }
+                        if (tG > 255) { uint32_t blow = tG - 255; g = litBaseG6 + ((63u - litBaseG6) * blow) / 256u; }
+                        else          { uint32_t v = litBaseG6 * tG; g = (v + dth + (v >> 8)) >> 8; }
+                        if (tB > 255) { uint32_t blow = tB - 255; b = litBaseB5 + ((31u - litBaseB5) * blow) / 256u; }
+                        else          { uint32_t v = litBaseB5 * tB; b = (v + dth + (v >> 8)) >> 8; }
+                        if (r > 31u) r = 31u;
+                        if (g > 63u) g = 63u;
+                        if (b > 31u) b = 31u;
+                        color = (uint16_t)((r << 11) | (g << 5) | b);
+                    }
+                    else
+                    {
+                        const uint16_t maxBrightness = (uint16_t)(255u + material->specular);
+                        color = jetModulateRGB565(color, brightness, ambR, ambG, ambB, maxBrightness);
+                    }
+#else
+                    // Z_BRIGHTNESS-only path: no ambient light, just a
+                    // scalar brightness applied to all three channels.
+                    if (brightness >= 255)
+                    {
+                        uint16_t blowout = brightness - 255;
+                        uint8_t r = ((color >> 11) & 0x1F);
+                        uint8_t g = ((color >> 5) & 0x3F);
+                        uint8_t b = (color & 0x1F);
+                        r = r + ((31 - r) * blowout) / 256;
+                        g = g + ((63 - g) * blowout) / 256;
+                        b = b + ((31 - b) * blowout) / 256;
+                        color = (r << 11) | (g << 5) | b;
+                    }
+                    else
+                    {
+                        const uint16_t br = ((color >> 11) & 0x1F) * brightness;
+                        const uint16_t bg = ((color >>  5) & 0x3F) * brightness;
+                        const uint16_t bb = ( color        & 0x1F) * brightness;
+                        const uint8_t r = (uint8_t)((br + 128 + (br >> 8)) >> 8);
+                        const uint8_t g = (uint8_t)((bg + 128 + (bg >> 8)) >> 8);
+                        const uint8_t b = (uint8_t)((bb + 128 + (bb >> 8)) >> 8);
+                        color = (r << 11) | (g << 5) | b;
+                    }
+#endif
+                }
+#endif
+#endif
+
+            // WATER_REFLECT on the general (LIGHTING=1) per-pixel path:
+            // sample the mirror row from the framebuffer.  The emissive
+            // flag above already bypassed all lighting modulation.
+            // When reflectBuffer is set, use it instead (prev-field SSR).
+            if (isWaterReflect)
+            {
+                const uint16_t* srcBuf = reflectBuffer ? reflectBuffer : framebuffer;
+                uint16_t reflCol;
+                if (waterSkyFallback && gradientColors != nullptr && gradientSize > 0) {
+                    reflCol = gradientColors[0];
+                } else {
+#if HALF_WIDTH_BUFFERS
+                    reflCol = srcBuf[waterMirrorBufBase + (x >> 1)];
+#else
+                    reflCol = srcBuf[waterMirrorBufBase + x];
+#endif
+                }
+                color = blendRGB565(material->color, reflCol, waterReflectAlpha);
+                // SSR already composited the final pixel; bypass the
+                // standard pixAlpha re-blend below or we get a double-blend
+                // (50% of 50% = 25% reflection strength on desktop).
+                pixAlpha = 255;
+            }
+            else if (isAdditive)
+            {
+                // Pre-compute the saturating add into `color` so the
+                // standard write path below emits it without a second blend.
+                color    = addBlendRGB565(framebuffer[bufferIndex], color, pixAlpha);
+                pixAlpha = 255;
+            }
+
+#if !DEBUG_OVERDRAW
+#if SCREEN_DOOR_ALPHA
+            // Stippling already accepted/rejected this pixel via
+            // shouldDrawPixel(); a straight write is correct here.
+            ++g_jetPxLoop;   // MESHPUNK: diagnostic, see g_jetPxSpan
+            framebuffer[bufferIndex] = color;
+            // MESHPUNK: record the write so checkerboard reconstruction
+            // rebuilds only THIS loop's skipped neighbours (see cbMask).
+            if (checkerboardMode && cbMask) {
+                const uint32_t ci = (uint32_t)y * ((uint32_t)screenWidth >> 1)
+                                  + ((uint32_t)x >> 1);
+                cbMask[ci >> 3] |= (uint8_t)(1u << (ci & 7u));
+            }
+#else
+            // Traditional alpha blend: lerp toward `color` by pixAlpha.
+            // pixAlpha already folds in material*object alpha and any
+            // per-pixel depth-fog fade. Skip the blend math when the
+            // material is fully opaque — common case.
+            if (pixAlpha == 255) {
+                framebuffer[bufferIndex] = color;
+            } else {
+                framebuffer[bufferIndex] = blendRGB565(framebuffer[bufferIndex], color, pixAlpha);
+            }
+#endif
+#endif
+#if RENDER_TILE_BUFFER
+                // Mark this tile as having been drawn to
+                int tileX = x / TILE_WIDTH;
+                int tileY = y / TILE_HEIGHT;
+                if (tileX >= 0 && tileX < (screenWidth + TILE_WIDTH - 1) / TILE_WIDTH &&
+                    tileY >= 0 && tileY < (screenHeight + TILE_HEIGHT - 1) / TILE_HEIGHT)
+                {
+                    //tileBuffer[tileY * ((screenWidth + TILE_WIDTH - 1) / TILE_WIDTH) + tileX] = 1;
+                }
+
+#endif
+            }
+            }  // close general per-pixel path block
+#endif // !JET_FAST_SIMPLE_SPANS || TEXTURE_MAPPING
+#undef JET_LIT_STEP
+#undef JET_LIT_STEP_CB
+        }
+
+        return true;
+    }
+} // namespace Renderer
+

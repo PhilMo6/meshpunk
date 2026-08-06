@@ -770,34 +770,84 @@ static TaskHandle_t      s_blit_task = nullptr;
 static SemaphoreHandle_t s_blit_idle = nullptr;   // given when no push in flight
 static const uint16_t* volatile s_blit_buf = nullptr;
 static volatile int s_blit_w = 0, s_blit_h = 0;
+static volatile int s_blit_x = 0, s_blit_y = 0;
+static volatile bool s_blit_is_rect = false;
 
 static void blit_task_body(void*) {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         const uint16_t* buf = s_blit_buf;
-        if (buf) host_blit_frame(buf, s_blit_w, s_blit_h);
+        if (buf) {
+            if (s_blit_is_rect)
+                host_blit_rect(buf, s_blit_x, s_blit_y, s_blit_w, s_blit_h);
+            else
+                host_blit_frame(buf, s_blit_w, s_blit_h);
+        }
         xSemaphoreGive(s_blit_idle);
     }
 }
 
-void host_blit_frame_async(const uint16_t* rgb565, int w, int h) {
-    if (!s_blit_task) {
-        if (!s_blit_idle) {
-            s_blit_idle = xSemaphoreCreateBinary();
-            if (!s_blit_idle) { host_blit_frame(rgb565, w, h); return; }
-            xSemaphoreGive(s_blit_idle);
-        }
-        xTaskCreatePinnedToCore(blit_task_body, "elf_blit", 4096, nullptr,
-                                3, &s_blit_task, 1 /* Core 1 */);
-        if (!s_blit_task) { host_blit_frame(rgb565, w, h); return; }
+// Bring the push task up on first use. False means the async path is
+// unavailable and the caller should push synchronously instead.
+static bool blit_async_begin(void) {
+    if (s_blit_task) return true;
+    if (!s_blit_idle) {
+        s_blit_idle = xSemaphoreCreateBinary();
+        if (!s_blit_idle) return false;
+        xSemaphoreGive(s_blit_idle);
     }
+    xTaskCreatePinnedToCore(blit_task_body, "elf_blit", 4096, nullptr,
+                            3, &s_blit_task, 1 /* Core 1 */);
+    return s_blit_task != nullptr;
+}
+
+void host_blit_frame_async(const uint16_t* rgb565, int w, int h) {
+    if (!blit_async_begin()) { host_blit_frame(rgb565, w, h); return; }
     // Wait until the previous frame is on the wire — after this the caller's
     // other buffer is free to render into.
     xSemaphoreTake(s_blit_idle, portMAX_DELAY);
-    s_blit_buf = rgb565;
-    s_blit_w = w;
-    s_blit_h = h;
+    s_blit_buf     = rgb565;
+    s_blit_x       = 0;
+    s_blit_y       = 0;
+    s_blit_w       = w;
+    s_blit_h       = h;
+    s_blit_is_rect = false;
     xTaskNotifyGive(s_blit_task);
+}
+
+// Async form of host_blit_rect, for modules that rasterise a band at a time
+// into internal RAM and double-buffer: hand one band over and rasterise the
+// next into the other buffer while this one goes out on the wire. The push
+// itself is CPU-driven (there is no DMA on this bus) but it spends nearly all
+// of its time spinning on the SPI busy flag, so on Core 1 it costs the module's
+// Core-0 rasteriser very little.
+//
+// Same one-deep back-pressure as host_blit_frame_async: this returns once the
+// PREVIOUS push has finished, which is exactly when the buffer handed over
+// before that one becomes safe to touch again. Two buffers are therefore
+// enough, and the caller must alternate them.
+void host_blit_rect_async(const uint16_t* rgb565, int x, int y, int w, int h) {
+    if (!rgb565 || w <= 0 || h <= 0) return;
+    if (x < 0 || y < 0 || x + w > 320 || y + h > 240) return;
+    if (!blit_async_begin()) { host_blit_rect(rgb565, x, y, w, h); return; }
+    xSemaphoreTake(s_blit_idle, portMAX_DELAY);
+    s_blit_buf     = rgb565;
+    s_blit_x       = x;
+    s_blit_y       = y;
+    s_blit_w       = w;
+    s_blit_h       = h;
+    s_blit_is_rect = true;
+    xTaskNotifyGive(s_blit_task);
+}
+
+// Block until no push is in flight. A module MUST call this before freeing or
+// reusing a buffer it handed to an async blit: the session-cleanup drain runs
+// only after the module has already returned, which is too late for memory the
+// module frees itself.
+void host_blit_wait(void) {
+    if (!s_blit_task || !s_blit_idle) return;
+    xSemaphoreTake(s_blit_idle, portMAX_DELAY);
+    xSemaphoreGive(s_blit_idle);
 }
 
 // Wait for any in-flight async push. Must be called before the module's
@@ -1414,6 +1464,8 @@ static const elf_symbol_t host_exports[] = {
     { "host_blit_frame",    (void*)host_blit_frame },
     { "host_blit_frame_async", (void*)host_blit_frame_async },
     { "host_blit_rect",     (void*)host_blit_rect },
+    { "host_blit_rect_async", (void*)host_blit_rect_async },
+    { "host_blit_wait",     (void*)host_blit_wait },
     { "host_clear_screen",  (void*)host_clear_screen },
     { "host_get_ticks_ms",  (void*)host_get_ticks_ms },
     { "host_get_ticks_us",  (void*)host_get_ticks_us },
@@ -1649,6 +1701,7 @@ static const elf_symbol_t host_exports[] = {
 // accessible while the cache is disabled (e.g. during flash writes) and the
 // module does file I/O. We try 64KB first for maximum headroom, falling back
 // to 48KB or 32KB if not enough contiguous internal RAM is available.
+// A launcher's "-stackkb N" caps this ladder at N (elf_host_run_pending).
 // (ESP-IDF stack sizes are in bytes — StackType_t is 1 byte.)
 static const uint32_t ELF_TASK_STACK_CANDIDATES[] = { 64*1024, 48*1024, 32*1024 };
 
@@ -1990,10 +2043,12 @@ int elf_host_run_pending(void) {
         BaseType_t ok = pdFAIL;
         uint32_t stack_used = 0;
         if (done) {
-            // Optional per-app floor: "-stackkb N" (from the app's launcher)
-            // appends one final, smaller rung for THIS launch only. Lets a
-            // known-shallow module (GameBoy) fit beside USB host mode without
-            // handing deep-stack modules (Doom) a rung they'd overflow.
+            // Per-app ceiling: "-stackkb N" (from the app's launcher) caps the
+            // ladder at N for THIS launch only, then descends through the
+            // built-in rungs smaller than N. This stack is internal SRAM, the
+            // same pool a module's own worker tasks draw on, so a module that
+            // declares its depth is not handed more than it asked for.
+            // Values outside 16..64 are ignored: the built-in ladder applies.
             uint32_t req_stack = 0;
             for (int i = 0; i < argc - 1; i++) {
                 if (strcmp(argv[i], "-stackkb") == 0) {
@@ -2001,11 +2056,16 @@ int elf_host_run_pending(void) {
                     if (kb >= 16 && kb <= 64) req_stack = (uint32_t)kb * 1024;
                 }
             }
-            uint32_t ladder[5];
+            uint32_t ladder[1 + (sizeof(ELF_TASK_STACK_CANDIDATES) /
+                                 sizeof(ELF_TASK_STACK_CANDIDATES[0]))];
             int nladder = 0;
-            for (uint32_t c : ELF_TASK_STACK_CANDIDATES) ladder[nladder++] = c;
-            if (req_stack && req_stack < ladder[nladder - 1])
+            if (req_stack) {
                 ladder[nladder++] = req_stack;
+                SLog.printf("[elf_host] stack ceiling %uKB (launcher -stackkb)\n",
+                            (unsigned)(req_stack / 1024));
+            }
+            for (uint32_t c : ELF_TASK_STACK_CANDIDATES)
+                if (!req_stack || c < req_stack) ladder[nladder++] = c;
 
             for (int ci = 0; ci < nladder; ci++) {
                 uint32_t candidate = ladder[ci];
