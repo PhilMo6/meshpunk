@@ -4,7 +4,6 @@
 #include "meshpunk_sync.h"
 #include "sound.h"
 #include "notify.h"
-#include "tdeck-pins.h"
 #include "ble_companion.h"
 #include "punkmesh.h"
 #include "usb_manager.h"   // usb_pool_alloc/free — dynamic USB driver segments
@@ -12,8 +11,6 @@
 
 #include <Arduino.h>
 #include <Ticker.h>
-#include <TFT_eSPI.h>
-#include <Wire.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -38,9 +35,12 @@ extern "C" {
 }
 
 // From main.cpp
-extern TFT_eSPI tft;
 extern Ticker lvgl_ticker;
 extern void wake_activity();  // reset inactivity timer + restore backlights
+
+// Panel access goes through the display backend (module video contract:
+// 320x240 RGB565 — see display_dev.h).
+#include "display/display_dev.h"
 
 // GCC runtime builtins (soft-float, 64-bit division, double-precision)
 extern "C" {
@@ -70,40 +70,10 @@ extern "C" {
     long long __moddi3(long long, long long);
 }
 
-// Trackball ISR counters (from main.cpp)
-extern volatile int trackball_click;
-extern volatile int trackball_up;
-extern volatile int trackball_down;
-extern volatile int trackball_left;
-extern volatile int trackball_right;
-
-// Legacy ASCII keyboard mode (from main.cpp): the keyboard MCU sends one
-// final ASCII byte per press instead of the 5-byte raw matrix.
-extern bool firmware_kb_legacy();
-
-// Keyboard constants (mirrored from main.cpp)
-#define KB_SLAVE_ADDR  0x55
-#define KB_COLS_N      5
-#define KB_ROWS_N      7
-
-static const char kb_map[KB_COLS_N][KB_ROWS_N] = {
-  {'q','w',  0, 'a',  0, ' ',  0 },
-  {'e','s','d','p','x','z',  0 },
-  {'r','g','t',  0, 'v','c','f'},
-  {'u','h','y',  0, 'b','n','j'},
-  {'o','l','i',  0, '$','m','k'},
-};
-
-// SYM-held layer — digits and symbols. Mirrors main.cpp's kb_matrix_symbol so
-// the ELF-module keyboard path can produce numbers/symbols (essential for DOS
-// and other modules; without this only letters were reachable).
-static const char kb_map_sym[KB_COLS_N][KB_ROWS_N] = {
-  {'#','1',  0, '*',  0,   0, '0'},
-  {'2','4','5','@','8','7',  0 },
-  {'3','/','(',  0, '?','9','6'},
-  {'_',':',')',  0, '!',',',';'},
-  {'+','"','-',  0,   0, '.','\''},
-};
+// Device input backend: keyboard sampling/decode, trackball counters + click
+// level, legacy-mode flag. The matrix tables and I2C protocol that used to be
+// mirrored here live in input/input_tdeck.cpp now.
+#include "input/input_dev.h"
 
 // Alt combo layer for ELF modules, keyed by the key's SYM-layer char (which
 // uniquely names a physical key). Every entry exists because the T-Deck
@@ -115,20 +85,6 @@ static const struct { char sym; unsigned char out; } kb_alt_combos[] = {
     { ')', '>'  },
     { '+', '='  },   // Alt+O: equals -- DOS SET syntax
 };
-
-// Modifier positions in the matrix
-#define MOD_LSHIFT_COL 1
-#define MOD_LSHIFT_ROW 6
-#define MOD_RSHIFT_COL 2
-#define MOD_RSHIFT_ROW 3
-#define MOD_SYM_COL    0
-#define MOD_SYM_ROW    2
-#define MOD_ALT_COL    0
-#define MOD_ALT_ROW    4
-#define KEY_ENTER_COL  3
-#define KEY_ENTER_ROW  3
-#define KEY_BS_COL     4
-#define KEY_BS_ROW     3
 
 // ---------------------------------------------------------------------------
 // Key queue for host_get_key()
@@ -318,17 +274,18 @@ static bool    s_legacy_flip_req = false;
 static void poll_input(bool kb_only = false) {
     bool cur_state[INPUT_STATE_SIZE] = {0};
 
-    // Read keyboard matrix via I2C — or one ASCII byte in legacy mode (old
-    // keyboard-MCU firmware: no release/repeat/modifier info, so the alt
-    // combos, F-keys, Shift+Backspace-Esc, ALT+ENTER layer chord and the
-    // Alt+Backspace exit chord cannot fire. A legacy user leaves a module with
-    // a bound quit key, reaching the binding layer via the sequence below where
-    // a module opted into -kbtoggle; a USB keyboard's chord still exits too.
-    uint8_t matrix[KB_COLS_N] = {0};
-    if (firmware_kb_legacy()) {
-        uint8_t v = 0;
-        Wire.requestFrom(KB_SLAVE_ADDR, 1);
-        if (Wire.available()) v = Wire.read();
+    // Sample the keyboard via the input backend — one ASCII byte per press in
+    // legacy mode (old keyboard-MCU firmware: no release/repeat/modifier
+    // info, so the alt combos, F-keys, Shift+Backspace-Esc, ALT+ENTER layer
+    // chord and the Alt+Backspace exit chord cannot fire. A legacy user
+    // leaves a module with a bound quit key, reaching the binding layer via
+    // the sequence below where a module opted into -kbtoggle; a USB
+    // keyboard's chord still exits too). detect_legacy_fw=false: the
+    // old-firmware heuristic stays on the interactive UI reader, exactly as
+    // before the input split.
+    input_dev_kbd_poll(/*detect_legacy_fw=*/false);
+    if (input_dev_kbd_legacy_get()) {
+        uint8_t v = input_dev_kbd_legacy_byte();
         if (v) {
             s_legacy_down_ch    = v;
             s_legacy_release_at = millis() + LEGACY_ELF_PULSE_MS;
@@ -349,68 +306,56 @@ static void poll_input(bool kb_only = false) {
             s_legacy_down_ch = 0;
         }
         if (s_legacy_down_ch) cur_state[s_legacy_down_ch] = true;
-        // matrix stays zero: the modifier bools and decode loop below are inert.
-    } else {
-        Wire.requestFrom(KB_SLAVE_ADDR, KB_COLS_N);
-        for (int c = 0; c < KB_COLS_N && Wire.available(); c++) {
-            matrix[c] = Wire.read();
-        }
+        // The backend's matrix stays zero in legacy mode: the modifier bools
+        // and the decode loop below read "nothing pressed" and are inert.
     }
 
-    bool shift = (matrix[MOD_LSHIFT_COL] & (1 << MOD_LSHIFT_ROW)) ||
-                 (matrix[MOD_RSHIFT_COL] & (1 << MOD_RSHIFT_ROW));
-    bool sym = (matrix[MOD_SYM_COL] & (1 << MOD_SYM_ROW));
-    bool alt = (matrix[MOD_ALT_COL] & (1 << MOD_ALT_ROW));
+    bool lshift = false, rshift = false, sym = false, alt = false;
+    input_dev_kbd_mods(&lshift, &rshift, &sym, &alt);
+    bool shift = lshift || rshift;
 
     bool alt_enter = false;
     s_key_mods = (shift ? HOST_MOD_SHIFT : 0) | (alt ? HOST_MOD_ALT : 0)
                | (sym ? HOST_MOD_SYM : 0);
 
-    // Decode matrix into character states
-    for (int c = 0; c < KB_COLS_N; c++) {
-        if (matrix[c] == 0) continue;
-        for (int r = 0; r < KB_ROWS_N; r++) {
-            if (!(matrix[c] & (1 << r))) continue;
-            // Skip modifiers
-            if (c == MOD_LSHIFT_COL && r == MOD_LSHIFT_ROW) continue;
-            if (c == MOD_RSHIFT_COL && r == MOD_RSHIFT_ROW) continue;
-            if (c == MOD_SYM_COL && r == MOD_SYM_ROW) continue; // sym
-            if (c == MOD_ALT_COL && r == MOD_ALT_ROW) continue; // alt
-
-            if (c == KEY_ENTER_COL && r == KEY_ENTER_ROW) {
-                // ALT+ENTER is the binding-layer chord where a module opted
-                // in; everywhere else it stays a plain Enter.
-                if (alt && s_kb_toggle_enabled) { alt_enter = true; continue; }
-                cur_state[0x0D] = true;
-            } else if (c == KEY_BS_COL && r == KEY_BS_ROW) {
-                // Shift+Backspace = Esc: the T-Deck has no Esc key and DOS
-                // tools (FDISK menus etc.) require one. Plain Backspace is
-                // unchanged, and the Alt+Backspace exit chord still sees
-                // 0x08 because shift is not held during it.
-                cur_state[shift ? 0x1B : 0x08] = true;
-            } else {
-                // Layer select: Alt + a digit-position key -> F1..F10 (module
-                // maps 0xB0-0xB9); Sym -> number/symbol layer; else base.
-                char ch;
-                if (alt) {
-                    char s = kb_map_sym[c][r];
-                    if (s >= '1' && s <= '9') {
-                        ch = (char)(0xB0 + (s - '1'));       // F1-F9
-                    } else if (s == '0') {
-                        ch = (char)0xB9;                     // F10
-                    } else {
-                        ch = kb_map[c][r];
-                        for (auto &m : kb_alt_combos) {
-                            if (m.sym == s) { ch = (char)m.out; break; }
-                        }
-                    }
-                } else if (sym) {
-                    ch = kb_map_sym[c][r];
+    // Decode the backend's pressed-key sample into character states.
+    // Enter/Backspace positions arrive as base==0x0D/0x08 (see input_dev.h).
+    InputKeyEv evs[INPUT_DEV_KEYS_MAX];
+    int ev_n = input_dev_kbd_decode(evs, INPUT_DEV_KEYS_MAX);
+    for (int i = 0; i < ev_n; i++) {
+        if (evs[i].base == 0x0D) {
+            // ALT+ENTER is the binding-layer chord where a module opted
+            // in; everywhere else it stays a plain Enter.
+            if (alt && s_kb_toggle_enabled) { alt_enter = true; continue; }
+            cur_state[0x0D] = true;
+        } else if (evs[i].base == 0x08) {
+            // Shift+Backspace = Esc: the T-Deck has no Esc key and DOS
+            // tools (FDISK menus etc.) require one. Plain Backspace is
+            // unchanged, and the Alt+Backspace exit chord still sees
+            // 0x08 because shift is not held during it.
+            cur_state[shift ? 0x1B : 0x08] = true;
+        } else {
+            // Layer select: Alt + a digit-position key -> F1..F10 (module
+            // maps 0xB0-0xB9); Sym -> number/symbol layer; else base.
+            char ch;
+            if (alt) {
+                char s = (char)evs[i].sym;
+                if (s >= '1' && s <= '9') {
+                    ch = (char)(0xB0 + (s - '1'));       // F1-F9
+                } else if (s == '0') {
+                    ch = (char)0xB9;                     // F10
                 } else {
-                    ch = kb_map[c][r];
+                    ch = (char)evs[i].base;
+                    for (auto &m : kb_alt_combos) {
+                        if (m.sym == s) { ch = (char)m.out; break; }
+                    }
                 }
-                if (ch) cur_state[(uint8_t)ch] = true;
+            } else if (sym) {
+                ch = (char)evs[i].sym;
+            } else {
+                ch = (char)evs[i].base;
             }
+            if (ch) cur_state[(uint8_t)ch] = true;
         }
     }
 
@@ -723,16 +668,11 @@ extern "C" {
 static volatile uint32_t g_bounce_reads = 0;
 
 void host_blit_frame(const uint16_t* rgb565, int w, int h) {
-    SPI_LOCK();
-    tft.startWrite();
-    int x_offset = (320 - w) / 2;
+    int x_offset = (display_dev_width() - w) / 2;
     if (x_offset < 0) x_offset = 0;
-    int y_offset = (240 - h) / 2;
+    int y_offset = (display_dev_height() - h) / 2;
     if (y_offset < 0) y_offset = 0;
-    tft.setAddrWindow(x_offset, y_offset, w, h);
-    tft.pushColors((uint16_t*)rgb565, w * h, false);
-    tft.endWrite();
-    SPI_UNLOCK();
+    display_dev_blit(x_offset, y_offset, w, h, rgb565);
 }
 
 // Blit a rectangle at absolute screen coordinates. A module that composites
@@ -742,13 +682,9 @@ void host_blit_frame(const uint16_t* rgb565, int w, int h) {
 // radio and SD still get the SPI bus between strips.
 void host_blit_rect(const uint16_t* rgb565, int x, int y, int w, int h) {
     if (!rgb565 || w <= 0 || h <= 0) return;
-    if (x < 0 || y < 0 || x + w > 320 || y + h > 240) return;
-    SPI_LOCK();
-    tft.startWrite();
-    tft.setAddrWindow(x, y, w, h);
-    tft.pushColors((uint16_t*)rgb565, w * h, false);
-    tft.endWrite();
-    SPI_UNLOCK();
+    if (x < 0 || y < 0 ||
+        x + w > display_dev_width() || y + h > display_dev_height()) return;
+    display_dev_blit(x, y, w, h, rgb565);
 }
 
 // ── Async blit ───────────────────────────────────────────────────────────────
@@ -860,11 +796,7 @@ static void blit_drain(void) {
 }
 
 void host_clear_screen(void) {
-    SPI_LOCK();
-    tft.startWrite();
-    tft.fillScreen(TFT_BLACK);
-    tft.endWrite();
-    SPI_UNLOCK();
+    display_dev_fill_black();
 }
 
 uint32_t host_get_ticks_ms(void) {
@@ -902,7 +834,7 @@ int host_get_key(int* pressed, unsigned char* key) {
 // buttons, dragging) read the level here each poll instead of inferring a
 // duration from the edge count.
 int host_trackball_button(void) {
-    return digitalRead(TDECK_TRACKBALL_CLICK) == LOW;
+    return input_dev_nav_click_held() ? 1 : 0;
 }
 
 void host_trackball_read(int* dx, int* dy, int* click) {

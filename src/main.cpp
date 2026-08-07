@@ -1,10 +1,8 @@
-#include "TouchDrvGT911.hpp"
-#include "utilities.h"
+#include "boards/board_pins.h"
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <SD.h>
-#include <TFT_eSPI.h>
 #include <Ticker.h> // Include ticker for LVGL timing
 #include <WiFi.h>
 #include <Wire.h>
@@ -15,7 +13,12 @@
 #include "theme/lv_theme_meshpunk.h"
 #include "emoji_font.h"
 #include "theme_font.h"
-#include "tdeck-pins.h"
+#include "audio/audio_dev.h"
+#include "display/display_dev.h"
+#include "gps/gps_dev.h"
+#include "input/input_dev.h"
+#include "input/input_ui.h"
+#include "power/power_dev.h"
 #include "meshpunk_sync.h"
 #include "Audio.h"
 #include "sound.h"
@@ -101,7 +104,7 @@ extern "C" unsigned lodepng_decode32(unsigned char **out, unsigned *w, unsigned 
                                      const unsigned char *in, size_t insize);
 
 // Radio
-RADIO_CLASS radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+RADIO_CLASS radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 
 // Meshcore
 StdRNG fast_rng;
@@ -135,8 +138,9 @@ void radio_apply_tx_power(int8_t dbm) {
 }
 
 // One-shot GPS time sync: poll in loop() until first fix, then stop.
+// The UART itself lives in the GPS transport backend (gps/gps_dev.h); the
+// clock-authority tiers, sky detector and cadence below are device-neutral.
 static TinyGPSPlus gps_tinygps;
-static HardwareSerial GPSSerial(1);
 // Satellites-in-view via GSV field 3 per talker (the built-in `satellites`
 // field is GGA sats-USED — zero until a fix exists, useless as a sky signal).
 // NOTE: gps_sync_restart() placement-news gps_tinygps, which wipes custom
@@ -276,38 +280,6 @@ static Audio*    audio = nullptr;          // ESP32-audioI2S player, created in 
 // ── Keyboard Backlight ─────────────────────────────────────────────────────
 static uint8_t kbd_brightness = 200;  // 0–255, persisted
 
-// ── Keyboard sym behavior ───────────────────────────────────────────────────
-// false = sym is a plain hold modifier. true = a clean tap of sym (press and
-// release with nothing typed in between) latches the symbol layer until the
-// next tap, while holding sym still works as a momentary modifier. Persisted.
-static bool kb_sym_toggle_pref = false;
-static bool kb_sym_latched = false;
-static bool kb_sym_phys_prev = false;
-static bool kb_sym_used_while_held = false;
-
-// ── Keyboard alt emoji layer ────────────────────────────────────────────────
-// alt+key types an emoji while a textarea is focused (the layer is inert
-// outside text fields, so a latched alt never hijacks WASD nav). Same
-// tap-toggle latch machinery as sym above, behind its own persisted pref.
-// The per-key map is keyed by the key's normal-layer char and persisted to
-// /emoji_keymap on LittleFS (kb_emoji_map_load/save below the matrices).
-static bool kb_alt_toggle_pref = false;
-static bool kb_alt_latched = false;
-static bool kb_alt_phys_prev = false;
-static bool kb_alt_used_while_held = false;
-static bool kb_alt_layer_active = false;
-
-// ── Keyboard legacy ASCII mode ──────────────────────────────────────────────
-// Keyboard-MCU firmware older than LilyGo's 250620 build has no raw matrix
-// mode (I2C cmd 0x03 is silently ignored) and only ever sends one final ASCII
-// byte per key press — no release events, no repeat, no modifier visibility
-// (the C3 applies shift/sym itself). In legacy mode we read that single byte
-// and synthesize tap events instead of decoding the 5-byte matrix. Everything
-// built on held-key state (sym/alt latches, emoji layer, chords, hold APIs)
-// is unavailable. Persisted; auto-enabled when the detection heuristic in
-// keyboard_read_cb identifies ASCII bytes arriving on the raw-mode path.
-static bool kb_legacy_mode = false;
-
 // ── Display Backlight ──────────────────────────────────────────────────────
 static uint8_t display_brightness = 16;  // 0–16, persisted
 
@@ -316,9 +288,6 @@ static uint16_t screen_timeout_secs  = 60;  // 0 = never, persisted
 static uint16_t kbd_timeout_secs     = 55;  // 0 = never, persisted
 static uint16_t msg_retain_days      = 30;  // days of message/routing history (0 = unlimited)
 
-// ── Trackball Sensitivity ────────────────────────────────────────────────
-static uint16_t trackball_sensitivity_ms = 75;  // ms between accepted direction pulses, persisted
-static uint16_t trackball_roll_ms = 0;                   // drain interval: 0 = instant (no momentum), persisted
 static uint32_t last_activity_ms     = 0;
 static bool     screen_timed_out     = false;
 static bool     kbd_timed_out        = false;
@@ -334,8 +303,6 @@ bool    firmware_notify_kbd_enabled()   { return notify_kbd_enabled; }
 bool    firmware_notify_sound_enabled() { return notify_sound_enabled; }
 uint8_t firmware_kbd_brightness()       { return kbd_brightness; }
 bool    firmware_kbd_timed_out()        { return kbd_timed_out; }
-// Read by elf_host.cpp's input poll (extern declaration there).
-bool    firmware_kb_legacy()            { return kb_legacy_mode; }
 
 // Timestamp source for notify_post record stamps — the same RTC the _rtc_time
 // binding reads (our clock authority; a sender's timestamp is never used).
@@ -403,11 +370,11 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("ble_bond_clear=%d\n", ble_bond_clear_pref ? 1 : 0);
   f.printf("ble_sync_max=%d\n", ble_sync_max_per_channel);
   f.printf("wifi_enabled=%d\n", wifi_enabled_pref ? 1 : 0);
-  f.printf("trackball_sens=%d\n", trackball_sensitivity_ms);
-  f.printf("trackball_roll=%d\n", trackball_roll_ms);
-  f.printf("sym_toggle=%d\n", kb_sym_toggle_pref ? 1 : 0);
-  f.printf("alt_toggle=%d\n", kb_alt_toggle_pref ? 1 : 0);
-  f.printf("kb_legacy=%d\n", kb_legacy_mode ? 1 : 0);
+  f.printf("trackball_sens=%d\n", input_ui_trackball_sens_get());
+  f.printf("trackball_roll=%d\n", input_ui_trackball_roll_get());
+  f.printf("sym_toggle=%d\n", input_ui_sym_toggle_get() ? 1 : 0);
+  f.printf("alt_toggle=%d\n", input_ui_alt_toggle_get() ? 1 : 0);
+  f.printf("kb_legacy=%d\n", input_dev_kbd_legacy_get() ? 1 : 0);
   f.printf("theme=%s\n", theme_pref_str.c_str());
   f.printf("font_ui=%s\n", font_ui_pref.c_str());
   f.printf("font_text=%s\n", font_text_pref.c_str());
@@ -785,16 +752,16 @@ static void firmware_prefs_load() {
       wifi_enabled_pref = (atoi(val) == 1);
     } else if (strcmp(key, "trackball_sens") == 0) {
       int v = atoi(val);
-      if (v >= 0 && v <= 500) trackball_sensitivity_ms = (uint16_t)v;
+      if (v >= 0 && v <= 500) input_ui_trackball_sens_set((uint16_t)v);
     } else if (strcmp(key, "trackball_roll") == 0) {
       int v = atoi(val);
-      if (v >= 0 && v <= 500) trackball_roll_ms = (uint16_t)v;
+      if (v >= 0 && v <= 500) input_ui_trackball_roll_set((uint16_t)v);
     } else if (strcmp(key, "sym_toggle") == 0) {
-      kb_sym_toggle_pref = (atoi(val) == 1);
+      input_ui_sym_toggle_set(atoi(val) == 1);
     } else if (strcmp(key, "alt_toggle") == 0) {
-      kb_alt_toggle_pref = (atoi(val) == 1);
+      input_ui_alt_toggle_set(atoi(val) == 1);
     } else if (strcmp(key, "kb_legacy") == 0) {
-      kb_legacy_mode = (atoi(val) == 1);
+      input_dev_kbd_legacy_load(atoi(val) == 1);
     } else if (strcmp(key, "theme") == 0) {
       theme_pref_str = String(val);
       theme_pref_str.trim();
@@ -898,7 +865,7 @@ static void gps_print_stats(const char* tag) {
   // Diagnostic hint
   if (delta == 0) {
     SLog.printf("[GPS %s]   !! no new bytes — check power/TX pin (expected RX=%d)\n",
-                  tag, TDECK_GPS_RX);
+                  tag, gps_dev_rx_pin());
   } else if (gps_tinygps.passedChecksum() == 0 && chars > 200 && gps_baud_locked) {
     SLog.printf("[GPS %s]   !! bytes flowing but 0 valid sentences at locked baud %u\n",
                   tag, (unsigned)GPS_BAUD_CANDIDATES[gps_baud_idx]);
@@ -908,12 +875,13 @@ static void gps_print_stats(const char* tag) {
 static void gps_start_probe_at_current_baud() {
   uint32_t baud = GPS_BAUD_CANDIDATES[gps_baud_idx];
   if (gps_serial_active) {
-    GPSSerial.updateBaudRate(baud);
+    gps_dev_update_baud(baud);
   } else {
-    GPSSerial.begin(baud, SERIAL_8N1, TDECK_GPS_RX, TDECK_GPS_TX);
+    gps_dev_begin(baud);
+    gps_dev_chip_init();
     gps_serial_active = true;
   }
-  GPSSerial.flush(false);
+  gps_dev_stream().flush();
   gps_baud_probe_start_ms = millis();
   gps_baud_probe_chars_start = gps_tinygps.charsProcessed();
   SLog.printf("[GPS] probing baud=%u (candidate %u/%u)\n",
@@ -921,7 +889,8 @@ static void gps_start_probe_at_current_baud() {
 }
 
 static void gps_sync_begin() {
-  SLog.printf("[GPS] Listening on UART1 RX=%d TX=%d\n", TDECK_GPS_RX, TDECK_GPS_TX);
+  SLog.printf("[GPS] Listening on UART1 RX=%d TX=%d\n",
+              gps_dev_rx_pin(), gps_dev_tx_pin());
   gps_sync_restart(true);
 }
 
@@ -1037,7 +1006,8 @@ static void gps_last_load() {
 
 void gps_sync_poll() {
   if (gps_sync_done) return;
-  while (GPSSerial.available()) gps_tinygps.encode(GPSSerial.read());
+  { Stream& gs = gps_dev_stream();
+    while (gs.available()) gps_tinygps.encode(gs.read()); }
 
   uint32_t now = millis();
 
@@ -1223,8 +1193,8 @@ void gps_sync_restart(bool manual) {
   gps_gsv_inview_ga.begin(gps_tinygps, "GAGSV", 3);
   gps_gsv_inview_gb.begin(gps_tinygps, "GBGSV", 3);
   if (gps_serial_active) {
-    GPSSerial.write(0xFF);
-    GPSSerial.flush(false);
+    gps_dev_stream().write(0xFF);
+    gps_dev_stream().flush();
   }
   gps_sync_done = false;
   gps_sync_start_ms = millis();
@@ -1256,157 +1226,6 @@ void gps_sync_restart(bool manual) {
   gps_start_probe_at_current_baud();
 }
 
-// Trackball click — fed into LVGL as LV_KEY_ENTER via keyboard_read_cb
-volatile int trackball_click = 0;
-
-void IRAM_ATTR ISR_click() {
-  static uint32_t last_click_ms = 0;
-  uint32_t now = millis();
-  if (now - last_click_ms < 1) return;
-  last_click_ms = now;
-  trackball_click = 1;
-}
-
-// Trackball direction counters — each ISR fires on a FALLING edge pulse
-// from the T-Deck trackball. The keyboard_read_cb consumes these as
-// LV_KEY_UP/DOWN/LEFT/RIGHT presses.
-volatile int trackball_up = 0;
-volatile int trackball_down = 0;
-volatile int trackball_left = 0;
-volatile int trackball_right = 0;
-
-void IRAM_ATTR ISR_trackball_up()    { trackball_up++; }
-void IRAM_ATTR ISR_trackball_down()  { trackball_down++; }
-void IRAM_ATTR ISR_trackball_left()  { trackball_left++; }
-void IRAM_ATTR ISR_trackball_right() { trackball_right++; }
-
-// Keyboard I2C defines
-#define LILYGO_KB_SLAVE_ADDRESS 0x55
-#define LILYGO_KB_BRIGHTNESS_CMD 0x01
-#define LILYGO_KB_ALT_B_BRIGHTNESS_CMD 0x02
-#define LILYGO_KB_MODE_RAW_CMD 0x03
-#define LILYGO_KB_MODE_KEY_CMD 0x04
-
-// Keyboard matrix dimensions (from stock ESP32-C3 firmware)
-#define KB_COLS 5
-#define KB_ROWS 7
-
-// Modifier key positions in the matrix
-#define KB_MOD_SYM_COL    0
-#define KB_MOD_SYM_ROW    2
-#define KB_MOD_ALT_COL    0
-#define KB_MOD_ALT_ROW    4
-#define KB_MOD_LSHIFT_COL 1
-#define KB_MOD_LSHIFT_ROW 6
-#define KB_MOD_RSHIFT_COL 2
-#define KB_MOD_RSHIFT_ROW 3
-#define KB_KEY_ENTER_COL  3
-#define KB_KEY_ENTER_ROW  3
-#define KB_KEY_BS_COL     4
-#define KB_KEY_BS_ROW     3
-#define KB_KEY_SPACE_COL  0
-#define KB_KEY_SPACE_ROW  5
-#define KB_KEY_MIC_COL    0
-#define KB_KEY_MIC_ROW    6
-
-// Normal character layer (col × row) — from stock C3 firmware Keyboard_ESP32C3.ino
-static const char kb_matrix[KB_COLS][KB_ROWS] = {
-  {'q','w',  0, 'a',  0, ' ',  0 },
-  {'e','s','d','p','x','z',  0 },
-  {'r','g','t',  0, 'v','c','f'},
-  {'u','h','y',  0, 'b','n','j'},
-  {'o','l','i',  0, '$','m','k'},
-};
-
-// Symbol character layer
-static const char kb_matrix_symbol[KB_COLS][KB_ROWS] = {
-  {'#','1',  0, '*',  0,   0, '0'},
-  {'2','4','5','@','8','7',  0 },
-  {'3','/',  '(',  0, '?','9','6'},
-  {'_',':',')',  0, '!',',',';'},
-  {'+','"','-',  0,   0, '.','\''},
-};
-
-// ── Alt emoji layer map ─────────────────────────────────────────────────────
-// Default emoji per key (normal-layer char -> Unicode codepoint), roughly the
-// most-used emojis with a few mnemonics (z=sleep, $=money, h=haha). Space is
-// deliberately absent so latched emoji runs can still be space-separated.
-// Sequence emojis are assignable too: the picker stores their PUA codepoint
-// and the send path decomposes it to real Unicode (see prepare_outgoing_text).
-struct KbEmojiDefault { char key; uint32_t cp; };
-static const KbEmojiDefault kb_emoji_defaults[] = {
-  {'q',0x1F923},{'w',0x1F609},{'e',0x1F60D},{'r',0x1F917},{'t',0x1F44D},
-  {'y',0x1F642},{'u',0x1F937},{'i',0x1F60A},{'o',0x1F618},{'p',0x1F970},
-  {'a',0x2764}, {'s',0x263A}, {'d',0x1F62D},{'f',0x1F525},{'g',0x1F601},
-  {'h',0x1F602},{'j',0x1F605},{'k',0x1F64F},{'l',0x1F606},
-  {'z',0x1F634},{'x',0x1F926},{'c',0x1F97A},{'v',0x1F495},{'b',0x1F382},
-  {'n',0x1F644},{'m',0x1F914},{'$',0x1F4B0},
-};
-
-// Active map, indexed by the key's normal-layer char. 0 = no emoji (the key
-// falls through to its normal char under alt).
-static uint32_t kb_emoji_map[128] = {0};
-
-static void kb_emoji_apply_defaults() {
-  memset(kb_emoji_map, 0, sizeof(kb_emoji_map));
-  for (auto &d : kb_emoji_defaults) kb_emoji_map[(uint8_t)d.key] = d.cp;
-}
-
-// /emoji_keymap on LittleFS: one "c=1F602" line per key (hex codepoint; 0
-// clears the key). Defaults apply first, then the file overrides — so a
-// missing file or a key the file doesn't mention means the compiled default.
-static void kb_emoji_map_load() {
-  kb_emoji_apply_defaults();
-  File f = LittleFS.open("/emoji_keymap", "r");
-  if (!f) return;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() < 3 || line[1] != '=') continue;
-    uint8_t c = (uint8_t)line[0];
-    if (c >= 128) continue;
-    kb_emoji_map[c] = (uint32_t)strtoul(line.c_str() + 2, nullptr, 16);
-  }
-  f.close();
-}
-
-static void kb_emoji_map_save() {
-  UsbFlashGuard _g;   // internal-flash write — pause USB audio around it (crash-safe)
-  File f = LittleFS.open("/emoji_keymap", "w", true);
-  if (!f) { SLog.println("[KB_EMOJI] cannot write /emoji_keymap"); return; }
-  for (int c = 32; c < 128; c++) {
-    bool is_default_key = false;
-    for (auto &d : kb_emoji_defaults) {
-      if ((uint8_t)d.key == c) { is_default_key = true; break; }
-    }
-    // Write every assigned key, plus explicit "=0" lines for cleared default
-    // keys so a cleared key doesn't resurrect its default on the next boot.
-    if (kb_emoji_map[c] || is_default_key)
-      f.printf("%c=%lX\n", (char)c, (unsigned long)kb_emoji_map[c]);
-  }
-  f.close();
-}
-
-// Pack a codepoint's UTF-8 bytes into a uint32 with the FIRST byte in the
-// LOW byte (U+1F602 = F0 9F 98 82 -> 0x82989FF0). lv_textarea_add_char()
-// reinterprets the uint32's memory as the char sequence
-// (letter_buf = (char *)&u32_buf), and the ESP32-S3 is little-endian, so
-// memory order = low byte first.
-static uint32_t utf8_pack_key(uint32_t cp) {
-  if (cp < 0x80u) return cp;
-  if (cp < 0x800u)
-    return  (0xC0u | (cp >> 6)) |
-           ((0x80u | (cp & 0x3Fu)) << 8);
-  if (cp < 0x10000u)
-    return  (0xE0u | (cp >> 12)) |
-           ((0x80u | ((cp >> 6) & 0x3Fu)) << 8) |
-           ((0x80u | (cp & 0x3Fu)) << 16);
-  return  (0xF0u | (cp >> 18)) |
-         ((0x80u | ((cp >> 12) & 0x3Fu)) << 8) |
-         ((0x80u | ((cp >> 6) & 0x3Fu)) << 16) |
-         ((0x80u | (cp & 0x3Fu)) << 24);
-}
-
 // Data directory paths
 #define LUA_PATH "/lua/"
 #define SOUNDS_PATH "/sounds/"
@@ -1415,16 +1234,8 @@ static uint32_t utf8_pack_key(uint32_t cp) {
 // Ticker for LVGL timing
 Ticker lvgl_ticker;
 
-// LVGL display and touch globals
-TFT_eSPI tft;
-TouchDrvGT911 touch;
-
 // LuaVGL state
 lua_State *L = NULL;
-
-// Keyboard variables
-bool keyboard_available = false;
-char last_key = 0;
 
 // Filesystem variables
 bool fs_mounted = false;
@@ -1456,7 +1267,7 @@ bool meshpunk_sd_mount() {
   static const uint32_t sd_freqs[] = {40000000U, 25000000U, 4000000U};
   sd_mounted = false;
   for (uint32_t freq : sd_freqs) {
-    if (SD.begin(BOARD_SDCARD_CS, SPI, freq)) {
+    if (SD.begin(PIN_SD_CS, SPI, freq)) {
       sd_mounted = true;
       SLog.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
       break;
@@ -1627,212 +1438,38 @@ static int lua_io_open(lua_State *L) {
   return 1;
 }
 
-// LilyGo T-Deck control backlight chip has 16 levels of adjustment range
-// The adjustable range is 0~15, 0 is the minimum brightness, 15 is the maximum
-// brightness
-void setBrightness(uint8_t value) {
-  static uint8_t level = 0;
-  static uint8_t steps = 16;
-  if (value == 0) {
-    digitalWrite(BOARD_BL_PIN, 0);
-    delay(3);
-    level = 0;
-    return;
-  }
-  if (level == 0) {
-    digitalWrite(BOARD_BL_PIN, 1);
-    level = steps;
-    delayMicroseconds(30);
-  }
-  int from = steps - level;
-  int to = steps - value;
-  int num = (steps + to - from) % steps;
-  for (int i = 0; i < num; i++) {
-    digitalWrite(BOARD_BL_PIN, 0);
-    digitalWrite(BOARD_BL_PIN, 1);
-  }
-  level = value;
-}
-
-// Helper: read the ILI9341 current scanline position via command 0x45.
-// Returns 0–319 indicating the gate line the panel is currently refreshing.
-static uint16_t ili9341_get_scanline() {
-  uint8_t hi = tft.readcommand8(0x45, 1); // GTS[8]
-  uint8_t lo = tft.readcommand8(0x45, 2); // GTS[7:0]
-  return ((hi & 0x01) << 8) | lo;
-}
-
-// Scanline-tracking flush callback.
-//
-// The ILI9341 physically scans gate lines 0→319 regardless of MADCTL
-// rotation settings. In landscape rotation 1 (MADCTL MV|MX), the gate
-// scan sweeps horizontally across the screen, so the scanline value
-// approximately maps to the LVGL x-coordinate.
-//
-// Strategy: before writing pixels, read the current scanline. If it is
-// inside (or just ahead of) the flush area, busy-wait for it to pass.
-// This makes our SPI writes trail behind the panel's read pointer,
-// preventing the display from showing a mix of old and new data.
-//
-// The SCANLINE_MARGIN adds a safety buffer — we wait until the scanline
-// is at least this many lines past the end of our flush area before
-// writing, to account for SPI transaction setup time.
-
-#define SCANLINE_MARGIN 8
-
+// LVGL flush: the panel write (scanline tear-sync, bus lock, pixel push)
+// lives in the display backend; this wrapper only unpacks the LVGL area and
+// signals completion.
 static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
                           uint8_t *px_map) {
-  uint32_t w = (area->x2 - area->x1 + 1);
-  uint32_t h = (area->y2 - area->y1 + 1);
-
-  SPI_LOCK();
-
-  // Read current scanline position.
-  // In rotation 1 the gate scan maps to the y-axis of the flush area
-  // (the ILI9341's 320 native rows become the 240-pixel vertical axis
-  // after MV swap + rotation). Try y1/y2 first; if tearing persists,
-  // switch flush_start/flush_end to use x1/x2 instead.
-  uint16_t scanline = ili9341_get_scanline();
-  uint16_t flush_start = area->y1;
-  uint16_t flush_end   = area->y2 + SCANLINE_MARGIN;
-
-  // Busy-wait if the scanline is inside (or about to enter) the flush
-  // area.  Timeout after ~8 ms to avoid blocking the system forever
-  // if readcommand8 returns garbage (e.g. MISO not connected).
-  int wait_us = 0;
-  while (scanline >= flush_start && scanline <= flush_end && wait_us < 8000) {
-    delayMicroseconds(10);
-    wait_us += 10;
-    scanline = ili9341_get_scanline();
-  }
-  tft.startWrite();
-  tft.setAddrWindow(area->x1, area->y1, w, h);
-  tft.pushColors((uint16_t *)px_map, w * h, false);
-  tft.endWrite();
-
-  SPI_UNLOCK();
-
+  display_dev_flush_rect(area->x1, area->y1,
+                         area->x2 - area->x1 + 1,
+                         area->y2 - area->y1 + 1,
+                         (const uint16_t *)px_map);
   lv_display_flush_ready(disp);
 }
 
-
-// Touch handling
-int16_t x[5], y[5];
-
-// Debug flag for touch
-bool touch_debug = true;
-unsigned long last_touch_debug = 0;
-
-// Keyboard functions
-void setKeyboardBrightness(uint8_t value) {
-  if (!keyboard_available)
-    return;
-
-  Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
-  Wire.write(LILYGO_KB_BRIGHTNESS_CMD);
-  Wire.write(value);
-  Wire.endTransmission();
-}
-
-void setKeyboardDefaultBrightness(uint8_t value) {
-  if (!keyboard_available)
-    return;
-
-  Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
-  Wire.write(LILYGO_KB_ALT_B_BRIGHTNESS_CMD);
-  Wire.write(value);
-  Wire.endTransmission();
-}
 
 // Reset inactivity timer and restore backlights — called after a native module
 // exits so the screen/keyboard don't appear timed-out to the user.
 void wake_activity() {
   last_activity_ms = millis();
-  if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
-  if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
+  if (screen_timed_out) { display_dev_brightness(display_brightness); screen_timed_out = false; }
+  if (kbd_timed_out)    { input_dev_kbd_backlight(kbd_brightness); kbd_timed_out = false; }
 }
 
-// Keyboard state tracking variables
-static uint32_t last_key_code = 0;
-static uint8_t prev_matrix[KB_COLS] = {0};
-static bool kb_key_state[128] = {0};
-static bool kb_key_prev[128] = {0};
-static uint32_t kb_key_press_time[128] = {0};
-static const uint32_t KEY_HOLD_THRESHOLD_MS = 400;
-static bool kb_shift_active = false;
-static bool kb_lshift_active = false;
-static bool kb_rshift_active = false;
-static bool kb_sym_active = false;
-static bool kb_alt_active = false;
-
-// ── Legacy ASCII mode runtime state ─────────────────────────────────────────
-// One byte arrives per physical press (no release/repeat), so each byte is
-// synthesized into a press: kb_key_state[ch] stays true for LEGACY_PULSE_MS
-// (feeds the _kb_* polling APIs and input capture), while the LVGL emit is a
-// one-poll edge per byte so double letters register.
-#define LEGACY_PULSE_MS 120
-static uint8_t  kb_legacy_down_ch  = 0;   // char currently pulsed, 0 = none
-static uint32_t kb_legacy_deadline = 0;   // millis() when the pulse releases
-
-// ── Old-keyboard-firmware detection (raw mode only) ─────────────────────────
-// A keyboard MCU without raw-mode support keeps sending single ASCII bytes,
-// which land in cur_matrix[0] with cols 1-4 zero. Lowercase ASCII (0x61-0x7A)
-// as a matrix byte means space+mic+letter pressed simultaneously — a state no
-// real typing produces — while such firmware can never light cols 1-4. The
-// verdict latches on the first decisive input: a col 1-4 byte proves raw
-// firmware and closes detection for the session; three signature events =
-// old firmware, and loop() auto-enables legacy mode. A manual Settings
-// toggle-off also closes detection so the user's choice isn't fought.
-static uint8_t s_kb_suspect_events = 0;
-static bool    s_kb_legacy_autoswitch_pending = false;
-static bool    s_kb_autoswitch_done = false;
-
-// Switch keyboard input mode at runtime. Sends the matching mode command to
-// the keyboard MCU (a no-op on firmware without command support) and drops all
-// key state derived under the previous mode.
-static void kb_set_legacy(bool on, bool save) {
-  kb_legacy_mode = on;
-  if (keyboard_available) {
-    Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
-    Wire.write(on ? LILYGO_KB_MODE_KEY_CMD : LILYGO_KB_MODE_RAW_CMD);
-    Wire.endTransmission();
-  }
-  memset(prev_matrix, 0, sizeof(prev_matrix));
-  memset(kb_key_state, 0, sizeof(kb_key_state));
-  memset(kb_key_prev, 0, sizeof(kb_key_prev));
-  last_key_code = 0;
-  kb_shift_active = kb_lshift_active = kb_rshift_active = false;
-  kb_sym_active = kb_alt_active = kb_alt_layer_active = false;
-  kb_sym_latched = kb_alt_latched = false;
-  kb_sym_phys_prev = kb_alt_phys_prev = false;
-  kb_legacy_down_ch = 0;
-  kb_legacy_deadline = 0;
-  s_kb_suspect_events = 0;
-  if (save) firmware_prefs_save();
-  SLog.printf("[KB] %s mode\n", on ? "legacy ASCII" : "raw matrix");
+// ── Hooks for the input layer (declared in input/input_ui.h) ───────────────
+// The indev callbacks live in input_ui.cpp; the activity/timeout policy and
+// its state stay here.
+void firmware_note_activity(void) {
+  last_activity_ms = millis();
 }
 
-// Bare mic press = notifications shortcut. The keyboard reader (LVGL indev
-// callback) only sets this flag; loop() dispatches it into Lua
-// (topbar.on_shortcut) outside of indev processing.
-static bool s_topbar_shortcut_pending = false;
-
-// Alt+mic while typing = emoji search popup (lib/emoji_popup). Same flag/
-// dispatch split as the topbar shortcut; the textarea focused at press time is
-// captured as the insert target for _emoji_popup_insert, which re-validates the
-// pointer before every insert (the app underneath can rebuild its views while
-// the popup is up).
-static bool      s_emoji_popup_pending = false;
-static lv_obj_t *s_emoji_popup_target  = NULL;
-
-// Alt+Backspace held ~1.5s = home shortcut (the Lua-land twin of the ELF exit
-// chord, same hold time): close the current app and return to the launcher
-// home page (apps.home_shortcut via loop()). Physical alt only — a LATCHED
-// alt while holding backspace to delete text must not count.
-#define HOME_CHORD_HOLD_MS 1500
-static uint32_t s_home_chord_start   = 0;      // 0 = chord not held
-static bool     s_home_chord_fired   = false;  // fired once for this hold
-static bool     s_home_shortcut_pending = false;
+void firmware_wake_restore(void) {
+  if (screen_timed_out) { display_dev_brightness(display_brightness); screen_timed_out = false; }
+  if (kbd_timed_out)    { input_dev_kbd_backlight(kbd_brightness); kbd_timed_out = false; }
+}
 
 // Navigation controller state — a STACK of navigable scopes, not a single
 // container. The TOP scope is the interactive one (in the focus group, gridnav
@@ -1938,367 +1575,19 @@ static int lua_nav_reset(lua_State *L) {
     return 0;
 }
 
-// Input capture for the Gamepad mapping wizard (_input_capture_* bindings):
-// armed by Lua, consumed by the capture block inside keyboard_read_cb.
-static volatile bool     s_input_capture_armed = false;
-static volatile uint32_t s_input_captured      = 0;
+// ── Nav-scope services for the input layer (declared in input/input_ui.h) ──
+// The indev callbacks moved to input_ui.cpp; the NavScope stack stays here.
 
-// LVGL keyboard read callback
-static bool trackball_btn_pressed = false;
-
-static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
+// Housekeeping at the top of every indev read.
+void nav_input_tick_begin(void) {
   flush_pending_gridnav();
   nav_check_valid();
+}
 
-  static uint32_t kb_mapped_key = 0;
-  bool any_new = false;
-  bool key_from_trackball = false;
-
-  // ── Read raw keyboard matrix (5 bytes) — or one ASCII byte in legacy mode ──
-  uint8_t cur_matrix[KB_COLS] = {0};
-  uint8_t legacy_byte = 0;   // legacy mode: char received this poll (one per press)
-  if (kb_legacy_mode) {
-    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
-    if (Wire.available()) legacy_byte = Wire.read();
-    if (legacy_byte >= 128) legacy_byte = 0;   // kb_key_state bounds
-    // cur_matrix stays zero: every matrix-derived block below (modifiers, mic
-    // shortcut, home chord, matrix scan) reads "nothing pressed" and is inert.
-  } else {
-    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, KB_COLS);
-    for (int c = 0; c < KB_COLS && Wire.available(); c++) {
-      cur_matrix[c] = Wire.read();
-    }
-    // Old-keyboard-firmware detection (see s_kb_* above): lowercase ASCII in
-    // col 0 before any col 1-4 byte = the MCU ignored the raw-mode command
-    // and is sending single chars. Either verdict latches s_kb_autoswitch_done
-    // and detection never runs again this session. loop() performs the switch.
-    if (!s_kb_autoswitch_done) {
-      if (cur_matrix[1] | cur_matrix[2] | cur_matrix[3] | cur_matrix[4]) {
-        s_kb_autoswitch_done = true;   // raw firmware proven — detection closed
-        SLog.println("[KB] raw matrix confirmed");
-      } else if (prev_matrix[0] == 0 &&
-                 cur_matrix[0] >= 0x61 && cur_matrix[0] <= 0x7A) {
-        s_kb_suspect_events++;
-        SLog.printf("[KB] ASCII-mode signature 0x%02X (%d/3)\n",
-                    cur_matrix[0], s_kb_suspect_events);
-        if (s_kb_suspect_events >= 3) {
-          s_kb_legacy_autoswitch_pending = true;
-          s_kb_autoswitch_done = true;
-        }
-      }
-    }
-  }
-
-  // ── Decode modifier key states ──
-  kb_lshift_active = cur_matrix[KB_MOD_LSHIFT_COL] & (1 << KB_MOD_LSHIFT_ROW);
-  kb_rshift_active = cur_matrix[KB_MOD_RSHIFT_COL] & (1 << KB_MOD_RSHIFT_ROW);
-  kb_shift_active = kb_lshift_active || kb_rshift_active;
-
-  // alt: same tap-toggle latch as sym below, behind its own pref. The emoji
-  // layer it drives only substitutes while typing in a textarea (see the
-  // substitution block after the resolver), so a latched alt never pauses
-  // WASD nav the way a latched sym does.
-  bool alt_phys = cur_matrix[KB_MOD_ALT_COL] & (1 << KB_MOD_ALT_ROW);
-  kb_alt_active = alt_phys;
-  if (kb_alt_toggle_pref) {
-    if (alt_phys && !kb_alt_phys_prev) {
-      kb_alt_used_while_held = false;             // new hold begins
-    } else if (!alt_phys && kb_alt_phys_prev && !kb_alt_used_while_held) {
-      kb_alt_latched = !kb_alt_latched;           // clean tap — toggle latch
-    }
-    kb_alt_layer_active = alt_phys || kb_alt_latched;
-  } else {
-    kb_alt_layer_active = alt_phys;
-    kb_alt_latched = false;
-  }
-  kb_alt_phys_prev = alt_phys;
-
-  // sym: plain hold by default. In toggle mode a clean tap (press + release
-  // with nothing typed during the hold) latches the symbol layer until the
-  // next tap; holding sym while typing still works as a momentary modifier.
-  bool sym_phys = cur_matrix[KB_MOD_SYM_COL] & (1 << KB_MOD_SYM_ROW);
-  if (kb_sym_toggle_pref) {
-    if (sym_phys && !kb_sym_phys_prev) {
-      kb_sym_used_while_held = false;             // new hold begins
-    } else if (!sym_phys && kb_sym_phys_prev && !kb_sym_used_while_held) {
-      kb_sym_latched = !kb_sym_latched;           // clean tap — toggle latch
-    }
-    kb_sym_active = sym_phys || kb_sym_latched;
-  } else {
-    kb_sym_active = sym_phys;
-    kb_sym_latched = false;
-  }
-  kb_sym_phys_prev = sym_phys;
-
-  // ── Bare mic press (0,6) = notifications shortcut ──
-  // The mic key has no normal-layer character (its bare press is dead in the
-  // matrix scan below), so it's free as a global hotkey: raise the topbar over
-  // a running app / toggle the notification drop-down (topbar.on_shortcut,
-  // dispatched from loop()). Gated on !kb_sym_active so sym+mic still types
-  // '0' through the symbol layer. Alt+mic instead opens the emoji search
-  // popup — only while a textarea is focused (dead press otherwise), capturing
-  // that textarea as the insert target.
-  {
-    bool mic_now  = cur_matrix[KB_KEY_MIC_COL]  & (1 << KB_KEY_MIC_ROW);
-    bool mic_prev = prev_matrix[KB_KEY_MIC_COL] & (1 << KB_KEY_MIC_ROW);
-    if (mic_now && !mic_prev && !kb_sym_active) {
-      if (kb_alt_layer_active) {
-        // The mic key never reaches the char scan (normal-layer ch==0), so
-        // mark the alt hold as used here — otherwise a held-alt+mic reads as
-        // a clean alt tap on release and flips the tap-toggle latch.
-        if (alt_phys) kb_alt_used_while_held = true;
-        lv_obj_t *foc = lv_group_get_focused(lv_group_get_default());
-        if (foc && lv_obj_is_valid(foc) &&
-            lv_obj_check_type(foc, &lv_textarea_class)) {
-          s_emoji_popup_target  = foc;
-          s_emoji_popup_pending = true;
-        }
-      } else {
-        s_topbar_shortcut_pending = true;
-      }
-    }
-  }
-
-  // ── Snapshot previous key state and clear current ──
-  memcpy(kb_key_prev, kb_key_state, 128);
-  memset(kb_key_state, 0, 128);
-
-  // ── Legacy mode: synthesize the received byte into key state ──
-  // Each byte is a discrete press (the MCU sends nothing on release), pulsed
-  // in kb_key_state for LEGACY_PULSE_MS so the _kb_* polling APIs and input
-  // capture see it. A re-arrival restarts the pulse as a fresh press.
-  bool legacy_new = false;
-  if (kb_legacy_mode) {
-    if (legacy_byte) {
-      kb_legacy_down_ch  = legacy_byte;
-      kb_legacy_deadline = millis() + LEGACY_PULSE_MS;
-      kb_key_press_time[legacy_byte] = millis();
-      legacy_new = true;
-    } else if (kb_legacy_down_ch &&
-               (int32_t)(millis() - kb_legacy_deadline) >= 0) {
-      kb_legacy_down_ch = 0;
-    }
-    if (kb_legacy_down_ch) kb_key_state[kb_legacy_down_ch] = true;
-  }
-
-  // ── Resolve ALL pressed keys from matrix ──
-  uint32_t resolved_key = 0;
-
-  for (int c = 0; c < KB_COLS; c++) {
-    if (cur_matrix[c] == 0) continue;
-    for (int r = 0; r < KB_ROWS; r++) {
-      if (!(cur_matrix[c] & (1 << r))) continue;
-      if (c == KB_MOD_SYM_COL && r == KB_MOD_SYM_ROW) continue;
-      if (c == KB_MOD_ALT_COL && r == KB_MOD_ALT_ROW) continue;
-      if (c == KB_MOD_LSHIFT_COL && r == KB_MOD_LSHIFT_ROW) continue;
-      if (c == KB_MOD_RSHIFT_COL && r == KB_MOD_RSHIFT_ROW) continue;
-      // (0,6) is the mic key: no normal-layer character (the ch==0 check
-      // below keeps the bare press dead), but its symbol layer is '0' —
-      // it must flow through so sym+mic can type the digit zero.
-
-      uint8_t ch = 0;
-      if (c == KB_KEY_ENTER_COL && r == KB_KEY_ENTER_ROW) {
-        ch = 0x0D;
-      } else if (c == KB_KEY_BS_COL && r == KB_KEY_BS_ROW) {
-        ch = 0x08;
-      } else {
-        ch = kb_sym_active ? kb_matrix_symbol[c][r] : kb_matrix[c][r];
-        if (ch == 0) continue;
-        if (kb_shift_active && ch >= 'a' && ch <= 'z') ch -= 32;
-      }
-
-      kb_key_state[ch] = true;
-      if (!kb_key_prev[ch]) {
-        kb_key_press_time[ch] = millis();
-      }
-      if (sym_phys) kb_sym_used_while_held = true;  // hold was used — not a tap
-      if (alt_phys) kb_alt_used_while_held = true;
-
-      if (resolved_key == 0) {
-        if (ch == 0x0D) resolved_key = LV_KEY_ENTER;
-        else if (ch == 0x08) resolved_key = LV_KEY_BACKSPACE;
-        else resolved_key = ch;
-      }
-    }
-  }
-
-  // ── Legacy mode: the received byte is the resolved key ──
-  // Only on the poll it arrived: the next poll resolves 0, which resets
-  // last_key_code below and reports RELEASED, so LVGL sees one clean press
-  // per byte and a repeated character re-registers.
-  if (kb_legacy_mode && legacy_new) {
-    if      (legacy_byte == 0x0D) resolved_key = LV_KEY_ENTER;
-    else if (legacy_byte == 0x08) resolved_key = LV_KEY_BACKSPACE;
-    else                          resolved_key = legacy_byte;
-  }
-
-  // ── Merge USB HID keyboard held keys (usb_task, Core 1 → here, Core 0) ──
-  // Shift/layout already resolved at parse time (usb_manager.cpp); chars OR
-  // into the same level-based state as matrix keys, so LVGL, nav, and the
-  // Lua _kb_* bindings see USB keys identically. Arrows arrive separately
-  // via the trackball counters. Matrix keys win the resolved_key slot.
-  {
-    bool usb_held[128];
-    if (usb_kbd_snapshot(usb_held)) {
-      for (int ch = 1; ch < 128; ch++) {
-        if (!usb_held[ch]) continue;
-        kb_key_state[ch] = true;
-        if (!kb_key_prev[ch]) {
-          kb_key_press_time[ch] = millis();
-        }
-        if (resolved_key == 0) {
-          if (ch == 0x0D)      resolved_key = LV_KEY_ENTER;
-          else if (ch == 0x08) resolved_key = LV_KEY_BACKSPACE;
-          else                 resolved_key = ch;
-        }
-      }
-    }
-  }
-
-  // ── Alt+Backspace held = home shortcut ──
-  // Same chord + hold time as the ELF exit chord, applied to Lua apps: close
-  // the current app, land on the launcher home page. Physical alt only (the
-  // ELF chord's rule too) so an alt-LATCH user holding backspace to delete
-  // text can't trigger it. Backspace keeps deleting during the hold — the
-  // same trade-off the ELF chord made. Fires once per hold.
-  {
-    bool chord = alt_phys && kb_key_state[0x08];
-    if (!chord) {
-      s_home_chord_start = 0;
-      s_home_chord_fired = false;
-    } else if (s_home_chord_start == 0) {
-      s_home_chord_start = millis();
-    } else if (!s_home_chord_fired &&
-               millis() - s_home_chord_start >= HOME_CHORD_HOLD_MS) {
-      s_home_chord_fired = true;
-      s_home_shortcut_pending = true;
-    }
-  }
-
-  bool kb_active = (resolved_key != 0);
-
-  // ── Input capture (Gamepad app mapping wizard; _input_capture_* below) ──
-  // While armed, the FIRST input this reader resolves is recorded as a
-  // module/driver code (chars as themselves incl. 0x0D/0x08; trackball →
-  // 0x81-0x84, click → 0x85) and ALL input is swallowed — the captured
-  // press must not also navigate the UI. Matrix and USB keys both land in
-  // kb_key_state, so both are capturable.
-  if (s_input_capture_armed) {
-    uint32_t got = 0;
-    for (int ch = 1; ch < 128 && !got; ch++)
-      if (kb_key_state[ch] && !kb_key_prev[ch]) got = ch;
-    if (!got) {
-      if      (trackball_click > 0) got = 0x85;
-      else if (trackball_up > 0)    got = 0x81;
-      else if (trackball_down > 0)  got = 0x82;
-      else if (trackball_left > 0)  got = 0x83;
-      else if (trackball_right > 0) got = 0x84;
-    }
-    if (got) {
-      s_input_captured     = got;
-      s_input_capture_armed = false;
-    }
-    trackball_click = 0;
-    trackball_up = trackball_down = trackball_left = trackball_right = 0;
-    resolved_key = 0;
-    kb_active = false;
-  }
-
-  // ── WASD intercept — treat as direction, not character (unless typing) ──
-  uint32_t wasd_dir = 0;
-  lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
-  bool typing = focused && lv_obj_is_valid(focused) && lv_obj_check_type(focused, &lv_textarea_class);
-
-  // ── Alt emoji layer — substitute AFTER resolution, only while typing ──
-  // kb_key_state[] above stays indexed by the base char (it's a 128-slot
-  // array); outside a textarea the layer is inert. Sym wins when both are
-  // active, shift is ignored (alt+shift+A = same emoji as alt+a), and an
-  // unmapped key falls through to its normal char. The key value carries the
-  // emoji's UTF-8 bytes packed low-byte-first (see utf8_pack_key).
-  if (typing && kb_alt_layer_active && !kb_sym_active &&
-      resolved_key >= 0x20 && resolved_key < 0x80) {
-    uint32_t base = resolved_key;
-    if (base >= 'A' && base <= 'Z') base += 32;
-    uint32_t cp = kb_emoji_map[base];
-    // emoji_preload gates on the ACTIVE blob: a mapped emoji the current set
-    // can't render (e.g. a sequence PUA after the SD extended set was
-    // removed) falls through to the plain char instead of emitting a
-    // codepoint that would draw tofu here and on the receiving device.
-    if (cp && emoji_preload(cp)) resolved_key = utf8_pack_key(cp);
-  }
-
-  if (!typing) {
-    if      (resolved_key == 'w') wasd_dir = LV_KEY_UP;
-    else if (resolved_key == 'a') wasd_dir = LV_KEY_LEFT;
-    else if (resolved_key == 's') wasd_dir = LV_KEY_DOWN;
-    else if (resolved_key == 'd') wasd_dir = LV_KEY_RIGHT;
-    if (wasd_dir) kb_active = false;
-  }
-
-  // ── LVGL state tracking (single-key for LVGL reporting) ──
-  if (kb_active) {
-    if (resolved_key != last_key_code) {
-      last_key_code = resolved_key;
-      kb_mapped_key = resolved_key;
-      any_new = true;
-      last_activity_ms = millis();
-    }
-  } else {
-    if (last_key_code != 0) last_key_code = 0;
-  }
-
-  memcpy(prev_matrix, cur_matrix, KB_COLS);
-
-  // ── Direction navigation — WASD + trackball, shared sensitivity ──
-  if (!kb_active) {
-    if (trackball_click > 0) {
-      trackball_click = 0;
-      last_key_code = LV_KEY_ENTER;
-      any_new = true;
-      key_from_trackball = true;
-      trackball_btn_pressed = true;
-    } else {
-      uint32_t nav_dir = wasd_dir;
-      if (!nav_dir) {
-        if      (trackball_up > 0)    nav_dir = LV_KEY_UP;
-        else if (trackball_down > 0)  nav_dir = LV_KEY_DOWN;
-        else if (trackball_left > 0)  nav_dir = LV_KEY_LEFT;
-        else if (trackball_right > 0) nav_dir = LV_KEY_RIGHT;
-      }
-
-      if (nav_dir) {
-        static uint32_t last_nav_ms = 0;
-        uint32_t now = millis();
-        uint16_t interval = (!wasd_dir && trackball_roll_ms > 0)
-                            ? trackball_roll_ms : trackball_sensitivity_ms;
-        if (now - last_nav_ms >= interval) {
-          last_nav_ms = now;
-          if (!wasd_dir) {
-            if (trackball_roll_ms > 0) {
-              if      (nav_dir == LV_KEY_UP)    trackball_up--;
-              else if (nav_dir == LV_KEY_DOWN)  trackball_down--;
-              else if (nav_dir == LV_KEY_LEFT)  trackball_left--;
-              else if (nav_dir == LV_KEY_RIGHT) trackball_right--;
-            } else {
-              if      (nav_dir == LV_KEY_UP)    trackball_up = 0;
-              else if (nav_dir == LV_KEY_DOWN)  trackball_down = 0;
-              else if (nav_dir == LV_KEY_LEFT)  trackball_left = 0;
-              else if (nav_dir == LV_KEY_RIGHT) trackball_right = 0;
-            }
-          }
-          last_key_code = nav_dir;
-          kb_mapped_key = nav_dir;
-          any_new = true;
-          key_from_trackball = true;
-        }
-      }
-    }
-    if (key_from_trackball) last_activity_ms = millis();
-  }
-
-  // ── Re-enable gridnav on trackball input (top scope only) ──
+// ── Re-enable gridnav on trackball input (top scope only) ──
+void nav_rearm_on_trackball(void) {
   NavScope *kb_top = nav_top();
-  if (key_from_trackball && kb_top && kb_top->cont &&
+  if (kb_top && kb_top->cont &&
       lv_obj_is_valid(kb_top->cont) && !kb_top->armed) {
     uint32_t cnt = lv_obj_get_child_count(kb_top->cont);
     for (uint32_t i = 0; i < cnt; i++) {
@@ -2313,63 +1602,23 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       lv_gridnav_set_focused(kb_top->cont, vis, LV_ANIM_OFF);
     }
   }
+}
 
-  // ── Wake from timeout ──
-  if (any_new) {
-    if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
-    if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
-  }
-
-  // ── Report to LVGL ──
-  if (kb_active) {
-    data->state = LV_INDEV_STATE_PRESSED;
-    data->key = kb_mapped_key;
-  } else if (any_new) {
-    data->state = LV_INDEV_STATE_PRESSED;
-    data->key = last_key_code;
-  } else if (trackball_btn_pressed) {
-    if (digitalRead(TDECK_TRACKBALL_CLICK) == LOW) {
-      data->state = LV_INDEV_STATE_PRESSED;
-      data->key = LV_KEY_ENTER;
-    } else {
-      data->state = LV_INDEV_STATE_RELEASED;
-      trackball_btn_pressed = false;
+// Touch disarms gridnav on the top scope so the finger scrolls instead of
+// moving focus; the trackball re-arms it (above).
+void nav_disarm_on_touch(void) {
+  NavScope *tp_top = nav_top();
+  if (tp_top && tp_top->cont && tp_top->armed) {
+    uint32_t cnt = lv_obj_get_child_count(tp_top->cont);
+    for (uint32_t i = 0; i < cnt; i++) {
+      lv_obj_remove_state(lv_obj_get_child(tp_top->cont, i),
+                          LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
     }
-  } else {
-    data->state = LV_INDEV_STATE_RELEASED;
+    lv_gridnav_remove(tp_top->cont);
+    tp_top->armed = false;
   }
 }
 
-static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
-  flush_pending_gridnav();
-  nav_check_valid();
-
-  uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
-  if (touched > 0) {
-    data->state = LV_INDEV_STATE_PRESSED;
-    data->point.x = x[0];
-    data->point.y = y[0];
-    last_activity_ms = millis();
-    if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
-    if (kbd_timed_out)    { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
-
-    // Touch disarms gridnav on the top scope so the finger scrolls instead of
-    // moving focus; trackball re-arms it (above). Safe point: indev callback,
-    // not inside a gridnav event dispatch.
-    NavScope *tp_top = nav_top();
-    if (tp_top && tp_top->cont && tp_top->armed) {
-      uint32_t cnt = lv_obj_get_child_count(tp_top->cont);
-      for (uint32_t i = 0; i < cnt; i++) {
-        lv_obj_remove_state(lv_obj_get_child(tp_top->cont, i),
-                            LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
-      }
-      lv_gridnav_remove(tp_top->cont);
-      tp_top->armed = false;
-    }
-  } else {
-    data->state = LV_INDEV_STATE_RELEASED;
-  }
-}
 
 // Setup Serial Protocol
 
@@ -2452,7 +1701,8 @@ void setupLvgl() {
   //}
 
 #define BUF_LINES 48
-#define BUF_SIZE (TFT_HEIGHT * BUF_LINES * sizeof(lv_color_t))
+  const size_t BUF_SIZE =
+      (size_t)display_dev_width() * BUF_LINES * sizeof(lv_color_t);
 
   static uint8_t *buf1 = (uint8_t *)ps_malloc(BUF_SIZE);
   static uint8_t *buf2 = (uint8_t *)ps_malloc(BUF_SIZE);
@@ -2469,7 +1719,7 @@ void setupLvgl() {
   lv_group_set_default(default_group);
 
   // Create a display
-  lv_display_t *disp = lv_display_create(TFT_HEIGHT, TFT_WIDTH);
+  lv_display_t *disp = lv_display_create(display_dev_width(), display_dev_height());
 
   // Set theme. Emoji font wraps montserrat_14 as fallback so ASCII/Latin still
   // render from the bitmap font; codepoints >= 0x2600 are loaded as PNGs from
@@ -2501,23 +1751,8 @@ void setupLvgl() {
   lv_display_set_flush_cb(disp, disp_flush_cb);
   lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_0);
 
-  // Register a touchscreen input device
-  lv_indev_t *touch_indev = lv_indev_create();
-  lv_indev_set_type(touch_indev, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_read_cb(touch_indev, touchpad_read_cb);
-  lv_indev_set_display(touch_indev, disp);
-
-  // Register keyboard input device if available
-  if (keyboard_available) {
-    lv_indev_t *kb_indev = lv_indev_create();
-    lv_indev_set_type(kb_indev, LV_INDEV_TYPE_KEYPAD);
-    lv_indev_set_read_cb(kb_indev, keyboard_read_cb);
-
-    // Connect keyboard to the default group
-    lv_indev_set_group(kb_indev, lv_group_get_default());
-
-    SLog.println("Keyboard input device registered with LVGL");
-  }
+  // Register the input devices (touch pointer + keypad when present)
+  input_ui_setup_indevs(disp);
 }
 
 // LVGL UI elements
@@ -6718,7 +5953,24 @@ void setupLuaVGL() {
   lua_register(L, "_mesh_generate_identity", lua_mesh_generate_identity);
 
   lua_register(L, "_get_battery_mv", [](lua_State *L) -> int {
-    lua_pushinteger(L, board.getBattMilliVolts());
+    lua_pushinteger(L, power_dev_battery_mv());
+    return 1;
+  });
+
+  // Device capability table for Lua (apps adapt per board; input specifics
+  // come from _input_caps in the input layer).
+  lua_register(L, "_device_caps", [](lua_State *L) -> int {
+    lua_newtable(L);
+    lua_pushstring(L, MESHPUNK_BOARD_NAME);        lua_setfield(L, -2, "name");
+    lua_pushinteger(L, display_dev_width());       lua_setfield(L, -2, "screen_w");
+    lua_pushinteger(L, display_dev_height());      lua_setfield(L, -2, "screen_h");
+    switch (audio_dev_kind()) {
+      case AUDIO_DEV_I2S:    lua_pushstring(L, "i2s");    break;
+      case AUDIO_DEV_BUZZER: lua_pushstring(L, "buzzer"); break;
+      default:               lua_pushstring(L, "none");   break;
+    }
+    lua_setfield(L, -2, "audio");
+    lua_pushboolean(L, power_dev_battery_mv() > 0);  lua_setfield(L, -2, "battery");
     return 1;
   });
 
@@ -7091,6 +6343,9 @@ void setupLuaVGL() {
   // ── Sound ──────────────────────────────────────────────────────────────────
   sound_register_lua(L);
 
+  // ── Input (keyboard/trackball/touch policy + capture + emoji keymap) ──────
+  input_ui_register_lua(L);
+
   // ── ELF module loader ─────────────────────────────────────────────────────
   elf_host_register_lua(L);
 
@@ -7099,7 +6354,7 @@ void setupLuaVGL() {
     int v = luaL_checkinteger(L, 1);
     if (v < 0) v = 0; if (v > 255) v = 255;
     kbd_brightness = (uint8_t)v;
-    setKeyboardBrightness(kbd_brightness);
+    input_dev_kbd_backlight(kbd_brightness);
     firmware_prefs_save();
     lua_pushinteger(L, kbd_brightness);
     return 1;
@@ -7111,7 +6366,7 @@ void setupLuaVGL() {
   lua_register(L, "_kbd_set_brightness_temp", [](lua_State* L) -> int {
     int v = luaL_checkinteger(L, 1);
     if (v < 0) v = 0; if (v > 255) v = 255;
-    setKeyboardBrightness((uint8_t)v);
+    input_dev_kbd_backlight((uint8_t)v);
     lua_pushinteger(L, v);
     return 1;
   });
@@ -7228,7 +6483,7 @@ void setupLuaVGL() {
     int v = luaL_checkinteger(L, 1);
     if (v < 0) v = 0; if (v > 16) v = 16;
     display_brightness = (uint8_t)v;
-    setBrightness(display_brightness);
+    display_dev_brightness(display_brightness);
     firmware_prefs_save();
     lua_pushinteger(L, display_brightness);
     return 1;
@@ -7244,7 +6499,7 @@ void setupLuaVGL() {
     if (v < 0) v = 0; if (v > 65535) v = 65535;
     screen_timeout_secs = (uint16_t)v;
     last_activity_ms = millis();
-    if (screen_timed_out) { setBrightness(display_brightness); screen_timed_out = false; }
+    if (screen_timed_out) { display_dev_brightness(display_brightness); screen_timed_out = false; }
     firmware_prefs_save();
     lua_pushinteger(L, screen_timeout_secs);
     return 1;
@@ -7258,7 +6513,7 @@ void setupLuaVGL() {
     if (v < 0) v = 0; if (v > 65535) v = 65535;
     kbd_timeout_secs = (uint16_t)v;
     last_activity_ms = millis();
-    if (kbd_timed_out) { setKeyboardBrightness(kbd_brightness); kbd_timed_out = false; }
+    if (kbd_timed_out) { input_dev_kbd_backlight(kbd_brightness); kbd_timed_out = false; }
     firmware_prefs_save();
     lua_pushinteger(L, kbd_timeout_secs);
     return 1;
@@ -7266,124 +6521,6 @@ void setupLuaVGL() {
   lua_register(L, "_kbd_timeout_get", [](lua_State* L) -> int {
     lua_pushinteger(L, kbd_timeout_secs);
     return 1;
-  });
-
-  // ── Trackball sensitivity ───────────────────────────────────────────────
-  lua_register(L, "_trackball_sensitivity_set", [](lua_State* L) -> int {
-    int v = luaL_checkinteger(L, 1);
-    if (v < 0) v = 0; if (v > 500) v = 500;
-    trackball_sensitivity_ms = (uint16_t)v;
-    firmware_prefs_save();
-    lua_pushinteger(L, trackball_sensitivity_ms);
-    return 1;
-  });
-  lua_register(L, "_trackball_sensitivity_get", [](lua_State* L) -> int {
-    lua_pushinteger(L, trackball_sensitivity_ms);
-    return 1;
-  });
-  lua_register(L, "_trackball_roll_set", [](lua_State* L) -> int {
-    int v = luaL_checkinteger(L, 1);
-    if (v < 0) v = 0; if (v > 500) v = 500;
-    trackball_roll_ms = (uint16_t)v;
-    firmware_prefs_save();
-    lua_pushinteger(L, trackball_roll_ms);
-    return 1;
-  });
-  lua_register(L, "_trackball_roll_get", [](lua_State* L) -> int {
-    lua_pushinteger(L, trackball_roll_ms);
-    return 1;
-  });
-
-  // Sym key behavior: false = hold modifier (default), true = tap toggles
-  // the symbol layer (hold still works as momentary). Persisted.
-  lua_register(L, "_kb_sym_toggle_set", [](lua_State* L) -> int {
-    kb_sym_toggle_pref = lua_toboolean(L, 1);
-    if (!kb_sym_toggle_pref) kb_sym_latched = false;
-    firmware_prefs_save();
-    return 0;
-  });
-  lua_register(L, "_kb_sym_toggle_get", [](lua_State* L) -> int {
-    lua_pushboolean(L, kb_sym_toggle_pref ? 1 : 0);
-    return 1;
-  });
-
-  // Alt key behavior: false = hold modifier (default), true = tap toggles
-  // the emoji layer (hold still works as momentary). Persisted.
-  lua_register(L, "_kb_alt_toggle_set", [](lua_State* L) -> int {
-    kb_alt_toggle_pref = lua_toboolean(L, 1);
-    if (!kb_alt_toggle_pref) kb_alt_latched = false;
-    firmware_prefs_save();
-    return 0;
-  });
-  lua_register(L, "_kb_alt_toggle_get", [](lua_State* L) -> int {
-    lua_pushboolean(L, kb_alt_toggle_pref ? 1 : 0);
-    return 1;
-  });
-
-  // Legacy ASCII keyboard mode (old keyboard-MCU firmware without raw matrix
-  // support). Live-flips the MCU mode command both directions; no reboot
-  // needed. A manual OFF also blocks the auto-switch until the next boot so
-  // detection doesn't fight the user's choice. Persisted.
-  lua_register(L, "_kb_legacy_set", [](lua_State* L) -> int {
-    bool on = lua_toboolean(L, 1);
-    if (!on) s_kb_autoswitch_done = true;
-    kb_set_legacy(on, /*save=*/true);
-    lua_pushboolean(L, kb_legacy_mode ? 1 : 0);
-    return 1;
-  });
-  lua_register(L, "_kb_legacy_get", [](lua_State* L) -> int {
-    lua_pushboolean(L, kb_legacy_mode ? 1 : 0);
-    return 1;
-  });
-
-  // Alt emoji layer keymap. Keys are identified by their normal-layer char
-  // ("a".."z", "$"); codepoints may be blob singles OR sequence PUAs.
-  lua_register(L, "_kb_emoji_get", [](lua_State* L) -> int {
-    const char *k = luaL_checkstring(L, 1);
-    uint8_t c = (uint8_t)k[0];
-    lua_pushinteger(L, (c && c < 128) ? (lua_Integer)kb_emoji_map[c] : 0);
-    return 1;
-  });
-  lua_register(L, "_kb_emoji_set", [](lua_State* L) -> int {
-    const char *k = luaL_checkstring(L, 1);
-    uint32_t cp = (uint32_t)luaL_checkinteger(L, 2);   // 0 clears the key
-    uint8_t c = (uint8_t)k[0];
-    if (!c || c >= 128) { lua_pushboolean(L, 0); return 1; }
-    kb_emoji_map[c] = cp;
-    kb_emoji_map_save();
-    lua_pushboolean(L, 1);
-    return 1;
-  });
-  lua_register(L, "_kb_emoji_reset", [](lua_State* L) -> int {
-    kb_emoji_apply_defaults();
-    LittleFS.remove("/emoji_keymap");
-    return 0;
-  });
-
-  // _emoji_popup_insert(cp) -> bool. Insert one emoji at the cursor of the
-  // textarea captured at alt+mic time (s_emoji_popup_target). Re-validates the
-  // pointer — the app underneath can rebuild its views while the popup is up —
-  // and gates on emoji_preload like the alt layer, so a stale target or an
-  // unrenderable codepoint returns false instead of emitting tofu.
-  lua_register(L, "_emoji_popup_insert", [](lua_State* L) -> int {
-    uint32_t cp = (uint32_t)luaL_checkinteger(L, 1);
-    lv_obj_t *ta = s_emoji_popup_target;
-    bool ok = cp > 0 && ta && lv_obj_is_valid(ta) &&
-              lv_obj_check_type(ta, &lv_textarea_class) && emoji_preload(cp);
-    if (ok) {
-      uint32_t packed = utf8_pack_key(cp);   // UTF-8 bytes, low byte first
-      char buf[5] = {0};
-      memcpy(buf, &packed, sizeof(packed));
-      lv_textarea_add_text(ta, buf);
-    }
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-  });
-
-  // _emoji_popup_release(): drop the captured insert target (popup closed).
-  lua_register(L, "_emoji_popup_release", [](lua_State* L) -> int {
-    s_emoji_popup_target = NULL;
-    return 0;
   });
 
   // Top bar transparency: true = the themed wallpaper shows through the status
@@ -7630,92 +6767,6 @@ void setupLuaVGL() {
     (void)L;
     lv_indev_reset(NULL, NULL);
     return 0;
-  });
-
-  // Input capture (Gamepad mapping wizard): arm, poll until a code arrives,
-  // stop to disarm. While armed keyboard_read_cb swallows ALL keyboard and
-  // trackball input and reports the first press as a driver code.
-  lua_register(L, "_input_capture_start", [](lua_State *L) -> int {
-    s_input_captured      = 0;
-    s_input_capture_armed = true;
-    return 0;
-  });
-  lua_register(L, "_input_capture_poll", [](lua_State *L) -> int {
-    if (s_input_captured) {
-      lua_pushinteger(L, (lua_Integer)s_input_captured);
-      s_input_captured = 0;
-    } else {
-      lua_pushnil(L);
-    }
-    return 1;
-  });
-  lua_register(L, "_input_capture_stop", [](lua_State *L) -> int {
-    s_input_capture_armed = false;
-    s_input_captured      = 0;
-    return 0;
-  });
-
-  lua_register(L, "_kb_is_down", [](lua_State *L) -> int {
-    int key = luaL_checkinteger(L, 1);
-    lua_pushboolean(L, key >= 0 && key < 128 && kb_key_state[key]);
-    return 1;
-  });
-
-  lua_register(L, "_kb_just_pressed", [](lua_State *L) -> int {
-    int key = luaL_checkinteger(L, 1);
-    lua_pushboolean(L, key >= 0 && key < 128 && kb_key_state[key] && !kb_key_prev[key]);
-    return 1;
-  });
-
-  lua_register(L, "_kb_just_released", [](lua_State *L) -> int {
-    int key = luaL_checkinteger(L, 1);
-    lua_pushboolean(L, key >= 0 && key < 128 && !kb_key_state[key] && kb_key_prev[key]);
-    return 1;
-  });
-
-  lua_register(L, "_kb_is_held", [](lua_State *L) -> int {
-    int key = luaL_checkinteger(L, 1);
-    bool held = false;
-    if (key >= 0 && key < 128 && kb_key_state[key] && kb_key_press_time[key] > 0) {
-      held = (millis() - kb_key_press_time[key]) > KEY_HOLD_THRESHOLD_MS;
-    }
-    lua_pushboolean(L, held);
-    return 1;
-  });
-
-  lua_register(L, "_kb_hold_duration", [](lua_State *L) -> int {
-    int key = luaL_checkinteger(L, 1);
-    if (key >= 0 && key < 128 && kb_key_state[key] && kb_key_press_time[key] > 0) {
-      lua_pushinteger(L, millis() - kb_key_press_time[key]);
-    } else {
-      lua_pushinteger(L, 0);
-    }
-    return 1;
-  });
-
-  lua_register(L, "_kb_shift", [](lua_State *L) -> int {
-    lua_pushboolean(L, kb_shift_active);
-    return 1;
-  });
-
-  lua_register(L, "_kb_lshift", [](lua_State *L) -> int {
-    lua_pushboolean(L, kb_lshift_active);
-    return 1;
-  });
-
-  lua_register(L, "_kb_rshift", [](lua_State *L) -> int {
-    lua_pushboolean(L, kb_rshift_active);
-    return 1;
-  });
-
-  lua_register(L, "_kb_sym", [](lua_State *L) -> int {
-    lua_pushboolean(L, kb_sym_active);
-    return 1;
-  });
-
-  lua_register(L, "_kb_alt", [](lua_State *L) -> int {
-    lua_pushboolean(L, kb_alt_active);
-    return 1;
   });
 
   lua_register(L, "_obj_move_foreground", [](lua_State *L) -> int {
@@ -8048,8 +7099,8 @@ void setupLuaVGL() {
   // so this is a no-op there.
   if (s_pack_extract_pending) {
     s_pack_extract_pending = false;
-    pinMode(BOARD_BL_PIN, OUTPUT);
-    setBrightness(display_brightness);
+    display_dev_backlight_init();
+    display_dev_brightness(display_brightness);
 
     s_pack_splash_label = lv_label_create(lv_scr_act());
     lv_obj_set_style_text_align(s_pack_splash_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -8311,41 +7362,30 @@ void setup() {
               (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
               (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
 
-  // Connect trackball / home button
-  pinMode(TDECK_TRACKBALL_CLICK, INPUT_PULLUP);
-  attachInterrupt(TDECK_TRACKBALL_CLICK, ISR_click, FALLING);
+  // Input pins + ISRs that need no bus/peripheral power (board input backend),
+  // and the input layer's prefs-save hook (same pattern as sound_init).
+  input_dev_preinit();
+  input_ui_init(firmware_prefs_save);
 
-  // The board peripheral power control pin needs to be set to HIGH when using
-  // the peripheral
-  pinMode(BOARD_POWERON, OUTPUT);
-  digitalWrite(BOARD_POWERON, HIGH);
+  // Peripheral power rail (board power backend)
+  power_dev_init();
 
   // Kick off one-shot GPS time sync; gps_sync_poll() runs it to completion in loop().
   gps_sync_begin();
 
   // Set CS on all SPI buses to high level during initialization
-  pinMode(BOARD_SDCARD_CS, OUTPUT);
-  pinMode(RADIO_CS_PIN, OUTPUT);
-  pinMode(BOARD_TFT_CS, OUTPUT);
+  pinMode(PIN_SD_CS, OUTPUT);
+  pinMode(PIN_LORA_CS, OUTPUT);
+  pinMode(PIN_TFT_CS, OUTPUT);
 
-  digitalWrite(BOARD_SDCARD_CS, HIGH);
-  digitalWrite(RADIO_CS_PIN, HIGH);
-  digitalWrite(BOARD_TFT_CS, HIGH);
+  digitalWrite(PIN_SD_CS, HIGH);
+  digitalWrite(PIN_LORA_CS, HIGH);
+  digitalWrite(PIN_TFT_CS, HIGH);
 
-  pinMode(BOARD_SPI_MISO, INPUT_PULLUP);
-  SPI.begin(BOARD_SPI_SCK, BOARD_SPI_MISO, BOARD_SPI_MOSI); // SD
+  pinMode(PIN_SPI_MISO, INPUT_PULLUP);
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI); // SD
 
-  pinMode(BOARD_BOOT_PIN, INPUT_PULLUP);
-  pinMode(BOARD_TBOX_G02, INPUT_PULLUP);
-  pinMode(BOARD_TBOX_G01, INPUT_PULLUP);
-  pinMode(BOARD_TBOX_G04, INPUT_PULLUP);
-  pinMode(BOARD_TBOX_G03, INPUT_PULLUP);
-
-  // Attach trackball direction interrupts
-  attachInterrupt(TDECK_TRACKBALL_UP,    ISR_trackball_up,    FALLING);
-  attachInterrupt(TDECK_TRACKBALL_DOWN,  ISR_trackball_down,  FALLING);
-  attachInterrupt(TDECK_TRACKBALL_LEFT,  ISR_trackball_left,  FALLING);
-  attachInterrupt(TDECK_TRACKBALL_RIGHT, ISR_trackball_right, FALLING);
+  pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
 
   SLog.println("Initializing display");
 
@@ -8377,7 +7417,7 @@ void setup() {
     // Load firmware preferences (tz, use_sd, clock_fmt)
     firmware_prefs_load();
     // Alt emoji layer per-key map (defaults + /emoji_keymap overrides)
-    kb_emoji_map_load();
+    input_ui_emoji_map_load();
     // Push the selection-highlight preferences into the live theme (the theme is
     // already inited; Lua applies the palette later and re-reads these).
     lv_theme_meshpunk_set_focus_solid(theme_focus_solid);
@@ -8482,59 +7522,12 @@ void setup() {
   }
   log_boot_mem("after wifi");
 
-  // Set touch int input
-  pinMode(BOARD_TOUCH_INT, INPUT);
-  delay(20);
-
-  SLog.println("Initializing GT911 touch sensor");
-
-  Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
-
-
-  touch.setPins(-1, BOARD_TOUCH_INT);
-  if (!touch.begin(Wire, GT911_SLAVE_ADDRESS_L)) {
-    while (1) {
-      SLog.println("Failed to find GT911 - check your wiring!");
-      delay(1000);
-    }
-  }
-
-  // Set touch max xy
-  touch.setMaxCoordinates(320, 240);
-
-  // Set swap xy
-  touch.setSwapXY(true);
-
-  // Set mirror xy
-  touch.setMirrorXY(false, true);
-  touch.setInterruptMode(LOW_LEVEL_QUERY);
-
-  // Initialize keyboard
-  Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
-  if (Wire.endTransmission() == 0) {
-    keyboard_available = true;
-    SLog.println("T-Deck keyboard found!");
-
-    // Set initial keyboard brightness
-    setKeyboardDefaultBrightness(127);
-    setKeyboardBrightness(kbd_brightness);
-
-    // Switch keyboard to raw matrix mode for hold detection — unless legacy
-    // ASCII mode is persisted (old keyboard-MCU firmware without raw-mode
-    // support; the KEY command is a no-op there and forces the single-byte
-    // protocol on newer firmware so both behave identically).
-    Wire.beginTransmission(LILYGO_KB_SLAVE_ADDRESS);
-    Wire.write(kb_legacy_mode ? LILYGO_KB_MODE_KEY_CMD : LILYGO_KB_MODE_RAW_CMD);
-    Wire.endTransmission();
-    SLog.printf("Keyboard switched to %s mode\n",
-                kb_legacy_mode ? "legacy ASCII" : "raw matrix");
-  } else {
-    SLog.println("T-Deck keyboard not found!");
-  }
+  // I2C bus + touch controller + keyboard probe/mode (board input backend);
+  // kbd_brightness is the persisted backlight level applied on probe success.
+  input_dev_init(kbd_brightness);
 
   // Initialize I2S audio output on T-Deck speaker
-  audio = new Audio();
-  audio->setPinout(TDECK_I2S_BCK, TDECK_I2S_WS, TDECK_I2S_DOUT);
+  audio = audio_dev_init();
   sound_init(audio, firmware_prefs_save);
   usb_manager_init(firmware_prefs_save);   // USB audio route/speaker prefs persist here
   notify_init();   // pre-render the melody + pre-alloc the notification log
@@ -8621,9 +7614,7 @@ void setup() {
 
   //Initialize the disply only after all other spi bus setup is finished
   SLog.println("Initialize display");
-  tft.begin();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
+  display_dev_init();
 
   // LVGL tick function
   lvgl_ticker.attach_ms(5, []() {
@@ -8669,8 +7660,8 @@ void setup() {
 
 
   // Adjust backlight
-  pinMode(BOARD_BL_PIN, OUTPUT);
-  setBrightness(display_brightness);
+  display_dev_backlight_init();
+  display_dev_brightness(display_brightness);
   last_activity_ms = millis();
 
   // Start BLE companion interface before spawning mesh task, since
@@ -8750,8 +7741,7 @@ static void drain_rx_events() {
 // press is dropped — the melody/blink already announce notifications
 // mid-module, and the store is reviewed after the run.
 static void dispatch_topbar_shortcut() {
-  if (!s_topbar_shortcut_pending) return;
-  s_topbar_shortcut_pending = false;
+  if (!input_ui_take_topbar_shortcut()) return;
   if (!L) return;
   lua_getglobal(L, "require");
   lua_pushstring(L, "lib/topbar");
@@ -8769,8 +7759,7 @@ static void dispatch_topbar_shortcut() {
 // any parentless popups, then go_home). Same deferral as the shortcuts above;
 // during ELF runs L is NULL and the hold is the ELF host's own exit chord.
 static void dispatch_home_shortcut() {
-  if (!s_home_shortcut_pending) return;
-  s_home_shortcut_pending = false;
+  if (!input_ui_take_home_shortcut()) return;
   if (!L) return;
   lua_getglobal(L, "require");
   lua_pushstring(L, "lib/apps");
@@ -8784,13 +7773,13 @@ static void dispatch_home_shortcut() {
   }
 }
 
-// Auto-enable legacy ASCII keyboard mode when the detection heuristic in
-// keyboard_read_cb flagged old keyboard-MCU firmware. Runs here so the prefs
-// flash write happens outside LVGL indev processing.
+// Auto-enable legacy ASCII keyboard mode when the backend's detection
+// heuristic (input_tdeck.cpp, run from the UI keyboard poll) flagged old
+// keyboard-MCU firmware. Runs here so the prefs flash write happens outside
+// LVGL indev processing.
 static void dispatch_kb_legacy_autoswitch() {
-  if (!s_kb_legacy_autoswitch_pending) return;
-  s_kb_legacy_autoswitch_pending = false;
-  kb_set_legacy(true, /*save=*/true);
+  if (!input_dev_kbd_legacy_autoswitch_pending()) return;
+  input_ui_set_legacy(true, /*save=*/true);
   notify_post("Old keyboard firmware detected - compatibility mode enabled: "
               "keys register one at a time, key combos and holds won't work "
               "(restart device to exit games). Toggle in Settings > Device");
@@ -8813,8 +7802,7 @@ static void dispatch_kb_legacy_autoswitch() {
 // Dispatch the alt+mic emoji-popup shortcut into Lua (lib/emoji_popup
 // .on_shortcut). Same deferral as dispatch_topbar_shortcut above.
 static void dispatch_emoji_popup() {
-  if (!s_emoji_popup_pending) return;
-  s_emoji_popup_pending = false;
+  if (!input_ui_take_emoji_popup()) return;
   if (!L) return;
   lua_getglobal(L, "require");
   lua_pushstring(L, "lib/emoji_popup");
@@ -8884,13 +7872,13 @@ void loop() {
   // ── Inactivity timeouts ─────────────────────────────────────────────────
   if (screen_timeout_secs > 0 && !screen_timed_out) {
     if (millis() - last_activity_ms > (uint32_t)screen_timeout_secs * 1000UL) {
-      setBrightness(0);
+      display_dev_brightness(0);
       screen_timed_out = true;
     }
   }
   if (kbd_timeout_secs > 0 && !kbd_timed_out) {
     if (millis() - last_activity_ms > (uint32_t)kbd_timeout_secs * 1000UL) {
-      setKeyboardBrightness(0);
+      input_dev_kbd_backlight(0);
       kbd_timed_out = true;
     }
   }

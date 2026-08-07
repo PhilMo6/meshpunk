@@ -6,6 +6,7 @@
 #include "meshpunk_sync.h"
 #include "punk_ble_interface.h"
 #include "meshpunk_fs.h"   // mp_littlefs_df — correct L: size (LittleFS.*Bytes() clobber)
+#include "power/power_dev.h"   // battery read (single firmware-wide path)
 #include <BLEDevice.h>
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
@@ -293,7 +294,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     // reference's UserData FS); SD is not reported here. usedBytes() walks
     // the whole partition (~600ms on 6MB, measured on hw) so it's cached
     // for 30s; totalBytes is constant after mount.
-    uint16_t batt_mv = analogReadMilliVolts(PIN_VBAT_READ) * 2;
+    uint16_t batt_mv = power_dev_battery_mv();
     static uint32_t cached_used_kb = 0, cached_total_kb = 0;
     static uint32_t storage_cache_ms = 0;
     if (cached_total_kb == 0 || millis() - storage_cache_ms > 30000) {
@@ -884,7 +885,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
 
   // ── Telemetry request (self) ────────────────────────────────────
   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len == 4) {
-    uint16_t batt_mv = analogReadMilliVolts(PIN_VBAT_READ) * 2;
+    uint16_t batt_mv = power_dev_battery_mv();
     CayenneLPP telemetry(51);
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)batt_mv / 1000.0f);
@@ -1101,7 +1102,7 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
       int i = 0;
       out_frame[i++] = RESP_CODE_STATS;
       out_frame[i++] = STATS_TYPE_CORE;
-      uint16_t battery_mv = analogReadMilliVolts(PIN_VBAT_READ) * 2;
+      uint16_t battery_mv = power_dev_battery_mv();
       uint32_t uptime_secs = millis() / 1000;
       uint16_t err_flags = _mesh.getErrorFlags();
       uint8_t queue_len = _mesh.getQueueLength();

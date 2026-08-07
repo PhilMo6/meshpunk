@@ -25,9 +25,11 @@
 #include "sound.h"
 #include "meshpunk_sync.h"
 
-// Host accessors implemented in main.cpp (the pref/backlight globals are
-// file-static there).
-extern void    setKeyboardBrightness(uint8_t value);
+// Keyboard backlight commands live in the board input backend.
+#include "input/input_dev.h"
+
+// Host accessors implemented in main.cpp (the pref globals are file-static
+// there).
 extern bool    firmware_notify_kbd_enabled();
 extern bool    firmware_notify_sound_enabled();
 extern uint8_t firmware_kbd_brightness();
@@ -132,11 +134,11 @@ void notify_tick() {
     if ((int32_t)(now - s_blink_next_ms) < 0) return;
     s_blink_step++;
     if (s_blink_step > s_blink_steps) {
-        setKeyboardBrightness(s_blink_restore);
+        input_dev_kbd_backlight(s_blink_restore);
         s_blink_active = false;
         return;
     }
-    setKeyboardBrightness((s_blink_step % 2 == 1) ? 255 : 0);
+    input_dev_kbd_backlight((s_blink_step % 2 == 1) ? 255 : 0);
     s_blink_next_ms = now + BLINK_STEP_MS;
 }
 
