@@ -73,7 +73,7 @@ MeshPunk can also be installed through [bmorcelli's Launcher](https://github.com
 
 Notes:
 
-- The MeshPunk app carries its own files and populates its filesystem by itself, so no SPIFFS copy options or extra steps are needed in the Launcher.
+- The MeshPunk app carries its own files and populates its filesystem by itself, so no extra steps are needed in the Launcher. Launcher 2.7.x may ask whether to copy SPIFFS during the install — either answer works.
 - `-firmware.bin` (the bare app) also installs through the Launcher — MeshPunk creates its own data partition if none exists. `-launcher.bin` is preferred since it declares the partition layout up front.
 - Don't install the `-merged.bin` through the Launcher; that one is a full-flash image for the web flasher.
 - Works with Launcher 2.7.2 and newer.

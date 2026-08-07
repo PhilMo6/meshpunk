@@ -27,21 +27,30 @@ def git_version(project_dir):
 RELEASES_DIR_NAME = "releases"
 
 # Launcher build (bmorcelli/Launcher): a merged image of bootloader + table +
-# the RELEASE app only. The release app embeds the data/ tree (MESHPUNK_EMBED_PACK)
-# and extracts it into LittleFS on first boot, so no filesystem payload ships in
-# the image. The table still declares the data partition so the Launcher creates
-# it: the entry's offset lies beyond the end of the file, which every Launcher
-# version treats as "create the partition, copy nothing". Launcher <=2.7.2
-# ignores the label and creates "spiffs" (declared > 5 MB -> fill-remaining;
-# <= 5 MB would get a 1 MB partition, too small for extraction - keep the csv
-# spiffs partition above 5 MB). Launcher >2.7.2 honors the "assets" label and
-# creates it at the exact declared size. The firmware mounts "spiffs" first,
-# then falls back to "assets", covering both generations. NOTE: do NOT relabel
-# this "spiffs" -- that name collides with the Launcher's own reserved spiffs
-# handling and yields a 0-size partition (block_count 0 -> divide-by-zero in
-# lfs_alloc on first write). The df/size mismatch this used to cause is fixed in
-# firmware instead (see _fs_df / g_lfs_mount_label).
-LAUNCHER_FS_THRESHOLD = 0x500000  # Launcher's LAUNCHER_DEFAULT_SPIFFS_THRESHOLD
+# the RELEASE app + the littlefs payload. The table declares the data partition
+# as "assets"; the Launcher creates it and copies the payload.
+#
+# Data partition sizing is version-dependent (Launcher src/sd_functions.cpp,
+# updateFromSD):
+#   2.8.0+   an entry that carries a payload, whose label is not "spiffs", and
+#            whose declared size exceeds LAUNCHER_DEFAULT_SPIFFS_SIZE (0x70000
+#            on >4 MB flash) gets the EXACT declared size. An entry with no
+#            payload in the file gets LAUNCHER_DEFAULT_SPIFFS_SIZE instead
+#            (sdPartitionIsEmpty short-circuit), which is why the littlefs image
+#            must ship inside this file.
+#   <=2.7.2  the label is ignored; declared > 5 MB fills the remaining flash,
+#            <= 5 MB gets a 1 MB partition (too small) - keep the csv partition
+#            above 5 MB. These versions have no littlefs superblock patch, so
+#            the partition/image size mismatch leaves the fs unmountable and the
+#            firmware reformats it; the app's embedded pack (MESHPUNK_EMBED_PACK)
+#            then repopulates it on first boot.
+#
+# The firmware mounts "spiffs" first, then falls back to "assets", covering both
+# generations. Do NOT relabel this "spiffs": the Launcher reserves that name --
+# 2.8.0 excludes it from the exact-size path and gates its copy behind the
+# askSpiffs prompt, and on 2.7.2 it yielded a 0-size partition (block_count 0 ->
+# divide-by-zero in lfs_alloc on first write).
+LAUNCHER_FS_THRESHOLD = 0x500000  # Launcher <=2.7.2 LAUNCHER_DEFAULT_SPIFFS_THRESHOLD
 
 def build_launcher_partition_table(fs_size):
     # ESP32 partition table: 32-byte entries (magic 0x50AA, type, subtype,
@@ -137,8 +146,8 @@ def merge_bin(source, target, env):
     # ---- Launcher build (bmorcelli/Launcher) ----------------------------------
     # Launcher installs a MERGED image, NOT an app-only bin: it reads the
     # partition table at file offset 0x8000, creates the partitions it declares,
-    # and copies the payloads that exist in the file. No filesystem payload here
-    # -- see the note at the constants above.
+    # and copies the payloads that exist in the file. The declared size must
+    # equal the littlefs image size -- see the note at the constants above.
     fs_size = os.path.getsize(bins["littlefs"])
     if fs_size <= LAUNCHER_FS_THRESHOLD:
         print("merge_bin: WARNING: declared fs %.1f MB is <= 5 MB; Launcher"
@@ -162,10 +171,14 @@ def merge_bin(source, target, env):
         OFFSETS["bootloader"], bins["bootloader"],
         OFFSETS["partitions"], launcher_table,
         OFFSETS["firmware"],   bins["firmware"],
+        OFFSETS["littlefs"],   bins["littlefs"],
     ]
     print("merge_bin: creating Launcher image %s" % launcher_img)
     subprocess.check_call(launcher_cmd)
-    print("merge_bin: Launcher image done (users install THIS file via Launcher)")
+    print("merge_bin: Launcher image done, %.1f MB incl. %.1f MB fs payload"
+          " (users install THIS file via Launcher)"
+          % (os.path.getsize(launcher_img) / (1024.0 * 1024.0),
+             fs_size / (1024.0 * 1024.0)))
 
     print("merge_bin: done")
 
