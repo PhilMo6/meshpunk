@@ -201,6 +201,14 @@ For full function, the keyboard MCU can be reflashed with [LilyGo's keyboard fir
 
 Tools → USB Drive shares the SD card with a PC: plug the device into the PC, press **Start sharing**, and it appears as a removable USB drive (~1 MB/s — the chip's USB is full-speed). While sharing, the PC owns the card exclusively: apps lose the SD drive and the mesh radio pauses. Eject the drive on the PC, then press **Stop** (or just leave the app) — the card remounts and the mesh resumes. Internal files can be shared by copying them to SD in Tools → Files first. After a drive session, USB **host** mode (Tools → USB Host) needs a reboot.
 
+### Freeing up RAM
+
+Games and emulators need a single large block of free memory, so a launch can fail even when total free memory looks like plenty — it is fragmented by whatever ran before. When a launch fails with a low-RAM notification:
+
+1. **Restart and launch it again before opening anything else.** A fresh boot gives the largest unbroken block, and this fixes most launch failures on its own.
+2. **Launch the game first, do everything else after.** Map tiles, long Messenger chats and Music leave memory broken up behind them.
+3. If it still won't launch, switch off what you aren't using — each frees a modest amount: **WiFi** and the **BLE companion** (Settings → Wireless), and **USB host mode** (Tools → USB Host → Stop; its own memory use is small, but it runs background tasks while on).
+
 ## Usage
 
 The example loads the `launcher.lua` script from the filesystem and displays a simple launcher UI. You can edit the Lua scripts in your IDE with proper syntax highlighting and then upload just the filesystem to quickly iterate on your UI design.

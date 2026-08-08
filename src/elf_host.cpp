@@ -2100,16 +2100,19 @@ int elf_host_run_pending(void) {
     if (!mod || result != 0) {
         const char* base = strrchr(path, '/');
         base = base ? base + 1 : path;
-        char msg[160];
+        char msg[192];   // == NOTIFY_LOG_TEXT_MAX (notify.cpp truncates above it)
         if (!mod) {
             snprintf(msg, sizeof(msg),
-                     "App launch failed: %s didn't load (PSRAM largest %uKB)",
+                     "App launch failed: %s didn't load - low RAM "
+                     "(PSRAM largest %uKB). Restart and try again; if it keeps "
+                     "failing see Read Me > Freeing up RAM.",
                      base,
                      (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
         } else if (result == -2) {
             snprintf(msg, sizeof(msg),
-                     "App launch failed: not enough internal RAM for %s "
-                     "(largest %uKB). USB host mode uses RAM - try Stop USB.",
+                     "App launch failed: not enough free RAM for %s "
+                     "(largest block %uKB). Restart and try again; if it keeps "
+                     "failing see Read Me > Freeing up RAM.",
                      base,
                      (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
         } else if (result == -1) {
