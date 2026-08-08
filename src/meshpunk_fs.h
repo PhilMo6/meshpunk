@@ -57,8 +57,8 @@ const char* meshpunk_parse_drive(const char* path, MpDrive* drive, bool default_
 // Do NOT use LittleFS.totalBytes()/usedBytes() for this: the Arduino wrapper
 // resolves them by its stored partitionLabel_, which the LVGL esp-littlefs
 // driver silently overwrites to the default "spiffs" via a bare LittleFS.begin().
-// On Launcher installs the FS is mounted under the "assets" label, so those
-// calls then query the wrong label and return 0. This queries esp_littlefs_info()
+// The FS is mounted under the "assets" label, so those calls then query the
+// wrong label and return 0. This queries esp_littlefs_info()
 // by the label we actually mounted under (g_lfs_mount_label), which resolves by
 // the real partition label and is immune to that clobber. Returns false and
 // leaves *total/*used untouched if the query fails.

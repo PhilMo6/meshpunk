@@ -45,11 +45,14 @@ RELEASES_DIR_NAME = "releases"
 #            firmware reformats it; the app's embedded pack (MESHPUNK_EMBED_PACK)
 #            then repopulates it on first boot.
 #
-# The firmware mounts "spiffs" first, then falls back to "assets", covering both
-# generations. Do NOT relabel this "spiffs": the Launcher reserves that name --
-# 2.8.0 excludes it from the exact-size path and gates its copy behind the
-# askSpiffs prompt, and on 2.7.2 it yielded a 0-size partition (block_count 0 ->
-# divide-by-zero in lfs_alloc on first write).
+# This label matches the one in meshpunk_custom_16Mb.csv, so Launcher and direct
+# flashes land on the same partition name; the firmware only falls back to
+# "spiffs" on tables written before that rename. Do NOT relabel this "spiffs":
+# the Launcher reserves that name -- 2.8.0 excludes it from the exact-size path
+# and gates its copy behind the askSpiffs prompt, and on 2.7.2 it yielded a
+# 0-size partition (block_count 0 -> divide-by-zero in lfs_alloc on first write).
+# It is also the ESP32 default name, so on a multi-firmware device it can belong
+# to another firmware entirely.
 LAUNCHER_FS_THRESHOLD = 0x500000  # Launcher <=2.7.2 LAUNCHER_DEFAULT_SPIFFS_THRESHOLD
 
 def build_launcher_partition_table(fs_size):

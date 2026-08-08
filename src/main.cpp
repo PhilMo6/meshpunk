@@ -1240,11 +1240,12 @@ lua_State *L = NULL;
 // Filesystem variables
 bool fs_mounted = false;
 bool sd_mounted = false;
-// Label LittleFS actually mounted under: "spiffs" on direct/CSV flashes,
-// "assets" on Launcher installs (merge_bin.py declares that label). Internal
-// size queries MUST use this, not the Arduino LittleFS wrapper's stored label
-// (which the LVGL esp-littlefs driver clobbers to "spiffs"). See mp_littlefs_df.
-const char* g_lfs_mount_label = "spiffs";
+// Label LittleFS actually mounted under: "assets" on current builds (both the
+// CSV and merge_bin.py declare that label), "spiffs" only on devices whose
+// partition table predates the rename. Internal size queries MUST use this, not
+// the Arduino LittleFS wrapper's stored label (which the LVGL esp-littlefs
+// driver clobbers to "spiffs"). See mp_littlefs_df.
+const char* g_lfs_mount_label = "assets";
 
 
 // sd_spi_take() / sd_spi_release() — mutex-based.
@@ -4449,13 +4450,14 @@ static bool pack_needs_extract() {
 }
 
 // Create a data partition when the table has none. Launcher 2.7.2 OTA installs
-// copy only the app, leaving the device without any spiffs partition; without
-// one there is nowhere to extract the pack. This appends a "spiffs" entry into
-// the free flash after the last used partition (same 0x8000 table write the
+// copy only the app, leaving the device without any data partition; without one
+// there is nowhere to extract the pack. This appends an "assets" entry into the
+// free flash after the last used partition (same 0x8000 table write the
 // Launcher itself performs), fixes up the table's MD5 entry, and reboots so the
 // bootloader and esp_partition see the new table. Hard guards: only runs when
 // NO spiffs/littlefs data partition exists, never moves or resizes existing
-// entries, and aborts on anything unexpected.
+// entries, and aborts on anything unexpected. Note the guard is by subtype, so
+// a data partition belonging to another firmware also suppresses this.
 static void ensure_data_partition() {
   if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL))
     return;
@@ -4516,7 +4518,7 @@ static void ensure_data_partition() {
   ne[3] = 0x82;  // subtype: spiffs
   memcpy(ne + 4, &part_off, 4);
   memcpy(ne + 8, &part_size, 4);
-  memcpy(ne + 12, "spiffs", 6);
+  memcpy(ne + 12, "assets", 6);
 
   if (md5_at >= 0) {
     int md5_new = insert_at + 32;
@@ -4530,7 +4532,7 @@ static void ensure_data_partition() {
     MD5Final(m + 16, &md5ctx);
   }
 
-  SLog.printf("[PART] adding spiffs partition at 0x%06X size 0x%06X, rebooting\n",
+  SLog.printf("[PART] adding assets partition at 0x%06X size 0x%06X, rebooting\n",
               (unsigned)part_off, (unsigned)part_size);
   if (esp_flash_erase_region(NULL, 0x8000, 0x1000) != ESP_OK) {
     SLog.println("[PART] table erase failed");
@@ -7389,17 +7391,24 @@ void setup() {
 
   SLog.println("Initializing display");
 
-  // Initialize filesystem. Normal builds use the partition labeled "spiffs"
-  // (the begin() default); installs via bmorcelli's Launcher create the data
-  // partition labeled "assets" (its exact-size install path), so fall back.
+  // Initialize filesystem. Both the CSV and merge_bin.py declare our data
+  // partition as "assets"; "spiffs" is only reached on devices whose partition
+  // table predates that rename (an app-only update does not rewrite the table).
+  // Select on which PARTITION EXISTS, never on which mount succeeds: "spiffs"
+  // is the ESP32 default name, so on a multi-firmware device it can belong to
+  // another firmware, and mounting with format-on-fail would erase its data.
 #ifdef MESHPUNK_EMBED_PACK
   ensure_data_partition();  // reboots if it had to create one
 #endif
-  bool fs_on_spiffs = LittleFS.begin(true);
-  if (!fs_on_spiffs) SLog.println("LittleFS: no \"spiffs\" partition, trying \"assets\" (Launcher install)");
-  if (fs_on_spiffs || LittleFS.begin(true, "/littlefs", 10, "assets")) {
+  const bool have_assets =
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "assets") ||
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x83, "assets");
+  if (!have_assets)
+    SLog.println("LittleFS: no \"assets\" partition, using legacy \"spiffs\" (pre-rename table)");
+  const char* fs_label = have_assets ? "assets" : "spiffs";
+  if (LittleFS.begin(true, "/littlefs", 10, fs_label)) {
     fs_mounted = true;
-    g_lfs_mount_label = fs_on_spiffs ? "spiffs" : "assets";
+    g_lfs_mount_label = fs_label;
     SLog.printf("LittleFS mounted successfully (label: %s)\n", g_lfs_mount_label);
 #ifdef MESHPUNK_EMBED_PACK
     // Fresh/wiped filesystem or a firmware update with new bundled files: the
