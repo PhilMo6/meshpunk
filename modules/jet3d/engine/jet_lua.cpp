@@ -15,6 +15,7 @@
 #include "jet_lua.h"
 #include "jet_overlay.h"
 #include "jet_audio.h"
+#include "music/jet_music.h"
 #include "jet_mesh.h"
 #include "jet_terrain.h"
 
@@ -1876,6 +1877,58 @@ static int snd_tone(lua_State* Ls) {
     return 1;
 }
 
+// jet.sound.fx(freq, ms [, opts]) -> voice
+//   opts: to (sweep target Hz), volume, wave, attack (ms), decay (ms),
+//         buzz (harsher waveform), hold (sustain until stop)
+// The shaped one-shot: attack, decay and an optional pitch sweep. A flat tone
+// that starts and stops at full level is what makes a beep sound cheap, so
+// game sounds should come through here rather than through tone().
+static int snd_fx(lua_State* Ls) {
+    jet_fx_t fx;
+    fx.freq      = (float)luaL_checknumber(Ls, 1);
+    fx.ms        = (int)luaL_checkinteger(Ls, 2);
+    fx.freq_to   = (float)optField(Ls, 3, "to", 0.0);
+    fx.volume    = (float)optField(Ls, 3, "volume", 1.0);
+    fx.wave      = (int)optField(Ls, 3, "wave", JET_WAVE_SQUARE);
+    fx.attack_ms = (int)optField(Ls, 3, "attack", -1.0);
+    fx.decay_ms  = (int)optField(Ls, 3, "decay", -1.0);
+    fx.buzz      = optFieldBool(Ls, 3, "buzz", 0);
+    fx.hold      = optFieldBool(Ls, 3, "hold", 0);
+    fx.vib_hz    = (float)optField(Ls, 3, "vib", 0.0);
+    fx.vib_depth = (float)optField(Ls, 3, "vibdepth", 0.0);
+    fx.vib_steps = (int)optField(Ls, 3, "vibsteps", 0.0);
+    fx.trem_depth = (float)optField(Ls, 3, "tremdepth", 0.0);
+    fx.poles      = (int)optField(Ls, 3, "poles", 1.0);
+    const int v = jet_audio_fx(&fx);
+    if (v < 0) { lua_pushnil(Ls); return 1; }
+    lua_pushinteger(Ls, v);
+    return 1;
+}
+
+// jet.sound.hold(freq [, {volume=, wave=}]) -> voice
+// A tone that sustains until stop(), steerable with set() — the engine note
+// case. A fixed-length tone retriggered every frame restarts its oscillator
+// phase, which clicks at the frame rate.
+static int snd_hold(lua_State* Ls) {
+    const int v = jet_audio_tone_hold((float)luaL_checknumber(Ls, 1),
+                                      (float)optField(Ls, 2, "volume", 1.0),
+                                      (int)optField(Ls, 2, "wave",
+                                                    JET_WAVE_SQUARE));
+    lua_pushinteger(Ls, v);
+    return 1;
+}
+
+// jet.sound.set(voice [, freq] [, volume]) — retune/re-level a LIVE voice
+// without restarting it. Omit freq (or pass <= 0) to change level only; omit
+// volume to change pitch only. A stale voice id is ignored.
+static int snd_set(lua_State* Ls) {
+    const int voice = (int)luaL_checkinteger(Ls, 1);
+    const float freq = (float)luaL_optnumber(Ls, 2, 0.0);
+    const float vol  = (float)luaL_optnumber(Ls, 3, -1.0);
+    jet_audio_voice_set(voice, freq, vol);
+    return 0;
+}
+
 static int snd_stop(lua_State* Ls) {
     jet_audio_stop((int)luaL_checkinteger(Ls, 1));
     return 0;
@@ -1893,10 +1946,50 @@ static int snd_active(lua_State* Ls) {
     return 1;
 }
 
+// --- music (OPL FM synth, see music/jet_music.h) ---------------------------
+
+// Prefers the pre-rendered PCM loop beside the MIDI; see
+// jet_music_play_file. The device never synthesises music.
+static int mus_play(lua_State* Ls) {
+    const char* path = luaL_checkstring(Ls, 1);
+    const int loop = lua_isnone(Ls, 2) ? 1 : lua_toboolean(Ls, 2);
+    lua_pushboolean(Ls, jet_music_play_file(path, loop));
+    return 1;
+}
+
+static int mus_stop(lua_State* Ls) { (void)Ls; jet_music_stop(); return 0; }
+
+static int mus_pause(lua_State* Ls) {
+    jet_music_pause(lua_toboolean(Ls, 1));
+    return 0;
+}
+
+static int mus_volume(lua_State* Ls) {
+    jet_music_volume((float)luaL_checknumber(Ls, 1));
+    return 0;
+}
+
+static int mus_playing(lua_State* Ls) {
+    lua_pushboolean(Ls, jet_music_playing());
+    return 1;
+}
+
+static const luaL_Reg music_funcs[] = {
+    { "play",    mus_play    },
+    { "stop",    mus_stop    },
+    { "pause",   mus_pause   },
+    { "volume",  mus_volume  },
+    { "playing", mus_playing },
+    { nullptr, nullptr }
+};
+
 static const luaL_Reg sound_funcs[] = {
     { "load",    snd_load    },
     { "play",    snd_play    },
     { "tone",    snd_tone    },
+    { "fx",      snd_fx      },
+    { "hold",    snd_hold    },
+    { "set",     snd_set     },
     { "stop",    snd_stop    },
     { "stopall", snd_stopall },
     { "volume",  snd_volume  },
@@ -3381,6 +3474,7 @@ static void registerAPI(lua_State* Ls) {
     newSubTable(Ls, "input",  input_funcs);
     newSubTable(Ls, "timer",  timer_funcs);
     newSubTable(Ls, "sound",  sound_funcs);
+    newSubTable(Ls, "music",  music_funcs);
 
     // Sample rate clips must be authored at, exposed so a game can assert it.
     lua_getfield(Ls, -1, "sound");
@@ -3391,6 +3485,10 @@ static void registerAPI(lua_State* Ls) {
     setIntField(Ls, "SQUARE",   JET_WAVE_SQUARE);
     setIntField(Ls, "NOISE",    JET_WAVE_NOISE);
     setIntField(Ls, "TRIANGLE", JET_WAVE_TRIANGLE);
+    setIntField(Ls, "SAW",      JET_WAVE_SAW);
+    setIntField(Ls, "TILTSAW",  JET_WAVE_TILTSAW);
+    setIntField(Ls, "PULSE",    JET_WAVE_PULSE);
+    setIntField(Ls, "ORGAN",    JET_WAVE_ORGAN);
 
     // Shading modes
     setIntField(Ls, "FLAT",      (lua_Integer)ShadingMode::FLAT);

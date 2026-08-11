@@ -95,6 +95,16 @@ $cpp_sources += (Get-Item "ctors_end.cpp").FullName
 
 $c_sources = @(Get-ChildItem "$LUA\*.c" | ForEach-Object { $_.FullName })
 
+# The OPL music stack (engine/music) is carried-in C from the doom module. It
+# is compiled with its own flags: compat/ FIRST on the include path so the
+# Doom headers those files include resolve to our stand-ins, and WITHOUT the
+# forced lua_out.h, which has nothing to do with it.
+$music_sources = @(Get-ChildItem "engine\music\*.c" | ForEach-Object { $_.FullName })
+$MUSICFLAGS = $COMMON + @(
+    "-Iengine\music\compat", "-Iengine\music", "-Iengine",
+    "-Wno-unused-variable", "-Wno-unused-but-set-variable"
+)
+
 $obj_dir = "obj"
 if (-not (Test-Path $obj_dir)) { New-Item -ItemType Directory $obj_dir | Out-Null }
 
@@ -113,7 +123,12 @@ $newest_header = if ($headers) {
 $objects = @()
 $failed = $false
 
-function Compile-One($src, $isCpp) {
+# NOTE: the override parameter must not be named $cflags. PowerShell
+# variable names are CASE-INSENSITIVE, so $cflags and the script's $CFLAGS
+# are the same variable inside this function -- naming it that way silently
+# compiled every non-music file with no flags at all, which links to
+# "dangerous relocation" errors that look nothing like the real cause.
+function Compile-One($src, $isCpp, $flagOverride = $null) {
     $name = [System.IO.Path]::GetFileNameWithoutExtension($src)
     $obj  = "$obj_dir/$name.o"
     $script:objects += $obj
@@ -131,7 +146,8 @@ function Compile-One($src, $isCpp) {
     if ($isCpp) {
         & $CXX $CXXFLAGS $opt $extra -c -o $obj $src
     } else {
-        & $CC $CFLAGS $opt $extra -c -o $obj $src
+        $use = if ($flagOverride) { $flagOverride } else { $CFLAGS }
+        & $CC $use $opt $extra -c -o $obj $src
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  FAILED: $srcname"
@@ -139,8 +155,9 @@ function Compile-One($src, $isCpp) {
     }
 }
 
-foreach ($src in $c_sources)   { Compile-One $src $false }
-foreach ($src in $cpp_sources) { Compile-One $src $true  }
+foreach ($src in $c_sources)     { Compile-One $src $false }
+foreach ($src in $music_sources) { Compile-One $src $false $MUSICFLAGS }
+foreach ($src in $cpp_sources)   { Compile-One $src $true  }
 
 if ($failed) {
     Write-Host "Compilation failed!"

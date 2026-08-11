@@ -1,0 +1,16 @@
+The waveform generators in engine/jet_audio.cpp (wave_sample: triangle,
+tilted saw, saw, pulse, organ and the pitch-filtered noise) are adapted from
+zepto-8's synth, whose formulas were reverse-engineered from PICO-8 output.
+
+    ZEPTO-8 - Fantasy console emulator
+    Copyright (c) 2016-2020 Sam Hocevar <sam@hocevar.net>
+
+    This program is free software. It comes without any warranty, to the
+    extent permitted by applicable law. You can redistribute it and/or
+    modify it under the terms of the Do What the Fuck You Want to Public
+    License, Version 2, as published by the WTFPL Task Force.
+    See http://www.wtfpl.net/ for more details.
+
+The WTFPL imposes no conditions; this notice is here as attribution, not as
+an obligation. Everything else in engine/ is part of the Meshpunk jet3d
+module and carries the module's own licensing (see JET-LICENSE.txt).

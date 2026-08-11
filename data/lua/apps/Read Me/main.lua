@@ -114,6 +114,12 @@ Emulators install from the App Library; you provide the game files on the SD car
 
 - GameBoy: .gb/.gbc roms in /gb (or the GameBoy app folder).
 
+- Sega 8-bit: .gg/.sms/.sg roms in /sega8 (or the Sega8 app folder). Game Gear, Master System and SG-1000 in one app - the file extension picks the system, and the launcher shows which one a rom will run as before you start it.
+
+- Genesis: .md/.gen/.bin roms in /genesis (or the Genesis app folder). Sega Genesis / Mega Drive. Battery-backed saves write to a .srm file next to the rom. If a game stalls at a fixed point or crawls while its music keeps playing, turn Idle Skip off in the launcher and relaunch - it trades some speed for compatibility.
+
+- SNES: .smc/.sfc/.fig roms in /snes (or the Snes app folder). Battery saves write to a .srm file next to the rom. The Renderer button is the one to reach for per game: Speed is the default and is much faster, while Accuracy redraws in the slower way some games need if the picture looks wrong.
+
 - Dos: disk images and game folders in /dos. A full 386 PC with VGA, Adlib, Sound Blaster and a PS/2 mouse. No disks? The app's Download DOS button fetches ready-made FreeDOS boot disks over WiFi (freedos-a.img is the boot floppy; freedos-c.img boots as a hard disk so A: stays free for game disks; the -nb versions leave out SET BLASTER for games that misbehave when they find a sound card). Point C: at a folder of games and it becomes a real writable C: drive, so installers and save games work. The Boot button lists every setting it will start with, including whether the trackball is a mouse or arrow keys.
 
   If a game misbehaves: Audio rate (see its ? button) trades pitch for speed and cures crackle - 0.5 is the usual answer; SB digital can fake a card fault so a game disables its own digitised sound; Timer cap keeps games alive that pace sound off the system timer. Keys: SYM+key for numbers and symbols, ALT+number for F1-F10, Shift+Backspace for Esc, and ALT+Enter switches your key bindings off and on (WASD are arrows by default) so the DOS prompt still types normally.
