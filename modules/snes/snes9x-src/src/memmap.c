@@ -154,8 +154,13 @@ bool S9xInitMemory(void)
    bytes0x2000 = (uint8_t *)malloc(0x2000);
 
    // Try to find the biggest (commercial) ROM size that can fit in our available memory.
-   // const size_t AllocSizes[] = {0x600000, 0x400000, 0x300000, 0x280000, 0x200000, 0x100000, 0x80000, 0};
-   const size_t AllocSizes[] = {0x600000, 0x400000, 0x200000, 0x80000, 0};
+   /* MESHPUNK: fine-grained rungs. A coarse ladder strands carts: dropping
+      straight from 0x400000 to 0x200000 leaves a 3MB cart nowhere to go even
+      when a 3MB block is free. Where the module image lands moves the largest
+      free block by hundreds of KB from one launch to the next, so the rung
+      that fits is not predictable. Each rung costs one failed malloc. */
+   const size_t AllocSizes[] = {0x600000, 0x400000, 0x300000, 0x280000,
+                                0x200000, 0x100000, 0x80000, 0};
    for (const size_t *size = AllocSizes; *size && !Memory.ROM; ++size)
    {
       Memory.ROM_AllocSize = *size + 0x10000 + 0x200; // Extra 64KB for mapping purposes

@@ -7,7 +7,22 @@
 
 extern uint8_t OpenBus;
 
-uint8_t S9xGetByte(uint32_t Address)
+/* MESHPUNK: the four bus accessors run once or more per 65816 instruction,
+ * called from ~250KB of opcode handler code that owns the shared 16KB
+ * instruction cache — so these are the most-evicted hot functions in the
+ * module. Placed in internal SRAM (same escape as fastrender/fxemu; loader
+ * copies .iram.text) they take no misses and evict nothing. This is the
+ * platform-correct form of the classic "inline getset" speed-up: inlining
+ * would grow the handlers by ~30-40KB against that same 16KB cache. The
+ * function bodies are untouched — WaitAddress arming (the idle-loop skip
+ * depends on it) and cycle accounting keep their exact semantics.
+ * build.ps1 gives this file -mtext-section-literals -fno-jump-tables so
+ * the section stays self-contained (the slow-path switches would otherwise
+ * emit jump tables the l32r audit reads as code). */
+#define GS_HOT __attribute__((section(".iram.text")))
+
+
+GS_HOT uint8_t S9xGetByte(uint32_t Address)
 {
    int32_t block = (Address >> MEMMAP_SHIFT) & MEMMAP_MASK;
    uint8_t* GetAddress = Memory.Map [block];
@@ -53,7 +68,7 @@ uint8_t S9xGetByte(uint32_t Address)
    }
 }
 
-uint16_t S9xGetWord(uint32_t Address)
+GS_HOT uint16_t S9xGetWord(uint32_t Address)
 {
    if ((Address & 0x0fff) == 0x0fff)
    {
@@ -113,7 +128,7 @@ uint16_t S9xGetWord(uint32_t Address)
    }
 }
 
-void S9xSetByte(uint8_t Byte, uint32_t Address)
+GS_HOT void S9xSetByte(uint8_t Byte, uint32_t Address)
 {
    int32_t block = (Address >> MEMMAP_SHIFT) & MEMMAP_MASK;
    uint8_t* SetAddress = Memory.Map[block];
@@ -176,7 +191,7 @@ void S9xSetByte(uint8_t Byte, uint32_t Address)
    }
 }
 
-void S9xSetWord(uint16_t Word, uint32_t Address)
+GS_HOT void S9xSetWord(uint16_t Word, uint32_t Address)
 {
    if ((Address & 0x0FFF) == 0x0FFF)
    {

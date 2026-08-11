@@ -21,6 +21,10 @@
 - Doom! Now with music and sound effects! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
 - Pico8 emulator, same as doom you must provide your own .p8 or .png pico8 carts. (thanks to https://github.com/mintylinux)
 - GameBoy emulator! you must provide your own .gb/.gbc roms. Link two T-Decks with a USB cable to play 2-player games — one deck runs USB host mode, the other plugs in as the device.
+- NES emulator! you must provide your own .nes roms.
+- SNES emulator! you must provide your own .smc/.sfc/.fig roms. Special-chip carts work too — SuperFX (Yoshi's Island) and Cx4 (Mega Man X2) — though the heaviest SuperFX games are slow.
+- Neo Geo Pocket / Color emulator! you must provide your own .ngp/.ngc roms.
+- Sega 8-bit emulator! Game Gear, Master System and SG-1000 in one app — you must provide your own .gg/.sms/.sg roms. The file extension picks the system, and the launcher tells you which one a rom will run as before you start it.
 - DOS emulator! A full 386 PC with VGA, Adlib, Sound Blaster and a PS/2 mouse, running real DOS from .img disk images — or point it at a folder of games on your SD card and it becomes a writable C: drive. No disks yet? The app's **Download DOS** button fetches ready-made FreeDOS boot disks straight to the device over WiFi. The trackball works as a mouse (with a DOS mouse driver loaded) or as arrow keys.
 - MP3 music player with a tag-based library, playlists, and auto-organizing by artist/album
 - Background apps — music keeps playing while you use the rest of the device
@@ -47,6 +51,10 @@
 Optional if installed. Download and place doom wad files onto the sd card in either /doom or /lua/apps/Games/Doom. You can get doom wads from https://freedoom.github.io/download.html. You can also use the original wad files. PWADS require a valid IWAD to run. remember that loading large wads can take a while.
 Pico8 carts go onto the sd card in either /p8carts or /lua/apps/Games/PICO-8 folder.
 Gameboy roms go onto the sd card in either /gb or /lua/apps/Games/GameBoy folder.
+NES roms (.nes) go onto the sd card in either /nes or /lua/apps/Games/Nes folder.
+SNES roms (.smc, .sfc, .fig) go onto the sd card in either /snes or /lua/apps/Games/Snes folder.
+Neo Geo Pocket roms (.ngp, .ngc) go onto the sd card in either /ngpc or /lua/apps/Games/NeoGeoPocket folder.
+Sega 8-bit roms (.gg, .sms, .sg) go onto the sd card in either /sega8 or /lua/apps/Games/Sega8 folder.
 DOS disk images and game folders go onto the sd card in /dos.
 
 If you have no disks the **Dos** app shows a **Download DOS** button — pick a disk, pick internal or SD storage, and it downloads over WiFi. The same list lives in Settings once you have one. Four disks are offered, all FreeDOS 1.4 with an XMS driver, CTMOUSE and EDIT already set up:
@@ -256,6 +264,19 @@ MIT
 - Pico8 emulation done with fake08 https://github.com/jtothebell/fake-08
    conversion of fake08 to meshpunk elf done by https://github.com/mintylinux
 - GameBoy emulation via the gnuboy core from retro-go https://github.com/ducalex/retro-go
+- NES emulation via Nofrendo (LGPL v2) (c) 1998-2000 Matthew Conte
+   vendored as arduino-nofrendo; mapper and port work by Neil Stevens, Firebug,
+   Benjamin C. W. Sittler and The Mighty Mike Master
+- SNES emulation via the Snes9x core from retro-go, based on libretro snes9x2010
+   NOTE: Snes9x is NOT free software — it may be used and distributed for
+   NON-COMMERCIAL, personal use only; commercial use needs the copyright holders'
+   permission. Also includes ndssfc (GPL v2) and ZSNES code (GPL v2)
+- Neo Geo Pocket / Color emulation via RACE (GPL v2) by Judge_, Flavor, Thor and neopop_uk
+   CZ80 by S. Dallongeville; Blip_Buffer (LGPL v2.1) by Shay Green;
+   libretro-common (MIT); sound from NEOPOP, based on sn76496.c from MAME
+- Sega Game Gear / Master System / SG-1000 emulation via the SMS Plus core from retro-go
+   SMS Plus (GPL v2) (c) 1998-2007 Charles MacDonald, accuracy work by Eke-Eke (SMS Plus GX)
+   SN76489 PSG by Maxim; YM2413 FM via emu2413 by Mitsutaka Okazaki
 - DOS (386) emulation via tiny386 by Chunhui He https://github.com/hchunhui/tiny386 (BSD-3-Clause)
    Peripherals ported from QEMU/TinyEMU (MIT); VGA and IDE by Fabrice Bellard
    Adlib OPL2 via fmopl (LGPL); firmware is SeaBIOS + SeaVGABIOS (LGPL v3)

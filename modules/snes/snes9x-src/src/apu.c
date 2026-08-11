@@ -168,8 +168,14 @@ void S9xSetAPUDSP(uint8_t byte)
    if (snes_sndq_active)
    {
       uint32_t head = s_sndq_head;
-      /* Full ring: the sound task drains in real time, so wait it out. */
-      while ((uint32_t)(head - s_sndq_tail) >= SNDQ_SIZE) {}
+      /* Full ring: sleep until the Core-1 sound task drains. Sleeping
+       * yields the core; a busy-spin would only be safe while the producer
+       * and the sound task are on different cores. */
+      while ((uint32_t)(head - s_sndq_tail) >= SNDQ_SIZE)
+      {
+         extern void host_sleep_ms(uint32_t ms);
+         host_sleep_ms(1);
+      }
       s_sndq[head & SNDQ_MASK].reg = reg;
       s_sndq[head & SNDQ_MASK].byte = byte;
       /* Keep the entry store ahead of the index publish. */

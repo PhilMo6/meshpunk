@@ -97,6 +97,7 @@ foreach ($src in ($core_sources + ($glue_sources | ForEach-Object { (Get-Item $_
     # reports false escapes. Without it the switch becomes a decision tree.
     $extra = if ($srcname -eq "fastrender.c") { @("-mtext-section-literals") }
              elseif ($srcname -eq "fxemu.c") { @("-mtext-section-literals", "-fno-jump-tables") }
+             elseif ($srcname -eq "getset.c") { @("-mtext-section-literals", "-fno-jump-tables") }
              else { @() }
     Write-Host "  CC $srcname ($opt)"
     & $CC $CFLAGS $opt $extra -c -o $obj $src

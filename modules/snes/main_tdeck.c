@@ -161,11 +161,16 @@ static void render_worker(void *arg)
         IPPU.RenderedScreenWidth = 256;
         IPPU.RenderedScreenHeight = h;
 
-        // Strip mode: each band goes straight from the band buffer to the
-        // panel, so there is no frame buffer to fill or blit afterwards.
-        fr_strip_out = 1;
+        // The span writes finished rows into GFX.Screen — the same double
+        // PSRAM frame buffer the Core-0 path uses — and blit_frame() hands
+        // the frame to the Core-1 SPI task, so the ~11.5ms wire time
+        // overlaps the next render instead of serializing into this one.
+        // blit_frame's swap pass skips every row (the span writes them
+        // TFT-ready), so its cost here is the flag memset plus, when this
+        // render outran the previous transfer, the wait for the buffer.
         snes_fast_span(0, (uint32_t)(h - 1), snes_worker_ld(),
                        snes_worker_fx());
+        blit_frame();
         s_worker_busy = 0;
         // Render finished — the published buffers may be refilled now.
         snes_worker_hungry = 1;
@@ -257,6 +262,7 @@ static void snes_sound_pull(int16_t *out, int count)
         out += frames;
         count -= frames;
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -374,11 +380,16 @@ int main(int argc, char **argv)
     snes_sndq_active = 1;
     host_audio_set_pull(snes_sound_pull, AUDIO_RATE);
 
-    // Stack ladder: the band context and strip buffer (~11KB) live on the
-    // worker's stack, which is internal SRAM — scarce and fragmented.
+    // Stack ladder: the band context lives on the worker's stack, which is
+    // internal SRAM — scarce and fragmented. Deepest render chain measured
+    // with -fstack-usage: render_worker 48 + snes_fast_span 13,264 + fr_bg 64
+    // + fr_bg_band 320 = 13,696 bytes, before the interrupt context FreeRTOS
+    // saves on this stack. 16KB leaves 2,688 bytes of headroom, 14KB leaves
+    // 640. A 12KB stack is smaller than snes_fast_span's frame alone, so it
+    // is not a rung.
     // Core-0 rendering needs no worker, so its stack stays unallocated.
     if (s_use_worker) {
-        static const int rungs[] = { 16, 14, 12 };
+        static const int rungs[] = { 16, 14 };
         for (unsigned i = 0; i < sizeof(rungs) / sizeof(rungs[0]); i++) {
             s_worker = host_spawn_task(render_worker, NULL, 1, 1, rungs[i]);
             if (s_worker) {
@@ -387,14 +398,16 @@ int main(int argc, char **argv)
             }
         }
         if (!s_worker) {
-            host_log("snes: render worker spawn failed");
-            host_audio_set_pull(NULL, 0);
-            snes_sndq_active = 0;
-            return 1;
+            // No stack for the worker: render on Core 0 instead. Slower, but
+            // it is the same path the Accuracy setting selects and it needs
+            // no internal SRAM, so the game still runs.
+            s_use_worker = 0;
+            host_log("snes: no worker stack, rendering on Core 0");
         }
-    } else {
-        printf("[snes] rendering on Core 0\n");
     }
+    if (!s_use_worker)
+        printf("[snes] rendering on Core 0\n");
+
 
     printf("[snes] ROM buffer %uKB, %s timing\n",
            (unsigned)(Memory.ROM_AllocSize >> 10),
@@ -429,6 +442,8 @@ int main(int argc, char **argv)
     // whichever path drew the frame — so a game that settles recovers.
     int fr_mis_score = 0;
     int fr_worker_trusted = 1;
+
+
 
     while (!host_should_exit()) {
         poll_input();

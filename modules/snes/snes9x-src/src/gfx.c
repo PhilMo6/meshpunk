@@ -208,6 +208,10 @@ void snes_worker_publish(void)
          {
             memcpy(s_pub_vram + (p << 10), Memory.VRAM + (p << 10), 1024);
             snes_vram_dirty[p] = 0;
+            /* MESHPUNK fr2: this page's decoded tiles are stale now. Same
+             * mutual exclusion as the snapshot itself — the worker is hungry
+             * while this runs, so no render is reading the cache. */
+            fr2_inval_page(p);
          }
    }
    s_pub_onb = PPU.OBJNameBase;
@@ -261,6 +265,9 @@ uint16_t snes_worker_bind(void)
    return PPU.ScreenHeight;
 #else
    fr_vram = s_pub_vram;
+   /* MESHPUNK fr2: the tile cache follows the snapshot; a Core-0 fast frame
+    * (live VRAM) sees the pointers differ and bypasses it. */
+   fr2_cache_vram = s_pub_vram;
    fr_pal = s_pub_pal;
    fr_pal_j = s_pub_pal_j;
    fr_pal_jn = s_pub_pal_jn;
@@ -2881,7 +2888,6 @@ void S9xUpdateScreen(void)
       fr_bgmode = PPU.BGMode;
       fr_bg3prio = PPU.BG3Priority;
       fr_clip = IPPU.Clip;
-      fr_strip_out = 0; /* Core 0 renders into GFX.Screen and blits a frame */
       snes_fast_span(starty, endy, LineData, snes_fixedc_j);
    }
    else

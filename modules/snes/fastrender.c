@@ -3,17 +3,20 @@
 // PPU state is in scope; other modes render through the stock path per
 // span, so mid-frame mode switches mix correctly.
 //
-// Model: spans render in BANDS of up to 8 scroll-constant lines. Within a
-// band, layers composite back-to-front in the exact global priority order
-// the stock renderer encodes in its depth values (sprite z = D+4*(prio+1))
-// into band buffers on the module task's stack — internal SRAM, so all
-// intermediate pixel traffic stays off the PSRAM bus. There is no
-// Z-buffer (priority is draw order) and no decoded-tile cache: each tile
-// visited decodes its needed rows once per band, straight from its 16/32
-// contiguous VRAM bytes, through a 256-entry planar LUT into one uint32
-// of eight 4-bit pixels per row. Banding is what amortizes the tilemap
-// and tile fetches across lines, matching the stock renderer's Lines
-// batching.
+// Model: spans render in BANDS of up to 7 scroll-constant lines, into band
+// buffers on the render worker's task stack — internal SRAM, so all
+// intermediate pixel traffic stays off the PSRAM bus. There is no Z-buffer:
+// priority is draw order, in the exact global order the stock renderer
+// encodes in its depth values (sprite z = D+4*(prio+1)). The main screen
+// composites FRONT-to-back (fr_screen_ftb) against a per-pixel coverage
+// mask, so a pixel is written once however many layers stack on it; the sub
+// screen composites back-to-front (fr_screen) and runs first, because the
+// main screen's colour math reads it as a finished surface.
+// Tile rows decode from 16/32 contiguous VRAM bytes through a 256-entry
+// planar LUT into one uint32 of eight 4-bit pixels, cached in fr2_tilecache
+// (2048 tiles x 8 rows, 64KB PSRAM) and invalidated per 1KB VRAM page.
+// Banding amortizes the tilemap fetches across lines, matching the stock
+// renderer's Lines batching.
 //
 // Color math resolves at store time against the already-composited sub
 // band: per pixel the sub state is 0 (no math), 1 (math vs fixed colour,
@@ -78,11 +81,10 @@
 // menu-scene amortization for room to also hold the decode and palette
 // tables there: HDMA per-line scrolling collapses gameplay bands to one
 // line regardless.
-// Band height. The context lives on the caller's stack (internal SRAM,
-// and the render worker's task stack caps at 16KB), so this is the main
-// stack consumer. Taller bands amortize the tilemap and tile fetches
-// across more lines and mean fewer strip pushes, each of which costs a
-// bus lock plus three SPI command transactions.
+// Band height. The context lives on the caller's stack (internal SRAM, and
+// the render worker's task stack caps at 16KB), so this is the main stack
+// consumer: 7 lines put FrBand at 13,076 bytes. Taller bands amortize the
+// tilemap and tile fetches across more lines.
 #define FR_MAX_LINES 7
 
 // ---------------------------------------------------------------------------
@@ -144,6 +146,33 @@ typedef struct {
     const SLineData *ld;                // journal row for y0
 } FrBand;
 
+
+// ---------------------------------------------------------------------------
+// fr2 stage 1: decoded-tile cache. A visible 4bpp tile's row was decoded from
+// VRAM (four scattered PSRAM byte reads + LUT merges) EVERY scanline it
+// appears on — HDMA collapses bands to one line, so a static background tile
+// paid full decode 224 times a frame, every frame. The cache pays once per
+// tile per VRAM change: 2048 slots (one per possible 32-byte 4bpp tile
+// position), each holding the eight LUT-decoded unflipped rows. Flips stay
+// at use time (vf indexes rows, hf is one fr_nibrev), so all four flip
+// variants share one entry.
+//
+// Coherency rides the publish machinery that already exists: the worker only
+// renders published snapshots, publishes only happen while the worker is
+// hungry, and the publish copies exactly the dirty 1KB VRAM pages — each
+// covering exactly 32 slots, invalidated in the same loop (fr2_inval_page).
+// The Core-0 fast path renders from LIVE VRAM, so it bypasses the cache
+// entirely (fr_vram != fr2_cache_vram) rather than poisoning it.
+// ---------------------------------------------------------------------------
+uint32_t fr2_tilecache[2048][8];      // 64KB PSRAM
+uint8_t  fr2_tilevalid[2048];
+const uint8_t *fr2_cache_vram;        // snapshot the cache is keyed to
+
+void fr2_inval_page(int page)
+{
+    memset(fr2_tilevalid + ((unsigned)page << 5), 0, 32);
+}
+
 // Key for the band's mathed palette (COLOR_OP(pal[i], fixed colour)): the
 // packed journaled fixed colour it was built for. The table itself lives
 // in the band context so the lookups stay in internal SRAM.
@@ -161,11 +190,12 @@ uint8_t snes_row_swapped[SNES_HEIGHT_EXTENDED];
 // frames) to the snapshot copy itself.
 const uint8_t *fr_vram;
 
-// Output mode: 1 = push each finished band straight to the panel from the
-// band buffer (internal SRAM, no frame buffer at all); 0 = write into
-// GFX.Screen for the Core-0 path, which blits a whole frame.
-int fr_strip_out;
-extern void host_blit_rect(const uint16_t *rgb565, int x, int y, int w, int h);
+// Output goes into GFX.Screen — the module's double PSRAM frame buffer —
+// and blit_frame() hands the finished frame to the Core-1 SPI task, the
+// same as the Genesis module. The band's PSRAM store costs ~3ms a frame and
+// the wire time (11.5ms at the panel's 80MHz) overlaps rendering on the
+// blit task.
+
 
 // Palette and forced-blank state for this span: live IPPU/PPU values when
 // rendering on Core 0, or the worker's frame-boundary snapshots.
@@ -226,7 +256,8 @@ FR_INLINE uint16_t fr_math2(const FrBand *B, uint16_t c, uint16_t o)
 // all its needed rows from one contiguous fetch.
 // ---------------------------------------------------------------------------
 static FR_HOT void fr_bg_band(FrBand *B, int bg, int prio, int left, int right,
-                       int is_sub, int do_math, int bits, uint32_t pal_base)
+                       int is_sub, int do_math, int bits, uint32_t pal_base,
+                       int ftb)
 {
     uint32_t voff = B->ld->BG[bg].VOffset;
     uint32_t hoff = B->ld->BG[bg].HOffset;
@@ -307,23 +338,52 @@ static FR_HOT void fr_bg_band(FrBand *B, int bg, int prio, int left, int right,
             tbase = (name_base + (chr << chr_shift)) & 0xffff;
             tp = &fr_vram[tbase];
 
-            // Decode this tile's rows for the whole segment in one visit.
-            // The flip-matched LUT bakes horizontal flip into nibble order,
-            // so pixel consumption below is always a sequential >> 4.
+            // Decode this tile's rows for the whole segment in one visit —
+            // through the fr2 tile cache when it applies (4bpp, rendering
+            // from the published snapshot), else the direct decode. A miss
+            // fills all eight rows so every later line of this tile, this
+            // frame and the next, is a single load per row.
             {
-                const uint32_t *lut = B->lut;
+                const uint32_t *rows = NULL;
                 any = 0;
-                for (r = 0; r < seg; r++) {
-                    uint32_t frow = finev + (uint32_t)r;
-                    uint32_t sr = vf ? (7 - frow) : frow;
-                    const uint8_t *rp = tp + sr * 2;
-                    uint32_t v = lut[rp[0]] | (lut[rp[1]] << 1);
-                    if (bits == 4)
-                        v |= (lut[rp[16]] << 2) | (lut[rp[17]] << 3);
-                    if (hf)
-                        v = fr_nibrev(v);
-                    nib[r] = v;
-                    any |= v;
+                if (bits == 4 && fr_vram == fr2_cache_vram) {
+                    uint32_t slot = tbase >> 5;
+                    if (!fr2_tilevalid[slot]) {
+                        const uint32_t *lut = B->lut;
+                        uint32_t *dst = fr2_tilecache[slot];
+                        int rr;
+                        for (rr = 0; rr < 8; rr++) {
+                            const uint8_t *rp = tp + rr * 2;
+                            dst[rr] = lut[rp[0]] | (lut[rp[1]] << 1)
+                                    | (lut[rp[16]] << 2) | (lut[rp[17]] << 3);
+                        }
+                        fr2_tilevalid[slot] = 1;
+                    }
+                    rows = fr2_tilecache[slot];
+                }
+                if (rows) {
+                    for (r = 0; r < seg; r++) {
+                        uint32_t frow = finev + (uint32_t)r;
+                        uint32_t v = rows[vf ? (7 - frow) : frow];
+                        if (hf)
+                            v = fr_nibrev(v);
+                        nib[r] = v;
+                        any |= v;
+                    }
+                } else {
+                    const uint32_t *lut = B->lut;
+                    for (r = 0; r < seg; r++) {
+                        uint32_t frow = finev + (uint32_t)r;
+                        uint32_t sr = vf ? (7 - frow) : frow;
+                        const uint8_t *rp = tp + sr * 2;
+                        uint32_t v = lut[rp[0]] | (lut[rp[1]] << 1);
+                        if (bits == 4)
+                            v |= (lut[rp[16]] << 2) | (lut[rp[17]] << 3);
+                        if (hf)
+                            v = fr_nibrev(v);
+                        nib[r] = v;
+                        any |= v;
+                    }
                 }
             }
             if (!any) {
@@ -368,6 +428,28 @@ static FR_HOT void fr_bg_band(FrBand *B, int bg, int prio, int left, int right,
                 if (do_math) {
                     uint8_t *covrow = B->cov[s + r];
                     uint8_t lc = B->lclass[s + r];
+                    if (ftb) {
+                        // Front-to-back with math: the math source is the
+                        // SUB screen, composited before any of this — main
+                        // pass order never enters the math inputs, so the
+                        // guard is the whole change.
+                        const uint16_t *subrow = B->sub_px[s + r];
+                        for (i = 0; i < n; i++, nr >>= 4) {
+                            uint32_t v = nr & 0xf;
+                            if (!v || covrow[x + i])
+                                continue;
+                            if (lc == 2)
+                                mrow[x + i] = fr_math2(B,
+                                    B->pal[cbase + v], subrow[x + i]);
+                            else if (lc == 1)
+                                mrow[x + i] = B->mathpal[cbase + v];
+                            else
+                                mrow[x + i] =
+                                    fr_math_idx(B, s + r, cbase + v, x + i);
+                            covrow[x + i] = 1;
+                        }
+                        continue;
+                    }
                     if (lc == 2) {
                         const uint16_t *subrow = B->sub_px[s + r];
                         uint32_t m = nr | (nr >> 1);
@@ -417,6 +499,51 @@ static FR_HOT void fr_bg_band(FrBand *B, int bg, int prio, int left, int right,
                 // flag; a full mask means eight unconditional stores.
                 {
                     uint8_t *covrow = B->cov[s + r];
+                    if (ftb) {
+                        // Front-to-back: anything already drawn here is in
+                        // FRONT of this layer, so paint only uncovered
+                        // pixels. The full-8 fast paths matter most on the
+                        // full-screen background layer, where the
+                        // branch-per-pixel form costs 12-27ms/frame.
+                        if (n == 8) {
+                            uint8_t ca = covrow[x] & covrow[x + 1]
+                                       & covrow[x + 2] & covrow[x + 3]
+                                       & covrow[x + 4] & covrow[x + 5]
+                                       & covrow[x + 6] & covrow[x + 7];
+                            if (ca)
+                                // Row group fully covered by layers in
+                                // front — nothing here is visible.
+                                continue;
+                            uint32_t m = nr | (nr >> 1);
+                            m |= (m >> 2);
+                            m &= 0x11111111u;
+                            if (m == 0x11111111u &&
+                                !(covrow[x] | covrow[x + 1] | covrow[x + 2]
+                                  | covrow[x + 3] | covrow[x + 4]
+                                  | covrow[x + 5] | covrow[x + 6]
+                                  | covrow[x + 7])) {
+                                // Opaque tile row onto untouched pixels:
+                                // the old bulk store, plus coverage.
+                                mrow[x + 0] = B->pal[cbase + (nr & 0xf)]; covrow[x + 0] = 1; nr >>= 4;
+                                mrow[x + 1] = B->pal[cbase + (nr & 0xf)]; covrow[x + 1] = 1; nr >>= 4;
+                                mrow[x + 2] = B->pal[cbase + (nr & 0xf)]; covrow[x + 2] = 1; nr >>= 4;
+                                mrow[x + 3] = B->pal[cbase + (nr & 0xf)]; covrow[x + 3] = 1; nr >>= 4;
+                                mrow[x + 4] = B->pal[cbase + (nr & 0xf)]; covrow[x + 4] = 1; nr >>= 4;
+                                mrow[x + 5] = B->pal[cbase + (nr & 0xf)]; covrow[x + 5] = 1; nr >>= 4;
+                                mrow[x + 6] = B->pal[cbase + (nr & 0xf)]; covrow[x + 6] = 1; nr >>= 4;
+                                mrow[x + 7] = B->pal[cbase + (nr & 0xf)]; covrow[x + 7] = 1;
+                                continue;
+                            }
+                        }
+                        for (i = 0; i < n; i++, nr >>= 4) {
+                            uint32_t v = nr & 0xf;
+                            if (v && !covrow[x + i]) {
+                                mrow[x + i] = B->pal[cbase + v];
+                                covrow[x + i] = 1;
+                            }
+                        }
+                        continue;
+                    }
                     uint32_t m = nr | (nr >> 1);
                     m |= (m >> 2);
                     m &= 0x11111111u;
@@ -448,7 +575,7 @@ static FR_HOT void fr_bg_band(FrBand *B, int bg, int prio, int left, int right,
 }
 
 static FR_HOT void fr_bg(FrBand *B, int bg, int prio, int is_sub, int bits,
-                  uint32_t pal_base)
+                  uint32_t pal_base, int ftb)
 {
     const ClipData *clip = &fr_clip[is_sub];
     int do_math = (!is_sub) && B->math_active && (SUB_OR_ADD(bg) != 0);
@@ -457,11 +584,14 @@ static FR_HOT void fr_bg(FrBand *B, int bg, int prio, int is_sub, int bits,
 
     // The priority-0 pass records whether this band's tilemap run holds
     // any priority-1 tiles; if it doesn't, the p1 walk has nothing to do.
-    if (prio == 1 && !B->p1seen[is_sub][bg])
+    // Front-to-back runs the p1 pass FIRST, before anything has set the
+    // flag — gating on it there silently dropped every priority-1 BG tile
+    // (EWJ's license text was the visible casualty), so ftb always walks.
+    if (prio == 1 && !ftb && !B->p1seen[is_sub][bg])
         return;
 
     if (!bands) {
-        fr_bg_band(B, bg, prio, 0, 256, is_sub, do_math, bits, pal_base);
+        fr_bg_band(B, bg, prio, 0, 256, is_sub, do_math, bits, pal_base, ftb);
         return;
     }
     for (b = 0; b < bands; b++) {
@@ -471,7 +601,7 @@ static FR_HOT void fr_bg(FrBand *B, int bg, int prio, int is_sub, int bits,
             right = 256;
         if (right <= left)
             continue;
-        fr_bg_band(B, bg, prio, left, right, is_sub, do_math, bits, pal_base);
+        fr_bg_band(B, bg, prio, left, right, is_sub, do_math, bits, pal_base, ftb);
     }
 }
 
@@ -500,7 +630,8 @@ static FR_HOT void fr_obj_setup(FrBand *B)
     }
 }
 
-static FR_HOT void fr_obj(FrBand *B, int prio, int is_sub, int math_layer_on)
+static FR_HOT void fr_obj(FrBand *B, int prio, int is_sub, int math_layer_on,
+                          int ftb)
 {
     const ClipData *clip = &fr_clip[is_sub];
     uint32_t bands = clip->Count[4];
@@ -515,8 +646,11 @@ static FR_HOT void fr_obj(FrBand *B, int prio, int is_sub, int math_layer_on)
         uint8_t lc = B->lclass[r];
         int k;
 
+        // Back-to-front draws the list in reverse so the earliest OAM
+        // entry lands on top by overwriting; front-to-back draws it forward
+        // so the earliest entry wins by getting there first. Same result.
         for (k = (int)B->obj_count[r] - 1; k >= 0; k--) {
-            int I = B->obj_idx[r][k];
+            int I = B->obj_idx[r][ftb ? ((int)B->obj_count[r] - 1 - k) : k];
             int S = ol->OBJ[I].Sprite;
             const SOBJ *o = &fr_objs[S];
             uint32_t line, chr_row, chr_page, tilex, cbase, frow;
@@ -563,15 +697,33 @@ static FR_HOT void fr_obj(FrBand *B, int prio, int is_sub, int math_layer_on)
                 taddr = fr_objnamebase + ((chr & 0x3ff) << 5);
                 if ((chr & 0x1ff) >= 256)
                     taddr += fr_objnamesel;
-                taddr = (taddr + frow * 2) & 0xffff;
-                tp = &fr_vram[taddr];
-                {
+                taddr &= 0xffff;   /* 32B-aligned tile base */
+                // Sprite tiles ride the same decoded-tile cache as the BGs:
+                // OBJ tiles are 4bpp 32-byte entries exactly like BG1/2's,
+                // and were being redecoded every line they appear on.
+                if (fr_vram == fr2_cache_vram) {
+                    uint32_t slot = taddr >> 5;
+                    if (!fr2_tilevalid[slot]) {
+                        const uint32_t *lut = B->lut;
+                        uint32_t *dst = fr2_tilecache[slot];
+                        const uint8_t *tq = &fr_vram[taddr];
+                        int rr;
+                        for (rr = 0; rr < 8; rr++) {
+                            const uint8_t *rp = tq + rr * 2;
+                            dst[rr] = lut[rp[0]] | (lut[rp[1]] << 1)
+                                    | (lut[rp[16]] << 2) | (lut[rp[17]] << 3);
+                        }
+                        fr2_tilevalid[slot] = 1;
+                    }
+                    nib = fr2_tilecache[slot][frow];
+                } else {
                     const uint32_t *lut = B->lut;
+                    tp = &fr_vram[(taddr + frow * 2) & 0xffff];
                     nib = lut[tp[0]] | (lut[tp[1]] << 1)
                         | (lut[tp[16]] << 2) | (lut[tp[17]] << 3);
-                    if (o->HFlip)
-                        nib = fr_nibrev(nib);
                 }
+                if (o->HFlip)
+                    nib = fr_nibrev(nib);
                 if (!nib)
                     continue;
 
@@ -596,17 +748,21 @@ static FR_HOT void fr_obj(FrBand *B, int prio, int is_sub, int math_layer_on)
                         srowpx[X] = B->pal[cbase + v];
                         setrow[X] = 2;
                     } else if (do_math) {
-                        if (lc == 2)
-                            mrow[X] = fr_math2(B,
-                                B->pal[cbase + v], srowpx[X]);
-                        else if (lc == 1)
-                            mrow[X] = B->mathpal[cbase + v];
-                        else
-                            mrow[X] = fr_math_idx(B, r, cbase + v, X);
-                        covrow[X] = 1;
+                        if (!ftb || !covrow[X]) {
+                            if (lc == 2)
+                                mrow[X] = fr_math2(B,
+                                    B->pal[cbase + v], srowpx[X]);
+                            else if (lc == 1)
+                                mrow[X] = B->mathpal[cbase + v];
+                            else
+                                mrow[X] = fr_math_idx(B, r, cbase + v, X);
+                            covrow[X] = 1;
+                        }
                     } else {
-                        mrow[X] = B->pal[cbase + v];
-                        covrow[X] = 1;
+                        if (!ftb || !covrow[X]) {
+                            mrow[X] = B->pal[cbase + v];
+                            covrow[X] = 1;
+                        }
                     }
                 }
             }
@@ -632,31 +788,79 @@ static FR_HOT void fr_screen(FrBand *B, int is_sub)
         en[i] = is_sub ? (ON_SUB(i) != 0) : (ON_MAIN(i) != 0);
 
     if (mode == 0) {
-        if (en[3]) fr_bg(B, 3, 0, is_sub, 2, 3u << 5);
-        if (en[2]) fr_bg(B, 2, 0, is_sub, 2, 2u << 5);
-        if (en[4]) fr_obj(B, 0, is_sub, obj_math);
-        if (en[3]) fr_bg(B, 3, 1, is_sub, 2, 3u << 5);
-        if (en[2]) fr_bg(B, 2, 1, is_sub, 2, 2u << 5);
-        if (en[4]) fr_obj(B, 1, is_sub, obj_math);
-        if (en[1]) fr_bg(B, 1, 0, is_sub, 2, 1u << 5);
-        if (en[0]) fr_bg(B, 0, 0, is_sub, 2, 0);
-        if (en[4]) fr_obj(B, 2, is_sub, obj_math);
-        if (en[1]) fr_bg(B, 1, 1, is_sub, 2, 1u << 5);
-        if (en[0]) fr_bg(B, 0, 1, is_sub, 2, 0);
-        if (en[4]) fr_obj(B, 3, is_sub, obj_math);
+        if (en[3]) fr_bg(B, 3, 0, is_sub, 2, 3u << 5, 0);
+        if (en[2]) fr_bg(B, 2, 0, is_sub, 2, 2u << 5, 0);
+        if (en[4]) fr_obj(B, 0, is_sub, obj_math, 0);
+        if (en[3]) fr_bg(B, 3, 1, is_sub, 2, 3u << 5, 0);
+        if (en[2]) fr_bg(B, 2, 1, is_sub, 2, 2u << 5, 0);
+        if (en[4]) fr_obj(B, 1, is_sub, obj_math, 0);
+        if (en[1]) fr_bg(B, 1, 0, is_sub, 2, 1u << 5, 0);
+        if (en[0]) fr_bg(B, 0, 0, is_sub, 2, 0, 0);
+        if (en[4]) fr_obj(B, 2, is_sub, obj_math, 0);
+        if (en[1]) fr_bg(B, 1, 1, is_sub, 2, 1u << 5, 0);
+        if (en[0]) fr_bg(B, 0, 1, is_sub, 2, 0, 0);
+        if (en[4]) fr_obj(B, 3, is_sub, obj_math, 0);
     } else {
         int bg3p = fr_bg3prio != 0;
-        if (en[2]) fr_bg(B, 2, 0, is_sub, 2, 0);
-        if (en[4]) fr_obj(B, 0, is_sub, obj_math);
-        if (en[2] && !bg3p) fr_bg(B, 2, 1, is_sub, 2, 0);
-        if (en[4]) fr_obj(B, 1, is_sub, obj_math);
-        if (en[1]) fr_bg(B, 1, 0, is_sub, 4, 0);
-        if (en[0]) fr_bg(B, 0, 0, is_sub, 4, 0);
-        if (en[4]) fr_obj(B, 2, is_sub, obj_math);
-        if (en[1]) fr_bg(B, 1, 1, is_sub, 4, 0);
-        if (en[0]) fr_bg(B, 0, 1, is_sub, 4, 0);
-        if (en[4]) fr_obj(B, 3, is_sub, obj_math);
-        if (en[2] && bg3p) fr_bg(B, 2, 1, is_sub, 2, 0);
+        if (en[2]) fr_bg(B, 2, 0, is_sub, 2, 0, 0);
+        if (en[4]) fr_obj(B, 0, is_sub, obj_math, 0);
+        if (en[2] && !bg3p) fr_bg(B, 2, 1, is_sub, 2, 0, 0);
+        if (en[4]) fr_obj(B, 1, is_sub, obj_math, 0);
+        if (en[1]) fr_bg(B, 1, 0, is_sub, 4, 0, 0);
+        if (en[0]) fr_bg(B, 0, 0, is_sub, 4, 0, 0);
+        if (en[4]) fr_obj(B, 2, is_sub, obj_math, 0);
+        if (en[1]) fr_bg(B, 1, 1, is_sub, 4, 0, 0);
+        if (en[0]) fr_bg(B, 0, 1, is_sub, 4, 0, 0);
+        if (en[4]) fr_obj(B, 3, is_sub, obj_math, 0);
+        if (en[2] && bg3p) fr_bg(B, 2, 1, is_sub, 2, 0, 0);
+    }
+}
+
+// fr2 stages 2+3: front-to-back composite for the main screen. The pass
+// list is fr_screen's, REVERSED — that list is the ground truth of the
+// stock renderer's priority order, so reversing it preserves priority by
+// construction. Each drawer paints only uncovered pixels and sets cov, so a
+// pixel is computed once no matter how many layers stack on it; the store
+// loop after (backdrop fill + swap) reads cov identically either way.
+// Math is no obstacle: its source is the SUB screen, composited before this
+// pass ever runs, so the math stores just carry the same coverage guard.
+// fr_screen (back-to-front) remains in use for the sub-screen composite.
+static FR_HOT void fr_screen_ftb(FrBand *B)
+{
+    int mode = fr_bgmode;
+    int obj_math = B->math_active && (SUB_OR_ADD(4) != 0);
+    int en[5];
+    int i;
+
+    for (i = 0; i < 5; i++)
+        en[i] = ON_MAIN(i) != 0;
+
+    if (mode == 0) {
+        if (en[4]) fr_obj(B, 3, 0, obj_math, 1);
+        if (en[0]) fr_bg(B, 0, 1, 0, 2, 0, 1);
+        if (en[1]) fr_bg(B, 1, 1, 0, 2, 1u << 5, 1);
+        if (en[4]) fr_obj(B, 2, 0, obj_math, 1);
+        if (en[0]) fr_bg(B, 0, 0, 0, 2, 0, 1);
+        if (en[1]) fr_bg(B, 1, 0, 0, 2, 1u << 5, 1);
+        if (en[4]) fr_obj(B, 1, 0, obj_math, 1);
+        if (en[2]) fr_bg(B, 2, 1, 0, 2, 2u << 5, 1);
+        if (en[3]) fr_bg(B, 3, 1, 0, 2, 3u << 5, 1);
+        if (en[4]) fr_obj(B, 0, 0, obj_math, 1);
+        if (en[2]) fr_bg(B, 2, 0, 0, 2, 2u << 5, 1);
+        if (en[3]) fr_bg(B, 3, 0, 0, 2, 3u << 5, 1);
+    } else {
+        int bg3p = fr_bg3prio != 0;
+        if (en[2] && bg3p) fr_bg(B, 2, 1, 0, 2, 0, 1);
+        if (en[4]) fr_obj(B, 3, 0, obj_math, 1);
+        if (en[0]) fr_bg(B, 0, 1, 0, 4, 0, 1);
+        if (en[1]) fr_bg(B, 1, 1, 0, 4, 0, 1);
+        if (en[4]) fr_obj(B, 2, 0, obj_math, 1);
+        if (en[0]) fr_bg(B, 0, 0, 0, 4, 0, 1);
+        if (en[1]) fr_bg(B, 1, 0, 0, 4, 0, 1);
+        if (en[4]) fr_obj(B, 1, 0, obj_math, 1);
+        if (en[2] && !bg3p) fr_bg(B, 2, 1, 0, 2, 0, 1);
+        if (en[4]) fr_obj(B, 0, 0, obj_math, 1);
+        if (en[2]) fr_bg(B, 2, 0, 0, 2, 0, 1);
     }
 }
 
@@ -688,12 +892,6 @@ FR_HOT void snes_fast_span(uint32_t starty, uint32_t endy, const SLineData *line
     int fblank = fr_fblank;
     const SPalWrite *pj;
     uint32_t pjn, ji = 0;
-    // Strip mode centres the frame itself (the whole-frame blit does this
-    // in the host); each finished band goes straight out.
-    int y_off = (240 - (int)(endy + 1)) / 2;
-
-    if (y_off < 0)
-        y_off = 0;
 
     if (!fr_lut_ready)
         fr_build_lut();
@@ -774,15 +972,12 @@ FR_HOT void snes_fast_span(uint32_t starty, uint32_t endy, const SLineData *line
 
         if (fblank) {
             for (r = 0; r < n; r++) {
-                uint16_t *out = fr_strip_out ? B.main_px[r] :
+                uint16_t *out =
                     (uint16_t *)(GFX.Screen + (y + (uint32_t)r) * GFX.Pitch2);
                 for (x = 0; x < 256; x++)
                     out[x] = (uint16_t)BLACK; // 0 — identical byte-swapped
-                if (!fr_strip_out)
-                    snes_row_swapped[y + (uint32_t)r] = 1;
+                snes_row_swapped[y + (uint32_t)r] = 1;
             }
-            if (fr_strip_out)
-                host_blit_rect(&B.main_px[0][0], 32, y_off + (int)y, 256, n);
             y += (uint32_t)n;
             continue;
         }
@@ -838,14 +1033,14 @@ FR_HOT void snes_fast_span(uint32_t starty, uint32_t endy, const SLineData *line
             }
         }
 
-        fr_screen(&B, 0);
+        fr_screen_ftb(&B);
 
         // Fused backdrop + byte-swap writeout: one traversal per line.
         // Fully-covered lines (the gameplay majority) take a straight
         // swap-copy; gaps get the classified backdrop as they stream out.
         // Rows leave here TFT-ready, so blit_frame skips its swap pass.
         for (r = 0; r < n; r++) {
-            uint16_t *out = fr_strip_out ? B.main_px[r] :
+            uint16_t *out =
                 (uint16_t *)(GFX.Screen + (y + (uint32_t)r) * GFX.Pitch2);
             const uint16_t *mrow = B.main_px[r];
             const uint8_t *covrow = B.cov[r];
@@ -889,11 +1084,8 @@ FR_HOT void snes_fast_span(uint32_t starty, uint32_t endy, const SLineData *line
                     out[x] = (uint16_t)((c >> 8) | (c << 8));
                 }
             }
-            if (!fr_strip_out)
-                snes_row_swapped[y + (uint32_t)r] = 1;
+            snes_row_swapped[y + (uint32_t)r] = 1;
         }
-        if (fr_strip_out)
-            host_blit_rect(&B.main_px[0][0], 32, y_off + (int)y, 256, n);
 
         y += (uint32_t)n;
     }

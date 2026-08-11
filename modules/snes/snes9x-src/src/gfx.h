@@ -125,6 +125,11 @@ extern uint8_t snes_row_swapped[SNES_HEIGHT_EXTENDED]; /* fastrender.c */
  * worker's per-frame clip refresh. */
 void snes_worker_publish(void);
 uint16_t snes_worker_bind(void);
+
+/* MESHPUNK fr2: decoded-tile cache (fastrender.c); the publish invalidates
+ * per dirty VRAM page and the bind keys the cache to the snapshot. */
+extern const uint8_t *fr2_cache_vram;
+void fr2_inval_page(int page);
 const SLineData *snes_worker_ld(void);
 const uint32_t *snes_worker_fx(void);
 extern volatile int snes_worker_hungry;
@@ -145,7 +150,6 @@ extern uint8_t fr_bg_tile16[4];
 extern int fr_bgmode;
 extern int fr_bg3prio;
 extern const ClipData *fr_clip;
-extern int fr_strip_out;
 extern volatile uint32_t snes_frame_seq;
 extern const uint8_t *fr_vram;  /* span tile source (fastrender.c) */
 extern const uint16_t *fr_pal;  /* span palette source (fastrender.c) */
