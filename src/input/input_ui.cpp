@@ -17,6 +17,7 @@ extern "C" {
 
 #include "input_dev.h"
 #include "input_ui.h"
+#include "input_zones.h"        // controller-mode touch zones
 #include "../meshpunk_sync.h"   // SLog
 #include "../usb_manager.h"     // usb_kbd_snapshot + UsbFlashGuard
 #include "../emoji_font.h"      // emoji_preload
@@ -223,6 +224,16 @@ bool input_ui_take_home_shortcut(void) {
 static volatile bool     s_input_capture_armed = false;
 static volatile uint32_t s_input_captured      = 0;
 
+// Shift+Alt (mode-cycle chord) edge state, set by the keyboard reader below
+// and consumed by loop()'s dispatcher. Physical modifier levels only (an alt
+// LATCH must not arm it) with a debounce window, matching the ELF binding
+// chord: a bouncing key or one dropped matrix read would otherwise fabricate
+// a second edge and cycle twice.
+#define TOUCH_CHORD_DEBOUNCE_MS 300
+static bool          s_touch_chord_prev    = false;
+static uint32_t      s_touch_chord_last_ms = 0;
+static volatile bool s_touch_chord_pending = false;
+
 // ── LVGL keyboard read callback ────────────────────────────────────────────
 static bool trackball_btn_pressed = false;
 
@@ -397,6 +408,32 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     }
   }
 
+  // ── Controller-mode zone key (touch zones, lib/touchlayout.lua) ──
+  // The held zone's code rides the same level-based state as matrix/USB
+  // keys, so LVGL key events (with native auto-repeat) and the _kb_*
+  // polling APIs see it identically. Physical keys win the resolved slot.
+  {
+    uint8_t zs[INPUT_DEV_TOUCH_MAX];
+    int zn = input_zones_held_all(zs, INPUT_DEV_TOUCH_MAX);
+    for (int i = 0; i < zn; i++) {
+      uint8_t z = zs[i];
+      if (!z || z >= 128) continue;
+      kb_key_state[z] = true;
+      if (!kb_key_prev[z]) {
+        kb_key_press_time[z] = millis();
+      }
+      // LVGL's keypad indev carries ONE key per cycle, so the first held
+      // zone wins the resolved slot; the rest are still live in
+      // kb_key_state[] for the _kb_* pollers (how games read a d-pad
+      // direction and a button together).
+      if (resolved_key == 0) {
+        if (z == 0x0D)      resolved_key = LV_KEY_ENTER;
+        else if (z == 0x08) resolved_key = LV_KEY_BACKSPACE;
+        else                resolved_key = z;
+      }
+    }
+  }
+
   // ── Alt+Backspace held = home shortcut ──
   // Same chord + hold time as the ELF exit chord, applied to Lua apps: close
   // the current app, land on the launcher home page. Physical alt only (the
@@ -415,6 +452,25 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
       s_home_chord_fired = true;
       s_home_shortcut_pending = true;
     }
+  }
+
+  // ── Shift+Alt = cycle the touch input mode ──
+  // The trigger on boards that have a keyboard (a keyboardless board uses
+  // its aux button). Requires BOTH modifiers and nothing else held, so it
+  // can't fire inside a shift- or alt-layer keystroke; the actual cycling
+  // happens in loop()'s dispatcher, which knows whether the running app has
+  // a controller layout.
+  {
+    bool other = false;
+    for (int i = 1; i < 128 && !other; i++)
+      if (kb_key_state[i]) other = true;
+    bool chord = kb_shift_active && alt_phys && !other;
+    if (chord && !s_touch_chord_prev &&
+        millis() - s_touch_chord_last_ms >= TOUCH_CHORD_DEBOUNCE_MS) {
+      s_touch_chord_last_ms = millis();
+      s_touch_chord_pending = true;
+    }
+    s_touch_chord_prev = chord;
   }
 
   bool kb_active = (resolved_key != 0);
@@ -565,11 +621,23 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   nav_input_tick_begin();
 
-  int16_t tx = 0, ty = 0;
-  if (input_dev_touch_read(&tx, &ty)) {
+  // All points, so controller mode can hold a direction and a button at
+  // once; LVGL's pointer only ever uses point 0 (it is single-point).
+  int16_t xs[INPUT_DEV_TOUCH_MAX], ys[INPUT_DEV_TOUCH_MAX];
+  int n = input_dev_touch_read_multi(xs, ys, INPUT_DEV_TOUCH_MAX);
+  if (n > 0) {
+    // Controller mode intercepts EVERY touch before LVGL sees a pointer:
+    // zone hits become held keys (merged in keyboard_read_cb), everything
+    // else is swallowed.
+    if (input_zones_touch_multi(xs, ys, n)) {
+      data->state = LV_INDEV_STATE_RELEASED;
+      firmware_note_activity();
+      firmware_wake_restore();
+      return;
+    }
     data->state = LV_INDEV_STATE_PRESSED;
-    data->point.x = tx;
-    data->point.y = ty;
+    data->point.x = xs[0];
+    data->point.y = ys[0];
     firmware_note_activity();
     firmware_wake_restore();
 
@@ -578,6 +646,7 @@ static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     // not inside a gridnav event dispatch.
     nav_disarm_on_touch();
   } else {
+    input_zones_touch_multi(nullptr, nullptr, 0);   // release every held zone
     data->state = LV_INDEV_STATE_RELEASED;
   }
 }
@@ -588,6 +657,92 @@ void input_ui_init(void (*prefs_save)(void)) {
   s_prefs_save = prefs_save;
 }
 
+// ── On-screen keyboard trigger (keyboardless boards) ───────────────────────
+// A textarea gaining focus (or being re-tapped) queues the OSK; loop()'s
+// dispatch_osk() opens lib/osk.lua — same pending-flag pattern as the emoji
+// popup. The captured target pointer is consumed by the _osk_* bindings in
+// main.cpp, which re-validate it before every use.
+static volatile bool s_osk_pending = false;
+static lv_obj_t *s_osk_target = NULL;
+static bool s_osk_active = false;
+
+bool input_ui_take_osk(void) {
+  if (!s_osk_pending) return false;
+  s_osk_pending = false;
+  return true;
+}
+
+lv_obj_t* input_ui_osk_target(void) { return s_osk_target; }
+void input_ui_osk_set_active(bool on) { s_osk_active = on; }
+void input_ui_osk_release(void) { s_osk_target = NULL; }
+
+// ── Touch input mode (contract: input_ui.h) ────────────────────────────────
+static uint8_t s_touch_mode = TOUCH_MODE_OFF;
+
+void input_ui_touch_mode_init(void) {
+  // No touch panel: the mode can never do anything, so leave it OFF. With a
+  // keyboard the user opts in via the chord; without one, touch controls are
+  // the only input there is, so they start live.
+  if (!input_dev_has_touch())          s_touch_mode = TOUCH_MODE_OFF;
+  else if (input_dev_has_keyboard())   s_touch_mode = TOUCH_MODE_OFF;
+  else                                 s_touch_mode = TOUCH_MODE_PAD;
+}
+
+uint8_t input_ui_touch_mode(void) { return s_touch_mode; }
+
+void input_ui_touch_mode_set(uint8_t mode) {
+  if (mode < TOUCH_MODE_COUNT) s_touch_mode = mode;
+}
+
+uint8_t input_ui_touch_mode_cycle(bool has_pad) {
+  if (!input_dev_has_touch()) return s_touch_mode;   // stays OFF
+  uint8_t m = s_touch_mode;
+  for (int i = 0; i < TOUCH_MODE_COUNT; i++) {
+    m = (uint8_t)((m + 1) % TOUCH_MODE_COUNT);
+    if (!has_pad && (m == TOUCH_MODE_PAD || m == TOUCH_MODE_PAD_HIDDEN)) continue;
+    break;
+  }
+  s_touch_mode = m;
+  return m;
+}
+
+bool input_ui_take_touch_chord(void) {
+  if (!s_touch_chord_pending) return false;
+  s_touch_chord_pending = false;
+  return true;
+}
+
+// Re-tapping an already-focused textarea fires no group focus event, so the
+// capture hook also plants a CLICKED callback on the target (dies with the
+// object; planted once per object via the last-hooked guard).
+static lv_obj_t *s_osk_last_hooked = NULL;
+
+static void osk_target_clicked_cb(lv_event_t *e) {
+  lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+  if (s_osk_active || s_touch_mode == TOUCH_MODE_OFF) return;
+  if (obj && lv_obj_is_valid(obj) && lv_obj_check_type(obj, &lv_textarea_class)) {
+    s_osk_target  = obj;
+    s_osk_pending = true;
+  }
+}
+
+static void osk_capture(lv_obj_t *obj) {
+  s_osk_target  = obj;
+  s_osk_pending = true;
+  if (obj != s_osk_last_hooked) {
+    lv_obj_add_event_cb(obj, osk_target_clicked_cb, LV_EVENT_CLICKED, NULL);
+    s_osk_last_hooked = obj;
+  }
+}
+
+static void osk_group_focus_cb(lv_group_t *g) {
+  if (s_osk_active || s_touch_mode == TOUCH_MODE_OFF) return;
+  lv_obj_t *obj = lv_group_get_focused(g);
+  if (obj && lv_obj_is_valid(obj) && lv_obj_check_type(obj, &lv_textarea_class)) {
+    osk_capture(obj);
+  }
+}
+
 void input_ui_setup_indevs(lv_display_t* disp) {
   // Register a touchscreen input device
   lv_indev_t *touch_indev = lv_indev_create();
@@ -595,16 +750,25 @@ void input_ui_setup_indevs(lv_display_t* disp) {
   lv_indev_set_read_cb(touch_indev, touchpad_read_cb);
   lv_indev_set_display(touch_indev, disp);
 
-  // Register keyboard input device if available
-  if (input_dev_has_keyboard()) {
-    lv_indev_t *kb_indev = lv_indev_create();
-    lv_indev_set_type(kb_indev, LV_INDEV_TYPE_KEYPAD);
-    lv_indev_set_read_cb(kb_indev, keyboard_read_cb);
+  // Register the keypad indev on EVERY board: with no physical keyboard the
+  // same callback still delivers USB-keyboard keys, nav pulses (buttons /
+  // USB arrows) and — with controller mode — synthesized zone keys, so apps
+  // reading LVGL key events work identically on keyboardless boards.
+  lv_indev_t *kb_indev = lv_indev_create();
+  lv_indev_set_type(kb_indev, LV_INDEV_TYPE_KEYPAD);
+  lv_indev_set_read_cb(kb_indev, keyboard_read_cb);
 
-    // Connect keyboard to the default group
-    lv_indev_set_group(kb_indev, lv_group_get_default());
+  // Connect keyboard to the default group
+  lv_indev_set_group(kb_indev, lv_group_get_default());
 
-    SLog.println("Keyboard input device registered with LVGL");
+  SLog.println("Keyboard input device registered with LVGL");
+
+  // Textarea focus opens the on-screen keyboard. Registered on every board
+  // with a touch panel: the callback itself is inert while the touch-input
+  // mode is OFF (the boot default wherever a physical keyboard exists), so
+  // the Shift+Alt chord can enable it at runtime with no re-registration.
+  if (input_dev_has_touch()) {
+    lv_group_set_focus_cb(lv_group_get_default(), osk_group_focus_cb);
   }
 }
 
@@ -624,6 +788,85 @@ void     input_ui_alt_toggle_set(bool on)        { kb_alt_toggle_pref = on;
 // ── Lua bindings (names unchanged from the pre-split main.cpp) ─────────────
 
 void input_ui_register_lua(lua_State *L) {
+  // ── Controller-mode zones (lib/touchlayout.lua) ─────────────────────────
+  // _zones_set{ {x=,y=,w=,h=,out=,label=}, ... } loads a layout;
+  // _zones_enable arms/disarms it (all touch intercepted while armed).
+  lua_register(L, "_zones_set", [](lua_State *L) -> int {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    InputZone zs[INPUT_ZONES_MAX];
+    int n = 0;
+    int len = (int)lua_rawlen(L, 1);
+    for (int i = 1; i <= len && n < INPUT_ZONES_MAX; i++) {
+      lua_rawgeti(L, 1, i);
+      if (lua_istable(L, -1)) {
+        InputZone *z = &zs[n];
+        memset(z, 0, sizeof(*z));
+        lua_getfield(L, -1, "x");     z->x = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+        lua_getfield(L, -1, "y");     z->y = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+        lua_getfield(L, -1, "w");     z->w = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+        lua_getfield(L, -1, "h");     z->h = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+        lua_getfield(L, -1, "out");   z->out = (uint8_t)lua_tointeger(L, -1); lua_pop(L, 1);
+        lua_getfield(L, -1, "label");
+        const char *lb = lua_tostring(L, -1);
+        if (lb) { strncpy(z->label, lb, sizeof(z->label) - 1); }
+        lua_pop(L, 1);
+        n++;
+      }
+      lua_pop(L, 1);
+    }
+    input_zones_set(zs, n);
+    lua_pushinteger(L, n);
+    return 1;
+  });
+  lua_register(L, "_zones_clear", [](lua_State *L) -> int {
+    input_zones_clear();
+    return 0;
+  });
+  lua_register(L, "_zones_enable", [](lua_State *L) -> int {
+    input_zones_enable(lua_toboolean(L, 1));
+    return 0;
+  });
+  lua_register(L, "_zones_enabled", [](lua_State *L) -> int {
+    lua_pushboolean(L, input_zones_enabled() ? 1 : 0);
+    return 1;
+  });
+
+  // ── Touch diagnostics (Tools/Touch Test) ────────────────────────────────
+  // _touch_raw() -> rx, ry, drops. rx/ry are the controller's own numbers
+  // for the last accepted sample, BEFORE the board's raw->screen transform;
+  // drops counts frames the backend threw away as invalid. Lets the
+  // measurement app show what the panel reported next to where the UI put
+  // the finger, without the app needing to know the board's geometry.
+  lua_register(L, "_touch_raw", [](lua_State *L) -> int {
+    // NOTE: lua_register is a MACRO. A comma at this brace level splits its
+    // argument list — braces do not protect commas, only parentheses do —
+    // so every declaration here stays on its own line.
+    InputTouchRaw t;
+    memset(&t, 0, sizeof(t));
+    input_dev_touch_raw(&t);
+    lua_newtable(L);
+    lua_pushinteger(L, t.x0);              lua_setfield(L, -2, "x0");
+    lua_pushinteger(L, t.y0);              lua_setfield(L, -2, "y0");
+    lua_pushinteger(L, t.x1);              lua_setfield(L, -2, "x1");
+    lua_pushinteger(L, t.y1);              lua_setfield(L, -2, "y1");
+    lua_pushinteger(L, t.points);          lua_setfield(L, -2, "points");
+    lua_pushinteger(L, (lua_Integer)t.drops); lua_setfield(L, -2, "drops");
+    return 1;
+  });
+
+  // ── Touch input mode (lib/touchlayout.lua applies it) ───────────────────
+  // _touch_mode() -> current mode; _touch_mode_cycle(has_pad) -> next mode.
+  // The Lua side passes has_pad because only it knows whether the running
+  // app ships a controller layout.
+  lua_register(L, "_touch_mode", [](lua_State *L) -> int {
+    lua_pushinteger(L, input_ui_touch_mode());
+    return 1;
+  });
+  lua_register(L, "_touch_mode_cycle", [](lua_State *L) -> int {
+    lua_pushinteger(L, input_ui_touch_mode_cycle(lua_toboolean(L, 1)));
+    return 1;
+  });
+
   // Device capability table for Lua (Settings/apps adapt per device).
   lua_register(L, "_input_caps", [](lua_State *L) -> int {
     lua_newtable(L);

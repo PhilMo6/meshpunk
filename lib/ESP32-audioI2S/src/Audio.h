@@ -163,7 +163,19 @@ class Audio : private AudioBuffer{
     AudioBuffer InBuff; // instance of input buffer
 
 public:
-    Audio(bool internalDAC = false, uint8_t channelEnabled = 3, uint8_t i2sPort = I2S_NUM_0); // #99
+    // MESHPUNK: dmaCount/dmaLen added (defaulted to the stock values, so every
+    // existing call site is unchanged). A DECODE-ONLY instance — one whose PCM
+    // is captured by the audio_process_extern hook and routed to USB instead of
+    // I2S — never writes a sample into the DMA ring, so it can install a
+    // minimal one and hand ~15KB of internal SRAM back. See the notes at the
+    // assignment in Audio.cpp.
+    Audio(bool internalDAC = false, uint8_t channelEnabled = 3, uint8_t i2sPort = I2S_NUM_0,
+          int dmaCount = 8, int dmaLen = 512); // #99
+    // MESHPUNK: true when i2s_driver_install() actually succeeded. The library
+    // ignores that return value, and an uninstalled driver faults inside the
+    // IDF's own validity checks, so callers passing custom DMA sizes MUST
+    // check this and fall back.
+    bool i2sDriverInstalled() const { return m_f_i2sInstalled; }
     ~Audio();
     void setBufsize(int rambuf_sz, int psrambuf_sz);
     bool connecttohost(const char* host, const char* user = "", const char* pwd = "");
@@ -553,6 +565,7 @@ private:
     bool            m_f_tts = false;                // text to speech
     bool            m_f_loop = false;               // Set if audio file should loop
     bool            m_f_forceMono = false;          // if true stereo -> mono
+    bool            m_f_i2sInstalled = false;       // MESHPUNK: install() succeeded
     bool            m_f_internalDAC = false;        // false: output vis I2S, true output via internal DAC
     bool            m_f_rtsp = false;               // set if RTSP is used (m3u8 stream)
     bool            m_f_m3u8data = false;           // used in processM3U8entries

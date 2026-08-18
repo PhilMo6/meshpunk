@@ -1,6 +1,7 @@
 #include "sound.h"
 #include "Audio.h"
 #include "usb_manager.h"
+#include "audio/audio_dev.h"
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
 #include <esp_random.h>
@@ -85,6 +86,32 @@ static const uint8_t kVolTable[22] = { 0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 17,
 
 static const uint32_t TONE_SR = 44100;
 static bool tone_sr_set = false;
+
+// ── No-I2S boards (buzzer/none audio backend) ────────────────────────────────
+// "This board has an I2S SPEAKER", decided once at init from whether
+// audio_dev_init() returned a player. NOT the same as "an Audio object
+// exists": a decode-only instance can appear later on these boards (see
+// s_audio_is_decoder) and must still never reach I2S.
+//
+// When false the IDF I2S driver was never installed for OUTPUT, so every raw
+// i2s_* write path below must be gated — i2s_set_sample_rates dereferences
+// the driver object inside its own validity check (NULL + 0x50
+// LoadProhibited, the Flappy Bird crash). The PCM mix still runs (play_pos
+// timing, USB routing); the audible local output is the buzzer translation:
+// each TONE object carries a note schedule (sound.h) and the mixer drives
+// the piezo from it.
+static bool s_i2s_present = false;
+static volatile uint32_t s_buzz_cur = 0;       // frequency currently on the piezo
+static uint32_t s_buzz_play_seq = 0;           // sound_play order (newest wins)
+static uint32_t s_pace_frac = 0;               // fractional-ms pacing accumulator
+
+// Decode-only player, opened on demand when a FILE is played on a board with
+// no I2S output and torn down when playback ends — it holds ~300KB of PSRAM
+// (the decode ring) while it lives. s_audio points at it while open, so every
+// existing s_audio path (decode pump, stop, pause, introspection) works
+// unchanged; s_i2s_present stays false, which is what keeps its PCM off I2S
+// and on the USB sink. Only ever touched under s_audio_mutex.
+static bool s_audio_is_decoder = false;
 // NOTE (2026-06-12): a "pull-native I2S" experiment lived here — it
 // uninstalled/reinstalled the I2S driver at the module's rate with a
 // shallow DMA queue (lower latency, no resampling). REMOVED at the base-
@@ -167,11 +194,16 @@ static volatile int s_extern_upsample = 4;  // 44100 / input_rate (default 11025
 static void (*s_extern_pull)(int16_t* out, int count) = nullptr;
 
 static void sound_task_body(void* param);
+// Decode-only player teardown (defined with the rest of its lifecycle by the
+// playback controls); used earlier than that by sound_obj_remove. Caller
+// must hold s_audio_mutex.
+static void decoder_close_locked();
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 void sound_init(Audio* audio_ptr, void (*prefs_save_fn)()) {
     s_audio      = audio_ptr;
+    s_i2s_present = (audio_ptr != nullptr);
     s_prefs_save = prefs_save_fn;
     s_sound_mutex = xSemaphoreCreateMutex();
     s_audio_mutex = xSemaphoreCreateMutex();
@@ -201,13 +233,19 @@ void sound_suspend() {
     // Let the sound task observe the flag and leave any in-flight i2s_write.
     vTaskDelay(pdMS_TO_TICKS(30));
     // Halt the I2S peripheral + DMA so its TX-EOF ISR stops firing while the
-    // CPU that services audio is handed to the module.
-    i2s_stop(I2S_NUM_0);
+    // CPU that services audio is handed to the module. No-I2S boards silence
+    // the buzzer instead (the task is parked by now, so it can't re-drive it).
+    if (s_i2s_present) {
+        i2s_stop(I2S_NUM_0);
+    } else if (s_buzz_cur) {
+        s_buzz_cur = 0;
+        audio_dev_buzzer_off();
+    }
 }
 
 void sound_resume() {
     if (!s_sound_suspended) return;
-    i2s_start(I2S_NUM_0);
+    if (s_i2s_present) i2s_start(I2S_NUM_0);
     tone_sr_set = false;          // force sample-rate reprogram on next tone
     s_sound_suspended = false;
 }
@@ -270,7 +308,7 @@ void    sound_set_muted(bool m)     { sound_muted = m; }
 bool sound_file_is_sd()                 { return active_file_is_sd; }
 
 bool sound_is_playing() {
-    if (s_audio->isRunning()) return true;
+    if (s_audio && s_audio->isRunning()) return true;
     for (int i = 0; i < sound_obj_count; i++)
         if (sound_objects[i]->type == SoundObject::TONE && sound_objects[i]->tone_playing)
             return true;
@@ -318,17 +356,21 @@ static void sound_obj_remove(int id) {
     // File is closed below, or the streamer keeps reading a dead handle.
     if (obj && obj->type == SoundObject::AUDIO_FILE && obj->id == s_active_file_id) {
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
-        s_audio->stopSong();
+        if (s_audio) s_audio->stopSong();
         s_snap_pos = 0; s_snap_dur = 0;
         s_snap_br  = 0; s_snap_sr  = 0; s_snap_ch = 0;
+        decoder_close_locked();   // the file it was decoding is going away
         xSemaphoreGive(s_audio_mutex);
         active_file_is_sd = false;
         s_active_file_id  = -1;
     }
     xSemaphoreGive(s_sound_mutex);
     if (!obj) return;
-    if (obj->type == SoundObject::TONE && obj->pcm_buffer)
-        free(obj->pcm_buffer);
+    if (obj->type == SoundObject::TONE) {
+        if (obj->pcm_buffer) free(obj->pcm_buffer);
+        free(obj->buzz_freq);
+        free(obj->buzz_end_ms);
+    }
     if (obj->type == SoundObject::AUDIO_FILE && obj->file) {
         // Closing an SD file is SPI traffic (directory-entry flush) — take the
         // bus lock or this Core-0 close races the radio on Core 1.
@@ -375,6 +417,80 @@ int sound_sweep(int from_id, int to_id) {
     if (swept > 0)
         SLog.printf("[SOUND] swept %d leaked object(s) (id %d..%d)\n", swept, from_id, to_id);
     return swept;
+}
+
+// ── Buzzer note-schedule capture (no-I2S boards) ─────────────────────────────
+// The generators below know the exact frequency plan of every sound; on
+// buzzer boards each TONE object also stores it as piecewise-constant
+// segments so the mixer can drive the piezo. Best-effort: an allocation
+// failure just leaves the object silent (buzz_count == 0). Envelopes,
+// waveforms and FM don't survive translation — a piezo plays one square
+// wave at a fixed gain.
+
+// Single tone (also the chord path, with the picked frequency). Frequency
+// sweeps subdivide into ~30ms steps sampled at segment midpoints, mirroring
+// the renderer's linear/exponential interpolation.
+static void tone_build_buzz(SoundObject* obj, const ToneParams& p) {
+    if (s_i2s_present) return;
+    bool sweep = (p.end_freq_hz > 0 && p.end_freq_hz != p.freq_hz);
+    int steps = 1;
+    if (sweep) {
+        steps = p.duration_ms / 30;
+        if (steps < 2)  steps = 2;
+        if (steps > 64) steps = 64;
+    }
+    uint16_t* f = (uint16_t*)ps_malloc(steps * sizeof(uint16_t));
+    uint32_t* e = (uint32_t*)ps_malloc(steps * sizeof(uint32_t));
+    if (!f || !e) { free(f); free(e); return; }
+
+    float freq_start = (float)p.freq_hz;
+    float freq_end   = sweep ? (float)p.end_freq_hz : freq_start;
+    float log_ratio  = 0.0f;
+    if (sweep && p.sweep_exp && freq_start > 0.0f && freq_end > 0.0f)
+        log_ratio = logf(freq_end / freq_start);
+
+    for (int i = 0; i < steps; i++) {
+        float t = ((float)i + 0.5f) / (float)steps;
+        float fr;
+        if (!sweep)            fr = freq_start;
+        else if (p.sweep_exp && freq_start > 0.0f && freq_end > 0.0f)
+                               fr = freq_start * expf(log_ratio * t);
+        else                   fr = freq_start + (freq_end - freq_start) * t;
+        if (fr < 0.0f)     fr = 0.0f;
+        if (fr > 20000.0f) fr = 20000.0f;
+        f[i] = (uint16_t)fr;
+        e[i] = ((uint32_t)p.duration_ms * (uint32_t)(i + 1)) / (uint32_t)steps;
+    }
+    obj->buzz_freq   = f;
+    obj->buzz_end_ms = e;
+    obj->buzz_count  = (uint16_t)steps;
+}
+
+// Melody: one segment per note, clamps mirroring the renderer (freq 0 = rest).
+static void melody_build_buzz(SoundObject* obj, const MelodyNote* notes, int count) {
+    if (s_i2s_present) return;
+    uint16_t* f = (uint16_t*)ps_malloc(count * sizeof(uint16_t));
+    uint32_t* e = (uint32_t*)ps_malloc(count * sizeof(uint32_t));
+    if (!f || !e) { free(f); free(e); return; }
+    uint32_t acc_ms = 0;
+    for (int n = 0; n < count; n++) {
+        int freq = notes[n].freq_hz;
+        int ms   = notes[n].ms;
+        if (ms < 1) ms = 1;
+        if (ms > 10000) ms = 10000;
+        if (freq > 0) {
+            if (freq > 20000) freq = 20000;
+            if (freq < 20)    freq = 20;
+        } else {
+            freq = 0;
+        }
+        acc_ms += (uint32_t)ms;
+        f[n] = (uint16_t)freq;
+        e[n] = acc_ms;
+    }
+    obj->buzz_freq   = f;
+    obj->buzz_end_ms = e;
+    obj->buzz_count  = (uint16_t)count;
 }
 
 // ── Tone generation ───────────────────────────────────────────────────────────
@@ -485,8 +601,11 @@ int sound_create_tone(const ToneParams& p) {
     obj->tone_playing = false;
     obj->tone_paused  = false;
     obj->tone_loop    = false;
+    tone_build_buzz(obj, p);
     if (!sound_obj_add(obj)) {   // registry realloc failed: don't leak the render
         free(obj->pcm_buffer);
+        free(obj->buzz_freq);
+        free(obj->buzz_end_ms);
         delete obj;
         return -1;
     }
@@ -612,8 +731,21 @@ int sound_create_chord(const uint16_t* freqs, int freq_count, const ToneParams& 
     obj->tone_playing = false;
     obj->tone_paused  = false;
     obj->tone_loop    = false;
+    {   // buzzer schedule: the chord collapses to its most audible (highest)
+        // component; the base sweep, if any, rides along
+        uint16_t maxf = 0;
+        for (int n = 0; n < freq_count; n++)
+            if (freqs[n] > maxf) maxf = freqs[n];
+        if (maxf) {
+            ToneParams bp = base;
+            bp.freq_hz = maxf;
+            tone_build_buzz(obj, bp);
+        }
+    }
     if (!sound_obj_add(obj)) {   // registry realloc failed: don't leak the render
         free(obj->pcm_buffer);
+        free(obj->buzz_freq);
+        free(obj->buzz_end_ms);
         delete obj;
         return -1;
     }
@@ -756,8 +888,11 @@ int sound_create_melody_notes(const MelodyNote* notes, int count, const TonePara
     obj->tone_playing = false;
     obj->tone_paused  = false;
     obj->tone_loop    = false;
+    melody_build_buzz(obj, notes, count);
     if (!sound_obj_add(obj)) {   // registry realloc failed: don't leak the render
         free(obj->pcm_buffer);
+        free(obj->buzz_freq);
+        free(obj->buzz_end_ms);
         delete obj;
         return -1;
     }
@@ -867,6 +1002,59 @@ int sound_load_file(lua_State* L) {
     return 1;
 }
 
+// ── Decode-only player lifecycle (boards with no I2S output) ─────────────────
+// Opened when a file is played and there is a sink that can carry the PCM,
+// closed the moment playback ends. Both run with s_audio_mutex HELD by the
+// caller: the Core-1 decode pump takes that mutex around audio->loop(), so
+// this can never delete an instance the pump is inside.
+
+// True when decoded PCM has somewhere to go on a board with no speaker of
+// its own. Without this a track would decode into nothing, spending ~300KB
+// of PSRAM and real CPU to produce silence.
+static bool decoder_sink_ready() {
+    return usb_audio_active();
+}
+
+static bool decoder_open_locked() {
+    if (s_audio) return true;                 // real player, or already open
+    if (s_i2s_present) return false;          // board has its own; never here
+    if (!decoder_sink_ready()) return false;  // nothing could hear it
+    s_audio = audio_dev_decoder_open();
+    s_audio_is_decoder = (s_audio != nullptr);
+    return s_audio_is_decoder;
+}
+
+static void decoder_close_locked() {
+    if (!s_audio_is_decoder) return;          // never touch a board's real player
+    Audio* a = s_audio;
+    s_audio = nullptr;                        // pump sees "no player" immediately
+    s_audio_is_decoder = false;
+    s_snap_pos = 0; s_snap_dur = 0;
+    s_snap_br  = 0; s_snap_sr  = 0; s_snap_ch = 0;
+    audio_dev_decoder_close(a);
+}
+
+// Stepped once per sound-task cycle: hand the ~300KB back as soon as it is
+// no longer earning its keep — the track ended, or the USB sink it was
+// decoding for went away (dongle unplugged / routing turned off), in which
+// case the song is stopped first. Takes s_audio_mutex itself and re-checks
+// under it, so it can never delete an instance sound_play() is mid-connect
+// on. No-op on boards with a real player.
+static void decoder_release_if_idle() {
+    if (!s_audio_is_decoder) return;
+    xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
+    if (s_audio_is_decoder && s_audio) {
+        bool sink_gone = !decoder_sink_ready();
+        if (sink_gone && s_audio->isRunning()) s_audio->stopSong();
+        if (sink_gone || !s_audio->isRunning()) {
+            decoder_close_locked();
+            s_active_file_id  = -1;
+            active_file_is_sd = false;
+        }
+    }
+    xSemaphoreGive(s_audio_mutex);
+}
+
 // ── Playback control ──────────────────────────────────────────────────────────
 
 void sound_play(int id) {
@@ -878,9 +1066,18 @@ void sound_play(int id) {
         obj->play_pos     = 0;
         obj->tone_playing = true;
         obj->tone_paused  = false;
+        obj->buzz_seq     = ++s_buzz_play_seq;   // newest tone owns the piezo
     } else {
         // Decoder state changes — serialize against the Core-1 decode pump.
+        // A board with no I2S output has no player at boot; open a decode-only
+        // one on demand (it needs a live USB sink to be worth its ~300KB).
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
+        if (!decoder_open_locked()) {
+            xSemaphoreGive(s_audio_mutex);
+            xSemaphoreGive(s_sound_mutex);
+            SLog.println("[SOUND] file play ignored: no decoder (no USB audio sink?)");
+            return;
+        }
         s_audio->stopSong();
         active_file_is_sd = false;
         s_file_eof = false;          // fresh track: drop any stale end-of-file flag
@@ -920,9 +1117,10 @@ void sound_stop(int id) {
         obj->play_pos     = 0;
     } else {
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
-        s_audio->stopSong();
+        if (s_audio) s_audio->stopSong();
         s_snap_pos = 0; s_snap_dur = 0;
         s_snap_br  = 0; s_snap_sr  = 0; s_snap_ch = 0;
+        decoder_close_locked();   // give the ~300KB back on a decode-only board
         xSemaphoreGive(s_audio_mutex);
         active_file_is_sd = false;
         obj->file_paused  = false;
@@ -939,7 +1137,7 @@ void sound_pause(int id) {
         obj->tone_paused = !obj->tone_paused;
     } else {
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
-        s_audio->pauseResume();
+        if (s_audio) s_audio->pauseResume();
         xSemaphoreGive(s_audio_mutex);
         obj->file_paused = !obj->file_paused;
     }
@@ -1013,6 +1211,32 @@ static void play_staged() {
     // the SPI/audio locks already released.
     bool silence_spk = usb_audio_push(s_stage, frames, rate, ch);
 
+    // ── No local speaker: pace to a DEADLINE, not a duration ─────────────
+    // A decode-only board has no I2S write to meter the decode loop, and
+    // i2s_write is NOT a delay — it returns as soon as the DMA has room, so
+    // the time the decode itself took is absorbed by it. Sleeping a whole
+    // chunk on top of the decode instead makes each cycle cost
+    // (decode + chunk), i.e. audio emitted slower than real time: the USB
+    // ring drains and every gap is an audible crackle. So track when this
+    // chunk is due to have finished playing and sleep only the remainder.
+    // Sub-millisecond remainders stay in the microsecond deadline and are
+    // recovered by later chunks, so there is no rounding drift.
+    if (!s_i2s_present) {
+        static uint32_t next_us = 0;
+        uint32_t dur_us = (uint32_t)(((uint64_t)frames * 1000000ULL) / (uint32_t)rate);
+        uint32_t now = micros();
+        // First chunk, or so far behind that catching up is pointless (SD
+        // stall, track change): restart the clock rather than sprinting to
+        // claw back time. Wrap-safe: micros() rolls over every ~71 min.
+        if (next_us == 0 || (int32_t)(now - next_us) > 250000) next_us = now;
+        next_us += dur_us;
+        int32_t wait_us = (int32_t)(next_us - micros());
+        if (wait_us >= 1000) vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
+        else                 taskYIELD();   // already at/behind the deadline
+        s_dbg_played++;
+        return;
+    }
+
     // ── Speaker: lib-identical gain, mono→stereo, paced write ────────────
     // Written in small slices so the stack buffer stays tiny. The blocking
     // i2s_write here is the pacing point for the entire decode loop —
@@ -1058,7 +1282,10 @@ static void sound_task_body(void* param) {
             continue;
         }
 
-        if (s_audio->isRunning()) {
+        // Release a decode-only player the moment it stops earning its PSRAM.
+        decoder_release_if_idle();
+
+        if (s_audio && s_audio->isRunning()) {
             // File decode runs HERE on Core 1 — moved off Core 0's loop() so a
             // heavy MP3/FLAC decode can't stutter LVGL/Lua. s_audio_mutex
             // serializes the decoder against Lua play/stop/pause (Core 0) and
@@ -1139,6 +1366,10 @@ static void sound_task_body(void* param) {
             // Don't reset tone_sr_set here — the ring buffer goes briefly empty
             // between module audio pushes, and reconfiguring I2S every wake cycle
             // causes audible DMA glitches.  Only the Audio-library path resets it.
+            if (s_buzz_cur) {   // last tone ended: silence the piezo
+                s_buzz_cur = 0;
+                audio_dev_buzzer_off();
+            }
             xSemaphoreGive(s_sound_mutex);
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
             continue;
@@ -1150,7 +1381,7 @@ static void sound_task_body(void* param) {
 
         s_dbg_pass_mixer++;   // productive mixer pass (not the idle-sleep path)
         if (!tone_sr_set) {
-            i2s_set_sample_rates(I2S_NUM_0, TONE_SR);
+            if (s_i2s_present) i2s_set_sample_rates(I2S_NUM_0, TONE_SR);
             tone_sr_set = true;
         }
 
@@ -1237,6 +1468,29 @@ static void sound_task_body(void* param) {
             if (n > 0) s_prev_extern = samp[n - 1];
         }
 
+        // ── Buzzer translation (no-I2S boards): pick this chunk's note ──
+        // The newest playing tone owns the piezo; its note schedule is
+        // sampled at the position play_pos just advanced to. Only the CHOICE
+        // happens here, where the mutex keeps objects from being removed
+        // mid-walk — driving the pin waits until the USB routing decision
+        // below, because the piezo is this board's speaker.
+        uint32_t buzz_want = 0;
+        if (!s_i2s_present) {
+            SoundObject* pick = nullptr;
+            for (int i = 0; i < sound_obj_count; i++) {
+                SoundObject* o = sound_objects[i];
+                if (o->type != SoundObject::TONE || !o->tone_playing || o->tone_paused) continue;
+                if (!o->buzz_count) continue;
+                if (!pick || o->buzz_seq > pick->buzz_seq) pick = o;
+            }
+            if (pick && !sound_muted && sound_volume > 0) {
+                uint32_t pos_ms = (uint32_t)((uint64_t)(pick->play_pos / 2) * 1000u / TONE_SR);
+                for (int i = 0; i < pick->buzz_count; i++) {
+                    if (pos_ms < pick->buzz_end_ms[i]) { buzz_want = pick->buzz_freq[i]; break; }
+                }
+            }
+        }
+
         xSemaphoreGive(s_sound_mutex);
 
         int16_t out[CHUNK * 2];
@@ -1255,8 +1509,32 @@ static void sound_task_body(void* param) {
             for (int s = 0; s < CHUNK * 2; s++)
                 out[s] = (int16_t)(out[s] * vol_scale);
         }
+
+        // Drive the piezo with the note chosen above — AFTER the routing
+        // decision, so a dongle that has taken over silences it exactly the
+        // way it silences I2S on a PCM board ("keep speaker on" reinstates
+        // both). Only frequency CHANGES reach the hardware.
+        if (!s_i2s_present) {
+            if (silence_spk) buzz_want = 0;
+            if (buzz_want != s_buzz_cur) {
+                s_buzz_cur = buzz_want;
+                if (buzz_want) audio_dev_buzzer_tone(buzz_want);
+                else           audio_dev_buzzer_off();
+            }
+        }
+
         size_t written = 0;
-        i2s_write(I2S_NUM_0, out, sizeof(out), &written, pdMS_TO_TICKS(50));
+        if (s_i2s_present) {
+            i2s_write(I2S_NUM_0, out, sizeof(out), &written, pdMS_TO_TICKS(50));
+        } else {
+            // No blocking DMA write to pace the loop: sleep the chunk's real
+            // duration (CHUNK/44100 = 5.805ms), with a fractional accumulator
+            // so note timing doesn't drift (a flat 6ms runs 3.4% slow).
+            s_pace_frac += (uint32_t)CHUNK * 1000u;
+            uint32_t ms = s_pace_frac / TONE_SR;
+            s_pace_frac -= ms * TONE_SR;
+            vTaskDelay(pdMS_TO_TICKS(ms));
+        }
     }
 }
 
@@ -1300,7 +1578,7 @@ void sound_register_lua(lua_State* L) {
         int v = luaL_checkinteger(L, 1);
         if (v < 0) v = 0; if (v > 21) v = 21;
         sound_volume = (uint8_t)v;
-        if (!sound_muted) s_audio->setVolume(sound_volume);
+        if (!sound_muted && s_audio) s_audio->setVolume(sound_volume);
         if (s_prefs_save) s_prefs_save();
         lua_pushinteger(L, sound_volume);
         return 1;
@@ -1315,7 +1593,7 @@ void sound_register_lua(lua_State* L) {
     });
     lua_register(L, "_sound_set_muted", [](lua_State* L) -> int {
         sound_muted = lua_toboolean(L, 1);
-        s_audio->setVolume(sound_muted ? 0 : sound_volume);
+        if (s_audio) s_audio->setVolume(sound_muted ? 0 : sound_volume);
         if (s_prefs_save) s_prefs_save();
         lua_pushboolean(L, sound_muted ? 1 : 0);
         return 1;
@@ -1346,7 +1624,7 @@ void sound_register_lua(lua_State* L) {
         // the actual file seek happens on the pump's next pass, under its SPI
         // bracket.
         xSemaphoreTake(s_audio_mutex, portMAX_DELAY);
-        bool ok = s_audio->setAudioPlayPosition((uint16_t)sec);
+        bool ok = s_audio && s_audio->setAudioPlayPosition((uint16_t)sec);
         xSemaphoreGive(s_audio_mutex);
         lua_pushboolean(L, ok ? 1 : 0);
         return 1;
@@ -1372,7 +1650,7 @@ void sound_register_lua(lua_State* L) {
     // when USB host mode has serial disabled.
     lua_register(L, "_sound_debug", [](lua_State* L) -> int {
         lua_newtable(L);
-        lua_pushboolean(L, s_audio->isRunning() ? 1 : 0); lua_setfield(L, -2, "running");
+        lua_pushboolean(L, s_audio && s_audio->isRunning() ? 1 : 0); lua_setfield(L, -2, "running");
         lua_pushinteger(L, (lua_Integer)s_dbg_pass_decode); lua_setfield(L, -2, "dec");
         lua_pushinteger(L, (lua_Integer)s_dbg_pass_mixer);  lua_setfield(L, -2, "mix");
         lua_pushinteger(L, (lua_Integer)s_dbg_staged);      lua_setfield(L, -2, "staged");

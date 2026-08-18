@@ -18,6 +18,7 @@
 #include "gps/gps_dev.h"
 #include "input/input_dev.h"
 #include "input/input_ui.h"
+#include "input/input_zones.h"
 #include "power/power_dev.h"
 #include "meshpunk_sync.h"
 #include "Audio.h"
@@ -28,6 +29,7 @@
 #include "elf_host.h"
 #include "meshpunk_fs.h"
 #include "fs_bridge.h"
+#include "img_bridge.h"
 #include "usb_manager.h"
 #include "usb_fs.h"
 #include "tdeck_link.h"
@@ -110,8 +112,24 @@ RADIO_CLASS radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LOR
 StdRNG fast_rng;
 SimpleMeshTables tables;
 
+#if defined(BOARD_HELTEC_V4)
+#include "boards/punk_heltec_board.h"
+PunkHeltecBoard board;   // FEM TX/RX switching + Heltec battery circuit
+#else
 ESP32Board board;
+#endif
 PunkSX1262Wrapper radio_driver(radio, board);
+
+// TX power is RADIATED dBm everywhere in the UI and prefs; boards with a PA
+// front-end map it to the chip's own output at the two setOutputPower choke
+// points below.
+static inline int8_t board_tx_dbm_to_chip(int8_t radiated) {
+#if defined(BOARD_HELTEC_V4)
+  return heltec_radiated_to_chip_dbm(radiated);
+#else
+  return radiated;
+#endif
+}
 PunkMesh* the_mesh = nullptr;
 
 // Live radio reconfiguration (declared in meshpunk_sync.h). Holding SPI_LOCK
@@ -131,10 +149,12 @@ void radio_apply_params(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr) {
 }
 
 void radio_apply_tx_power(int8_t dbm) {
+  int8_t chip = board_tx_dbm_to_chip(dbm);
   SPI_LOCK();
-  int16_t s = radio.setOutputPower(dbm);
+  int16_t s = radio.setOutputPower(chip);
   SPI_UNLOCK();
-  SLog.printf("[RADIO] live tx power: %d dBm (%d)\n", (int)dbm, s);
+  SLog.printf("[RADIO] live tx power: %d dBm radiated (chip %d) (%d)\n",
+              (int)dbm, (int)chip, s);
 }
 
 // One-shot GPS time sync: poll in loop() until first fix, then stop.
@@ -1265,10 +1285,11 @@ void sd_spi_release() {
 // (4 MHz Arduino default) to ~50ms. Probe descending; 4 MHz floor = old
 // behavior.
 bool meshpunk_sd_mount() {
+#if defined(PIN_SD_CS)
   static const uint32_t sd_freqs[] = {40000000U, 25000000U, 4000000U};
   sd_mounted = false;
   for (uint32_t freq : sd_freqs) {
-    if (SD.begin(PIN_SD_CS, SPI, freq)) {
+    if (SD.begin(PIN_SD_CS, board_sd_spi(), freq)) {
       sd_mounted = true;
       SLog.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
       break;
@@ -1276,6 +1297,11 @@ bool meshpunk_sd_mount() {
     SD.end();
     SLog.printf("[SD] Mount failed at %lu Hz\n", (unsigned long)freq);
   }
+#else
+  // No confirmed SD wiring for this board.
+  sd_mounted = false;
+  SLog.println("[SD] no SD pins defined for this board");
+#endif
   return sd_mounted;
 }
 
@@ -6048,6 +6074,9 @@ void setupLuaVGL() {
   // Unified drive-aware _fs_* family (fs_bridge.cpp) — used by lib/fileman.lua
   fs_bridge_register(L);
 
+  // In-memory image buffers (_img_*, img_bridge.cpp) — used by lib/imgview.lua
+  img_bridge_register(L);
+
   // USB-OTG host manager (_usb_*) — used by Tools/USB (also PHY boot self-heal)
   usb_manager_register_lua(L);
 
@@ -6771,6 +6800,41 @@ void setupLuaVGL() {
     return 0;
   });
 
+  // ── On-screen keyboard (lib/osk.lua; keyboardless boards) ────────────────
+  // The OSK types into its own PREVIEW textarea; these bindings bridge it to
+  // the app textarea input_ui captured at focus time. Every use re-validates
+  // both pointers — the app underneath can rebuild its views while the OSK
+  // is up (same discipline as _emoji_popup_insert).
+  lua_register(L, "_osk_initial_text", [](lua_State *L) -> int {
+    lv_obj_t *ta = input_ui_osk_target();
+    if (ta && lv_obj_is_valid(ta) && lv_obj_check_type(ta, &lv_textarea_class)) {
+      lua_pushstring(L, lv_textarea_get_text(ta));
+    } else {
+      lua_pushstring(L, "");
+    }
+    return 1;
+  });
+  lua_register(L, "_osk_commit", [](lua_State *L) -> int {
+    const char *s = luaL_checkstring(L, 1);
+    lv_obj_t *ta = input_ui_osk_target();
+    bool ok = ta && lv_obj_is_valid(ta) &&
+              lv_obj_check_type(ta, &lv_textarea_class);
+    if (ok) {
+      lv_textarea_set_text(ta, s);
+    }
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+  });
+  lua_register(L, "_osk_set_active", [](lua_State *L) -> int {
+    input_ui_osk_set_active(lua_toboolean(L, 1));
+    return 0;
+  });
+  lua_register(L, "_osk_release", [](lua_State *L) -> int {
+    input_ui_osk_set_active(false);
+    input_ui_osk_release();
+    return 0;
+  });
+
   lua_register(L, "_obj_move_foreground", [](lua_State *L) -> int {
     luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
     if (!lobj || !lobj->obj) return 0;
@@ -7376,18 +7440,24 @@ void setup() {
   gps_sync_begin();
 
   // Set CS on all SPI buses to high level during initialization
-  pinMode(PIN_SD_CS, OUTPUT);
+  // Park every chip select this board hangs on the shared SPI bus. Boards
+  // where the radio has the bus to itself (Heltec) define only PIN_LORA_CS.
   pinMode(PIN_LORA_CS, OUTPUT);
-  pinMode(PIN_TFT_CS, OUTPUT);
-
-  digitalWrite(PIN_SD_CS, HIGH);
   digitalWrite(PIN_LORA_CS, HIGH);
+#if defined(PIN_SD_CS)
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+#endif
+#if defined(PIN_TFT_CS)
+  pinMode(PIN_TFT_CS, OUTPUT);
   digitalWrite(PIN_TFT_CS, HIGH);
+#endif
 
   pinMode(PIN_SPI_MISO, INPUT_PULLUP);
-  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI); // SD
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI); // radio (+ SD/TFT where shared)
 
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+
 
   SLog.println("Initializing display");
 
@@ -7534,6 +7604,9 @@ void setup() {
   // I2C bus + touch controller + keyboard probe/mode (board input backend);
   // kbd_brightness is the persisted backlight level applied on probe success.
   input_dev_init(kbd_brightness);
+  // Touch-input default, derived from what the backend just reported: live
+  // on a keyboardless board, off (chord-reachable) where a keyboard exists.
+  input_ui_touch_mode_init();
 
   // Initialize I2S audio output on T-Deck speaker
   audio = audio_dev_init();
@@ -7545,15 +7618,35 @@ void setup() {
   // and survives every sweep; everything at/above it is Lua-created and gets
   // swept by luaTearDown on ELF launch (Lua handles die with lua_close anyway).
   s_boot_sound_mark = sound_mark();
-  audio->setVolume(sound_get_muted() ? 0 : sound_get_volume());
-  SLog.printf("[AUDIO] I2S init: vol=%d muted=%d\n", sound_get_volume(), sound_get_muted() ? 1 : 0);
+  if (audio) audio->setVolume(sound_get_muted() ? 0 : sound_get_volume());
+  SLog.printf("[AUDIO] %s init: vol=%d muted=%d\n",
+              audio ? "I2S" : "no-I2S (buzzer/none backend)",
+              sound_get_volume(), sound_get_muted() ? 1 : 0);
   log_boot_mem("after audio");
 
   // Initialize LORA Radio
   SLog.println(F("===== RADIO INIT ====="));
 
+#if defined(BOARD_HELTEC_V4)
+  // FEM LDO + type auto-detect + receive path, before the first radio access.
+  // (PIN_BOARD_SDA/SCL=-1 in platformio.ini is load-bearing here: without
+  // them ESP32Board::begin() runs Wire.begin() on the generic variant's
+  // default I2C pins 8/9 — the radio's NSS/SCK — and kills all radio SPI.)
+  board.begin();
+#endif
+
   int16_t state = radio.begin();
   SLog.printf("[RADIO] begin() = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+
+#if defined(BOARD_HELTEC_V4)
+  // SX1262 module wiring on this board: 1.8V TCXO on DIO3, the FEM's TX/RX
+  // switch driven from DIO2, 140mA chip limit (the PA has its own LDO).
+  state = radio.setTCXO(1.8);
+  SLog.printf("[RADIO] setTCXO(1.8) = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  state = radio.setDio2AsRfSwitch(true);
+  SLog.printf("[RADIO] setDio2AsRfSwitch = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  radio.setCurrentLimit(140);
+#endif
 
   delay(100);
 
@@ -7588,8 +7681,10 @@ void setup() {
 
   radio.setCRC(true);
 
-  state = radio.setOutputPower(tx_pwr);
-  SLog.printf("[RADIO] setOutputPower = %d %s\n", state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  state = radio.setOutputPower(board_tx_dbm_to_chip(tx_pwr));
+  SLog.printf("[RADIO] setOutputPower(chip %d for %d radiated) = %d %s\n",
+              (int)board_tx_dbm_to_chip(tx_pwr), (int)tx_pwr,
+              state, state == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
 
   if (the_mesh->_prefs.rx_boost) {
     SPI_LOCK();
@@ -7810,6 +7905,46 @@ static void dispatch_kb_legacy_autoswitch() {
 
 // Dispatch the alt+mic emoji-popup shortcut into Lua (lib/emoji_popup
 // .on_shortcut). Same deferral as dispatch_topbar_shortcut above.
+// Touch-input mode trigger — the board's aux button (the Heltec IO key), the
+// Shift+Alt chord on boards with a keyboard, or a tap on an on-screen MODE
+// zone. All three land in lib/touchlayout.lua's mode manager, which cycles
+// the shared mode and applies it to the running app.
+static void dispatch_mode_button() {
+  bool from_btn   = input_dev_aux_btn_take();
+  bool from_chord = input_ui_take_touch_chord();
+  bool from_zone  = input_zones_mode_toggle_take();
+  if (!from_btn && !from_chord && !from_zone) return;
+  if (!L) return;
+  lua_getglobal(L, "require");
+  lua_pushstring(L, "lib/touchlayout");
+  if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "on_mode_button");
+  lua_remove(L, -2);   // drop the module table
+  if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+  if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    SLog.printf("[touchlayout] on_mode_button error: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 1);
+  }
+}
+
+// On-screen keyboard (keyboardless boards): a textarea focus/tap queued the
+// OSK in input_ui; open lib/osk.lua outside indev processing. Same pattern
+// as the emoji popup below.
+static void dispatch_osk() {
+  if (!input_ui_take_osk()) return;
+  if (!L) return;
+  lua_getglobal(L, "require");
+  lua_pushstring(L, "lib/osk");
+  if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "open");
+  lua_remove(L, -2);   // drop the module table
+  if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+  if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    SLog.printf("[osk] open error: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 1);
+  }
+}
+
 static void dispatch_emoji_popup() {
   if (!input_ui_take_emoji_popup()) return;
   if (!L) return;
@@ -7859,6 +7994,12 @@ void loop() {
 
   // Alt+mic emoji search popup (same flag pattern).
   dispatch_emoji_popup();
+
+  // On-screen keyboard open request (keyboardless boards; same flag pattern).
+  dispatch_osk();
+
+  // Input-mode button (IO key / MODE zone tap; same flag pattern).
+  dispatch_mode_button();
 
   // Alt+backspace home chord (same flag pattern).
   dispatch_home_shortcut();

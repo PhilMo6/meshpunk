@@ -26,6 +26,21 @@ def git_version(project_dir):
 # All release artifacts land here.
 RELEASES_DIR_NAME = "releases"
 
+# Per-board release naming. The slug matches MESHPUNK_BOARD_NAME in
+# src/boards/board_pins.h, which is also what the on-device guide tells the
+# user to look for. The LAUNCHER artifact is the one exception: its filename
+# pattern predates the slugs and the LauncherHub catalog entry downloads it
+# by explicit URL, so its name must not change shape (T-Deck only - the
+# Launcher firmware does not exist for the Heltec).
+BOARD_SLUG = {
+    "meshpunk":               "tdeck",
+    "meshpunk_release":       "tdeck",
+    "meshpunk_heltec":        "heltec_v4",
+    "meshpunk_heltec_release": "heltec_v4",
+}
+RELEASE_ENVS  = {"meshpunk_release", "meshpunk_heltec_release"}
+LAUNCHER_ENVS = {"meshpunk_release"}   # bmorcelli Launcher exists for T-Deck only
+
 # Launcher build (bmorcelli/Launcher): a merged image of bootloader + table +
 # the RELEASE app + the littlefs payload. The table declares the data partition
 # as "assets"; the Launcher creates it and copies the payload.
@@ -75,11 +90,14 @@ def merge_bin(source, target, env):
     build_dir   = env.subst("$BUILD_DIR")
     project_dir = env.subst("$PROJECT_DIR")
     version     = git_version(project_dir)
+    pioenv      = env["PIOENV"]
+    slug        = BOARD_SLUG.get(pioenv, pioenv)
 
     releases_dir = os.path.join(project_dir, RELEASES_DIR_NAME)
     os.makedirs(releases_dir, exist_ok=True)
 
-    output      = os.path.join(releases_dir, "meshpunk-%s-merged.bin" % version)
+    output      = os.path.join(releases_dir,
+                               "meshpunk-%s-%s-merged.bin" % (slug, version))
 
     bins = {
         "bootloader": os.path.join(build_dir, "bootloader.bin"),
@@ -89,12 +107,13 @@ def merge_bin(source, target, env):
     }
 
     # The littlefs image is identical across envs (same data/ + partition csv),
-    # so if this env hasn't run buildfs, reuse the dev env's image instead of
-    # requiring a second buildfs run.
+    # so if this env hasn't run buildfs, reuse the same board's dev-env image
+    # instead of requiring a second buildfs run.
     if not os.path.isfile(bins["littlefs"]):
-        alt = os.path.join(os.path.dirname(build_dir), "meshpunk", "littlefs.bin")
+        dev_env = "meshpunk_heltec" if "heltec" in pioenv else "meshpunk"
+        alt = os.path.join(os.path.dirname(build_dir), dev_env, "littlefs.bin")
         if os.path.isfile(alt):
-            print("merge_bin: using littlefs.bin from dev env")
+            print("merge_bin: using littlefs.bin from %s env" % dev_env)
             bins["littlefs"] = alt
 
     for name, path in bins.items():
@@ -125,26 +144,38 @@ def merge_bin(source, target, env):
     subprocess.check_call(cmd)
 
     # Full filesystem image (the build's littlefs, for flashing the FS alone).
-    littlefs_out = os.path.join(releases_dir, "meshpunk-%s-littlefs.bin" % version)
+    littlefs_out = os.path.join(releases_dir,
+                                "meshpunk-%s-%s-littlefs.bin" % (slug, version))
     shutil.copy2(bins["littlefs"], littlefs_out)
     print("merge_bin: copied full littlefs image to %s" % littlefs_out)
 
-    # Distribution artifacts below require the release env: its app embeds the
+    # Distribution artifacts below require a release env: its app embeds the
     # data pack (MESHPUNK_EMBED_PACK) and is self-contained. A dev app has no
     # pack, so publishing it as firmware.bin/launcher.bin would install with an
     # empty filesystem.
-    if env["PIOENV"] != "meshpunk_release":
+    if pioenv not in RELEASE_ENVS:
         print("merge_bin: dev env - skipping firmware/launcher artifacts"
-              " (use 'pio run -e meshpunk_release' for release builds)")
+              " (use 'pio run -e meshpunk_release' or"
+              " 'pio run -e meshpunk_heltec_release' for release builds)")
         print("merge_bin: done")
         return
 
     # Self-contained app binary: THE universal file. Flash at the app offset
     # (0x10000) via any flasher, or install through the Launcher; it populates
     # its own filesystem on first boot.
-    firmware_out = os.path.join(releases_dir, "meshpunk-%s-firmware.bin" % version)
+    firmware_out = os.path.join(releases_dir,
+                                "meshpunk-%s-%s-firmware.bin" % (slug, version))
     shutil.copy2(bins["firmware"], firmware_out)
     print("merge_bin: copied firmware (app) binary to %s" % firmware_out)
+
+    # Launcher image: T-Deck only, and its filename pattern is LOAD-BEARING -
+    # the LauncherHub catalog entry downloads it by explicit URL, so the name
+    # keeps its original versioned shape with no board slug.
+    if pioenv not in LAUNCHER_ENVS:
+        print("merge_bin: no Launcher firmware for this board -"
+              " skipping launcher artifact")
+        print("merge_bin: done")
+        return
 
     # ---- Launcher build (bmorcelli/Launcher) ----------------------------------
     # Launcher installs a MERGED image, NOT an app-only bin: it reads the

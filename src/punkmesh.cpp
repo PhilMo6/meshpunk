@@ -1,4 +1,5 @@
 #include "punkmesh.h"
+#include "boards/board_pins.h"   // MESHPUNK_BOARD_LABEL — default node name
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
 #include <helpers/TransportKeyStore.h>
@@ -2237,49 +2238,101 @@ static void prune_routing_logs(fs::FS* storage, const String& prefix, uint32_t c
 }
 
 // Age-prune one text-message log: rewrite it keeping only records with ts >=
-// cutoff. Records ("ts=..\n..\n---\n") are append/oldest-first, so we find the
-// first keeper's byte offset and copy the tail (chunked — no big buffer). Caller
-// holds the SD lock. .tmp + rename keeps it crash-safe like the count trim.
+// cutoff. Records ("ts=..\n..\n---\n") are append/oldest-first, so the scan
+// finds the first keeper's byte offset and the tail is copied out.
+//
+// Both phases run in 512-byte chunks. A per-byte File::read()/available()
+// pair costs a full stdio/VFS round trip per byte — slow enough that scanning
+// the old prefix of a design-normal file (MSG_FILE_SAFETY_BYTES allows 768KB)
+// from the Core-0 loop starves IDLE0 past the 5s task watchdog and reboots
+// the device; with the sweep restarting on the same file each boot, that is
+// a boot loop (hw-observed, ~360KB prefix).
+//
+// Every read is checked: a short or failed read at either phase leaves the
+// file untouched on disk — a partial tail must never be renamed over good
+// data. delay(1) every 128KB keeps IDLE0 fed even on a slow card. Caller
+// holds MESH_LOCK and the SD lock, so the file cannot grow mid-rewrite.
+// .tmp + rename keeps it crash-safe like the count trim.
 static void prune_msg_file_by_age(fs::FS* storage, const String& path, uint32_t cutoff_ts) {
     if (!storage || cutoff_ts == 0) return;
     File f = storage->open(path.c_str(), "r");
     if (!f) return;
+    const long fsize = (long)f.size();
 
     long keep_start = -1;
     long rec_start = 0;
     uint32_t cur_ts = 0;
     char line[256];
-    while (f.available()) {
-        int len = 0;
-        while (f.available() && len < (int)sizeof(line) - 1) {
-            char ch = f.read();
-            if (ch == '\n' || ch == '\r') break;
-            line[len++] = ch;
+    int  llen = 0;
+    uint8_t buf[512];
+    long consumed = 0;         // bytes handed to the parser so far
+    long since_yield = 0;
+    bool read_err = false;
+
+    while (consumed < fsize && keep_start < 0) {
+        int n = f.read(buf, sizeof(buf));
+        if (n <= 0) { read_err = true; break; }
+        for (int i = 0; i < n && keep_start < 0; i++) {
+            char ch = (char)buf[i];
+            bool eol = (ch == '\n' || ch == '\r');
+            if (!eol && llen < (int)sizeof(line) - 1) line[llen++] = ch;
+            // A line ends at its terminator or at the buffer cap; the rest of
+            // an over-long line parses as its own line, as it always has.
+            if (eol || llen >= (int)sizeof(line) - 1) {
+                line[llen] = '\0';
+                if (llen == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
+                    if (cur_ts >= cutoff_ts) {
+                        keep_start = rec_start;
+                    } else {
+                        rec_start = consumed + i + 1;  // next record starts after '\n'
+                        cur_ts = 0;
+                    }
+                } else if (strncmp(line, "ts=", 3) == 0) {
+                    cur_ts = strtoul(line + 3, nullptr, 10);
+                }
+                llen = 0;
+            }
         }
-        line[len] = '\0';
-        if (len == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
-            if (cur_ts >= cutoff_ts) { keep_start = rec_start; break; }
-            rec_start = f.position();   // next record begins after this terminator
-            cur_ts = 0;
-        } else if (strncmp(line, "ts=", 3) == 0) {
-            cur_ts = strtoul(line + 3, nullptr, 10);
-        }
+        consumed += n;
+        since_yield += n;
+        if (since_yield >= 128 * 1024) { since_yield = 0; delay(1); }
     }
-    if (keep_start < 0) keep_start = f.size();   // every record older than cutoff
+    if (read_err) {
+        f.close();
+        SLog.printf("[PRUNE] scan read failed at %ld/%ld - leaving %s untouched\n",
+                    consumed, fsize, path.c_str());
+        return;
+    }
+    if (keep_start < 0) keep_start = fsize;      // every record older than cutoff
     if (keep_start == 0) { f.close(); return; }  // nothing to drop
 
-    f.seek(keep_start);
+    if (!f.seek(keep_start)) {
+        f.close();
+        SLog.printf("[PRUNE] seek failed - leaving %s untouched\n", path.c_str());
+        return;
+    }
     String tmp = path + ".tmp";
     File wf = storage->open(tmp.c_str(), "w", true);
     if (!wf) { f.close(); return; }
-    uint8_t chunk[512];
-    while (f.available()) {
-        int n = f.read(chunk, sizeof(chunk));
+    const long expect = fsize - keep_start;
+    long copied = 0;
+    since_yield = 0;
+    while (copied < expect) {
+        int n = f.read(buf, sizeof(buf));
         if (n <= 0) break;
-        wf.write(chunk, n);
+        if ((long)wf.write(buf, n) != (long)n) break;   // write error / card full
+        copied += n;
+        since_yield += n;
+        if (since_yield >= 128 * 1024) { since_yield = 0; delay(1); }
     }
     wf.close();
     f.close();
+    if (copied != expect) {
+        storage->remove(tmp.c_str());
+        SLog.printf("[PRUNE] tail copy short (%ld/%ld) - leaving %s untouched\n",
+                    copied, expect, path.c_str());
+        return;
+    }
     storage->remove(path.c_str());
     if (!storage->rename(tmp.c_str(), path.c_str()))
         SLog.printf("[STORAGE] age-prune rename failed: %s\n", path.c_str());
@@ -5323,7 +5376,7 @@ PunkMesh::PunkMesh(mesh::Radio &radio, StdRNG &rng, mesh::RTCClock &rtc, SimpleM
     // defaults
     memset(&_prefs, 0, sizeof(_prefs));
     _prefs.airtime_factor = 2.0; // one third
-    strcpy(_prefs.node_name, "Meshpunk T-deck");
+    strcpy(_prefs.node_name, "Meshpunk " MESHPUNK_BOARD_LABEL);
     _prefs.freq = LORA_FREQ;
     _prefs.tx_power_dbm = LORA_TX_POWER;
     _prefs.bandwidth = LORA_BW;

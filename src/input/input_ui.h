@@ -40,6 +40,44 @@ bool input_ui_take_topbar_shortcut(void);
 bool input_ui_take_emoji_popup(void);
 bool input_ui_take_home_shortcut(void);
 
+// ── On-screen keyboard trigger ─────────────────────────────────────────────
+// take: pending-open flag (textarea focused/re-tapped; suppressed while the
+// touch-input mode is OFF). target: the captured textarea — consumers MUST
+// re-validate (lv_obj_is_valid + class check) before every use. set_active
+// guards re-triggering while the OSK is up; release drops the pointer.
+bool      input_ui_take_osk(void);
+lv_obj_t* input_ui_osk_target(void);
+void      input_ui_osk_set_active(bool on);
+void      input_ui_osk_release(void);
+
+// ── Touch input mode ───────────────────────────────────────────────────────
+// One runtime state shared by the Lua and ELF worlds: what the touchscreen
+// is doing besides pointing. Advanced by ONE trigger — the board's aux
+// button where it exists, or the Shift+Alt chord on boards with a keyboard.
+// Not persisted: init() re-derives the default every boot, so a keyboardless
+// board comes up with touch controls live and a keyboard board comes up
+// clean until the user asks for them.
+enum {
+    TOUCH_MODE_OFF = 0,       // touch is a plain pointer; no OSK on focus
+    TOUCH_MODE_PAD,           // controller zones armed, indicators shown
+    TOUCH_MODE_PAD_HIDDEN,    // zones armed, indicators hidden
+    TOUCH_MODE_KB,            // on-screen keyboard
+    TOUCH_MODE_COUNT,
+};
+
+void    input_ui_touch_mode_init(void);   // call after input_dev_init()
+uint8_t input_ui_touch_mode(void);
+void    input_ui_touch_mode_set(uint8_t mode);
+
+// Advance to the next applicable mode and return it. has_pad=false skips the
+// two PAD states (nothing to arm — an app or module with no layout).
+uint8_t input_ui_touch_mode_cycle(bool has_pad);
+
+// Shift+Alt chord edge seen by the interactive keyboard reader; true once
+// per chord. The ELF host runs its own detector — this reader is dormant
+// while a module owns the device.
+bool input_ui_take_touch_chord(void);
+
 // ── Pref accessors (prefs writer/loader + Settings bindings state) ─────────
 uint16_t input_ui_trackball_sens_get(void);
 void     input_ui_trackball_sens_set(uint16_t v);

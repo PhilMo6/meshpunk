@@ -151,7 +151,8 @@ uint32_t AudioBuffer::getReadPos() {
     return m_readPtr - m_buffer;
 }
 //---------------------------------------------------------------------------------------------------------------------
-Audio::Audio(bool internalDAC /* = false */, uint8_t channelEnabled /* = I2S_DAC_CHANNEL_BOTH_EN */, uint8_t i2sPort) {
+Audio::Audio(bool internalDAC /* = false */, uint8_t channelEnabled /* = I2S_DAC_CHANNEL_BOTH_EN */, uint8_t i2sPort,
+             int dmaCount /* = 8 */, int dmaLen /* = 512 */) {
 
     //    build-in-DAC works only with ESP32 (ESP32-S3 has no build-in-DAC)
     //    build-in-DAC last working Arduino Version: 2.0.0-RC2
@@ -182,8 +183,11 @@ Audio::Audio(bool internalDAC /* = false */, uint8_t channelEnabled /* = I2S_DAC
     // free scarce internal SRAM for USB-host + ELF-module coexistence, and it
     // lowers audio latency as a bonus. 8x512 is still deep margin against the
     // mixer's ~5.8ms chunk cadence. If audio underruns, step back toward 12.
-    m_i2s_config.dma_buf_count        = 8;
-    m_i2s_config.dma_buf_len          = 512;
+    // Now the DEFAULTS of the constructor args: a decode-only instance (PCM
+    // captured by the audio_process_extern hook, output routed to USB, no
+    // sample ever written to this ring) passes something minimal instead.
+    m_i2s_config.dma_buf_count        = dmaCount;
+    m_i2s_config.dma_buf_len          = dmaLen;
     m_i2s_config.use_apll             = APLL_DISABLE; // must be disabled in V2.0.1-RC1
     m_i2s_config.tx_desc_auto_clear   = true;   // new in V1.0.1
     m_i2s_config.fixed_mclk           = I2S_PIN_NO_CHANGE;
@@ -207,7 +211,8 @@ Audio::Audio(bool internalDAC /* = false */, uint8_t channelEnabled /* = I2S_DAC
                 m_i2s_config.communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S_MSB);
             #endif
 
-            i2s_driver_install((i2s_port_t)m_i2s_num, &m_i2s_config, 0, NULL);
+            // MESHPUNK: record the result, same reason as the branch below.
+            m_f_i2sInstalled = (i2s_driver_install((i2s_port_t)m_i2s_num, &m_i2s_config, 0, NULL) == ESP_OK);
             i2s_set_dac_mode((i2s_dac_mode_t)m_f_channelEnabled);
             if(m_f_channelEnabled != I2S_DAC_CHANNEL_BOTH_EN) {
                 m_f_forceMono = true;
@@ -225,11 +230,17 @@ Audio::Audio(bool internalDAC /* = false */, uint8_t channelEnabled /* = I2S_DAC
             m_i2s_config.communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB);
         #endif
 
-        i2s_driver_install((i2s_port_t)m_i2s_num, &m_i2s_config, 0, NULL);
+        // MESHPUNK: the return value was discarded here. A rejected config
+        // (e.g. out-of-range DMA sizes) then looks like a successful
+        // construction but leaves the driver UNINSTALLED, and every IDF i2s_*
+        // call dereferences the driver object inside its own validity check —
+        // a null-pointer fault at the first use, far from the cause. Recorded
+        // so callers that pass custom DMA sizes can fall back.
+        m_f_i2sInstalled = (i2s_driver_install((i2s_port_t)m_i2s_num, &m_i2s_config, 0, NULL) == ESP_OK);
         m_f_forceMono = false;
     }
 
-    i2s_zero_dma_buffer((i2s_port_t) m_i2s_num);
+    if (m_f_i2sInstalled) i2s_zero_dma_buffer((i2s_port_t) m_i2s_num);
 
     for(int i = 0; i <3; i++) {
         m_filter[i].a0  = 1;
@@ -304,7 +315,10 @@ Audio::~Audio() {
     //InBuff.~AudioBuffer(); #215 the AudioBuffer is automatically destroyed by the destructor
     setDefaults();
     if(m_playlistBuff) {free(m_playlistBuff); m_playlistBuff = NULL;}
-    i2s_driver_uninstall((i2s_port_t)m_i2s_num); // #215 free I2S buffer
+    // MESHPUNK: only uninstall what we installed — tearing down a driver that
+    // never came up is an error return here and a fault on some IDF paths.
+    if(m_f_i2sInstalled) i2s_driver_uninstall((i2s_port_t)m_i2s_num); // #215 free I2S buffer
+    m_f_i2sInstalled = false;
     if(m_chbuf) {free(m_chbuf); m_chbuf = NULL;}
 }
 //---------------------------------------------------------------------------------------------------------------------
@@ -4481,7 +4495,9 @@ void Audio::setI2SCommFMT_LSB(bool commFMT) {
     }
     AUDIO_INFO("commFMT = %i", m_i2s_config.communication_format);
     i2s_driver_uninstall((i2s_port_t)m_i2s_num);
-    i2s_driver_install  ((i2s_port_t)m_i2s_num, &m_i2s_config, 0, NULL);
+    // MESHPUNK: keep the installed-flag truthful across this reinstall (the
+    // custom DMA sizes ride along in m_i2s_config, so they survive it).
+    m_f_i2sInstalled = (i2s_driver_install((i2s_port_t)m_i2s_num, &m_i2s_config, 0, NULL) == ESP_OK);
 }
 //---------------------------------------------------------------------------------------------------------------------
 bool Audio::playSample(int16_t sample[2]) {

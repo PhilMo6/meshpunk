@@ -75,6 +75,15 @@ extern "C" {
 // mirrored here live in input/input_tdeck.cpp now.
 #include "input/input_dev.h"
 
+// Touch controller mode: the shared zone layer + pre-rendered indicator
+// chips. Armed on keyboardless boards when the launcher passed a layout via
+// _elf_touch_layout; the Core-1 input task samples touch and feeds zone
+// edges into the key queue (see poll_input).
+#include "input/input_zones.h"
+#include "input/zone_overlay.h"
+#include "input/host_osk.h"
+#include "input/input_ui.h"   // shared touch-input mode (TOUCH_MODE_*)
+
 // Alt combo layer for ELF modules, keyed by the key's SYM-layer char (which
 // uniquely names a physical key). Every entry exists because the T-Deck
 // matrix has no such key at all. F1-F10 (Alt + digit-position keys) are a
@@ -156,6 +165,36 @@ static volatile bool s_quit_requested = false;
 // OR'd into the exit-hold check so a USB keyboard can leave a module too.
 static volatile bool s_usb_bs_down  = false;
 static volatile bool s_usb_alt_down = false;
+
+// ── Touch controller layout (set by _elf_touch_layout, per launch) ─────────
+// Zone OUT codes are MODULE keycodes (the launcher generates the layout from
+// its keybind actions), so zone edges push straight into the key queue and
+// never pass through the keymap. OUT 0xFF is the quit zone: a screen corner
+// is far easier to hit than a bound key, so it must be HELD to fire.
+static InputZone s_elf_zones[INPUT_ZONES_MAX];
+static int              s_elf_zone_count  = 0;
+static volatile bool    s_zone_overlay_on = false;
+static uint8_t          s_zone_prev_out   = 0;   // first held (OSK path)
+// Held-zone SET from the previous poll, diffed to emit press/release edges
+// so a d-pad direction and a face button can be down at the same time.
+static uint8_t          s_zone_prev[INPUT_DEV_TOUCH_MAX] = {0};
+static int              s_zone_prev_n     = 0;
+static uint32_t         s_zone_quit_since = 0;
+// Key under the finger while the host OSK is open, committed when it lifts.
+static uint8_t          s_osk_hover       = 0;
+#define ZONE_QUIT_HOLD_MS 600
+// Chips inside the module's frame are stamped into every pushed frame; chip
+// parts in the letterbox borders are pushed directly ONCE (the module never
+// redraws there) — re-armed whenever the module clears the screen. The last
+// frame rect lets the toggle erase border chips when hiding the overlay.
+static volatile bool s_zone_border_pushed = false;
+static volatile bool s_zone_frame_seen    = false;
+static volatile int  s_zone_fx = 0, s_zone_fy = 0, s_zone_fw = 0, s_zone_fh = 0;
+// Shift+Alt mode-cycle chord, this task's own edge state (loop()'s detector
+// doesn't run during a module).
+#define TOUCH_CHORD_MS 300
+static bool     s_elf_chord_prev    = false;
+static uint32_t s_elf_chord_last_ms = 0;
 
 // Raw-delta mode: set by host_trackball_read() (module emulates a mouse and
 // owns the ISR counters); reset before each module run.
@@ -270,6 +309,50 @@ static uint32_t s_legacy_release_at = 0;
 #define LEGACY_SEQ_3 0x0D
 static uint8_t s_legacy_hist[3]  = {0, 0, 0};
 static bool    s_legacy_flip_req = false;
+
+// Apply a touch-input mode to the running module: controller layout, host
+// keyboard, or nothing. Owns the panel cleanup each transition needs — the
+// module never redraws the letterbox borders, so indicator parts out there
+// must be erased explicitly the moment they stop being shown.
+static void elf_apply_touch_mode(uint8_t mode) {
+    bool has_pad    = (s_elf_zone_count > 0);
+    bool want_pad   = has_pad && (mode == TOUCH_MODE_PAD ||
+                                  mode == TOUCH_MODE_PAD_HIDDEN);
+    bool want_chips = has_pad && (mode == TOUCH_MODE_PAD);
+    bool want_kb    = (mode == TOUCH_MODE_KB);
+
+    if (s_zone_overlay_on && !want_chips) {
+        int ffx = s_zone_frame_seen ? s_zone_fx : 0;
+        int ffy = s_zone_frame_seen ? s_zone_fy : 0;
+        int ffw = s_zone_frame_seen ? s_zone_fw : 0;
+        int ffh = s_zone_frame_seen ? s_zone_fh : 0;
+        zone_overlay_push_outside(ffx, ffy, ffw, ffh, true, display_dev_blit);
+    }
+    s_zone_overlay_on    = want_chips;
+    s_zone_border_pushed = false;
+
+    if (want_kb) {
+        const InputZone* oz = nullptr;
+        int on = 0;
+        host_osk_zones(&oz, &on);
+        if (host_osk_open(display_dev_blit)) {
+            input_zones_set(oz, on);
+            input_zones_enable(true);
+            return;
+        }
+        // Frame allocation failed — fall through and arm nothing.
+    } else if (host_osk_active()) {
+        host_osk_close(display_dev_blit);
+    }
+
+    if (want_pad) {
+        input_zones_set(s_elf_zones, s_elf_zone_count);
+        input_zones_enable(true);
+    } else {
+        input_zones_enable(false);
+        input_zones_clear();
+    }
+}
 
 static void poll_input(bool kb_only = false) {
     bool cur_state[INPUT_STATE_SIZE] = {0};
@@ -479,6 +562,117 @@ static void poll_input(bool kb_only = false) {
         esc_held = false;
     }
 
+    // Touch controller zones + host OSK, keyboardless boards only — sampled
+    // at the trackball cadence (~33Hz; a touch read is an I2C transaction,
+    // too heavy for the 100Hz keyboard tick). Zone edges bypass the keymap:
+    // OUT already IS the module keycode — or plain ASCII while the OSK is
+    // open. The quit zone (0xFF) fires only after a deliberate hold and is
+    // swallowed like the bound quit key — the module never sees it.
+    if (!kb_only) {
+        if (input_zones_enabled()) {
+            int16_t xs[INPUT_DEV_TOUCH_MAX], ys[INPUT_DEV_TOUCH_MAX];
+            int np = input_dev_touch_read_multi(xs, ys, INPUT_DEV_TOUCH_MAX);
+            input_zones_touch_multi(xs, ys, np);
+
+            uint8_t cur[INPUT_DEV_TOUCH_MAX];
+            int cn = input_zones_held_all(cur, INPUT_DEV_TOUCH_MAX);
+
+            // Quit needs a deliberate unbroken hold; lifting cancels it.
+            if (input_zones_out_held(HOST_KEY_QUIT)) {
+                if (!s_zone_quit_since) s_zone_quit_since = millis();
+                else if (millis() - s_zone_quit_since >= ZONE_QUIT_HOLD_MS)
+                    s_quit_requested = true;
+            } else {
+                s_zone_quit_since = 0;
+            }
+
+            // Typing commits on RELEASE, controller zones on the press edge.
+            // A keyboard key is ~30px: a finger that lands between two and
+            // settles crosses both, and a press-edge send types both. Only
+            // the key under the finger when it LIFTS is sent, so a sloppy
+            // tap is one character and sliding off the keys before lifting
+            // is none. Games need the opposite — key-down has a duration —
+            // so the hold model stays for every non-OSK layout.
+            bool osk = host_osk_active();
+            if (osk) {
+                // The keyboard stays single-point: two-finger typing has no
+                // meaning and the commit-on-lift model tracks ONE key.
+                uint8_t zout = cn > 0 ? cur[0] : 0;
+                if (zout != s_zone_prev_out) {
+                    uint8_t prev = s_zone_prev_out;
+                    s_zone_prev_out = zout;
+                    if (prev && prev < INPUT_ZONE_MODE)
+                        host_osk_key_feedback(prev, false, display_dev_blit);
+                    if (zout && zout < INPUT_ZONE_MODE)
+                        host_osk_key_feedback(zout, true, display_dev_blit);
+                }
+                if (np > 0) {
+                    s_osk_hover = zout;  // 0 once the finger leaves the keys
+                } else if (s_osk_hover) {
+                    uint8_t k = s_osk_hover; // the key it lifted on
+                    s_osk_hover = 0;
+                    if (k < INPUT_ZONE_MODE) { kq_push(k, 1); kq_push(k, 0); }
+                }
+            } else {
+                // Controller: diff the held SET so a direction and a button
+                // can be down together (and a third finger is just another
+                // member). Release-then-press order keeps a slide between
+                // two zones looking the same as it did single-touch.
+                s_osk_hover = 0;
+                for (int i = 0; i < s_zone_prev_n; i++) {
+                    uint8_t o = s_zone_prev[i];
+                    bool still = false;
+                    for (int j = 0; j < cn && !still; j++) still = (cur[j] == o);
+                    if (!still && o && o < INPUT_ZONE_MODE) kq_push(o, 0);
+                }
+                for (int j = 0; j < cn; j++) {
+                    uint8_t o = cur[j];
+                    bool was = false;
+                    for (int i = 0; i < s_zone_prev_n && !was; i++)
+                        was = (s_zone_prev[i] == o);
+                    if (!was && o && o < INPUT_ZONE_MODE) kq_push(o, 1);
+                }
+                s_zone_prev_out = cn > 0 ? cur[0] : 0;
+            }
+            memcpy(s_zone_prev, cur, (size_t)cn);
+            s_zone_prev_n = cn;
+        }
+
+        // Mode trigger — the board's aux button (Heltec IO key) or the
+        // Shift+Alt chord where a keyboard exists. loop()'s own chord
+        // detector is dormant while a module owns the device, so this is
+        // the second half of that pair; both advance the SAME shared mode.
+        // Requires both modifiers and no character key held, so it cannot
+        // fire inside a shift- or alt-layer keystroke.
+        bool chord_edge = false;
+        {
+            bool other = false;
+            for (int i = 1; i < 0x80 && !other; i++)
+                if (cur_state[i]) other = true;
+            bool chord = shift && alt && !other;
+            if (chord && !s_elf_chord_prev &&
+                (uint32_t)(millis() - s_elf_chord_last_ms) >= TOUCH_CHORD_MS) {
+                s_elf_chord_last_ms = millis();
+                chord_edge = true;
+            }
+            s_elf_chord_prev = chord;
+        }
+        if (input_dev_aux_btn_take() || chord_edge) {
+            // Nothing is held down under the OSK (its keys commit on lift),
+            // so there is no release to emit — and a tap still in progress
+            // must not fire into the mode being switched to.
+            if (!host_osk_active()) {
+                for (int i = 0; i < s_zone_prev_n; i++)   // release every held
+                    if (s_zone_prev[i] && s_zone_prev[i] < INPUT_ZONE_MODE)
+                        kq_push(s_zone_prev[i], 0);        // across table swaps
+            }
+            s_zone_prev_out = 0;
+            s_zone_prev_n   = 0;
+            s_osk_hover     = 0;
+            elf_apply_touch_mode(
+                input_ui_touch_mode_cycle(s_elf_zone_count > 0));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +730,27 @@ static void elf_input_start() {
     s_legacy_hist[0] = s_legacy_hist[1] = s_legacy_hist[2] = 0;
     s_legacy_flip_req = false;
     s_quit_requested = false;
+    s_osk_hover = 0;
+    // The zone layer may still hold a LUA layout: Lua teardown is C-side and
+    // never ran touchlayout's disarm if the launching app had zones armed.
+    // Those out-codes are Lua key codes, not module keycodes — force-disarm
+    // before applying the mode below.
+    input_zones_enable(false);
+    input_zones_clear();
+    s_zone_prev_out      = 0;
+    s_zone_prev_n        = 0;
+    s_zone_quit_since    = 0;
+    s_zone_overlay_on    = false;
+    s_zone_border_pushed = false;
+    s_zone_frame_seen    = false;
+    s_elf_chord_prev     = false;
+    // Indicator chips are rendered up front (cheap, and the mode can turn
+    // them on later); the shared touch mode then decides what is armed —
+    // controller layout, host keyboard, or nothing. It carries over from
+    // the Lua side, so a board that came up with touch controls live starts
+    // the module the same way.
+    if (s_elf_zone_count > 0) zone_overlay_build(s_elf_zones, s_elf_zone_count);
+    elf_apply_touch_mode(input_ui_touch_mode());
     s_input_task_run = true;
     // Priority 5: ABOVE usb_mgr (4), sound_task (3) and elf_blit (3). The
     // keyboard poll is a tiny, latency-critical task (one I2C read every 10ms);
@@ -555,12 +770,31 @@ static void elf_input_start() {
 // Stop the Core 1 input task and wait for it to fully exit before returning,
 // so no I2C read is in flight when loopTask resumes its own keyboard scan.
 static void elf_input_stop() {
-    if (!s_input_task) return;
-    s_input_task_run = false;
-    for (int i = 0; i < 100 && s_input_task; i++) {  // ~200ms safety cap
-        vTaskDelay(pdMS_TO_TICKS(2));
+    if (s_input_task) {
+        s_input_task_run = false;
+        for (int i = 0; i < 100 && s_input_task; i++) {  // ~200ms safety cap
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        s_input_task = nullptr;
     }
-    s_input_task = nullptr;
+    // Zone/OSK teardown does NOT happen here: the blit task may still be
+    // pushing chip/OSK pixels until blit_drain() — elf_zones_teardown() runs
+    // after it in _launch_elf.
+}
+
+// Disarm the touch layout and free the overlay chips + OSK frame. Only safe
+// once no blit can be in flight (after blit_drain): the blit paths read
+// those buffers, which is exactly why host_osk_close() does NOT free — this
+// is the single point that does. No panel work: LVGL repaints on resume.
+static void elf_zones_teardown() {
+    host_osk_free();
+    input_zones_enable(false);
+    input_zones_clear();
+    zone_overlay_clear();
+    s_elf_zone_count  = 0;
+    s_zone_overlay_on = false;
+    s_zone_prev_out   = 0;
+    s_zone_prev_n     = 0;
 }
 
 // ── Firmware-internal injection (USB HID keyboard; see elf_host.h) ─────────
@@ -672,7 +906,32 @@ void host_blit_frame(const uint16_t* rgb565, int w, int h) {
     if (x_offset < 0) x_offset = 0;
     int y_offset = (display_dev_height() - h) / 2;
     if (y_offset < 0) y_offset = 0;
+    // Controller-mode indicators: stamped into the module's own buffer just
+    // before the push (transparent — only outline/label pixels are written).
+    // Writing into it is safe on this path — a full-frame renderer rewrites
+    // every pixel next frame, so the stamp is transient (and idempotent for
+    // a module re-pushing a static frame). Chip colors are byte-swap-
+    // invariant, so byte-swapped module frames render them correctly too.
+    if (s_zone_overlay_on) {
+        zone_overlay_stamp((uint16_t*)rgb565, x_offset, y_offset, w, h);
+        s_zone_fx = x_offset; s_zone_fy = y_offset;
+        s_zone_fw = w;        s_zone_fh = h;
+        s_zone_frame_seen = true;
+    }
+    // Open OSK: stamped INTO the buffer so one push carries game + keyboard
+    // — a post-push re-push alternated game/keyboard pixels on the panel,
+    // a visible blink at the module's frame rate. (The game deliberately
+    // keeps rendering while the user types.)
+    if (host_osk_active())
+        host_osk_stamp((uint16_t*)rgb565, x_offset, y_offset, w, h);
     display_dev_blit(x_offset, y_offset, w, h, rgb565);
+    // Chip parts in the letterbox borders never ride a frame — push them
+    // once per screen-clear, AFTER the frame so a clear can't wipe them.
+    if (s_zone_overlay_on && !s_zone_border_pushed) {
+        s_zone_border_pushed = true;
+        zone_overlay_push_outside(x_offset, y_offset, w, h, false,
+                                  display_dev_blit);
+    }
 }
 
 // Blit a rectangle at absolute screen coordinates. A module that composites
@@ -684,6 +943,13 @@ void host_blit_rect(const uint16_t* rgb565, int x, int y, int w, int h) {
     if (!rgb565 || w <= 0 || h <= 0) return;
     if (x < 0 || y < 0 ||
         x + w > display_dev_width() || y + h > display_dev_height()) return;
+    // Controller-mode indicators: transparent-stamp the overlapping chip
+    // parts into the strip before it goes out, exactly like the frame path
+    // (band renderers re-rasterize every strip, so the stamp is transient).
+    if (s_zone_overlay_on)
+        zone_overlay_stamp((uint16_t*)rgb565, x, y, w, h);
+    if (host_osk_active())
+        host_osk_stamp((uint16_t*)rgb565, x, y, w, h);
     display_dev_blit(x, y, w, h, rgb565);
 }
 
@@ -797,6 +1063,12 @@ static void blit_drain(void) {
 
 void host_clear_screen(void) {
     display_dev_fill_black();
+    // The clear just wiped any border chips — repaint them on the next frame.
+    s_zone_border_pushed = false;
+    // An open OSK was wiped with them: repaint it whole, right now.
+    if (host_osk_active())
+        host_osk_maintain(0, 0, display_dev_width(), display_dev_height(),
+                          display_dev_blit);
 }
 
 uint32_t host_get_ticks_ms(void) {
@@ -2057,6 +2329,11 @@ int elf_host_run_pending(void) {
         SLog.println("[elf_host] elf_load failed");
     }
 
+    // Touch layout/OSK teardown — after blit_drain: no push reads the
+    // overlay buffers past this point. Also clears a layout stashed by
+    // _elf_touch_layout when the launch failed before arming it.
+    elf_zones_teardown();
+
     // Close any file descriptors the module left open
     mod_close_tracked_files();
 
@@ -2127,6 +2404,38 @@ int elf_host_run_pending(void) {
     return result;
 }
 
+// _elf_touch_layout({ {x=,y=,w=,h=,out=,label=}, ... }) — controller zones
+// for the NEXT module launch. OUT codes are module keycodes (0xFF = quit);
+// lib/keybind.lua generates the table from a launcher's action list. Armed
+// in elf_input_start on keyboardless boards, cleared when the module exits —
+// call it before every _launch_elf. Returns the zone count accepted.
+static int lua_elf_touch_layout(lua_State* L) {
+    s_elf_zone_count = 0;
+    if (!lua_istable(L, 1)) { lua_pushinteger(L, 0); return 1; }
+    int len = (int)lua_rawlen(L, 1);
+    for (int i = 1; i <= len && s_elf_zone_count < INPUT_ZONES_MAX; i++) {
+        lua_rawgeti(L, 1, i);
+        if (lua_istable(L, -1)) {
+            InputZone* z = &s_elf_zones[s_elf_zone_count];
+            memset(z, 0, sizeof(*z));
+            lua_getfield(L, -1, "x");   z->x   = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+            lua_getfield(L, -1, "y");   z->y   = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+            lua_getfield(L, -1, "w");   z->w   = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+            lua_getfield(L, -1, "h");   z->h   = (int16_t)lua_tointeger(L, -1); lua_pop(L, 1);
+            lua_getfield(L, -1, "out"); z->out = (uint8_t)lua_tointeger(L, -1); lua_pop(L, 1);
+            lua_getfield(L, -1, "label");
+            const char* lb = lua_tostring(L, -1);
+            if (lb) { strncpy(z->label, lb, sizeof(z->label) - 1); }
+            lua_pop(L, 1);
+            s_elf_zone_count++;
+        }
+        lua_pop(L, 1);
+    }
+    lua_pushinteger(L, s_elf_zone_count);
+    return 1;
+}
+
 void elf_host_register_lua(lua_State* L) {
     lua_register(L, "_launch_elf", lua_launch_elf);
+    lua_register(L, "_elf_touch_layout", lua_elf_touch_layout);
 }

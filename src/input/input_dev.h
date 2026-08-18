@@ -105,6 +105,36 @@ extern volatile int trackball_click;
 // buttons need the level.
 bool input_dev_nav_click_held(void);
 
+// Auxiliary (mode) button: one event per press, consumed by loop()'s
+// dispatcher to cycle the input mode (controller/OSK). Boards without a
+// second button return false.
+bool input_dev_aux_btn_take(void);
+
 // ── Touch ──────────────────────────────────────────────────────────────────
-// Latest touch point; true while touched (first contact wins).
+// Latest touch point; true while touched (first contact wins). What LVGL's
+// pointer indev uses — it is single-point by nature.
 bool input_dev_touch_read(int16_t* tx, int16_t* ty);
+
+// All current touch points, up to `max`; returns the count (0 = not
+// touched). Controller mode uses this so a d-pad direction and a face
+// button can be held at once. Panel limits: GT911 (T-Deck) reports up to 5,
+// CHSC6X (Heltec) 2 — hw-verified, not datasheet-derived. Backends fill
+// point 0 identically to input_dev_touch_read.
+#define INPUT_DEV_TOUCH_MAX 5
+int input_dev_touch_read_multi(int16_t* xs, int16_t* ys, int max);
+
+// Diagnostics for the touch measurement app (Tools/Touch Test): the last
+// accepted frame, BEFORE the board's raw->screen transform, so the app can
+// compare what the controller reported against where the UI thinks the
+// finger is. Slot 1 is carried because a phantom contact occupying slot 0
+// while the real one sits in slot 1 would mis-locate every touch that
+// happens near an edge — the theory this exists to test. Boards whose
+// driver already returns screen coordinates report those unchanged.
+typedef struct {
+    int16_t  x0, y0;    // slot 0 raw, -1 when the frame carried none
+    int16_t  x1, y1;    // slot 1 raw, -1 when absent
+    uint8_t  points;    // point count the controller reported
+    uint32_t drops;     // frames/slots rejected as invalid since boot
+} InputTouchRaw;
+
+void input_dev_touch_raw(InputTouchRaw* out);

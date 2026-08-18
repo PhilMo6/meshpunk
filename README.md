@@ -1,12 +1,26 @@
-# MeshPunk - LVGL with Lua for T-Deck
+# MeshPunk - LVGL with Lua for LoRa handhelds
+
+## Supported devices
+
+| Device | PlatformIO env | Inputs |
+| --- | --- | --- |
+| LilyGo T-Deck | `meshpunk` | Keyboard, trackball, touchscreen |
+| Heltec V4 + Expansion Kit V2 | `meshpunk_heltec` | Touchscreen only |
+
+Device-specific code lives behind a per-subsystem backend (`src/input`,
+`src/display`, `src/audio`, `src/power`, `src/gps`), so the rest of the
+firmware is board-neutral and gates on **capabilities** rather than on which
+board it is. Releases are built per device — flash the build that matches
+your hardware.
 
 ## Features
 
 - Combines the power of LVGL with the simplicity of Lua scripting
-- Runs on the LilyGo T-Deck
 - Uses PlatformIO for easy building
-- Sound support
-- Touch and trackball nav controls
+- Sound support (speaker, or buzzer melodies on boards without an audio amp)
+- Touch, trackball and keyboard nav controls — whichever the board has
+- On-screen keyboard and on-screen game pads for keyboardless boards, with a
+  per-game layout editor
 - SD card support
 - BLE support for phone apps
 - WiFi support
@@ -28,7 +42,7 @@
 - DOS emulator! A full 386 PC with VGA, Adlib, Sound Blaster and a PS/2 mouse, running real DOS from .img disk images — or point it at a folder of games on your SD card and it becomes a writable C: drive. No disks yet? The app's **Download DOS** button fetches ready-made FreeDOS boot disks straight to the device over WiFi. The trackball works as a mouse (with a DOS mouse driver loaded) or as arrow keys.
 - MP3 music player with a tag-based library, playlists, and auto-organizing by artist/album
 - Background apps — music keeps playing while you use the rest of the device
-- USB host support (Tools > USB Host): plug devices into the T-Deck — a USB-C audio dongle (routes all device audio), a gamepad (map it to controls for any game via the Games > Gamepad app), a mouse (moves focus, click selects), a keyboard, or a thumb drive (browsable as the `U:` drive). Gamepad, mouse and link-cable drivers download automatically from the App Library.
+- USB host support (Tools > USB Host): plug devices in — a USB-C audio adapter (routes all device audio), a gamepad (map it to controls for any game via the Games > Gamepad app), a mouse (moves focus, click selects), a keyboard, or a thumb drive (browsable as the `U:` drive). Gamepad, mouse and link-cable drivers download automatically from the App Library. **The device supplies no USB power — see [USB accessories](#usb-accessories) for what adapter you need.**
 - Themes! make Meshpunk look the way you want. 15 themes are included!
 - File manager (Tools > Files) for both internal flash and SD
 - App Library — browse and install apps and themes straight from GitHub over WiFi, and update the ones you already have, no reflash needed
@@ -36,7 +50,7 @@
 
 ## Installation 
 
-1. Download the release file you want to install from the release page.
+1. Download the release file you want to install from the release page. **Releases are built per device — the filenames carry the board name** (`meshpunk-tdeck-<version>-…` / `meshpunk-heltec_v4-<version>-…`); a build for the wrong board will not run correctly.
 - For a first-time install download the -merged.bin file
 - For updates download the -firmware.bin: it updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept)
 2. Go to https://meshcore.io/flasher scroll to bottom and click on Custom Firmware
@@ -71,7 +85,7 @@ If a game misbehaves: **Audio rate** (the `?` next to it explains) trades pitch 
 
 MP3s go onto the sd card in /Music. The Music app can auto-sort tagged files into /Music/Artist/Album for you, and playlists live in /Music/Playlists.
 
-## Using with the Launcher (optional)
+## Using with the Launcher (optional, T-Deck only)
 
 MeshPunk can also be installed through [bmorcelli's Launcher](https://github.com/bmorcelli/Launcher) — a multi-firmware boot menu that lets you keep several firmwares on one device and choose which to boot. If you run the Launcher, install the **`-launcher.bin`** release, not the other files.
 
@@ -90,7 +104,11 @@ Notes:
 
 The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. Tiles are downloaded over WiFi, converted to RGB565 `.bin` format, and cached on SD card for offline use.
 
-- Map app Keyboard Shortcuts
+- Map app touch controls
+
+Drag to pan; the on-screen buttons cover zoom and the map menu. Long-press a contact marker for its details.
+
+- Map app Keyboard Shortcuts (boards with a keyboard, or a USB one)
 
 | Key | Action |
 |-----|--------|
@@ -137,7 +155,7 @@ System apps (App Library, Files, Map, Messenger, and the Settings pages) are non
 ## Requirements for Development
 
 - PlatformIO
-- T-Deck device
+- A supported device (T-Deck or Heltec V4 + Expansion Kit)
 - Git (for submodules)
 
 ## Building and Development
@@ -150,23 +168,30 @@ System apps (App Library, Files, Map, Messenger, and the Settings pages) are non
    ```
 3. Open in PlatformIO
 4. Edit Lua scripts in the `/data/lua` directory
-5. Build and upload to your T-Deck device:
+5. Build and upload to your device. The default env is the T-Deck; pass `-e`
+   for any other board:
    ```
-   pio run --target upload
+   pio run --target upload                    # T-Deck
+   pio run -e meshpunk_heltec --target upload # Heltec V4
    ```
    This will upload only the firmware, not the filesystem data.
 6. To upload the filesystem data (when changing lua scripts)
    ```
    pio run --target uploadfs
+   pio run -e meshpunk_heltec --target uploadfs
    ```
-7. To build release artifacts (written to `releases/`): the release env embeds
+7. To build release artifacts (written to `releases/`): the release envs embed
    the `data/` tree into the app so the published binaries are self-contained
    ```
-   pio run -e meshpunk_release
+   pio run -e meshpunk_release        # T-Deck  -> meshpunk-tdeck-<ver>-*.bin + launcher
+   pio run -e meshpunk_heltec_release # Heltec  -> meshpunk-heltec_v4-<ver>-*.bin
    ```
-   If it reports missing littlefs, run `pio run -t buildfs` first; if the
-   firmware was already up to date, force the artifact step with
-   `pio run -e meshpunk_release -t mergebin`.
+   Each produces the board's `-merged`, `-firmware` and `-littlefs` binaries;
+   the Launcher image is T-Deck only and keeps its original
+   `meshpunk-<ver>-launcher.bin` name (its LauncherHub catalog entry depends
+   on it). If a build reports missing littlefs, run
+   `pio run [-e <env>] -t buildfs` first; if the firmware was already up to
+   date, force the artifact step with `pio run -e <release env> -t mergebin`.
 
 ## VSCode hints
 
@@ -174,15 +199,33 @@ You must close the serial monitor before uploadfs or it wont work.
 
 ## Navigation
 
-The device supports three input methods for navigating the UI:
+Which of these you have depends on the board:
 
-- **Trackball** — roll to move focus between elements, click to select
-- **WASD keys** — `W`/`A`/`S`/`D` mirror trackball directions (up/left/down/right). When a text input is focused, WASD type normally instead
-- **Touchscreen** — tap to interact with elements directly
+- **Touchscreen** — tap to interact with elements directly. Present on every supported board, and the primary input on a board without a keyboard or trackball
+- **Trackball** (T-Deck) — roll to move focus between elements, click to select
+- **WASD keys** (boards with a keyboard) — `W`/`A`/`S`/`D` mirror trackball directions (up/left/down/right). When a text input is focused, WASD type normally instead
+- **USB keyboard / mouse / gamepad** — attached through Tools → USB Host, these drive focus exactly as a trackball does, which is how a touch-only board gets key-driven navigation
 
-Trackball and WASD share a configurable sensitivity setting (Device Settings → Trackball) that controls the minimum time between accepted direction inputs (0–500ms).
+Trackball and WASD share a configurable sensitivity setting (Device Settings → Trackball) that controls the minimum time between accepted direction inputs (0–500ms). That setting only applies to boards that have them.
+
+A touch-only board has no directional input, so there is no focus to move — everything is reached by tapping it directly.
+
+### On-screen keyboard and game pads
+
+Boards without a keyboard get both, built into the firmware:
+
+- **On-screen keyboard** — opens when a text field is focused; it is the text entry path in apps and in native games alike
+- **On-screen game pad** — native games (Doom, GameBoy, DOS, the emulators) draw a button layout over the game, rendered outline-and-label only so the game stays visible behind it
+
+One control cycles the on-screen input through pad → pad hidden → keyboard → off: the **IO button** on the Heltec, or **Shift+Alt** on a board with a keyboard. The **Touch input** row in Settings → Device does the same cycle — the way in for legacy T-Deck keyboards, which report no modifiers and so cannot chord. A board with a keyboard boots with all of it off; a keyboardless board boots with the pad on.
+
+**Quitting a native game** — any of: hold `Alt`+`Backspace` ~1.5s (needs a keyboard), hold the on-screen **QUIT** button ~1s, or a key bound to quit in the launcher's Controls screen.
+
+Each ELF game launcher has a **Touch** button opening a layout editor: drag to move a button, size steppers to resize, nudge arrows for fine positioning. Layouts are saved per game (`L:/touch_layouts/<app>.cfg`) and Reset restores the preset.
 
 ### Keyboard shortcuts
+
+These require a built-in keyboard (a USB keyboard covers most of them too); on a touch-only board see the on-screen keyboard above.
 
 - **Mic key** — global notifications shortcut: over a running app it peeks the top bar; on the launcher (or while peeked) it toggles the notification drop-down. `Sym`+`Mic` still types `0`.
 - **Alt + letter (while typing)** — emoji layer: each letter key types its assigned emoji into the focused text field. Assign emojis per key in Settings → Emoji; an optional tap-to-latch mode for `Alt` (Settings → Device → Keyboard) keeps the layer on between taps.
@@ -192,17 +235,35 @@ Trackball and WASD share a configurable sensitivity setting (Device Settings →
 - **`q`** — backs out of selection modes: message selection in a chat, row-select lists, and the Map app.
 - **Enter (in a chat)** — sends the message. Long-press the message input to open the clipboard menu (paste copied contact cards and text).
 
-### Keyboard firmware compatibility
+### Keyboard firmware compatibility (T-Deck only)
 
 Full keyboard function requires LilyGo's **250620 or newer** keyboard firmware on the T-Deck's keyboard MCU (the separate ESP32-C3 that scans the keys). Units manufactured before mid-2025 shipped older keyboard firmware without raw-matrix support — on those, Meshpunk detects the mismatch after a few keypresses and automatically switches to a **legacy compatibility mode** (a notification confirms it; manual override in Settings → Device → "Legacy keyboard").
 
 Legacy mode limitations (the old keyboard firmware reports one character per press, with no key-release or modifier information):
 
 - Typing, WASD navigation, Enter/Backspace work — tap-based only, no key holds or repeats
-- Sym/Alt tap-latches, the emoji layer, and all keyboard chords (including **Alt+Backspace quit-to-home**) are unavailable — use each app's on-screen controls, and **restart the device to leave a native game** (a USB keyboard's Alt+Backspace chord still works)
+- Sym/Alt tap-latches, the emoji layer, and all keyboard chords (including **Alt+Backspace quit-to-home**) are unavailable — use each app's on-screen controls, and quit native games with the **on-screen QUIT button** or a key bound to quit in the launcher (a USB keyboard's Alt+Backspace chord also works)
+- The Shift+Alt on-screen-input trigger is a chord too — use the **Touch input** row in Settings → Device instead: set it to **Pad** before launching a game and the on-screen controls (including QUIT) are there
 - On the oldest (2023) keyboard firmware the backlight ignores Meshpunk's brightness setting — toggle it with `Alt`+`B` (handled inside the keyboard itself)
 
 For full function, the keyboard MCU can be reflashed with [LilyGo's keyboard firmware](https://github.com/Xinyuan-LilyGO/T-Deck/tree/master/firmware) (`T-Keyboard_Keyboard_ESP32C3_250620.bin`) via an external USB-TTL adapter on the 6-pin header next to the RST button — then turn legacy mode off in Settings → Device.
+
+### USB accessories
+
+The device can act as a USB host (Tools → USB Host → **Start**), so you can attach an audio adapter, keyboard, mouse, gamepad or thumb drive. Press **Stop** when finished — host mode runs background tasks the whole time it is on.
+
+**The device supplies no power over USB.** If nothing happens when you plug something in, that is almost always why. Two kinds of adapter cover everything, and any generic one of either kind works:
+
+| You want to attach | Use | Notes |
+| --- | --- | --- |
+| Keyboard, mouse, gamepad, thumb drive | **USB-C OTG splitter Y-cable with PD** — USB-C plug into the device, USB-A socket for the accessory, second USB-C socket for a charger or power bank | Search for "USB-C OTG splitter" + "PD". Common ones do 100W charging and USB 2.0 at up to 480 Mbps, no drivers. **Plug the charger in as well as the accessory** — a plain OTG adapter with no power input does nothing |
+| Headphones or speakers | **USB-C to 3.5mm adapter with its own USB-C charging port** — sold as a 2-in-1 audio-and-charge adapter, typically PD 60W | Has a DAC and enumerates as a USB audio device. Carries no data, which does not matter for audio. **Does not need the OTG Y-cable** — it brings its own charging port |
+
+An accessory with its own power supply or battery works without any adapter.
+
+**USB hubs are not supported.** The firmware recognises a hub and refuses it (`usb_core.cpp` — single device only until IDF5), so it is one accessory at a time.
+
+Drivers for the gamepad, mouse and link cable download automatically from the App Library the first time they are needed.
 
 ### USB drive mode
 
@@ -257,6 +318,7 @@ MIT
 - LuaVGL by XuNeo: https://github.com/XuNeo/luavgl
 - LVGL: https://lvgl.io/
 - LilyGo for the T-Deck hardware
+- Heltec for the WiFi LoRa 32 V4 hardware and Expansion Kit
 - Emojis from https://github.com/googlefonts/noto-emoji
 - Emoji converted to .bin with ImageMagick
 - doomgeneric https://github.com/ozkl/doomgeneric

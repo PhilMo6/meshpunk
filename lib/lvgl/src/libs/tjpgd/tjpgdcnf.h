@@ -12,7 +12,11 @@
 /  2: Grayscale (8-bit/pix)
 */
 
-#define JD_USE_SCALE    0
+/* MESHPUNK: enabled so jd_decomp() can descale by 1/2, 1/4 or 1/8 while it
+   decodes — that is what lets src/img_bridge.cpp open a multi-megapixel JPEG
+   into a screen-sized buffer without ever holding the full-resolution image.
+   Additive for LVGL's own decoder: lv_tjpgd.c pins jd->scale = 0. */
+#define JD_USE_SCALE    1
 /* Switches output descaling feature.
 /  0: Disable
 /  1: Enable

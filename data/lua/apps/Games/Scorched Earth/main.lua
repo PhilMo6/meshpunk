@@ -1013,4 +1013,23 @@ local function entry()
     showMenu(scr)
 end
 
+
+
 entry()
+
+-- On-screen controller layout, owned by this app: the zones send the same key
+-- codes it already reads. Registered after entry() because apps.set_root
+-- clears any close callback set before it.
+do
+    local ok, touchlayout = pcall(require, "lib/touchlayout")
+    if ok then
+        touchlayout.set{
+            { x = 60,  y = 110, w = 70, h = 60, out = 0x77, label = "^" },
+            { x = 0,   y = 170, w = 70, h = 70, out = 0x61, label = "<" },
+            { x = 60,  y = 170, w = 70, h = 70, out = 0x73, label = "v" },
+            { x = 130, y = 170, w = 70, h = 70, out = 0x64, label = ">" },
+            { x = 240, y = 160, w = 80, h = 80, out = 0x0D, label = "FIRE" },
+        }
+        apps.set_on_close(touchlayout.clear)
+    end
+end

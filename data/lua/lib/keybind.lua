@@ -231,6 +231,9 @@ function Kb:trkball_string()
         t.momentum and 1 or 0, t.impulse, t.friction, t.thresh)
 end
 
+-- Touch controller layouts moved to lib/padlayout (per-launcher presets +
+-- user editing) — this lib stays physical-keys only.
+
 -- ── config persistence (the app owns the file, we own these lines) ──────────
 
 function Kb:save_lines(f)

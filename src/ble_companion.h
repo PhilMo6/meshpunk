@@ -17,7 +17,8 @@ class PunkMesh;
 // FW_VER_CODE / FW_VERSION / FW_BUILD_DATE live in version.h (single
 // bump site, shared with the Lua _FW_API/_FW_VERSION globals).
 #include "version.h"
-#define MESHPUNK_MODEL_NAME      "MeshPunk T-Deck"
+#include "boards/board_pins.h"   // MESHPUNK_BOARD_LABEL
+#define MESHPUNK_MODEL_NAME      "MeshPunk " MESHPUNK_BOARD_LABEL
 
 // ── Command codes (app → device) ─────────────────────────────────
 #define CMD_APP_START                 1

@@ -271,6 +271,29 @@ if _kb_legacy_get then
     end)
 end
 
+-- On-screen input mode: the same global state the Shift+Alt chord (or a
+-- board's aux button) advances — here as a row, because a legacy keyboard
+-- reports no modifiers so its users cannot chord at all, in apps or in
+-- games. Cycled with has_pad=true: unlike the in-app trigger this row's
+-- job is arming Pad BEFORE a game is launched, so the Pad states must be
+-- reachable even though this settings page has no layout of its own.
+-- Not persisted (matches the chord): the mode re-derives every boot.
+if _touch_mode and _touch_mode_cycle then
+    local MODE_NAMES = { [0] = "Off", [1] = "Pad", [2] = "Pad hidden",
+                         [3] = "Keyboard" }
+    local function mode_text()
+        return "Touch input: < " .. (MODE_NAMES[_touch_mode()] or "?") .. " >"
+    end
+    local mode_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+    local mode_lbl = mode_btn:Label { text = mode_text(), align = lvgl.ALIGN.LEFT_MID }
+
+    mode_btn:onClicked(function()
+        local m = _touch_mode_cycle(true)
+        mode_lbl:set({ text = mode_text() })
+        status.text = "On-screen input: " .. (MODE_NAMES[m] or "?")
+    end)
+end
+
 -- ── Trackball Sensitivity ────────────────────────────────────────────────────
 content:Label { text = "-- Trackball --", w = lvgl.PCT(100), h = 16 }
 

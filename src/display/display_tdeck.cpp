@@ -13,13 +13,19 @@
 #if defined(BOARD_TDECK)
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <TFT_eSPI.h>
 
 #include "display_dev.h"
+#include "../boards/board_pins.h"
 #include "../utilities.h"      // BOARD_BL_PIN
 #include "../meshpunk_sync.h"  // SPI_LOCK/SPI_UNLOCK
 
 static TFT_eSPI tft;
+
+// The T-Deck's SD slot lives on the same shared FSPI bus as the panel and
+// radio — the global SPI object main.cpp begins at boot.
+SPIClass& board_sd_spi(void) { return SPI; }
 
 void display_dev_init(void) {
   tft.begin();

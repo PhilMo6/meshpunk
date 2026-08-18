@@ -98,7 +98,81 @@
 //                  the push task may still be reading). A module importing
 //                  either fails to LOAD on level 7 with an unresolved
 //                  symbol, so min_fw=8 is mandatory for it (Jet 3D)
-#define MESHPUNK_FW_API 8
+//   9  2026-08-12  unreleased since the v0.3.4 tag (which shipped level 8):
+//                  the in-memory IMAGE BRIDGE — _img_info(path),
+//                  _img_open(path[,opts]) -> dsc,w,h,div, _img_scale(dsc,w,h)
+//                  and _img_close([dsc]) (src/img_bridge.cpp) decode a PNG,
+//                  baseline JPEG or RGB565 .bin into an app-owned PSRAM RGB565
+//                  buffer and hand Lua an lv_image_dsc_t* that LVGL draws
+//                  through its use-directly path — which is what lifts the
+//                  512KB LV_CACHE_DEF_SIZE ceiling that silently FAILS the
+//                  decode of any larger image; paired with lib/imgview.lua
+//                  (fit / 1:1-pan viewer widget) and LV_USE_TJPGD 1 plus the
+//                  JD_USE_SCALE vendored patch that lets TJpgDec descale while
+//                  decoding, so a multi-megapixel JPEG lands in a screen-sized
+//                  buffer. An app using either fails at require/nil-call time
+//                  on level 8, so min_fw=9 is mandatory for it (Tools/Images);
+//                  the ON-SCREEN KEYBOARD bridge for keyboardless boards —
+//                  _osk_initial_text / _osk_commit / _osk_set_active /
+//                  _osk_release (lib/osk.lua) connect the OSK's own preview
+//                  textarea to the app textarea input_ui captured at focus
+//                  time, re-validating both pointers on every use; and
+//                  CONTROLLER-MODE TOUCH ZONES — _zones_set / _zones_enable /
+//                  _zones_enabled / _zones_clear (lib/touchlayout.lua) load
+//                  and arm an on-screen button layout that intercepts all
+//                  touch while armed, with _elf_touch_layout(zones) staging
+//                  the same for the NEXT module launch (OUT codes are module
+//                  keycodes, 0xFF = quit; armed in elf_input_start, cleared
+//                  when the module exits); the SHARED TOUCH MODE that decides
+//                  when those arm — _touch_mode() and
+//                  _touch_mode_cycle(has_pad) expose the OFF / PAD /
+//                  PAD_HIDDEN / KB state, which also governs whether the
+//                  OSK opens on textarea focus. It is NOT
+//                  persisted: re-derived every boot (no touch -> OFF, keyboard
+//                  -> OFF, keyboardless -> PAD) and advanced by one trigger,
+//                  the board aux button or Shift+Alt; the INPUT CAPABILITY
+//                  probe _input_caps() -> { keyboard, trackball, touch,
+//                  kbd_backlight }, the runtime answer to what hardware this
+//                  is — a board may have touch and no keyboard, so an app
+//                  offering keyboard-only affordances should gate on this
+//                  rather than on board identity; _touch_raw() -> { x0, y0,
+//                  x1, y1, points, drops }, the panel's own coordinates
+//                  BEFORE the board's raw->screen transform plus a count of
+//                  frames the backend rejected (bad checksum, invalid slot,
+//                  short I2C read) — feeds Tools/Touch Test; and
+//                  lib/padlayout, per-launcher on-screen controller presets
+//                  carrying the user's own drag/resize edits (persisted to
+//                  L:/touch_layouts/<app>.cfg) into _elf_touch_layout;
+//                  lib/touchlayout's app-facing API — touchlayout.set(zones)
+//                  arms a Lua app's OWN on-screen controller layout (a
+//                  zone's `out` is the key code it sends, which is why only
+//                  the app authors it) and touchlayout.clear() drops it,
+//                  registered through the normal apps.set_on_close hook
+//                  AFTER the app's set_root (set_root clears callbacks
+//                  registered before it); the lib holds zone plumbing and
+//                  the overlay only, no per-app data (Snake, Scorched
+//                  Earth); and the HELP SYSTEM — lib/helpdocs discovers
+//                  guide pages (lua/help on both drives, L: wins) plus a
+//                  readme.lua inside any installed app (title = the app's
+//                  registry name; the file only runs when its page is
+//                  opened), executing each page in a restricted env (copied
+//                  string/table/math, no io/os/_G/require, text-only load)
+//                  with the _input_caps and _device_caps snapshots passed
+//                  as chunk arguments — a help page therefore calls NO
+//                  firmware binding and carries no min_fw of its own. The
+//                  Read Me app is a viewer over this lib and requires it at
+//                  load, so Read Me >= 1.0.5 needs min_fw=9 (mandatory).
+//                  An app calling the bindings above unguarded fails at
+//                  nil-call time on level 8, so it needs min_fw=9; the ELF
+//                  launchers deliberately stay at min_fw=8 by loading
+//                  lib/padlayout through pcall and calling the binding
+//                  behind an "if _elf_touch_layout and pad" guard, and
+//                  Snake / Scorched Earth stay ungated the same way (their
+//                  pcall'd require of lib/touchlayout fails on older
+//                  firmware and the touch pad is simply absent). NO new ELF
+//                  host_exports this cycle, so no module gains a load-time
+//                  dependency on level 9
+#define MESHPUNK_FW_API 9
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:

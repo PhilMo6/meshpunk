@@ -20,6 +20,16 @@ struct SoundObject {
     bool      tone_paused;
     bool      tone_loop;
 
+    // Buzzer note schedule — captured at creation on boards with no I2S
+    // player (audio_dev_init returned nullptr). Piecewise-constant frequency
+    // segments derived from the generator parameters; the mixer drives the
+    // piezo from these while the PCM mix advances play_pos for timing.
+    // Empty (buzz_count == 0) on I2S boards and for AUDIO_FILE objects.
+    uint16_t* buzz_freq;    // per-segment frequency, Hz (0 = rest)
+    uint32_t* buzz_end_ms;  // cumulative segment end time, ms
+    uint16_t  buzz_count;
+    uint32_t  buzz_seq;     // play-order stamp; newest playing tone owns the piezo
+
     // FILE fields
     fs::File* file;
     bool      file_is_sd;

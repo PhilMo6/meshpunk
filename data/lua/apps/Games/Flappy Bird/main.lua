@@ -92,6 +92,24 @@ local function save_score(score)
     end
 end
 
+-- SFX mute, persisted in its own file ("1"/"0") so save.txt stays a bare
+-- score readable by older versions of this app.
+local function load_muted()
+    local f = io.open(app_dir .. "/mute.txt", "r")
+    if not f then return false end
+    local txt = f:read("*a")
+    f:close()
+    return txt == "1"
+end
+
+local function save_muted(m)
+    local f = io.open(app_dir .. "/mute.txt", "w")
+    if f then
+        f:write(m and "1" or "0")
+        f:close()
+    end
+end
+
 local function randomY()
     return math.random(TOP_Y + 20, BOTTOM_Y - PIPE_GAP - 20)
 end
@@ -510,6 +528,33 @@ local function createQuitBtn(sysLayer)
     return quitBtn
 end
 
+-- SFX mute chip, below the quit button (64x60, TOP_RIGHT). Parented to the
+-- app root, NOT the gridnav'd sysLayer: during play sysLayer has no focusable
+-- children, and a focusable chip there would let trackball focus wander off
+-- the flap layer mid-round. Touch-only as a result.
+local function createMuteBtn(parent)
+    local btn = parent:Label{
+        text = game.sfx_muted and "SFX OFF" or "SFX ON",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        text_color = "#FFFFFF",
+        bg_color = "#000000", bg_opa = 120,
+        radius = 4, pad_all = 4,
+        align = { type = lvgl.ALIGN.TOP_RIGHT, y_ofs = 64, x_ofs = -4 },
+    }
+    btn:add_flag(lvgl.FLAG.CLICKABLE)
+    btn:onevent(lvgl.EVENT.PRESSED, function()
+        if not game.running then return end
+        game.sfx_muted = not game.sfx_muted
+        save_muted(game.sfx_muted)
+        if game.sfx_muted then
+            if game.flap_snd then game.flap_snd:stop() end
+            if game.gameover_snd then game.gameover_snd:stop() end
+        end
+        btn:set{ text = game.sfx_muted and "SFX OFF" or "SFX ON" }
+    end)
+    return btn
+end
+
 local function entry()
     local scr = screenCreate()   -- apps.new_root inside: already registered
     game.scr = scr
@@ -518,6 +563,7 @@ local function entry()
     local scoreBest = load_score() or 0
     local scoreNow = 0
     local debouncing = false
+    game.sfx_muted = load_muted()
 
     -- Game over: chromatic descent, plays once
     game.gameover_snd = sound.generateMelody({
@@ -575,7 +621,7 @@ local function entry()
         debouncing = true
         game.playing = false
         if game.flap_snd then game.flap_snd:stop() end
-        if game.gameover_snd then game.gameover_snd:play() end
+        if game.gameover_snd and not game.sfx_muted then game.gameover_snd:play() end
         pipes:stop()
         bird:gameOver()
         if scoreNow > scoreBest then
@@ -660,7 +706,7 @@ local function entry()
         if not game.running or not game.playing then return end
         if event == lvgl.EVENT.PRESSED then
             bird:pressed()
-            if game.flap_snd then game.flap_snd:play() end
+            if game.flap_snd and not game.sfx_muted then game.flap_snd:play() end
         else
             bird:released()
             if game.flap_snd then game.flap_snd:stop() end
@@ -725,6 +771,10 @@ local function entry()
     _gridnav_add(sysLayer, GRIDNAV_ROLLOVER)
     local grp = lvgl.group.get_default()
     grp:add_obj(sysLayer)
+
+    -- Created last on the root: z-topmost, survives the menu/play/game-over
+    -- button churn (only explicitly-deleted widgets go).
+    createMuteBtn(scr)
 end
 
 entry()

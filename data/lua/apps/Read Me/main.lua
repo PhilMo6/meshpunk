@@ -1,10 +1,12 @@
--- Read Me — on-device user guide. Content mirrors the project README's
--- device-usage sections (keep the two in sync when either changes).
+-- Read Me — on-device user guide. A viewer over lib/helpdocs: system pages
+-- from lua/help on both drives plus a readme.lua inside any installed app,
+-- merged with the inline PAGES below into a Guide tab and an Apps tab.
 -- Contents page -> one scrollable page per topic, with < / > page flipping.
-local lvgl  = require("lvgl")
-local apps  = require("lib/apps")
-local nav   = require("lib/nav")
-local theme = require("lib/theme")
+local lvgl     = require("lvgl")
+local apps     = require("lib/apps")
+local nav      = require("lib/nav")
+local theme    = require("lib/theme")
+local helpdocs = require("lib/helpdocs")
 
 local root = apps.new_root()
 root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 0, border_width = 0, bg_opa = 0 }
@@ -20,173 +22,73 @@ local H = lvgl.VER_RES()
 -- text editable without escape noise.
 local PAGES = {
 
-{ t = "Welcome", b = [[
-MeshPunk turns the LilyGo T-Deck into a LoRa mesh communicator with full MeshCore support - plus offline maps, music, games and emulators, themes, a file manager, and an App Library for installing more over WiFi.
-
-Highlights:
-- Sound, SD card, BLE (phone apps), WiFi
-- GPS sets the clock automatically
-- Full emoji support, with a downloadable extended set
-- Background apps - music keeps playing while you do other things
-- USB host support (experimental)
-
-This guide covers day-to-day use. Flip pages with the < and > buttons above.]] },
-
-{ t = "First-time setup", b = [[
-After flashing:
-
-1. Use an SD card - it persists your mesh and firmware settings (highly recommended).
-2. Open Settings > Radio and set the radio to your local defaults.
-3. Set your extra settings: RX boost, Contact Overwrite, and Message Repeat.
-4. Get meshing!
-5. Install apps from the App Library.
-
-Game and music files live on the SD card - see the Games and Music pages for where each kind goes.]] },
-
-{ t = "Navigation", b = [[
-Three ways to move around the UI:
-
-- Trackball: roll to move focus between elements, click to select.
-- WASD keys: W/A/S/D mirror the trackball directions (up/left/down/right). When a text input is focused they type normally instead.
-- Touchscreen: tap to interact directly.
-
-Trackball and WASD share a configurable sensitivity setting (Settings > Device > Trackball): the minimum time between accepted direction inputs, 0-500 ms.]] },
-
-{ t = "Keyboard shortcuts", b = [[
-- Mic key: global notifications shortcut. Over a running app it peeks the top bar; on the launcher (or while peeked) it toggles the notification drop-down. Sym+Mic still types 0.
-
-- Alt + letter (while typing): emoji layer - each letter key types its assigned emoji into the text field. Assign emojis per key in Settings > Emoji. An optional tap-to-latch mode for Alt (Settings > Device > Keyboard) keeps the layer on between taps.
-
-- Alt + Mic (while typing): emoji search - opens a popup over the whole emoji set. Page through it, or jump by hex codepoint (e.g. 1F600 for smileys). Tapping an emoji inserts it into the text field you were typing in; the popup stays open for multiple inserts until Close (or Alt+Mic again).
-
-- Sym (tap-to-latch): with the optional latch mode (Settings > Device > Keyboard), a clean tap of Sym latches the symbol layer until the next tap; holding Sym while typing stays momentary. WASD navigation pauses while latched - tap Sym again to resume.
-
-- Alt + Backspace (hold ~1.5s): quit to home - closes the current app and returns to the launcher home page. The same chord quits a running native game (Doom, GameBoy, PICO-8, DOS).
-
-- q: backs out of selection modes - message selection in a chat, row-select lists, and the Map app.
-
-- Enter (in a chat): sends the message. Long-press the message input for the clipboard menu.]] },
-
-{ t = "Emoji", b = [[
-Emoji work anywhere you can type:
-
-- Alt + letter types the emoji assigned to that key. Customize every key in Settings > Emoji.
-- Alt + Mic opens the emoji search popup for everything you have not put on a key.
-
-The standard emoji set ships with the firmware. An extended set (skin tones and many more sequences) can be downloaded over WiFi from Settings > Emoji - it lives on the SD card.]] },
-
-{ t = "Messenger and mesh", b = [[
-Full MeshCore support: direct messages, channels, and contacts.
-
-Room servers and repeaters: log in, sync messages, and run admin commands right from the Messenger app.
-
-In a chat: Enter sends the message. Long-press the message input to open the clipboard menu (paste copied contact cards and text). When selecting messages in the list, q backs out of selection.
-
-Tip: before your first messages, set the radio to your local defaults (Settings > Radio) and review RX boost, Contact Overwrite, and Message Repeat.]] },
-
-{ t = "Map", b = [[
-The Map app shows OpenStreetMap tiles with mesh contact positions overlaid. Tiles download over WiFi and are cached on the SD card for offline use.
-
-Keyboard shortcuts:
-h - center on home (own GPS position)
-q - quit (closes a popup first if open)
-o or + - zoom in
-i or - - zoom out
-Space - stop scrolling
-Enter - select contact at center / stop scrolling
-c - cycle archived-contact pages
-Trackball - pan the map
-
-Pre-cache downloads: in the map settings you can bulk-download tiles for offline use - choose an area size and zoom range, then download. Tiles are written atomically, so interrupted downloads won't leave corrupt files.
-
-Contact selection: long-press a contact marker (touch), or center it and press Enter, to view details - name, type, distance, hop count, last seen.
-
-Meshprint: with enough mesh data you can run a meshprint on a message sender to capture the first and second hop repeaters and triangulate the sender's general location. The more data you have, the better the results.]] },
-
 { t = "Games and emulators", b = [[
 Lua games included: Flappy Bird, Snake, and Scorched Earth.
 
-Emulators install from the App Library; you provide the game files on the SD card:
+Emulators install from the App Library; you provide the game files on the SD card. Each emulator reads its own folder - /gb for GameBoy, /snes for SNES, and so on - or its app folder. Every installed emulator has its own page in the Apps tab of this guide with its file types, folders, settings and default keys, and that page installs along with it.
 
-- Doom: .wad files in /doom (or the Doom app folder). PWADs need a valid IWAD; Freedoom wads work too. Large wads take a while to load. Music and sound effects included.
+Quitting a native game, any of these:
+- Hold Alt + Backspace for about 1.5 seconds (needs a keyboard).
+- Hold the on-screen QUIT button for about a second.
+- A key you bound to quit in the launcher's Controls screen.
 
-- PICO-8: .p8 or .png carts in /p8carts (or the PICO-8 app folder).
+Each game launcher's ? button shows this plus the game's controls.]] },
 
-- GameBoy: .gb/.gbc roms in /gb (or the GameBoy app folder).
+{ t = "Audio", b = [[
+Where sound comes out, and how to route it.
 
-- Sega 8-bit: .gg/.sms/.sg roms in /sega8 (or the Sega8 app folder). Game Gear, Master System and SG-1000 in one app - the file extension picks the system, and the launcher shows which one a rom will run as before you start it.
+USB audio: route all device audio to a USB audio adapter via Tools > USB Host. Music, app sounds and game audio all follow the route. The adapter needs external power - see the USB accessories page.
 
-- Genesis: .md/.gen/.bin roms in /genesis (or the Genesis app folder). Sega Genesis / Mega Drive. Battery-backed saves write to a .srm file next to the rom. If a game stalls at a fixed point or crawls while its music keeps playing, turn Idle Skip off in the launcher and relaunch - it trades some speed for compatibility.
+Devices with a buzzer instead of a speaker play notification melodies and app tones on the buzzer, one note at a time. For music and game audio on those, a powered USB audio adapter is the way.
 
-- SNES: .smc/.sfc/.fig roms in /snes (or the Snes app folder). Battery saves write to a .srm file next to the rom. The Renderer button is the one to reach for per game: Speed is the default and is much faster, while Accuracy redraws in the slower way some games need if the picture looks wrong.
-
-- Dos: disk images and game folders in /dos. A full 386 PC with VGA, Adlib, Sound Blaster and a PS/2 mouse. No disks? The app's Download DOS button fetches ready-made FreeDOS boot disks over WiFi (freedos-a.img is the boot floppy; freedos-c.img boots as a hard disk so A: stays free for game disks; the -nb versions leave out SET BLASTER for games that misbehave when they find a sound card). Point C: at a folder of games and it becomes a real writable C: drive, so installers and save games work. The Boot button lists every setting it will start with, including whether the trackball is a mouse or arrow keys.
-
-  If a game misbehaves: Audio rate (see its ? button) trades pitch for speed and cures crackle - 0.5 is the usual answer; SB digital can fake a card fault so a game disables its own digitised sound; Timer cap keeps games alive that pace sound off the system timer. Keys: SYM+key for numbers and symbols, ALT+number for F1-F10, Shift+Backspace for Esc, and ALT+Enter switches your key bindings off and on (WASD are arrows by default) so the DOS prompt still types normally.
-
-
-Quitting a native game: hold Alt + Backspace for about 1.5 seconds to return to the launcher. Each game launcher's ? button shows this plus the game's controls.]] },
-
-{ t = "Freeing up RAM", b = [[
-Games and emulators are the hungriest things the device runs. Each one needs a single large block of free memory, so a launch can fail even when the total free memory looks like plenty - the memory is there, just broken into pieces by whatever ran before it.
-
-If an app or game fails to launch with a low-RAM message:
-
-1. Restart the device and launch it again, before opening anything else. A fresh boot gives the largest unbroken block of memory, and this fixes most launch failures on its own.
-2. Launch the game first, then do everything else afterwards. Apps that load a lot - Map tiles, long Messenger chats, Music - leave memory broken up behind them.
-
-If it still won't launch, switch off what you are not using. Each of these frees a modest amount, so use them together:
-
-- WiFi (Settings > Wireless): leave it off unless you are downloading map tiles, apps, or the extended emoji set.
-- BLE companion (Settings > Wireless): off unless a phone app is connected to the device.
-- USB host mode (Tools > USB Host): press Stop when you are done with a USB device. Its own memory use is small, but it also runs background tasks while it is on.
-
-A restart is by far the biggest win here - try that first, every time.]] },
-
-{ t = "Music and audio", b = [[
-The Music app plays MP3s from /Music on the SD card.
-
-- Tag-based library with playlists (playlists live in /Music/Playlists).
-- Auto-organize sorts tagged files into /Music/Artist/Album for you.
-- Background playback: music keeps playing while you use the rest of the device.
-
-USB audio (experimental): route all device audio to a USB-C audio dongle via Tools > USB Host.]] },
-
-{ t = "App Library and themes", b = [[
-The App Library installs apps and themes onto the device over WiFi, and updates ones already installed - no firmware reflash required. It reads its catalog from github.com/PhilMo6/meshpunk-apps.
-
-- Apps are grouped by category; when an installed app is behind the catalog, an Updates list appears at the top.
-- Everything that ships with the firmware is tracked too, so even preinstalled apps and themes update OTA.
-- System apps (App Library, Files, Map, Messenger, and the Settings pages) are non-removable, but can still be updated.
-
-Themes: 15 are included - switch in Settings > Theme, and download more via Settings > Theme > Get.
-
-Contributions (your own apps and themes) are welcome via pull request - see the catalog repo's README.]] },
+Music playback is the Music app (App Library) - its page in the Apps tab covers the library, playlists and background playback.]] },
 
 { t = "Files and storage", b = [[
 Tools > Files is the file manager, covering both internal flash and the SD card.
 
 An SD card is highly recommended: it persists your mesh and firmware settings, and holds game files, music, cached map tiles, and the extended emoji set.]] },
 
-{ t = "USB drive mode", b = [[
-Tools > USB Drive shares the SD card with a PC: plug the device into the PC, press Start sharing, and it appears as a removable USB drive (about 1 MB/s - the chip's USB is full-speed).
-
-While sharing, the PC owns the card exclusively: apps lose the SD drive and the mesh radio pauses. Eject the drive on the PC, then press Stop (or just leave the app) - the card remounts and the mesh resumes.
-
-Internal files can be shared by copying them to SD in Tools > Files first.
-
-After a drive session, USB host mode (Tools > USB Host) needs a reboot.]] },
-
-{ t = "Firmware updates", b = [[
-Releases are on the MeshPunk GitHub releases page.
-
-- First install: download the -merged.bin and flash it at meshcore.io/flasher (bottom of the page, Custom Firmware). Note: it replaces the filesystem with MeshPunk's - the flasher warns about this.
-
-- Updates: download the -firmware.bin. It updates the firmware AND refreshes the bundled files automatically on the next boot; your settings and messages are kept.
-
-- Launcher users: with bmorcelli's multi-firmware Launcher (2.7.2+), install the -launcher.bin through the Launcher (FAT32 SD, WebUI, or direct URL/OTA). First boot sets up the filesystem (about a minute). Don't install the -merged.bin through the Launcher - that one is for the web flasher.]] },
-
 }
+
+-- ── Page set ────────────────────────────────────────────────────────────────
+-- This app's own pages, plus everything lib/helpdocs discovers: system pages
+-- under lua/help on either drive, and a readme.lua inside any installed app.
+-- Discovery runs nothing for an app page (its title is the app's name) and
+-- executes a system page once, in a sandbox, to read its title and order.
+-- Orders start at 110 so these sit after the migrated guide pages (10-80) and
+-- before About (900). Each is about an app that will carry its own readme.lua,
+-- at which point its entry here goes away -- an app must not be described in
+-- both places or it appears twice.
+local ENTRIES = {}
+for i, pg in ipairs(PAGES) do
+    ENTRIES[#ENTRIES + 1] = { title = pg.t, section = "Guide", order = 100 + i * 10, body = pg.b }
+end
+do
+    local ok, found = pcall(helpdocs.discover)
+    if ok and type(found) == "table" then
+        for _, e in ipairs(found) do ENTRIES[#ENTRIES + 1] = e end
+    end
+end
+helpdocs.sort(ENTRIES)
+
+-- Fallback so an install with no pages at all still says something useful
+-- rather than presenting an empty list. Runs BEFORE the tab split so the
+-- fallback page lands in a tab like any other entry.
+if #ENTRIES == 0 then
+    ENTRIES[1] = { title = "No help installed", section = "Guide", order = 1, body = [[
+No help pages were found on this device.
+
+Guide pages live in lua/help on internal storage or the SD card, and an app can ship its own page as readme.lua inside its folder. Installing an app from the App Library brings its help with it.]] }
+end
+
+-- Split into tabs: the guide reads as a narrative, app help is a directory of
+-- whatever is installed. Both keep the order helpdocs.sort established.
+local TABS   = { "Guide", "Apps" }
+local BY_TAB = { Guide = {}, Apps = {} }
+for _, e in ipairs(ENTRIES) do
+    local t = BY_TAB[e.section] and e.section or "Guide"
+    BY_TAB[t][#BY_TAB[t] + 1] = e
+end
 
 -- ── Views ───────────────────────────────────────────────────────────────────
 -- App Library's swap_view pattern: build the new full-screen view, then
@@ -223,16 +125,23 @@ local function tool(content, txt, width, fn)
     b:onClicked(fn)
 end
 
-show_page = function(i)
-    local pg = PAGES[i]
+-- The tab the reader is in. Paging stays inside it, and Back returns to it.
+local cur_tab = TABS[1]
+
+show_page = function(tab, i)
+    local list = BY_TAB[tab]
+    local pg   = list[i]
+    -- Resolved here, not at discovery: an app page's file runs the first time
+    -- its page is opened, then the text is cached on the entry.
+    local text = helpdocs.body(pg)
     swap_view(function(v)
         local content = new_content(v)
-        tool(content, "Back", lvgl.PCT(31), show_contents)
+        tool(content, "Back", lvgl.PCT(31), function() show_contents(tab) end)
         tool(content, "< Prev", lvgl.PCT(31), function()
-            show_page(i > 1 and i - 1 or #PAGES)
+            show_page(tab, i > 1 and i - 1 or #list)
         end)
         tool(content, "Next >", lvgl.PCT(31), function()
-            show_page(i < #PAGES and i + 1 or 1)
+            show_page(tab, i < #list and i + 1 or 1)
         end)
         -- Title on its own themed card (readable over wallpaper). Clear just
         -- CLICKABLE so gridnav skips it (nav pitfall: default Objects are
@@ -240,7 +149,7 @@ show_page = function(i)
         local trow = content:Object { w = lvgl.PCT(100), h = 26, pad_all = 4 }
         trow:clear_flag(lvgl.FLAG.SCROLLABLE)
         trow:clear_flag(lvgl.FLAG.CLICKABLE)
-        trow:Label { text = i .. "/" .. #PAGES .. "  " .. pg.t, w = lvgl.PCT(100) }
+        trow:Label { text = i .. "/" .. #list .. "  " .. pg.title, w = lvgl.PCT(100) }
         -- Body text lives in its own scrollable, focusable wrapper. Gridnav's
         -- SCROLL_FIRST scrolls the FOCUSED CHILD (never the nav container),
         -- so trackball-scrollable text must itself be a focusable scrollable
@@ -255,26 +164,43 @@ show_page = function(i)
             w = lvgl.PCT(100), h = H - 86,
             pad_all = 6,
         }
-        body:Label { text = pg.b, w = lvgl.PCT(100) }
+        body:Label { text = text, w = lvgl.PCT(100) }
     end)
 end
 
-show_contents = function()
+show_contents = function(tab)
+    cur_tab = tab or cur_tab
+    local list = BY_TAB[cur_tab]
     swap_view(function(v)
         local content = new_content(v)
-        local trow = content:Object { w = lvgl.PCT(70), h = 24, pad_all = 3 }
-        trow:clear_flag(lvgl.FLAG.SCROLLABLE)
-        trow:clear_flag(lvgl.FLAG.CLICKABLE)
-        trow:Label { text = "MeshPunk Guide", w = lvgl.PCT(100) }
-        tool(content, "Home", 60, function() apps.go_home() end)
-        for i, pg in ipairs(PAGES) do
+        -- Tab row: Home, then one button per tab. The active tab is marked in
+        -- its label rather than by styling, so it reads on every theme.
+        tool(content, "Home", lvgl.PCT(31), function() apps.go_home() end)
+        for _, name in ipairs(TABS) do
+            local n = #BY_TAB[name]
+            local mark = (name == cur_tab) and "* " or ""
+            tool(content, mark .. name .. " (" .. n .. ")", lvgl.PCT(31), function()
+                show_contents(name)
+            end)
+        end
+        if #list == 0 then
+            -- An empty Apps tab is the normal state until an app ships help,
+            -- so say why rather than showing a blank page.
+            local erow = content:Object { w = lvgl.PCT(100), h = 60, pad_all = 6 }
+            erow:clear_flag(lvgl.FLAG.SCROLLABLE)
+            erow:clear_flag(lvgl.FLAG.CLICKABLE)
+            erow:Label { text = "No app help installed yet. An app can ship its own page, and installing it brings the page with it.",
+                         w = lvgl.PCT(100) }
+            return
+        end
+        for i, pg in ipairs(list) do
             local b = content:Button { w = lvgl.PCT(100), h = 26 }
-            b:Label { text = i .. ". " .. pg.t, align = lvgl.ALIGN.LEFT_MID }
-            b:onClicked(function() show_page(i) end)
+            b:Label { text = i .. ". " .. pg.title, align = lvgl.ALIGN.LEFT_MID }
+            b:onClicked(function() show_page(cur_tab, i) end)
         end
     end)
 end
 
-show_contents()
+show_contents(TABS[1])
 
 return root

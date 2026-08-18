@@ -349,7 +349,11 @@
 
 #define LV_USE_LIBPNG 0
 #define LV_USE_BMP 0
-#define LV_USE_TJPGD 0
+
+/*TJpgDec — baseline JPEG. Decodes MCU block by block (no full-image buffer),
+  so it also backs the _img_* bridge's JPEG path (src/img_bridge.cpp), which
+  drives jd_prepare/jd_decomp directly with JD_USE_SCALE.*/
+#define LV_USE_TJPGD 1
 #define LV_USE_LIBJPEG_TURBO 0
 
 #define LV_USE_GIF 0

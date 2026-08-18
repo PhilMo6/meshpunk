@@ -336,17 +336,56 @@ bool input_dev_nav_click_held(void) {
   return digitalRead(TDECK_TRACKBALL_CLICK) == LOW;
 }
 
+// No second/mode button on the T-Deck.
+bool input_dev_aux_btn_take(void) { return false; }
+
 // ── Touch ──────────────────────────────────────────────────────────────────
 
 bool input_dev_touch_read(int16_t* tx, int16_t* ty) {
-  static int16_t x[5], y[5];
-  uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
-  if (touched > 0) {
-    if (tx) *tx = x[0];
-    if (ty) *ty = y[0];
-    return true;
+  int16_t x[INPUT_DEV_TOUCH_MAX], y[INPUT_DEV_TOUCH_MAX];
+  if (input_dev_touch_read_multi(x, y, INPUT_DEV_TOUCH_MAX) <= 0) return false;
+  if (tx) *tx = x[0];
+  if (ty) *ty = y[0];
+  return true;
+}
+
+// The GT911 tracks 5 points and the driver already returns them all; the
+// controller is queried for its own supported count so a differently
+// configured panel can't overrun the caller's arrays.
+// The GT911 driver is told the panel geometry (setMaxCoordinates below) and
+// returns screen coordinates directly, so "raw" and mapped are the same
+// here; reported anyway so the measurement app runs on both boards.
+static volatile int16_t s_raw_x  = -1, s_raw_y  = -1;
+static volatile int16_t s_raw_x1 = -1, s_raw_y1 = -1;
+static volatile uint8_t s_raw_n  = 0;
+
+void input_dev_touch_raw(InputTouchRaw* out) {
+  if (!out) return;
+  out->x0     = s_raw_x;
+  out->y0     = s_raw_y;
+  out->x1     = s_raw_x1;
+  out->y1     = s_raw_y1;
+  out->points = s_raw_n;
+  out->drops  = 0;          // the driver does its own validation
+}
+
+int input_dev_touch_read_multi(int16_t* xs, int16_t* ys, int max) {
+  if (!xs || !ys || max <= 0) return 0;
+  int16_t x[INPUT_DEV_TOUCH_MAX], y[INPUT_DEV_TOUCH_MAX];
+  int want = touch.getSupportTouchPoint();
+  if (want > INPUT_DEV_TOUCH_MAX) want = INPUT_DEV_TOUCH_MAX;
+  if (want < 1) want = 1;
+  int n = (int)touch.getPoint(x, y, (uint8_t)want);
+  if (n > max) n = max;
+  for (int i = 0; i < n; i++) { xs[i] = x[i]; ys[i] = y[i]; }
+  if (n > 0) {
+    s_raw_x  = x[0];
+    s_raw_y  = y[0];
+    s_raw_x1 = (n > 1) ? x[1] : -1;
+    s_raw_y1 = (n > 1) ? y[1] : -1;
+    s_raw_n  = (uint8_t)n;
   }
-  return false;
+  return n;
 }
 
 #endif // BOARD_TDECK
