@@ -49,4 +49,9 @@ WHAT IF IT DOES NOT WAKE
 If the device seems unresponsive, plug in USB power and try again. A battery too low to start up can leave it unable to boot while still having enough charge to sit in standby.
 ]]
 
-return { body = body }
+return {
+    title   = "Power and standby",
+    section = "Guide",
+    order   = 77,
+    body    = body,
+}

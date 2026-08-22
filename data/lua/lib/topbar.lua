@@ -395,7 +395,11 @@ function M.create()
     --the time label changes legnth by a couple pixels as time changes so give it a width so it does not move the flex grid
     local time_label = bar:Label{ text = render_time(), h = 20 , w = 100 } 
 
-    local battery_label =  bar:Label{ text = render_battery_pct(), h = 20 }
+    -- Fixed width: the text is 2-4 characters wide depending on charge, and
+    -- it is a tap target (below), so a text-sized label would give a moving,
+    -- sometimes tiny hit area on the touchscreen.
+    local battery_label =  bar:Label{ text = render_battery_pct(), h = 20, w = 46,
+                                      align = lvgl.ALIGN.RIGHT_MID }
 
     -- The battery area is its own tap target: it opens the power drop-down
     -- instead of the notification panel (a clickable child swallows the tap,
