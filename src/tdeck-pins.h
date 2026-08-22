@@ -43,7 +43,7 @@
 
 #define TDECK_BAT_ADC 4
 
-// T-Deck Plus onboard GPS (L76K) on UART1
+// T-Deck Plus onboard GPS (u-blox MIA-M10Q) on UART1
 #define TDECK_GPS_RX   44
 #define TDECK_GPS_TX   43
 #define TDECK_GPS_BAUD 9600

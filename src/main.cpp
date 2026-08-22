@@ -850,12 +850,13 @@ static bool           gps_baud_locked = false;
 static uint32_t       gps_baud_probe_chars_start = 0;
 static bool           gps_serial_active = false;
 
-// GPS module identity (established by a since-retired boot probe, hw
-// 2026-07-13): Allystar-class L1/L5 dual-band (GPS+GAL+BDS+QZSS, no GLONASS,
-// NMEA 4.1, 38400). It rejects every known text command dialect (PMTK, PCAS,
-// PAIR, PQTM, PDTINFO — each echoed as "$GNTXT,...,<prefix> inv format"), has
-// no standby command we can use, and is rail-powered with no control GPIO:
-// the receiver runs continuously by hardware design.
+// GPS module identity: a u-blox MIA-M10Q, read off the T-Deck-GPS daughter
+// board's U1 designator. GPS+GAL+BDS+QZSS, no GLONASS, NMEA 4.1 at 38400.
+// Text command dialects do not work on it — a since-retired boot probe tried
+// PMTK, PCAS, PAIR, PQTM and PDTINFO (hw 2026-07-13) and got nothing usable
+// back. Its command language is UBX, which is what gps_dev_power_down /
+// gps_dev_wake speak (gps_tdeck.cpp). The receiver is rail-powered with no
+// control GPIO, so the UART is the only power lever.
 
 static void gps_print_stats(const char* tag) {
   uint32_t elapsed = millis() - gps_sync_start_ms;

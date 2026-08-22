@@ -8,10 +8,9 @@
 // receiver OFF at reset, so nothing streams until that drive lands.
 // PPS on GPIO41 is not used yet.
 //
-// Unlike the T-Deck's Allystar receiver, the L76K accepts standard
-// PCAS/PMTK commands — chip_init is where rate/constellation tuning goes
-// when wanted. Bring-up keeps the factory defaults (NMEA @ 9600, which the
-// firmware's baud probe locks onto).
+// The L76K accepts standard PCAS/PMTK commands — chip_init is where
+// rate/constellation tuning goes when wanted. Bring-up keeps the factory
+// defaults (NMEA @ 9600, which the firmware's baud probe locks onto).
 
 #if defined(BOARD_HELTEC_V4)
 

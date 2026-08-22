@@ -8,7 +8,6 @@
 #include "ble_companion.h"
 #include "notify.h"
 #include "usb_manager.h"   // UsbFlashGuard — pause USB audio around flash writes
-#include "gps/gps_dev.h"   // TEMPORARY: the "g" GPS sleep-command probe
 
 // Shared-SPI-bus lock pair (defined in main.cpp).
 // sd_spi_take()    — acquire spi_bus_mutex before any SD operation.
@@ -5903,15 +5902,6 @@ void PunkMesh::onContactVisit(const ContactInfo &contact)
     AdvertTimeHelper::formatRelativeTimeDiff(tmp, secs, false);
     SLog.println(tmp);
 }
-
-// ── TEMPORARY: GPS sleep-command probe ("g 1|2|3" console commands) ────────
-// The receiver's binary-dialect verdict comes from its own ACK/VER replies
-// and the NMEA byte rate (silence after sleep, resumption after wake), so
-// every step prints its evidence — no current meter needed. Commands are
-// single-letter because the console drops characters.
-
-// Fish Allystar binary frames (F1 D9 cls id len_lo len_hi payload ck ck)
-// out of the mixed NMEA stream and print them decoded.
 
 void PunkMesh::handleCommand(const char *command)
 {

@@ -186,7 +186,16 @@
 //                  but LUA_COMPAT_GLOBAL (default ON) keeps it valid as a
 //                  plain name. An app using 5.5-only syntax or stdlib
 //                  additions (global declarations, table.create, ...) needs
-//                  min_fw=10. NO binding or ELF host_export changes
+//                  min_fw=10. Also in this cycle: the power menu's ten Lua
+//                  bindings — _system_poweroff and _system_standby (each
+//                  returns false, refused, while a USB drive or a link
+//                  session owns the hardware), _standby_heartbeat_get/_set,
+//                  _standby_heartbeat_secs_get/_set, _auto_standby_get/_set
+//                  and _auto_standby_mins_get/_set. The Settings/Power store
+//                  app carries min_fw=10 for them; the topbar battery
+//                  drop-down that uses the first two ships with firmware.
+//                  NO new ELF host_exports this cycle, so no module gains a
+//                  load-time dependency on level 10
 #define MESHPUNK_FW_API 10
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see

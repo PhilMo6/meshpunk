@@ -30,8 +30,9 @@ void gps_dev_chip_init(void);
 
 // Chip-level power down / wake, used by shutdown and standby on boards whose
 // receiver has no controllable power rail (T-Deck: always-on rail, the UART
-// is the only lever — Allystar binary CFG-SLEEP). Heltec: no-ops, the VGNSS
-// rail cut in power_heltec.cpp is the lever there.
+// is the only lever — UBX-RXM-PMREQ to sleep, a contiguous UBX frame to
+// wake). Heltec: no-ops, the VGNSS rail cut in power_heltec.cpp is the lever
+// there.
 void gps_dev_power_down(void);
 void gps_dev_wake(void);
 
