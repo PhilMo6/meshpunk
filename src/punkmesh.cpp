@@ -3556,7 +3556,7 @@ struct CountingLineReader {
     }
 };
 
-int PunkMesh::readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32_t min_ts,
+int PunkMesh::readStoredMsgsFrom(const char* path, uint32_t start_offset,
                                  StoredMsg* out, uint32_t* end_offsets, int max_count,
                                  uint32_t* next_offset, uint32_t* file_size) {
     *next_offset = start_offset;
@@ -3587,14 +3587,14 @@ int PunkMesh::readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32
     int count = 0, parsed = 0, llen;
 
     // Parse at most max_count COMPLETE records per call (keeps every call
-    // bounded even when the min_ts filter drops all of them).
+    // bounded even when none of them yield a record).
     while (parsed < max_count && (llen = lr.next(line, sizeof(line))) >= 0) {
         if (llen == 0) continue;
 
         if (llen == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-') {
             parsed++;
             *next_offset = lr.consumed;          // record boundary
-            if (has_data && (min_ts == 0 || m.timestamp > min_ts)) {
+            if (has_data) {
                 out[count] = m;
                 end_offsets[count] = lr.consumed;
                 count++;

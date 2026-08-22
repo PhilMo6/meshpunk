@@ -624,12 +624,11 @@ public:
                               size_t offset, StoredMsg& m);
   int readAllStoredMsgs(const char* path, StoredMsg* out, int max_count);
   // Seek-based batched read: parses up to max_count COMPLETE ("---"-terminated)
-  // records starting at byte start_offset. Records with ts <= min_ts are
-  // filtered from out[] (pass 0 for no filter) but still advance the cursor.
+  // records starting at byte start_offset.
   // end_offsets[] holds the offset just past each returned record;
   // *next_offset lands just past the last parsed record (= resume cursor);
   // *file_size is the file's current size. Returns records in out[].
-  int readStoredMsgsFrom(const char* path, uint32_t start_offset, uint32_t min_ts,
+  int readStoredMsgsFrom(const char* path, uint32_t start_offset,
                          StoredMsg* out, uint32_t* end_offsets, int max_count,
                          uint32_t* next_offset, uint32_t* file_size);
   // Byte offset at which the newest `n` records begin, never earlier than

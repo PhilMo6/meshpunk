@@ -290,7 +290,7 @@ static String clock_fmt_str = "12";
 static bool   ble_enabled_pref = true;
 bool   ble_bond_clear_pref = false;
 // Newest messages the companion sync serves per conversation file (0 = all).
-static uint16_t ble_sync_max_per_channel = 0;
+static uint16_t ble_sync_max_per_channel = 100;
 static bool   wifi_enabled_pref = true;
 // Saved WiFi networks (multi-slot). /wifi_creds holds alternating ssid/pass
 // lines, so the legacy single-network file (2 lines) reads as one entry.

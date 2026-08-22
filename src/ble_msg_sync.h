@@ -9,21 +9,22 @@
 // Replaces the global-watermark + full-store-scan model with a per-file
 // ledger so sync work is proportional to NEW data, never store size:
 //
-//   * Ledger: one entry per message log {basename, synced_offset, last_ts}.
+//   * Ledger: one entry per message log {basename, synced_offset}.
 //     Logs are append-only, so "new records" always live at >= synced_offset
 //     and a sync is seek(offset) + bounded forward read — never a whole-file
 //     parse. Persisted to <messages>/ble_sync.idx (RAM authoritative, lazy
-//     write); the legacy ble_sync_ts watermark is migrated once then deleted.
+//     write).
 //
 //   * Dirty flags: the RX path marks exactly the file it appended
 //     (markDirty). An idle CMD_SYNC_NEXT_MESSAGE answers NO_MORE with zero
 //     file opens. Reconciliation (boot / sidecar loss) compares directory
 //     sizes against ledger offsets — metadata only, no content reads.
 //
-//   * Compaction/migration rescans (offset reset to 0) filter records by
-//     last_ts so already-synced history isn't re-served. The filter is ONLY
-//     applied on rescans — the normal append path serves everything past the
-//     offset, so a clock step backwards can never lose a message.
+//   * One serving path: whenever a file is picked, PunkMesh::_ble_sync_max_
+//     per_channel (0 = no limit) moves the offset to the newest N records.
+//     A compaction (file shrank) leaves the stored offset pointing at nothing,
+//     so it resets to 0 and the cap trims it forward again on the next pick —
+//     at most N already-delivered records repeat.
 //
 //   * Delivery-safe commits: serving frame N commits frame N-1's offset (the
 //     app's strictly-sequential pulls imply receipt); crash or disconnect
@@ -47,7 +48,6 @@ struct BleSyncFrame {
   uint8_t  len;
   uint8_t  data[BLE_SYNC_FRAME_MAX];
   uint32_t end_offset;   // file offset just past this frame's record
-  uint32_t ts;           // record timestamp (advances ledger last_ts)
 };
 
 class BleMsgSync {
@@ -82,15 +82,13 @@ private:
   struct LedgerEntry {
     char     name[BLE_SYNC_NAME_LEN];  // basename, e.g. "dm_Alice.log"
     uint32_t offset;                   // synced-through byte offset
-    uint32_t last_ts;                  // newest record ts accounted for
-    bool     rescan;                   // offset was reset: filter by last_ts
     bool     dirty;                    // has (or may have) unsynced records
     bool     seen;                     // scratch flag for reconciliation
   };
 
   LedgerEntry* findEntry(const char* name);
   LedgerEntry* addEntry(const char* name);
-  void   commit(LedgerEntry* e, uint32_t offset, uint32_t ts);
+  void   commit(LedgerEntry* e, uint32_t offset);
   void   commitBatchTail();
   bool   loadBatch();                // read next batch of current file
   int    pickDirty();                // ledger idx of next dirty entry, or -1
@@ -114,18 +112,12 @@ private:
   int           _cur = -1;             // ledger idx being served
   uint32_t      _cur_next_offset = 0;  // resume point in current file
   uint32_t      _batch_tail_offset = 0;
-  uint32_t      _batch_max_ts = 0;
   bool          _cur_exhausted = false;
 
   State         _state = ST_INIT;
   bool          _tickle = false;
   bool          _sidecar_dirty = false;
   uint32_t      _sidecar_touch_ms = 0;
-
-  // One-shot startup modes resolved by the first reconcile:
-  bool          _have_legacy = false;  // old ble_sync_ts found → ts-filtered rescan
-  uint32_t      _legacy_ts = 0;
-  bool          _seed_mode = false;    // no prior state → seed offsets to sizes
 };
 
 #endif // BLE_COMPANION_ENABLED

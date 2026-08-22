@@ -17,7 +17,9 @@ static_assert(BLE_SYNC_FRAME_MAX == MAX_FRAME_SIZE,
 extern void sd_spi_release();
 
 // Sidecar layout (v1): 'B' 'S' ver count, then per entry:
-//   u8 name_len, name bytes, u32 offset, u32 last_ts, u8 flags(bit0=rescan)
+//   u8 name_len, name bytes, u32 offset, u32 reserved, u8 reserved
+// The two trailing fields are unused: written as 0, ignored on read. The
+// layout is kept so ledgers written by earlier firmware still load.
 static const uint8_t SIDECAR_MAGIC0 = 'B';
 static const uint8_t SIDECAR_MAGIC1 = 'S';
 static const uint8_t SIDECAR_VER    = 1;
@@ -133,16 +135,15 @@ BleMsgSync::LedgerEntry* BleMsgSync::addEntry(const char* name) {
   return e;
 }
 
-void BleMsgSync::commit(LedgerEntry* e, uint32_t offset, uint32_t ts) {
+void BleMsgSync::commit(LedgerEntry* e, uint32_t offset) {
   e->offset = offset;
-  if (ts > e->last_ts) e->last_ts = ts;
   _sidecar_dirty = true;
   _sidecar_touch_ms = millis();
 }
 
 void BleMsgSync::commitBatchTail() {
   if (_cur < 0) return;
-  commit(&_ledger[_cur], _batch_tail_offset, _batch_max_ts);
+  commit(&_ledger[_cur], _batch_tail_offset);
 }
 
 String BleMsgSync::sidecarPath() {
@@ -174,7 +175,7 @@ int BleMsgSync::nextFrame(uint8_t* out) {
   // The app's pulls are strictly sequential: asking for frame N implies
   // frame N-1 arrived — commit it.
   if (_frame_idx > 0 && _cur >= 0) {
-    commit(&_ledger[_cur], _frames[_frame_idx - 1].end_offset, _frames[_frame_idx - 1].ts);
+    commit(&_ledger[_cur], _frames[_frame_idx - 1].end_offset);
   }
   BleSyncFrame& f = _frames[_frame_idx++];
   memcpy(out, f.data, f.len);
@@ -205,10 +206,9 @@ void BleMsgSync::tryLoadMore() {
         if (loadBatch()) return;      // got frames to serve
       }
       if (_cur_exhausted) {
-        // File fully consumed: commit through its tail, clear flags.
+        // File fully consumed: commit through its tail, clear the flag.
         commitBatchTail();
         _ledger[_cur].dirty = false;
-        _ledger[_cur].rescan = false;
         _cur = -1;
       }
       // !exhausted but zero frames (all records filtered): loop back into
@@ -224,11 +224,12 @@ void BleMsgSync::tryLoadMore() {
     // past the older records. Readers run oldest-first from the stored offset,
     // so without this a weeks-old backlog is streamed a frame per pull before
     // anything recent arrives. Committed here rather than on delivery — the
-    // skipped records are meant to go whether or not the app pulls them. Left
-    // alone on a rescan, where last_ts already bounds what gets served.
+    // skipped records are meant to go whether or not the app pulls them.
+    // This is the only place a serve position is chosen: every start point
+    // (new file, fresh install, compaction reset) passes through it.
     uint32_t start = _ledger[idx].offset;
     uint16_t cap   = _mesh->_ble_sync_max_per_channel;
-    if (cap > 0 && !_ledger[idx].rescan) {
+    if (cap > 0) {
       uint32_t trimmed = _mesh->offsetOfNewestRecords(
           fullPath(_ledger[idx].name).c_str(), start, (int)cap);
       if (trimmed > start) {
@@ -243,41 +244,41 @@ void BleMsgSync::tryLoadMore() {
 
     _cur_next_offset  = start;
     _batch_tail_offset = start;
-    _batch_max_ts      = _ledger[idx].last_ts;
     _cur_exhausted = false;
   }
 }
 
 bool BleMsgSync::loadBatch() {
   LedgerEntry* e = &_ledger[_cur];
-  uint32_t min_ts = e->rescan ? e->last_ts : 0;
   uint32_t next = _cur_next_offset, fsize = 0;
 
   int n = _mesh->readStoredMsgsFrom(fullPath(e->name).c_str(), _cur_next_offset,
-                                    min_ts, _records, _rec_ends, BLE_SYNC_BATCH,
+                                    _records, _rec_ends, BLE_SYNC_BATCH,
                                     &next, &fsize);
 
   if (_cur_next_offset > fsize) {
-    // File shrank under us (retention compaction): restart with ts filter.
-    SLog.printf("[BLE SYNC] %s compacted (off=%u > size=%u), rescanning\n",
+    // File shrank under us (retention compaction): the offset no longer
+    // locates a record, so the head is the only safe restart point. Drop the
+    // in-flight file instead of reading on from 0 — the cap is applied where
+    // a file is picked, and serving straight from here would bypass it.
+    SLog.printf("[BLE SYNC] %s compacted (off=%u > size=%u), restarting\n",
                 e->name, _cur_next_offset, fsize);
     e->offset = 0;
-    e->rescan = (e->last_ts > 0);
-    _cur_next_offset = 0;
-    _batch_tail_offset = 0;
+    e->dirty = true;
     _sidecar_dirty = true;
     _sidecar_touch_ms = millis();
+    _frame_count = _frame_idx = 0;
+    _cur_exhausted = false;
+    _cur = -1;                        // re-picked below, through the cap
     return false;                     // caller loops back in
   }
 
   _frame_count = _frame_idx = 0;
   for (int i = 0; i < n; i++) {
     int flen = buildSyncFrameFor(*_mesh, _records[i], _frames[_frame_count].data);
-    if (_records[i].timestamp > _batch_max_ts) _batch_max_ts = _records[i].timestamp;
     if (flen > 0) {
       _frames[_frame_count].len = (uint8_t)flen;
       _frames[_frame_count].end_offset = _rec_ends[i];
-      _frames[_frame_count].ts = _records[i].timestamp;
       _frame_count++;
     }
   }
@@ -288,8 +289,8 @@ bool BleMsgSync::loadBatch() {
   _cur_next_offset = next;
   _cur_exhausted = (next >= fsize) || !progressed;
 
-  // Zero-record batches (rescan filtering) stay silent — one line per batch
-  // that actually serves messages.
+  // Batches that parsed nothing stay silent — one line per batch that
+  // actually read records.
   if (n > 0) {
     SLog.printf("[BLE SYNC] %s off=%u->%u size=%u records=%d frames=%d\n",
                 e->name, start, next, fsize, n, _frame_count);
@@ -300,10 +301,7 @@ bool BleMsgSync::loadBatch() {
 void BleMsgSync::onSyncSessionEnd() {
   if (_cur >= 0 && !hasFrame()) {
     commitBatchTail();
-    if (_cur_exhausted) {
-      _ledger[_cur].dirty = false;
-      _ledger[_cur].rescan = false;
-    }
+    if (_cur_exhausted) _ledger[_cur].dirty = false;
     _cur = -1;
   }
 }
@@ -360,23 +358,14 @@ void BleMsgSync::reconcile() {
     if (!e) {
       e = addEntry(base);
       if (!e) continue;               // ledger full
-      if (_have_legacy) {
-        // Migrating from the old global watermark: everything up to the
-        // watermark was synced; rescan with the ts filter finds the rest.
-        e->offset = 0;
-        e->last_ts = _legacy_ts;
-        e->rescan = (_legacy_ts > 0);
-      } else if (_seed_mode) {
-        // Fresh install, no prior state: serve only what arrives from now on.
-        e->offset = infos[i].size;
-      }
-      // else: file appeared while running — offset 0, all of it is new.
+      // offset 0: the whole file is new (fresh install, a conversation that
+      // started while we were away, or a lost sidecar). The cap decides how
+      // much of it actually goes out.
     }
     e->seen = true;
 
     if (infos[i].size < e->offset) {          // compacted while we were away
       e->offset = 0;
-      e->rescan = (e->last_ts > 0);
       e->dirty = true;
     } else if (infos[i].size > e->offset) {
       e->dirty = true;
@@ -397,19 +386,6 @@ void BleMsgSync::reconcile() {
   }
   if (w != _ledger_count) { _ledger_count = w; _sidecar_dirty = true; _sidecar_touch_ms = millis(); }
 
-  if (_have_legacy || _seed_mode) {
-    persistSidecar();
-    if (_have_legacy) {
-      bool is_sd = (_mesh->_storage != &LittleFS);
-      if (is_sd) sd_spi_take();
-      _mesh->_storage->remove((_mesh->messagesDirPath() + "/ble_sync_ts").c_str());
-      if (is_sd) sd_spi_release();
-      SLog.printf("[BLE SYNC] migrated legacy watermark=%u\n", _legacy_ts);
-    }
-    _have_legacy = false;
-    _seed_mode = false;
-  }
-
   if (dirty_count > 0) _tickle = true;
   _state = ST_READY;
   SLog.printf("[BLE SYNC] reconcile: files=%d ledger=%d dirty=%d\n",
@@ -419,8 +395,6 @@ void BleMsgSync::reconcile() {
 // ── Sidecar persistence ──────────────────────────────────────────
 
 void BleMsgSync::loadSidecar() {
-  _have_legacy = false;
-  _seed_mode = false;
   if (!_mesh->_storage) return;
 
   bool is_sd = (_mesh->_storage != &LittleFS);
@@ -438,12 +412,12 @@ void BleMsgSync::loadSidecar() {
       if (f.read(&nlen, 1) != 1 || nlen == 0 || nlen >= BLE_SYNC_NAME_LEN) { ok = false; break; }
       LedgerEntry* e = &_ledger[_ledger_count];
       memset(e, 0, sizeof(*e));
-      uint8_t flags;
+      uint32_t unused32;
+      uint8_t  unused8;
       if (f.read((uint8_t*)e->name, nlen) != nlen ||
           f.read((uint8_t*)&e->offset, 4) != 4 ||
-          f.read((uint8_t*)&e->last_ts, 4) != 4 ||
-          f.read(&flags, 1) != 1) { ok = false; break; }
-      e->rescan = (flags & 0x01) != 0;
+          f.read((uint8_t*)&unused32, 4) != 4 ||
+          f.read(&unused8, 1) != 1) { ok = false; break; }
       _ledger_count++;
     }
     if (!ok) {
@@ -453,24 +427,8 @@ void BleMsgSync::loadSidecar() {
     f.close();
   }
 
-  if (_ledger_count == 0) {
-    // No (usable) sidecar: try the legacy single-watermark file once.
-    File lf = _mesh->_storage->open((_mesh->messagesDirPath() + "/ble_sync_ts").c_str(), "r");
-    if (lf) {
-      uint32_t ts = 0;
-      if (lf.read((uint8_t*)&ts, 4) == 4 && ts > 0) {
-        _legacy_ts = ts;
-        _have_legacy = true;
-      }
-      lf.close();
-    }
-    if (!_have_legacy) _seed_mode = true;   // fresh install: sync from now on
-  }
-
   if (is_sd) sd_spi_release();
-  SLog.printf("[BLE SYNC] ledger loaded: %d entries%s%s\n", _ledger_count,
-              _have_legacy ? " (legacy migration pending)" : "",
-              _seed_mode ? " (fresh, seeding to current sizes)" : "");
+  SLog.printf("[BLE SYNC] ledger loaded: %d entries\n", _ledger_count);
 }
 
 void BleMsgSync::persistSidecar() {
@@ -486,13 +444,14 @@ void BleMsgSync::persistSidecar() {
     f.write(hdr, 4);
     for (int i = 0; i < _ledger_count; i++) {
       LedgerEntry* e = &_ledger[i];
-      uint8_t nlen = (uint8_t)strlen(e->name);
-      uint8_t flags = e->rescan ? 0x01 : 0x00;
+      uint8_t  nlen = (uint8_t)strlen(e->name);
+      uint32_t unused32 = 0;
+      uint8_t  unused8 = 0;
       f.write(&nlen, 1);
       f.write((const uint8_t*)e->name, nlen);
       f.write((const uint8_t*)&e->offset, 4);
-      f.write((const uint8_t*)&e->last_ts, 4);
-      f.write(&flags, 1);
+      f.write((const uint8_t*)&unused32, 4);
+      f.write(&unused8, 1);
     }
     f.close();
   }
