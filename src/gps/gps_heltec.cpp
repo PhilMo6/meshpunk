@@ -40,6 +40,11 @@ void gps_dev_chip_init(void) {
   // display's Vext). PCAS/PMTK tuning can go here later.
 }
 
+// Power is handled at the rail: power_heltec.cpp cuts VGNSS for standby and
+// shutdown, so there is nothing to say to the chip itself.
+void gps_dev_power_down(void) {}
+void gps_dev_wake(void)       {}
+
 int gps_dev_rx_pin(void) { return HELTEC_GPS_RX; }
 int gps_dev_tx_pin(void) { return HELTEC_GPS_TX; }
 

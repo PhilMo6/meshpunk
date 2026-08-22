@@ -6,7 +6,7 @@
 --
 -- MEMORY SHAPE (the reason this app is built the way it is): a captured packet
 -- is stored as ONE packed string, never as a Lua table and never as an LVGL
--- object. A table with ~10 fields costs ~750 B (Lua 5.4 hash nodes dominate);
+-- object. A table with ~10 fields costs ~290 B of hash nodes, plus its strings;
 -- the packed string is ~280 B. Only PAGE rows exist as widgets at any moment —
 -- an unbounded row list is what caused trouble in the messages and contacts
 -- lists. Tables are rebuilt transiently, for rendering or inspection only.

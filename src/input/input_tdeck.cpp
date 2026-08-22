@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <esp_system.h>   // esp_reset_reason (GT911 wake pulse gate)
 #include "TouchDrvGT911.hpp"
 
 #include "input_dev.h"
@@ -139,7 +140,37 @@ void input_dev_preinit(void) {
   attachInterrupt(TDECK_TRACKBALL_RIGHT, ISR_trackball_right, FALLING);
 }
 
+void input_dev_wake_pin_release(void) {
+  detachInterrupt(TDECK_TRACKBALL_CLICK);
+}
+
+void input_dev_wake_pin_restore(void) {
+  pinMode(TDECK_TRACKBALL_CLICK, INPUT_PULLUP);
+  attachInterrupt(TDECK_TRACKBALL_CLICK, ISR_click, FALLING);
+}
+
+void input_dev_shutdown_prepare(void) {
+  input_dev_kbd_backlight(0);
+  // GT911 sleep: the driver drives INT low, then command 0x05. Only a >5ms
+  // INT high pulse wakes it (I2C is dead in sleep) — input_dev_init sends
+  // that pulse on deep-sleep-wake boots. INT low also disarms the board's
+  // TP_EN touch-power latch (see power_tdeck.cpp).
+  touch.sleep();
+}
+
 void input_dev_init(uint8_t kbd_backlight_boot) {
+  if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+    // Waking from power-off: the shutdown path put the GT911 to sleep, and
+    // in that state its I2C is dead — begin() below would fail and hang the
+    // probe loop. It wakes only on a >5ms HIGH pulse on INT. Cold boots must
+    // skip this: an active GT911 drives INT itself (contention).
+    pinMode(BOARD_TOUCH_INT, OUTPUT);
+    digitalWrite(BOARD_TOUCH_INT, HIGH);
+    delay(8);
+    pinMode(BOARD_TOUCH_INT, INPUT);
+    delay(10);
+  }
+
   // Set touch int input
   pinMode(BOARD_TOUCH_INT, INPUT);
   delay(20);

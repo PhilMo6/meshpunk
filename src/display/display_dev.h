@@ -44,3 +44,16 @@ void display_dev_fill_black(void);
 // PWM range onto the same 0-16 scale so the persisted pref stays portable).
 void display_dev_backlight_init(void);
 void display_dev_brightness(uint8_t value);
+
+// Panel sleep-in/sleep-out (ST7789/ILI9341 SLPIN 0x10 / SLPOUT 0x11) for
+// standby. Frame memory is retained through sleep-in, so waking shows the
+// screen exactly as it was. Callers pair this with display_dev_brightness().
+void display_dev_sleep(bool sleep);
+
+// Full known-state backlight re-init to `value`. The T-Deck's pulse-counted
+// chip can end up dark while the driver's level tracking says lit (any
+// glitch that trips its shutdown threshold does it, and the incremental
+// path then pulses zero times forever) — this forces a guaranteed shutdown
+// and a fresh turn-on, resynchronizing chip and driver unconditionally.
+// Use when resuming from a long off period (standby exit); costs ~5ms.
+void display_dev_backlight_reset(uint8_t value);

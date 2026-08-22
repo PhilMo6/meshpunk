@@ -172,7 +172,22 @@
 //                  firmware and the touch pad is simply absent). NO new ELF
 //                  host_exports this cycle, so no module gains a load-time
 //                  dependency on level 9
-#define MESHPUNK_FW_API 9
+//  10  2026-08-19  unreleased since the v0.3.5 tag (which shipped level 9):
+//                  Lua runtime upgraded 5.4.7 -> 5.5.1 (lib/lua; same
+//                  LUA_32BITS config, same streaming luaL_loadfilex override
+//                  in src/main.cpp). Contract changes an app can feel: the
+//                  for-loop control variable (numeric counter / FIRST
+//                  generic-for name) is read-only — assigning it is a
+//                  LOAD-time error, so an app doing it fails to open on this
+//                  level and later (fixed in lib/musiclib + the Gamepad store
+//                  app 1.0.2; both fixes also run on 5.4);
+//                  collectgarbage("setpause"/"setstepmul") raise "invalid
+//                  option" (no app used them); "global" is reserved upstream
+//                  but LUA_COMPAT_GLOBAL (default ON) keeps it valid as a
+//                  plain name. An app using 5.5-only syntax or stdlib
+//                  additions (global declarations, table.create, ...) needs
+//                  min_fw=10. NO binding or ELF host_export changes
+#define MESHPUNK_FW_API 10
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:

@@ -99,7 +99,23 @@ void notify_init() {
         SLog.println("[notify] melody pre-render failed - sound alerts disabled");
 }
 
+// ── Standby defer ───────────────────────────────────────────────────────────
+// Writers: standby controller (Core 0) sets defer; the mesh task records the
+// pending alert. Single flag reads/writes — volatile is enough here.
+
+static volatile bool s_standby_defer   = false;
+static volatile bool s_standby_pending = false;
+
+void notify_standby_defer(bool on)     { s_standby_defer = on; }
+bool notify_standby_alert_pending()    { return s_standby_pending; }
+bool notify_standby_take_alert() {
+  bool p = s_standby_pending;
+  s_standby_pending = false;
+  return p;
+}
+
 void notify_message_alert() {
+    if (s_standby_defer) { s_standby_pending = true; return; }
     if (firmware_notify_sound_enabled() && s_melody_id >= 0)
         sound_play(s_melody_id);   // mutex-guarded; the Core-1 sound task mixes it
 
@@ -144,7 +160,7 @@ void notify_tick() {
 
 // ── Generic notification store ──────────────────────────────────────────────
 
-void notify_post(const char* text) {
+static void notify_store(const char* text) {
     if (s_log && s_log_mutex && text && text[0] &&
         xSemaphoreTake(s_log_mutex, portMAX_DELAY) == pdTRUE) {
         NotifyRec* rec = &s_log[s_log_head];
@@ -156,8 +172,13 @@ void notify_post(const char* text) {
         if (s_log_unseen < 0xFFFF) s_log_unseen++;
         xSemaphoreGive(s_log_mutex);
     }
+}
+
+void notify_post(const char* text) {
+    notify_store(text);
     notify_message_alert();   // record even when both delivery prefs are off
 }
+
 
 int notify_log_count() {
     if (!s_log_mutex) return 0;

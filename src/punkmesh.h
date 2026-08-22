@@ -305,6 +305,10 @@ public:
   void loadContacts();
   void saveContacts();                          // full rewrite (removal/clear/bulk)
   void saveOneContact(const ContactInfo& c);    // O(1) in-place single-slot write
+  // Shutdown/reboot: write out everything that persists lazily (contacts,
+  // room sync cursors, path history) so a power-off can't lose the deferred
+  // tail. Call under MESH_LOCK.
+  void flushForShutdown();
   void loadChannels();
   void saveChannels();
   // Public chat is slot 0 but, like any channel, can be deleted and re-added.

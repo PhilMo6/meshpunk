@@ -658,10 +658,11 @@ void input_ui_init(void (*prefs_save)(void)) {
 }
 
 // ── On-screen keyboard trigger (keyboardless boards) ───────────────────────
-// A textarea gaining focus (or being re-tapped) queues the OSK; loop()'s
-// dispatch_osk() opens lib/osk.lua — same pending-flag pattern as the emoji
-// popup. The captured target pointer is consumed by the _osk_* bindings in
-// main.cpp, which re-validate it before every use.
+// A textarea gaining focus queues the OSK (for a touch: on the lift, see
+// osk_group_focus_cb); loop()'s dispatch_osk() opens lib/osk.lua — same
+// pending-flag pattern as the emoji popup. The captured target pointer is
+// consumed by the _osk_* bindings in main.cpp, which re-validate it before
+// every use.
 static volatile bool s_osk_pending = false;
 static lv_obj_t *s_osk_target = NULL;
 static bool s_osk_active = false;
@@ -712,11 +713,18 @@ bool input_ui_take_touch_chord(void) {
   return true;
 }
 
-// Re-tapping an already-focused textarea fires no group focus event, so the
-// capture hook also plants a CLICKED callback on the target (dies with the
-// object; planted once per object via the last-hooked guard).
-static lv_obj_t *s_osk_last_hooked = NULL;
-
+// A touch press focuses the textarea on the PRESS edge (LVGL runs click-focus
+// right after LV_EVENT_PRESSED), and opening the OSK from that focus puts the
+// modal over the textarea while the finger is still down. So for a touch the
+// focus callback only plants a SHORT_CLICKED hook on the target. Objects carry
+// LV_OBJ_FLAG_PRESS_LOCK by default, so the textarea keeps the press through
+// any popup its LONG_PRESSED handler spawns and receives CLICKED on the lift
+// regardless; SHORT_CLICKED is sent only for a press that never reached the
+// long-press threshold, and never after a scroll. A tap opens the OSK on the
+// lift; a hold never does. Focus from any other indev (keypad / nav buttons /
+// programmatic) has no lift to wait for and queues the OSK at once. The hook
+// is planted remove+add: one per object, no address memory (a rebuilt
+// textarea can reuse a freed one's address). It dies with the object.
 static void osk_target_clicked_cb(lv_event_t *e) {
   lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
   if (s_osk_active || s_touch_mode == TOUCH_MODE_OFF) return;
@@ -726,21 +734,22 @@ static void osk_target_clicked_cb(lv_event_t *e) {
   }
 }
 
-static void osk_capture(lv_obj_t *obj) {
-  s_osk_target  = obj;
-  s_osk_pending = true;
-  if (obj != s_osk_last_hooked) {
-    lv_obj_add_event_cb(obj, osk_target_clicked_cb, LV_EVENT_CLICKED, NULL);
-    s_osk_last_hooked = obj;
-  }
+static void osk_hook(lv_obj_t *obj) {
+  lv_obj_remove_event_cb(obj, osk_target_clicked_cb);
+  lv_obj_add_event_cb(obj, osk_target_clicked_cb, LV_EVENT_SHORT_CLICKED, NULL);
 }
 
 static void osk_group_focus_cb(lv_group_t *g) {
   if (s_osk_active || s_touch_mode == TOUCH_MODE_OFF) return;
   lv_obj_t *obj = lv_group_get_focused(g);
-  if (obj && lv_obj_is_valid(obj) && lv_obj_check_type(obj, &lv_textarea_class)) {
-    osk_capture(obj);
-  }
+  if (!(obj && lv_obj_is_valid(obj) && lv_obj_check_type(obj, &lv_textarea_class))) return;
+  osk_hook(obj);
+  lv_indev_t *act = lv_indev_active();
+  bool touch_press = act && lv_indev_get_type(act) == LV_INDEV_TYPE_POINTER &&
+                     lv_indev_get_active_obj() == obj;
+  if (touch_press) return;   // opens from osk_target_clicked_cb on a short tap's lift
+  s_osk_target  = obj;
+  s_osk_pending = true;
 }
 
 void input_ui_setup_indevs(lv_display_t* disp) {

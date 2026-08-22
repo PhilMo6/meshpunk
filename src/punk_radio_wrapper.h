@@ -9,9 +9,11 @@
 // against display/SD. By overriding here instead of patching MeshCore, we
 // keep the submodule clean for painless updates.
 class PunkSX1262Wrapper : public CustomSX1262Wrapper {
+  CustomSX1262* _sx;                      // concrete radio, for raw IRQ reads
+  volatile bool _ls_wake_suspect = false; // set after a light-sleep DIO1 wake
 public:
   PunkSX1262Wrapper(CustomSX1262& radio, mesh::MainBoard& board)
-    : CustomSX1262Wrapper(radio, board) {}
+    : CustomSX1262Wrapper(radio, board), _sx(&radio) {}
 
   void begin() override {
     SPI_LOCK(); CustomSX1262Wrapper::begin(); SPI_UNLOCK();
@@ -19,8 +21,38 @@ public:
   void powerOff() override {
     SPI_LOCK(); CustomSX1262Wrapper::powerOff(); SPI_UNLOCK();
   }
+
+  // Standby: a DIO1 rising edge during light sleep wakes the chip, but the
+  // edge itself is lost (the GPIO interrupt logic is clock-gated during the
+  // sleep), so the base wrapper's ISR flag never gets set and the received
+  // packet would sit unread with DIO1 latched high forever. The standby
+  // loop calls this after every DIO1 wake; the dispatcher's next recvRaw()
+  // then falls back to the SX1262's own IRQ register.
+  void noteLightSleepWake() { _ls_wake_suspect = true; }
+
   int recvRaw(uint8_t* bytes, int sz) override {
-    SPI_LOCK(); int r = CustomSX1262Wrapper::recvRaw(bytes, sz); SPI_UNLOCK(); return r;
+    SPI_LOCK();
+    int r = CustomSX1262Wrapper::recvRaw(bytes, sz);
+    if (r <= 0 && _ls_wake_suspect) {
+      _ls_wake_suspect = false;
+      if (_sx->getIrqFlags() & RADIOLIB_SX126X_IRQ_RX_DONE) {
+        int len = _sx->getPacketLength();
+        if (len > 0) {
+          if (len > sz) len = sz;
+          if (_sx->readData(bytes, (size_t)len) == RADIOLIB_ERR_NONE) {
+            n_recv++;
+            r = len;
+          } else {
+            n_recv_errors++;
+          }
+        }
+        // readData left the chip in standby, and the base call's re-arm
+        // branch didn't run (no ISR flag) — re-enter RX here. The base's
+        // state variable still says RX, which is true again after this.
+        _sx->startReceive();
+      }
+    }
+    SPI_UNLOCK(); return r;
   }
   bool startSendRaw(const uint8_t* bytes, int len) override {
     SPI_LOCK(); bool r = CustomSX1262Wrapper::startSendRaw(bytes, len); SPI_UNLOCK(); return r;

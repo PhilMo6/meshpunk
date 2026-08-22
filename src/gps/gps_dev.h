@@ -21,11 +21,19 @@ void gps_dev_update_baud(uint32_t baud);
 Stream& gps_dev_stream(void);
 
 // Send whatever configuration commands this chip needs after begin().
-// T-Deck: NO-OP — its Allystar-class receiver rejects every known text
-// command dialect (PMTK, PCAS, CASIC, UBX), so there is nothing to send.
-// This hook is where a chip that DOES accept configuration (e.g. the L76K
-// on other boards) sets its rate/constellations.
+// T-Deck: currently empty — the receiver is a u-blox MIA-M10Q whose command
+// language is UBX (text dialects are silently discarded foreign framing);
+// u-blox configuration could live here now. This hook is where a chip that
+// accepts configuration (e.g. the L76K on other boards) sets its
+// rate/constellations.
 void gps_dev_chip_init(void);
+
+// Chip-level power down / wake, used by shutdown and standby on boards whose
+// receiver has no controllable power rail (T-Deck: always-on rail, the UART
+// is the only lever — Allystar binary CFG-SLEEP). Heltec: no-ops, the VGNSS
+// rail cut in power_heltec.cpp is the lever there.
+void gps_dev_power_down(void);
+void gps_dev_wake(void);
 
 // RX pin, for the existing boot/diagnostic log lines only.
 int gps_dev_rx_pin(void);

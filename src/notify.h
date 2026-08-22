@@ -22,6 +22,16 @@ enum NotifyChannelMode : uint8_t {
 // Pre-render the notification melody. Call once in setup(), after sound_init().
 void notify_init();
 
+// Standby integration: while defer is on, notify_message_alert() records the
+// alert instead of playing it (light sleep freezes the sound task, so a
+// melody started mid-standby would be mangled). The standby exit path turns
+// defer off and, if an alert was recorded, fires notify_message_alert() for
+// real — after the sound path is running again. The notification STORE is
+// unaffected: posts are logged and counted while deferred.
+void notify_standby_defer(bool on);
+bool notify_standby_alert_pending();   // peek (drain-loop wake decision)
+bool notify_standby_take_alert();      // consume (standby exit replay)
+
 // Fire the DM/mention alert (melody + keyboard blink, each behind its user
 // pref). Called from the mesh RX handlers on the mesh task; the blink state
 // machine is single-task (armed here, stepped by notify_tick on that task).

@@ -206,6 +206,144 @@ function M.closeNotifPanel()
     if panel_overlay then close_panel() end
 end
 
+-- ── Power drop-down ─────────────────────────────────────────────────────────
+-- Same overlay shape as the notification drop-down, opened by tapping the
+-- battery area of the bar. Rows: Standby (immediate), Power off and Restart
+-- (two-tap arm/confirm). The C bindings defer the real action to the top of
+-- loop(), so handlers here just close up, paint, and call the binding.
+
+local power_overlay = nil   -- non-nil while the power drop-down is open
+
+local function close_power_panel()
+    if not power_overlay then return end
+    nav.pop()
+    power_overlay:delete()
+    power_overlay = nil
+    if peeked then M.hide() end   -- peeked from an app: give it the screen back
+end
+
+-- Small self-expiring notice card (for refused actions).
+local function power_notice(text)
+    local card = lvgl.Object {
+        w = 280, h = lvgl.SIZE_CONTENT, x = 20, y = 104,
+        bg_color = "#333333", border_width = 1, border_color = "#555555",
+        pad_all = 8,
+    }
+    card:clear_flag(lvgl.FLAG.SCROLLABLE)
+    card:Label { text = text, w = lvgl.PCT(100) }
+    pcall(_obj_move_foreground, card)
+    lvgl.Timer { period = 1800, cb = function(t)
+        t:delete()
+        card:delete()
+    end }
+end
+
+-- Full-screen farewell, painted for ~half a second before the C side takes
+-- over (the bindings defer to the next loop() tick, so this stays visible).
+local function power_farewell(text, fn)
+    local f = lvgl.Object {
+        w = 320, h = 240, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 255, border_width = 0, pad_all = 0,
+    }
+    f:clear_flag(lvgl.FLAG.SCROLLABLE)
+    f:add_flag(lvgl.FLAG.CLICKABLE)   -- swallow taps on the way down
+    f:Label { text = text, align = lvgl.ALIGN.CENTER }
+    pcall(_obj_move_foreground, f)
+    lvgl.Timer { period = 500, cb = function(t)
+        t:delete()
+        local ok, accepted = pcall(fn)
+        if not ok or accepted == false then
+            f:delete()
+            power_notice("Unavailable: USB or link session active")
+        end
+    end }
+end
+
+local function wake_hint()
+    local ok, caps = pcall(_input_caps)
+    if ok and type(caps) == "table" and caps.trackball then
+        return "Click trackball to wake"
+    end
+    return "Press USER to wake"
+end
+
+local function open_power_panel()
+    if power_overlay then return end
+
+    local overlay = lvgl.Object {
+        w = 320, h = 240, x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)   -- modal: swallow taps on the dim area
+    pcall(_obj_move_foreground, overlay)
+    power_overlay = overlay
+
+    -- Same gridnav rule as the notification panel: every focusable is a
+    -- DIRECT child of the pushed container.
+    local panel = overlay:Object {
+        w = 320, h = lvgl.SIZE_CONTENT, x = 0, y = 0,
+        max_height = 240,
+        bg_color = "#333333", border_width = 1, border_color = "#555555",
+        pad_all = 4,
+        flex = { flex_direction = "column", flex_wrap = "nowrap" },
+    }
+    nav.push(panel)
+
+    panel:Label { text = "Power", w = lvgl.PCT(100), h = 20 }
+
+    local standby_btn = panel:Button { w = lvgl.PCT(100), h = 26 }
+    standby_btn:Label { text = "Standby - wake on alerts", align = lvgl.ALIGN.CENTER }
+    local off_btn = panel:Button { w = lvgl.PCT(100), h = 26 }
+    local off_label = off_btn:Label { text = "Power off", align = lvgl.ALIGN.CENTER }
+    local restart_btn = panel:Button { w = lvgl.PCT(100), h = 26 }
+    local restart_label = restart_btn:Label { text = "Restart", align = lvgl.ALIGN.CENTER }
+
+    local armed = nil   -- "off" | "restart": tapped once, awaiting the confirm tap
+
+    standby_btn:onevent(lvgl.EVENT.RELEASED, function()
+        close_power_panel()
+        local ok, accepted = pcall(_system_standby)
+        if not ok or accepted == false then
+            power_notice("Unavailable: USB or link session active")
+        end
+    end)
+
+    off_btn:onevent(lvgl.EVENT.RELEASED, function()
+        if armed ~= "off" then
+            armed = "off"
+            off_label:set{ text = "Tap again to power off" }
+            restart_label:set{ text = "Restart" }
+            return
+        end
+        close_power_panel()
+        power_farewell("Powering off...\n" .. wake_hint(), _system_poweroff)
+    end)
+
+    restart_btn:onevent(lvgl.EVENT.RELEASED, function()
+        if armed ~= "restart" then
+            armed = "restart"
+            restart_label:set{ text = "Tap again to restart" }
+            off_label:set{ text = "Power off" }
+            return
+        end
+        close_power_panel()
+        power_farewell("Restarting...", _system_reboot)
+    end)
+
+    nav.tap(overlay, close_power_panel)   -- tap the dim area (panel doesn't bubble)
+end
+
+function M.togglePowerPanel()
+    if power_overlay then close_power_panel() else open_power_panel() end
+end
+
+-- Close the power drop-down if open (no-op otherwise). Parentless like the
+-- notification panel, so app teardown must close it explicitly too.
+function M.closePowerPanel()
+    if power_overlay then close_power_panel() end
+end
+
 -- Mic-key shortcut (dispatched from loop() via dispatch_topbar_shortcut).
 -- Hidden bar (an app owns the screen) -> peek it over the app; peeked -> put
 -- it away; visible on the launcher -> toggle the drop-down directly.
@@ -258,6 +396,12 @@ function M.create()
     local time_label = bar:Label{ text = render_time(), h = 20 , w = 100 } 
 
     local battery_label =  bar:Label{ text = render_battery_pct(), h = 20 }
+
+    -- The battery area is its own tap target: it opens the power drop-down
+    -- instead of the notification panel (a clickable child swallows the tap,
+    -- so the rest of the bar keeps the notification behavior above).
+    battery_label:add_flag(lvgl.FLAG.CLICKABLE)
+    nav.tap(battery_label, function() M.togglePowerPanel() end)
     
     -- Recompute from the counters (O(threads)) rather than a running +1, so own
     -- echoes don't inflate it and opening a thread (which zeroes its counter) is

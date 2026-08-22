@@ -508,6 +508,7 @@ function M.home_shortcut()
     local ok, ep = pcall(require, "lib/emoji_popup")
     if ok and ep and ep.close then pcall(ep.close) end
     if topbar.closeNotifPanel then pcall(topbar.closeNotifPanel) end
+    if topbar.closePowerPanel then pcall(topbar.closePowerPanel) end
     M.go_home()
 end
 

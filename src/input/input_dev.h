@@ -49,6 +49,23 @@ bool input_dev_has_kbd_backlight(void);
 void input_dev_preinit(void);
 void input_dev_init(uint8_t kbd_backlight_boot);
 
+// Power-off tail: park input hardware that lives on an always-on rail.
+// T-Deck: keyboard backlight off, then GT911 sleep (command 0x05 with INT
+// held low) — the GT911 sits on the always-on rail AND its INT feeds the
+// board's TP_EN touch-power latch, so sleeping it both saves its idle draw
+// and stops a screen touch from lifting the V3V rail while "off". The wake
+// side (INT high pulse before the probe, deep-sleep-wake boots only) lives
+// in input_dev_init. Heltec: no-op (touch dies with the Vext rail).
+void input_dev_shutdown_prepare(void);
+
+// Standby transitions: detach the GPIO0 click ISR while the pin serves as a
+// light-sleep wake source, and re-attach it afterwards. Meshtastic's working
+// T-Deck light sleep does exactly this around its wake-pin arming (its
+// notifyLightSleep observers), and re-attaching via attachInterrupt also
+// restores the edge interrupt config the wake arming rewrote.
+void input_dev_wake_pin_release(void);
+void input_dev_wake_pin_restore(void);
+
 // ── Keyboard sampling ───────────────────────────────────────────────────────
 // poll performs ONE bus transaction and stores the sample; the query calls
 // below read that stored sample. Single-reader by construction: the LVGL

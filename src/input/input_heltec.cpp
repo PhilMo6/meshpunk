@@ -110,6 +110,19 @@ void input_dev_init(uint8_t kbd_backlight_boot) {
   }
 }
 
+// Nothing on an always-on rail to park: the CHSC6X dies with the Vext rail
+// (power_heltec.cpp), and there is no keyboard.
+void input_dev_shutdown_prepare(void) {}
+
+void input_dev_wake_pin_release(void) {
+  detachInterrupt(HELTEC_BTN_PRG);
+}
+
+void input_dev_wake_pin_restore(void) {
+  pinMode(HELTEC_BTN_PRG, INPUT_PULLUP);
+  attachInterrupt(HELTEC_BTN_PRG, ISR_prg_btn, FALLING);
+}
+
 // ── Keyboard facet: no keyboard on this board ──────────────────────────────
 
 void    input_dev_kbd_poll(bool detect_legacy_fw) { (void)detect_legacy_fw; }

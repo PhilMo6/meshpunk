@@ -290,8 +290,8 @@ function M.load_playlist(path)
     local out = {}
     local data = fileman.read(path)
     if not data then return out end
-    for line in (data .. "\n"):gmatch("(.-)\n") do
-        line = line:gsub("^%s+", ""):gsub("[\r%s]+$", "")
+    for raw in (data .. "\n"):gmatch("(.-)\n") do
+        local line = raw:gsub("^%s+", ""):gsub("[\r%s]+$", "")
         if line ~= "" and line:sub(1, 1) ~= "#" then out[#out + 1] = line end
     end
     return out

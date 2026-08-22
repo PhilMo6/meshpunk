@@ -102,6 +102,20 @@ void display_dev_backlight_init(void) {
   ledcAttachPin(HELTEC_TFT_BL_PIN, HELTEC_BL_LEDC_CH);
 }
 
+// LEDC PWM has no chip-side state to desync — a plain set is a full reset.
+void display_dev_backlight_reset(uint8_t value) {
+  display_dev_brightness(value);
+}
+
+// SLPIN/SLPOUT. The panel needs 120ms after SLPOUT before it accepts
+// further commands (ST7789 datasheet minimum).
+void display_dev_sleep(bool sleep) {
+  SPI_LOCK();
+  tft.writecommand(sleep ? 0x10 : 0x11);
+  SPI_UNLOCK();
+  delay(sleep ? 5 : 120);
+}
+
 // value 0-16 (same persisted scale as the T-Deck's 16-level chip): 0 = off,
 // 16 = full. Linear duty mapping.
 void display_dev_brightness(uint8_t value) {

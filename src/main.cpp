@@ -7,6 +7,9 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <esp_heap_caps.h> // DMA-capable buffer allocation for LVGL
+#include <esp_sleep.h>     // standby light sleep (standby_run)
+#include <driver/gpio.h>   // gpio_wakeup_enable for the standby wake pins
+#include <driver/rtc_io.h> // RTC-domain pull for the standby ext0 wake pin
 #include <mbedtls/platform.h> // runtime override of mbedTLS allocator (TLS -> PSRAM)
 #include "multi_heap.h" // ESP-IDF arena allocator for the Lua PSRAM arena
 #include <lvgl.h>
@@ -57,6 +60,8 @@ bool gps_sync_is_done();
 // the longer location-hunt budget (boot / user-triggered syncs).
 void gps_sync_restart(bool manual);
 
+
+#include <esp_random.h>
 
 extern "C" {
 #include <lua.h>
@@ -312,7 +317,23 @@ static uint32_t last_activity_ms     = 0;
 static bool     screen_timed_out     = false;
 static bool     kbd_timed_out        = false;
 
+// ── Power menu requests ───────────────────────────────────────────────────
+// Set by the _system_poweroff/_system_standby bindings, handled at the top
+// of loop() so the action runs on a clean Core-0 stack after the Lua caller
+// has returned and painted its farewell. Handlers: system_shutdown() /
+// standby_run(), defined above loop().
+static volatile bool s_poweroff_request = false;
+static volatile bool s_standby_request  = false;
+extern volatile bool mesh_task_paused;   // meshpunk_tasks.cpp (link/USB sessions)
+extern void gps_notify_wake();           // meshpunk_tasks.cpp
+
 // ── Notification Preferences ─────────────────────────────────────────────
+static bool     standby_heartbeat    = true;   // periodic kbd glow in standby
+                                               // (device setting)
+static uint16_t standby_heartbeat_secs = 30;   // min seconds between glows
+static bool     auto_standby         = false;  // enter standby on idle timeout
+static uint16_t auto_standby_mins    = 15;     // idle minutes before auto standby
+                                               // (15/30/60, device setting)
 static bool     notify_kbd_enabled   = true;   // keyboard blink on DM / @mention
 static bool     notify_sound_enabled = true;   // melody on DM / @mention
 
@@ -384,6 +405,10 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("screen_timeout=%d\n", screen_timeout_secs);
   f.printf("kbd_timeout=%d\n", kbd_timeout_secs);
   f.printf("msg_retain_days=%d\n", msg_retain_days);
+  f.printf("standby_heartbeat=%d\n", standby_heartbeat ? 1 : 0);
+  f.printf("standby_heartbeat_secs=%d\n", standby_heartbeat_secs);
+  f.printf("auto_standby=%d\n", auto_standby ? 1 : 0);
+  f.printf("auto_standby_mins=%d\n", auto_standby_mins);
   f.printf("notify_kbd=%d\n", notify_kbd_enabled ? 1 : 0);
   f.printf("notify_sound=%d\n", notify_sound_enabled ? 1 : 0);
   f.printf("ble_enabled=%d\n", ble_enabled_pref ? 1 : 0);
@@ -757,6 +782,16 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "kbd_timeout") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 65535) kbd_timeout_secs = (uint16_t)v;
+    } else if (strcmp(key, "standby_heartbeat") == 0) {
+      standby_heartbeat = (atoi(val) == 1);
+    } else if (strcmp(key, "standby_heartbeat_secs") == 0) {
+      int v = atoi(val);
+      if (v >= 5 && v <= 600) standby_heartbeat_secs = (uint16_t)v;
+    } else if (strcmp(key, "auto_standby") == 0) {
+      auto_standby = (atoi(val) == 1);
+    } else if (strcmp(key, "auto_standby_mins") == 0) {
+      int v = atoi(val);
+      if (v >= 1 && v <= 600) auto_standby_mins = (uint16_t)v;
     } else if (strcmp(key, "notify_kbd") == 0) {
       notify_kbd_enabled = (atoi(val) == 1);
     } else if (strcmp(key, "notify_sound") == 0) {
@@ -5774,8 +5809,9 @@ void setupLuaVGL() {
   // (Runtime TTF fonts are initialized in luaBringUp(), BEFORE the Lua arena —
   // the ~430KB buffers must land below the gap, not inside it. See luaBringUp.)
 
-  // Create Lua state with PSRAM allocator
-  L = lua_newstate(lua_psram_alloc, NULL);
+  // Create Lua state with PSRAM allocator (5.5 needs an explicit string-hash
+  // seed; esp_random() is the hardware TRNG)
+  L = lua_newstate(lua_psram_alloc, NULL, esp_random());
   if (!L) {
     SLog.println("Failed to create Lua state");
     return;
@@ -6086,6 +6122,25 @@ void setupLuaVGL() {
     delay(100);
     ESP.restart();
     return 0;
+  });
+
+  // Power menu (topbar battery drop-down). Both defer to the top of loop():
+  // the Lua caller returns and paints its farewell first, then the action
+  // runs on a clean Core-0 stack. Both return false (refused) while a USB
+  // drive session or a link session (mesh paused) owns the hardware.
+  lua_register(L, "_system_poweroff", [](lua_State *L) -> int {
+    if (usbdrive_active() || mesh_task_paused) { lua_pushboolean(L, false); return 1; }
+    SLog.println("[SYSTEM] Power off requested from Lua");
+    s_poweroff_request = true;
+    lua_pushboolean(L, true);
+    return 1;
+  });
+  lua_register(L, "_system_standby", [](lua_State *L) -> int {
+    if (usbdrive_active() || mesh_task_paused) { lua_pushboolean(L, false); return 1; }
+    SLog.println("[SYSTEM] Standby requested from Lua");
+    s_standby_request = true;
+    lua_pushboolean(L, true);
+    return 1;
   });
 
   // Heap stats: free + largest contiguous block for PSRAM and internal RAM.
@@ -6403,6 +6458,54 @@ void setupLuaVGL() {
   });
   lua_register(L, "_kbd_is_timed_out", [](lua_State* L) -> int {
     lua_pushboolean(L, kbd_timed_out);
+    return 1;
+  });
+
+  // ── Standby heartbeat (kbd backlight glow each drain window) ───────────
+  lua_register(L, "_standby_heartbeat_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, standby_heartbeat);
+    return 1;
+  });
+  lua_register(L, "_standby_heartbeat_set", [](lua_State* L) -> int {
+    standby_heartbeat = lua_toboolean(L, 1);
+    firmware_prefs_save();
+    lua_pushboolean(L, standby_heartbeat);
+    return 1;
+  });
+  lua_register(L, "_standby_heartbeat_secs_get", [](lua_State* L) -> int {
+    lua_pushinteger(L, standby_heartbeat_secs);
+    return 1;
+  });
+  lua_register(L, "_standby_heartbeat_secs_set", [](lua_State* L) -> int {
+    int v = (int)luaL_checkinteger(L, 1);
+    if (v < 5) v = 5;
+    if (v > 600) v = 600;
+    standby_heartbeat_secs = (uint16_t)v;
+    firmware_prefs_save();
+    lua_pushinteger(L, standby_heartbeat_secs);
+    return 1;
+  });
+  lua_register(L, "_auto_standby_get", [](lua_State* L) -> int {
+    lua_pushboolean(L, auto_standby);
+    return 1;
+  });
+  lua_register(L, "_auto_standby_set", [](lua_State* L) -> int {
+    auto_standby = lua_toboolean(L, 1);
+    firmware_prefs_save();
+    lua_pushboolean(L, auto_standby);
+    return 1;
+  });
+  lua_register(L, "_auto_standby_mins_get", [](lua_State* L) -> int {
+    lua_pushinteger(L, auto_standby_mins);
+    return 1;
+  });
+  lua_register(L, "_auto_standby_mins_set", [](lua_State* L) -> int {
+    int v = (int)luaL_checkinteger(L, 1);
+    if (v < 1) v = 1;
+    if (v > 600) v = 600;
+    auto_standby_mins = (uint16_t)v;
+    firmware_prefs_save();
+    lua_pushinteger(L, auto_standby_mins);
     return 1;
   });
 
@@ -7428,6 +7531,18 @@ void setup() {
               (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
               (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
 
+  // A panic reboot is a CPU-only reset (RTC_SW_CPU_RST): the GPIO matrix and
+  // a latched radio IRQ line survive it. If a level-typed standby wake was
+  // armed at the crash, the first attachInterrupt below would install the
+  // GPIO ISR service onto an already-asserted status bit and storm the
+  // interrupt watchdog at every boot (symbolized gpio_intr_service loop) —
+  // a boot loop only a full power cycle escapes. Neutralize the wake pins'
+  // interrupt config before any ISR service can exist.
+  gpio_intr_disable((gpio_num_t)PIN_LORA_DIO1);
+  gpio_set_intr_type((gpio_num_t)PIN_LORA_DIO1, GPIO_INTR_DISABLE);
+  gpio_intr_disable((gpio_num_t)PIN_BOOT_BTN);
+  gpio_set_intr_type((gpio_num_t)PIN_BOOT_BTN, GPIO_INTR_DISABLE);
+
   // Input pins + ISRs that need no bus/peripheral power (board input backend),
   // and the input layer's prefs-save hook (same pattern as sound_init).
   input_dev_preinit();
@@ -7960,6 +8075,224 @@ static void dispatch_emoji_popup() {
   }
 }
 
+// ── Power off ──────────────────────────────────────────────────────────────
+// Device-neutral teardown, then the board backend parks its rails and deep
+// sleeps (power_dev_shutdown never returns; GPIO0 reboots). Runs from the
+// top of loop() via s_poweroff_request — see the _system_poweroff binding.
+static void system_shutdown() {
+  SLog.println("[POWER] shutting down");
+  MESH_LOCK();
+  the_mesh->flushForShutdown();
+  MESH_UNLOCK();
+  mesh_task_paused = true;
+  delay(60);   // let an in-flight dispatcher tick finish before the radio sleeps
+#if BLE_COMPANION_ENABLED
+  if (ble_serial) { MESH_LOCK(); ble_companion_stop(); MESH_UNLOCK(); }
+#endif
+  WiFi.mode(WIFI_OFF);
+  MESH_LOCK();
+  radio_driver.powerOff();   // SX1262 -> sleep (SPI-locked inside)
+  MESH_UNLOCK();
+  if (sd_mounted) {
+    sd_spi_take();
+    SD.end();
+    sd_mounted = false;
+    sd_spi_release();
+  }
+  input_dev_shutdown_prepare();   // kbd backlight off; T-Deck: GT911 sleep
+  gps_dev_power_down();           // T-Deck: CFG-SLEEP (always-on rail); Heltec: no-op
+  display_dev_fill_black();
+  display_dev_sleep(true);
+  display_dev_brightness(0);
+  SLog.println("[POWER] entering deep sleep (wake: GPIO0)");
+  delay(20);   // let the serial line drain
+  power_dev_shutdown();   // never returns
+}
+
+// ── Standby: screen off, mesh alive, wake on notification or button ────────
+// Manual light-sleep loop. Lua/LVGL stay frozen in RAM (no teardown); the
+// mesh task keeps running in the awake windows between sleeps, so the node
+// still ACKs and syncs. Wakes fully when notify classifies an RX as alert-
+// worthy (notify_standby_* — the same per-channel/DM gates as the melody),
+// or when GPIO0 (trackball click / USER) is pressed. Runs from the top of
+// loop() via s_standby_request.
+static void standby_run() {
+  SLog.println("[POWER] standby: wake on notification or GPIO0");
+  uint32_t t0 = millis();
+
+  // REQUIRED before the loop freezes: the tap that chose Standby deleted the
+  // drop-down from inside its own event handler, and that interaction's
+  // indev/render work is still pending when the request flag lands here one
+  // tick later. Light-sleeping on top of that pending work hangs
+  // esp_light_sleep_start — LVGL must be pumped to completion first.
+  for (int i = 0; i < 3; i++) { lv_timer_handler(); delay(25); }
+
+  notify_standby_defer(true);   // alerts are recorded, replayed on exit
+#if BLE_COMPANION_ENABLED
+  bool ble_was_on = (ble_serial != nullptr);
+  if (ble_was_on) { MESH_LOCK(); ble_companion_stop(); MESH_UNLOCK(); }
+#endif
+  bool wifi_was_on = (WiFi.getMode() != WIFI_OFF);
+  if (wifi_was_on) WiFi.mode(WIFI_OFF);
+  // Halt the I2S DMA + sound task (the ELF-takeover seam) — no peripheral
+  // DMA runs across the light-sleep freezes, and any playing music stops
+  // cleanly instead of stuttering through the drain windows. The deferred
+  // alert replays after sound_resume() on exit.
+  sound_suspend();
+
+  display_dev_brightness(0);
+  screen_timed_out = true;
+  input_dev_kbd_backlight(0);
+  kbd_timed_out = true;
+  display_dev_sleep(true);      // frame memory survives; wake shows the old screen
+  power_dev_standby_enter();    // Heltec: GNSS rail off
+
+  // Keep the wake pins' runtime input config through light sleep instead of
+  // letting the pads switch to their sleep configuration at entry.
+  gpio_sleep_sel_dis((gpio_num_t)PIN_LORA_DIO1);
+  gpio_sleep_sel_dis((gpio_num_t)PIN_BOOT_BTN);
+  // The ext0 wake below switches GPIO0 to its RTC function during sleep,
+  // where the digital INPUT_PULLUP doesn't apply — enable the RTC-domain
+  // pull (the shutdown recipe) so the pad can't float LOW and insta-wake.
+  rtc_gpio_pullup_en((gpio_num_t)PIN_BOOT_BTN);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIN_BOOT_BTN);
+  // Keep the RTC peripherals powered through light sleep — the wake logic
+  // depends on them.
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  // Hand GPIO0 over to wake duty: its click ISR is detached for the whole
+  // standby; the drain windows read the pin level directly instead.
+  input_dev_wake_pin_release();
+  gps_dev_power_down();         // T-Deck: CFG-SLEEP (always-on rail); Heltec: no-op
+
+  // A press is visible two ways: the wake-status/level right after a sleep,
+  // and the click ISR counter during the awake drain windows. Clear stale
+  // counts so the entry tap can't instantly bounce us back out.
+  trackball_up = trackball_down = trackball_left = trackball_right = 0;
+  trackball_click = 0;
+
+
+  uint32_t hb_last = millis();   // heartbeat pacing (first glow after one interval)
+
+  bool user_wake = false;
+  while (true) {
+    // An alert can fire before the first sleep (packet during the entry
+    // window) — never sleep past one.
+    if (notify_standby_alert_pending()) break;
+    // Quiesce the mesh before freezing the chip: holding MESH_LOCK means the
+    // dispatcher's current tick has COMPLETED — Core 1 is never frozen
+    // mid-SPI, mid-TX-start or mid-persist, and the RX-mode check below
+    // cannot be raced by a new TX between check and sleep. The mesh task
+    // resumes at MESH_UNLOCK to drain whatever woke us.
+    MESH_LOCK();
+    bool slept = false;
+    if (radio_driver.isInRecvMode()) {
+      // Level wakes: DIO1 idles LOW and latches HIGH on RX-done; GPIO0
+      // idles HIGH (its pull survives light sleep) and reads LOW pressed.
+      // The timer is a safety net: if the DIO1 level wake ever fails to
+      // fire, the next timer wake polls the radio's IRQ register instead,
+      // bounding notification latency at ~15s.
+      //
+      // STORM GUARD: DIO1's interrupt-enable must be OFF while its type is
+      // level-HIGH. A packet holds DIO1 HIGH until the mesh task services
+      // the radio over SPI; with the interrupt enabled, the unmask at sleep
+      // exit fires a level ISR whose handler never clears the SOURCE — an
+      // infinite gpio_intr_service loop that trips the interrupt watchdog
+      // and that panic's CPU-only reset preserves the armed state, so the
+      // device boot-loops on the stale asserted status. The gpio WAKE logic
+      // works with the interrupt disabled. (GPIO0's ISR is already detached
+      // for the whole standby.)
+      gpio_intr_disable((gpio_num_t)PIN_LORA_DIO1);
+      gpio_wakeup_enable((gpio_num_t)PIN_LORA_DIO1, GPIO_INTR_HIGH_LEVEL);
+      gpio_wakeup_enable((gpio_num_t)PIN_BOOT_BTN,  GPIO_INTR_LOW_LEVEL);
+      esp_sleep_enable_gpio_wakeup();
+      // The button additionally wakes through ext0 — the RTC-domain path the
+      // shutdown wake already proved on this exact pin. DIO1 (GPIO45) is not
+      // an RTC pad, so it can only use the digital gpio wake + the timer net.
+      esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BOOT_BTN, 0);
+      esp_sleep_enable_timer_wakeup(15ULL * 1000000ULL);
+      esp_light_sleep_start();
+      gpio_wakeup_disable((gpio_num_t)PIN_LORA_DIO1);
+      gpio_wakeup_disable((gpio_num_t)PIN_BOOT_BTN);
+      // Restore RadioLib's edge semantics before re-enabling: POSEDGE on an
+      // already-high line does not fire, and a packet latched during the
+      // sleep is picked up by the IRQ-register fallback armed below.
+      gpio_set_intr_type((gpio_num_t)PIN_LORA_DIO1, GPIO_INTR_POSEDGE);
+      gpio_intr_enable((gpio_num_t)PIN_LORA_DIO1);
+      slept = true;
+    }
+    MESH_UNLOCK();
+    if (slept) {
+
+      // A press outlasts the microseconds from wake to this read, so the
+      // live level identifies a button wake. (esp_sleep_get_gpio_wakeup_
+      // status() is C-series-only — not available on the S3.)
+      if (digitalRead(PIN_BOOT_BTN) == LOW) {
+        user_wake = true;
+        break;
+      }
+      // Any wake may carry a latched-but-unsignalled RX: the RX-done edge is
+      // lost with the gated clocks, so arm the wrapper's IRQ-register
+      // fallback for the dispatcher's next recvRaw().
+      radio_driver.noteLightSleepWake();
+    }
+    // Drain window: the mesh task pulls the packet, ACKs, and classifies.
+    // Heartbeat: a periodic aliveness glow, decoupled from the wake rate —
+    // it rides existing drain windows (never creates a wake of its own) and
+    // lights at most once per standby_heartbeat_secs. The 15s timer wake
+    // bounds how far past due it can run (device setting; no kbd = no-op).
+    bool hb_glow = standby_heartbeat &&
+                   (millis() - hb_last >= (uint32_t)standby_heartbeat_secs * 1000UL);
+    if (hb_glow) { input_dev_kbd_backlight(40); hb_last = millis(); }
+    uint32_t drain_start = millis();
+    while (millis() - drain_start < 400) {
+      if (notify_standby_alert_pending()) break;
+      if (trackball_click > 0 || digitalRead(PIN_BOOT_BTN) == LOW) { user_wake = true; break; }
+      delay(10);
+    }
+    if (hb_glow) input_dev_kbd_backlight(0);
+    if (user_wake || notify_standby_alert_pending()) break;
+    // Not alert-worthy (advert / foreign traffic / ACK): back to sleep. If
+    // the radio is mid-TX, loop without sleeping until it returns to RX.
+    if (!radio_driver.isInRecvMode()) delay(20);
+  }
+
+  // ── Restore ──
+  // gpio_wakeup_enable/disable rewrote these pins' interrupt TYPE, which
+  // kills RadioLib's DIO1 RX-done edge ISR and the GPIO0 click ISR for good
+  // — restore both (the registered handlers themselves were untouched).
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
+  gpio_set_intr_type((gpio_num_t)PIN_LORA_DIO1, GPIO_INTR_POSEDGE);
+  gpio_intr_enable((gpio_num_t)PIN_LORA_DIO1);
+  input_dev_wake_pin_restore();   // re-attach the GPIO0 click ISR (edge config included)
+  power_dev_standby_exit();     // Heltec: GNSS rail back on
+  display_dev_sleep(false);
+  // Full backlight re-init, not the incremental path: after minutes held in
+  // shutdown the pulse chip's state cannot be trusted to match the driver's
+  // tracking, and a mismatch leaves the screen black with no self-heal.
+  display_dev_backlight_reset(display_brightness);
+  wake_activity();              // backlights + inactivity timers
+  trackball_up = trackball_down = trackball_left = trackball_right = 0;
+  trackball_click = 0;          // the wake press must not click whatever was focused
+  if (wifi_was_on && wifi_enabled_pref) { WiFi.mode(WIFI_STA); wifi_auto_kick(); }
+#if BLE_COMPANION_ENABLED
+  if (ble_was_on && ble_enabled_pref) {
+    MESH_LOCK();
+    ble_companion_init_early();
+    ble_companion_start(*the_mesh);
+    MESH_UNLOCK();
+  }
+#endif
+  gps_dev_wake();               // T-Deck: RXD activity wake; Heltec: no-op
+  gps_notify_wake();            // fresh GPS sync cycle
+  sound_resume();               // I2S back before the deferred alert replays
+  notify_standby_defer(false);
+  if (notify_standby_take_alert()) notify_message_alert();
+  SLog.printf("[POWER] standby end (%s) after %lus\n",
+              user_wake ? "button" : "notification",
+              (unsigned long)((millis() - t0) / 1000UL));
+}
+
 void loop() {
   // Core 0 (UI domain) — LVGL + Lua + input. The mesh dispatcher runs on
   // Core 1 via mesh_task (see meshpunk_tasks.cpp).
@@ -7974,6 +8307,18 @@ void loop() {
     elf_host_run_pending();     // runs the module to completion (elf_host logs PSRAM)
     luaBringUp();               // recreate Lua + arena + launcher (logs [lua_arena])
     return;   // skip the rest of this tick; the fresh launcher runs next tick
+  }
+
+  // Power menu actions, deferred here from their Lua bindings so they run on
+  // a clean stack after the farewell painted (see system_shutdown/standby_run).
+  if (s_poweroff_request) {
+    s_poweroff_request = false;
+    system_shutdown();   // never returns
+  }
+  if (s_standby_request) {
+    s_standby_request = false;
+    standby_run();       // blocks here until woken
+    return;   // fresh tick for the restored UI
   }
 
   // Handle LVGL tasks
@@ -8031,5 +8376,17 @@ void loop() {
       input_dev_kbd_backlight(0);
       kbd_timed_out = true;
     }
+  }
+
+  // Auto standby: enter the low-power state after the configured idle time,
+  // on the same activity clock as the timeouts above. The standby binding's
+  // guards apply here too (never while a USB drive or link session owns the
+  // hardware). wake_activity() at standby exit resets the idle clock, so
+  // the next idle period re-arms naturally.
+  if (auto_standby && auto_standby_mins > 0 && !s_standby_request &&
+      !usbdrive_active() && !mesh_task_paused &&
+      millis() - last_activity_ms > (uint32_t)auto_standby_mins * 60000UL) {
+    SLog.println("[POWER] auto standby (idle timeout)");
+    s_standby_request = true;
   }
 }

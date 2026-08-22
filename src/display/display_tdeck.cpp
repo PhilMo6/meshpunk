@@ -118,31 +118,74 @@ void display_dev_backlight_init(void) {
   pinMode(BOARD_BL_PIN, OUTPUT);
 }
 
+// SLPIN/SLPOUT. The panel needs 120ms after SLPOUT before it accepts
+// further commands (datasheet minimum for both ST7789 and ILI9341).
+void display_dev_sleep(bool sleep) {
+  SPI_LOCK();
+  tft.writecommand(sleep ? 0x10 : 0x11);
+  SPI_UNLOCK();
+  delay(sleep ? 5 : 120);
+}
+
 // LilyGo T-Deck control backlight chip has 16 levels of adjustment range
 // The adjustable range is 0~15, 0 is the minimum brightness, 15 is the maximum
 // brightness
+static uint8_t s_bl_level = 0;
+static const uint8_t s_bl_steps = 16;
+static portMUX_TYPE s_bl_mux = portMUX_INITIALIZER_UNLOCKED;
+
 void display_dev_brightness(uint8_t value) {
-  static uint8_t level = 0;
-  static uint8_t steps = 16;
   if (value == 0) {
     digitalWrite(BOARD_BL_PIN, 0);
     delay(3);
-    level = 0;
+    s_bl_level = 0;
     return;
   }
-  if (level == 0) {
+  // The pulse-counter chip shuts down (and zeroes its counter) if the line
+  // sits LOW for more than a few milliseconds. A preemption or ISR landing
+  // between a pulse's LOW and HIGH writes stretches it past that threshold:
+  // the chip goes dark while the level tracking still says lit, and every
+  // later call with the same target computes zero pulses — a stuck-black
+  // backlight. The whole train is <150us, so run it with interrupts off.
+  taskENTER_CRITICAL(&s_bl_mux);
+  if (s_bl_level == 0) {
     digitalWrite(BOARD_BL_PIN, 1);
-    level = steps;
-    delayMicroseconds(30);
+    s_bl_level = s_bl_steps;
+    delayMicroseconds(100);   // turn-on settle from shutdown before pulsing
   }
-  int from = steps - level;
-  int to = steps - value;
-  int num = (steps + to - from) % steps;
+  int from = s_bl_steps - s_bl_level;
+  int to = s_bl_steps - value;
+  int num = (s_bl_steps + to - from) % s_bl_steps;
   for (int i = 0; i < num; i++) {
     digitalWrite(BOARD_BL_PIN, 0);
     digitalWrite(BOARD_BL_PIN, 1);
   }
-  level = value;
+  s_bl_level = value;
+  taskEXIT_CRITICAL(&s_bl_mux);
+}
+
+// Guaranteed shutdown (>=3ms LOW clears the chip's counter whatever state it
+// was in), then a fresh turn-on with a generous settle, then pulse down to
+// the target — chip and driver state agree afterward no matter what happened
+// before. See display_dev.h.
+void display_dev_backlight_reset(uint8_t value) {
+  // Re-latch the pad configuration first: a pad coming out of a hold or a
+  // sleep state can silently ignore writes until reconfigured, which would
+  // swallow the whole train below.
+  pinMode(BOARD_BL_PIN, OUTPUT);
+  digitalWrite(BOARD_BL_PIN, 0);
+  delay(4);
+  s_bl_level = 0;
+  if (value == 0) return;
+  taskENTER_CRITICAL(&s_bl_mux);
+  digitalWrite(BOARD_BL_PIN, 1);
+  delayMicroseconds(100);
+  for (int i = 0; i < (int)(s_bl_steps - value); i++) {
+    digitalWrite(BOARD_BL_PIN, 0);
+    digitalWrite(BOARD_BL_PIN, 1);
+  }
+  s_bl_level = value;
+  taskEXIT_CRITICAL(&s_bl_mux);
 }
 
 #endif // BOARD_TDECK
