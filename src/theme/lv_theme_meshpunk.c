@@ -9,6 +9,8 @@
 #include <lvgl.h> /*To see all the widgets*/
 #include "lv_theme_meshpunk.h"
 
+#include "../input/punk_keyboard.h"
+
 #include "../../lib/lvgl/src/themes/lv_theme_private.h"
 #include "../../lib/lvgl/src/misc/lv_color.h"
 #include "../../lib/lvgl/src/core/lv_global.h"
@@ -1193,6 +1195,24 @@ static void theme_apply(lv_theme_t * th, lv_obj_t * obj)
 
 #if LV_USE_KEYBOARD
     else if(lv_obj_check_type(obj, &lv_keyboard_class)) {
+        lv_obj_add_style(obj, &theme->styles.scr, 0);
+        lv_obj_add_style(obj, theme->disp_size == DISP_LARGE ? &theme->styles.pad_small : &theme->styles.pad_tiny, 0);
+        lv_obj_add_style(obj, &theme->styles.outline_primary, LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &theme->styles.outline_secondary, LV_STATE_EDITED);
+        lv_obj_add_style(obj, &theme->styles.btn, LV_PART_ITEMS);
+        lv_obj_add_style(obj, &theme->styles.disabled, LV_PART_ITEMS | LV_STATE_DISABLED);
+        lv_obj_add_style(obj, &theme->styles.bg_color_white, LV_PART_ITEMS);
+        lv_obj_add_style(obj, &theme->styles.keyboard_button_bg, LV_PART_ITEMS);
+        lv_obj_add_style(obj, &theme->styles.pressed, LV_PART_ITEMS | LV_STATE_PRESSED);
+        lv_obj_add_style(obj, &theme->styles.bg_color_grey, LV_PART_ITEMS | LV_STATE_CHECKED);
+        lv_obj_add_style(obj, &theme->styles.bg_color_primary_muted, LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &theme->styles.bg_color_secondary_muted, LV_PART_ITEMS | LV_STATE_EDITED);
+    }
+
+    /* The OSK's own keyboard widget. lv_obj_check_type is an exact class
+     * match, so without this branch it would fall through the whole chain and
+     * get no styling at all — invisible keys. Same style list as above. */
+    else if(lv_obj_check_type(obj, &punk_keyboard_class)) {
         lv_obj_add_style(obj, &theme->styles.scr, 0);
         lv_obj_add_style(obj, theme->disp_size == DISP_LARGE ? &theme->styles.pad_small : &theme->styles.pad_tiny, 0);
         lv_obj_add_style(obj, &theme->styles.outline_primary, LV_STATE_FOCUS_KEY);

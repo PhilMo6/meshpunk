@@ -22,6 +22,7 @@
 #include "input/input_dev.h"
 #include "input/input_ui.h"
 #include "input/input_zones.h"
+#include "input/punk_keyboard.h"
 #include "power/power_dev.h"
 #include "meshpunk_sync.h"
 #include "Audio.h"
@@ -5828,6 +5829,10 @@ void setupLuaVGL() {
   luaL_requiref(L, "lvgl", luaopen_lvgl, 1);
   lua_pop(L, 1);
   luavgl_set_font_extension(L, meshpunk_make_font, NULL);
+
+  // The OSK's keyboard widget (lvgl.PunkKeyboard / obj:PunkKeyboard{}). Must
+  // follow luaopen_lvgl: it chains onto luavgl's buttonmatrix metatable.
+  punk_keyboard_lua_register(L);
 
   // T-Deck peer link (gblink)
   lua_register(L, "_gblink_status", lua_gblink_status);

@@ -29,6 +29,10 @@ end
 
 body = body .. [[
 
+Bigger keys: the keyboard key in the bottom left corner of the on-screen keyboard swaps between the normal layout and a big-key one. The big layout drops the keys that do not type so the letters get the room, and it shows the key you are pressing above your finger. Choose capitals or symbols in the normal layout first - the big layout comes up in whichever one you were in. In big symbol mode the 1# key flips between two pages of symbols. The check key is what closes the keyboard and keeps your text.]]
+
+body = body .. [[
+
 Quitting a native game: hold the on-screen QUIT button for about a second.]]
 
 if caps.keyboard then

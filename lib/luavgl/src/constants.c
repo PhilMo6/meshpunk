@@ -456,6 +456,11 @@ static const rotable_Reg builtin_font_const_table[] = {
      .ptr = &lv_font_unscii_16,
      },
 #endif
+
+    /* MESHPUNK: sentinel. rotable_newlib() and the linear scan in find_key()
+     * both walk this array until name == NULL; every other rotable_Reg table
+     * in this file already ends this way. */
+    {0, 0},
 };
 
 static const rotable_Reg scr_load_anim_const_table[] = {

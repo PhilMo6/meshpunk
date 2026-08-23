@@ -1,14 +1,15 @@
--- lib/osk.lua — full-screen on-screen keyboard for keyboardless boards.
+-- lib/osk.lua — full-screen on-screen keyboard for touch boards.
 --
 -- Opened by the firmware (dispatch_osk in loop()) when a textarea gains
--- focus or is re-tapped on a board with no physical keyboard; never opens on
--- the T-Deck. Full-screen modal: a one-line PREVIEW textarea on top (seeded
--- with the target field's current text), and below it either the LVGL
--- keyboard widget (typing mode) or an embedded emoji grid (emoji mode) —
--- the :)/abc button swaps the two in place, the same way the keyboard's own
--- number key swaps key sets. The keyboard's check key commits the preview
--- text into the app's textarea via _osk_commit (which re-validates the
--- captured target); the hide key cancels. Either path closes the modal.
+-- focus or is re-tapped, on any touch board whose touch mode is not OFF.
+-- Full-screen modal: a one-line PREVIEW textarea on top (seeded with the
+-- target field's current text), and below it either the PunkKeyboard widget
+-- (typing mode) or an embedded emoji grid (emoji mode) — the :)/abc button
+-- swaps the two in place, the same way the keyboard's own number key swaps
+-- key sets. The keyboard's check key commits the preview text into the app's
+-- textarea via _osk_commit (which re-validates the captured target) and
+-- closes the modal; it is the only key that closes it. The keyboard key
+-- beside it toggles the widget's big-key layout and stays in the modal.
 --
 -- Emoji mode shows the USER'S emoji set first: the per-key alt-layer map
 -- from Settings > Emoji (_kb_emoji_get, the same assignments the T-Deck
@@ -81,16 +82,15 @@ function M.open()
     }
     preview:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-    -- Typing mode: the LVGL keyboard, typing into the preview. Its check
-    -- key fires READY (commit + close), its hide key CANCEL (close).
-    local kb = overlay:Keyboard { w = W, h = H - 48 }
+    -- Typing mode: the firmware's own keyboard widget, typing into the
+    -- preview. Its check key fires READY (commit + close); its keyboard key
+    -- swaps the normal and big-key layouts inside the widget and sends
+    -- nothing here. Nothing emits CANCEL any more, so check is the way out.
+    local kb = overlay:PunkKeyboard { w = W, h = H - 48 }
     kb:set_textarea(preview)
 
     kb:onevent(lvgl.EVENT.READY, function()
         pcall(_osk_commit, preview.text or "")
-        teardown()
-    end)
-    kb:onevent(lvgl.EVENT.CANCEL, function()
         teardown()
     end)
 

@@ -196,7 +196,25 @@
 //                  drop-down that uses the first two ships with firmware.
 //                  NO new ELF host_exports this cycle, so no module gains a
 //                  load-time dependency on level 10
-#define MESHPUNK_FW_API 10
+//  11  2026-08-23  unreleased since the v0.3.6 tag (which shipped level 10):
+//                  the on-screen keyboard now has its own widget —
+//                  lvgl.PunkKeyboard{} / obj:PunkKeyboard{} with methods
+//                  set_textarea, set_mode, set_big and get_big. It is a
+//                  buttonmatrix subclass living in src/input/punk_keyboard.c
+//                  and registered from our own tree, so neither luavgl nor
+//                  LVGL is patched and lvgl.Keyboard stays exactly as it was.
+//                  The widget carries a BIG key layout beside the normal one:
+//                  the bottom-left keyboard key toggles the two and no longer
+//                  emits LV_EVENT_CANCEL, so the OSK is closed by its check
+//                  key alone. Size is process-global and independent of mode;
+//                  the big layouts drop the mode keys (picked in the normal
+//                  layout) and big symbol mode splits the symbols over two
+//                  pages that its 1# key cycles. lib/osk.lua uses it and
+//                  ships with the firmware, so no store app is affected — an
+//                  app that wants the widget itself needs min_fw=11. NO new
+//                  ELF host_exports this cycle, so no module gains a
+//                  load-time dependency on level 11
+#define MESHPUNK_FW_API 11
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:
