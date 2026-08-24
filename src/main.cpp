@@ -24,6 +24,7 @@
 #include "input/input_zones.h"
 #include "input/punk_keyboard.h"
 #include "power/power_dev.h"
+#include "screenshot.h"
 #include "meshpunk_sync.h"
 #include "Audio.h"
 #include "sound.h"
@@ -376,6 +377,10 @@ static int32_t tz_effective_offset_minutes() {
   int32_t base = tz_is_auto ? tz_auto_offset_minutes() : tz_manual_minutes;
   return base + (dst_enabled ? 60 : 0);
 }
+
+// Same offset for other translation units (screenshot.cpp names its files in
+// local time, so a shot taken at 3pm does not read as 22:00).
+int32_t firmware_tz_offset_minutes() { return tz_effective_offset_minutes(); }
 
 extern bool sd_mounted;
 void sd_spi_release();
@@ -1502,15 +1507,45 @@ static int lua_io_open(lua_State *L) {
   return 1;
 }
 
+// ── Screenshot capture ──────────────────────────────────────────────────────
+// A request (the _screenshot binding, or a tap on a SHOT zone in controller
+// mode) is served by dispatch_screenshot() from loop(), NOT where it was
+// raised: the capture drives lv_refr_now, and an LVGL event or timer callback
+// is already inside lv_timer_handler. The dispatchers run after it returns.
+static bool       s_shot_armed = false;   // flush_cb diverts pixels while set
+static bool       s_shot_req   = false;   // a capture was asked for
+static lv_obj_t*  s_shot_hide  = nullptr; // hidden for the capture (the trigger)
+static bool       s_shot_done  = false;   // a result is waiting to be polled
+static bool       s_shot_ok    = false;
+static char       s_shot_result[96] = {0};
+// A momentary PSRAM dip must not lose a request — the frame buffer claim is
+// retried for this long before the shot is reported as failed (hw-observed
+// during a SNES run, where one claim in several missed and the next worked).
+#define SHOT_RETRY_MS 1000
+static bool       s_shot_retrying  = false;
+static uint32_t   s_shot_first_try = 0;
+
 // LVGL flush: the panel write (scanline tear-sync, bus lock, pixel push)
 // lives in the display backend; this wrapper only unpacks the LVGL area and
 // signals completion.
+//
+// The capture refresh takes the pixels and leaves the panel alone. The screen
+// is re-rendered with the trigger button hidden, and pushing that would blank
+// the button for the length of the write; not pushing it means nothing on the
+// panel changes at all, and the post-capture invalidate repaints from the real
+// tree afterwards.
 static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
                           uint8_t *px_map) {
-  display_dev_flush_rect(area->x1, area->y1,
-                         area->x2 - area->x1 + 1,
-                         area->y2 - area->y1 + 1,
-                         (const uint16_t *)px_map);
+  if (s_shot_armed) {
+    screenshot_feed_be565((const uint16_t *)px_map, area->x1, area->y1,
+                          area->x2 - area->x1 + 1,
+                          area->y2 - area->y1 + 1);
+  } else {
+    display_dev_flush_rect(area->x1, area->y1,
+                           area->x2 - area->x1 + 1,
+                           area->y2 - area->y1 + 1,
+                           (const uint16_t *)px_map);
+  }
   lv_display_flush_ready(disp);
 }
 
@@ -7004,6 +7039,41 @@ void setupLuaVGL() {
     return 0;
   });
 
+  // _screenshot([obj]) -> true. Queues a capture of whatever is on the panel;
+  // loop()'s dispatcher performs it (see s_shot_req). `obj` is hidden for the
+  // duration, which is how the button that triggered the shot stays out of it.
+  // The result is not available here — poll for it with _screenshot_poll.
+  lua_register(L, "_screenshot", [](lua_State *L) -> int {
+    luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+    lv_obj_t *obj = (lobj && lobj->obj) ? lobj->obj : nullptr;
+    if (obj && obj != s_shot_hide) {
+      s_shot_hide = obj;
+      // Same C-level DELETE handler reasoning as _snapshot_attach_free above:
+      // a Lua obj:onevent(DELETE,..) is unref'd before it could fire, and this
+      // pointer must not outlive the object.
+      lv_obj_add_event_cb(obj, [](lv_event_t *e) {
+        if ((lv_obj_t *)lv_event_get_target(e) == s_shot_hide) s_shot_hide = nullptr;
+      }, LV_EVENT_DELETE, nullptr);
+    }
+    s_shot_req = true;
+    lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  // _screenshot_poll() -> nil while a capture is still pending, then either the
+  // written path or false + reason (once — the result is consumed by the read).
+  lua_register(L, "_screenshot_poll", [](lua_State *L) -> int {
+    if (!s_shot_done) { lua_pushnil(L); return 1; }
+    s_shot_done = false;
+    if (s_shot_ok) {
+      lua_pushstring(L, s_shot_result);
+      return 1;
+    }
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, s_shot_result);
+    return 2;
+  });
+
   lua_register(L, "_list_dir_sd", lua_list_dir_sd);
   lua_register(L, "_file_exists_sd", lua_file_exists_sd);
   lua_register(L, "_mkdir_sd", lua_mkdir_sd);
@@ -8048,6 +8118,54 @@ static void dispatch_mode_button() {
   }
 }
 
+// Screenshot: the _screenshot binding or a tap on a SHOT zone in controller
+// mode. Runs here because it drives its own refresh — see the state block by
+// disp_flush_cb. Blocking loop() for the write is deliberate and short (the
+// PNG writer streams; there is no seconds-long encode to hide from the UI).
+static void dispatch_screenshot() {
+  bool from_zone = input_zones_shot_take();
+  if (!s_shot_req && !from_zone) return;
+  s_shot_req = true;          // a zone tap becomes a request like any other
+  s_shot_done = false;
+
+  if (!screenshot_begin()) {
+    if (!s_shot_retrying) { s_shot_retrying = true; s_shot_first_try = millis(); }
+    if (millis() - s_shot_first_try < SHOT_RETRY_MS) return;   // keep the request
+    s_shot_req = false;
+    s_shot_retrying = false;
+    snprintf(s_shot_result, sizeof(s_shot_result), "%s",
+             screenshot_busy() ? "previous capture still saving" : "low memory");
+    s_shot_ok = false;
+    s_shot_done = true;
+    return;
+  }
+  s_shot_req = false;
+  s_shot_retrying = false;
+
+  // Hidden only for the capture refresh. The panel is not written during it,
+  // so the button never visibly blinks.
+  bool hidden = false;
+  if (s_shot_hide && !lv_obj_has_flag(s_shot_hide, LV_OBJ_FLAG_HIDDEN)) {
+    lv_obj_add_flag(s_shot_hide, LV_OBJ_FLAG_HIDDEN);
+    hidden = true;
+  }
+
+  lv_obj_t *scr = lv_screen_active();
+  s_shot_armed = true;
+  lv_obj_invalidate(scr);
+  lv_refr_now(NULL);
+  s_shot_armed = false;
+
+  if (hidden && s_shot_hide) lv_obj_remove_flag(s_shot_hide, LV_OBJ_FLAG_HIDDEN);
+  // The armed refresh left LVGL believing the panel holds pixels it never
+  // received; invalidating again repaints it from the real tree on the next
+  // lv_timer_handler.
+  lv_obj_invalidate(scr);
+
+  s_shot_ok = screenshot_finish_to_disk(s_shot_result, sizeof(s_shot_result));
+  s_shot_done = true;
+}
+
 // On-screen keyboard (keyboardless boards): a textarea focus/tap queued the
 // OSK in input_ui; open lib/osk.lua outside indev processing. Same pattern
 // as the emoji popup below.
@@ -8351,6 +8469,9 @@ void loop() {
 
   // Input-mode button (IO key / MODE zone tap; same flag pattern).
   dispatch_mode_button();
+
+  // Screenshot request (Tools/Screenshot's button, or a SHOT zone tap).
+  dispatch_screenshot();
 
   // Alt+backspace home chord (same flag pattern).
   dispatch_home_shortcut();

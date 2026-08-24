@@ -42,6 +42,13 @@ local M = {}
 -- at a Dos prompt.
 M.QUIT = 0xFF
 
+-- Screenshot is the same kind of code: a FIRMWARE out (0xFD) elf_host swallows
+-- on both edges, saving a PNG of the module's frame instead of passing it on.
+-- Shipped UNBOUND. The keymap is a pure remapper, so any default binding takes
+-- that key away from every module — worth it for an exit, not for an occasional
+-- capture. It shows as a "---" row in Controls for the user to bind.
+M.SHOT = 0xFD
+
 -- Every physical T-Deck key that resolves to a character, plus the trackball
 -- pseudo-codes elf_host emits. Order here is the order the picker shows.
 local KEY_ORDER = {
@@ -133,7 +140,8 @@ Kb.__index = Kb
 
 -- opts: actions, root, show_screen, font, accent, title, on_back, on_save,
 --       trackball = { momentum, impulse, friction, thresh }, input_note,
---       quit = false to suppress the standard Quit action.
+--       quit = false to suppress the standard Quit action,
+--       shot = false to suppress the standard Screenshot action.
 function M.new(opts)
     local self = setmetatable({}, Kb)
     self.root        = opts.root
@@ -159,6 +167,13 @@ function M.new(opts)
     if opts.quit ~= false then
         self.actions[#self.actions + 1] = {
             id = "quit", label = "Quit", out = M.QUIT, def1 = M.KEYS.y,
+        }
+    end
+    -- Same reasoning as quit: appended here so every module gains it and none
+    -- can drift out of having one. Unbound until the user picks a key.
+    if opts.shot ~= false then
+        self.actions[#self.actions + 1] = {
+            id = "shot", label = "Screenshot", out = M.SHOT,
         }
     end
 

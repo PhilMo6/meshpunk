@@ -364,6 +364,12 @@ static int l_punk_kb_set_textarea(lua_State *L)
 {
     lv_obj_t *obj = luavgl_to_obj(L, 1);
     lv_obj_t *ta = lua_isnoneornil(L, 2) ? NULL : luavgl_to_obj(L, 2);
+    /* The key handler calls lv_textarea_* on whatever it is given, and the
+     * stock LV_ASSERT_OBJ compiles out in release. Raise a Lua error rather
+     * than let a wrong argument reach the textarea API. */
+    if (ta != NULL && !lv_obj_check_type(ta, &lv_textarea_class)) {
+        return luaL_argerror(L, 2, "textarea expected");
+    }
     punk_keyboard_set_textarea(obj, ta);
     lua_settop(L, 1);
     return 1;

@@ -14,15 +14,30 @@
 // (lib/touchlayout.lua) via the _zones_* bindings, from launchers via
 // _elf_touch_layout, or from the host OSK (whose 45 keys size the cap).
 //
-// out code 0xFE is reserved: a MODE zone — touching it queues a mode-button
-// event (same channel as the hardware IO button) instead of a key.
+// Out codes 0xFD and above are RESERVED and never reach an app or a module:
+//   0xFD  SHOT zone — queues a screenshot request (drained by loop()'s
+//         dispatcher in the Lua world, by the ELF input task during a run).
+//         The same code is the out of lib/keybind's bindable Screenshot
+//         action, so a key and a pad tap arrive as one thing.
+//   0xFE  MODE zone — queues a mode-button event (same channel as the
+//         hardware IO button).
+//   0xFF  QUIT (HOST_KEY_QUIT, elf_host.cpp) — ends the module.
+// Use zone_out_is_key() rather than comparing against one of them: that is
+// the single place the boundary moves when another code is reserved.
 
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define INPUT_ZONES_MAX   48
+#define INPUT_ZONE_SHOT   0xFD   // reserved out: screenshot pseudo-zone
 #define INPUT_ZONE_MODE   0xFE   // reserved out: mode-toggle pseudo-zone
+
+// True when an out code is a real key to deliver (non-zero, not reserved).
+static inline bool zone_out_is_key(uint8_t out) {
+  return out != 0 && out < INPUT_ZONE_SHOT;
+}
 
 typedef struct {
   int16_t x, y;
@@ -57,3 +72,6 @@ bool input_zones_out_held(uint8_t out);
 
 // Mode-zone tap event (0xFE): true once per tap.
 bool input_zones_mode_toggle_take(void);
+
+// Shot-zone tap event (0xFD): true once per tap.
+bool input_zones_shot_take(void);

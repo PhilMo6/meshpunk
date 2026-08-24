@@ -45,6 +45,10 @@ body = body .. [[
 
 Editing the pad layout: each game launcher has a Touch button that opens a layout editor. Drag a button to move it, use the size steppers to resize it, and the nudge arrows for fine positioning. Your layout is saved per game, so every game can have its own. Reset puts the original layout back.]]
 
+body = body .. [[
+
+Screenshots from a game: every layout carries a SHOT pad, switched off to begin with so it costs no screen space in games you never capture. Turn it on in that same editor - select it, press On, then drag it clear of the buttons you actually play with. Each launcher's Controls screen also has a Screenshot action you can bind to a key, unbound to begin with so it takes no key away from the game. Either one writes a PNG to the SD card; the Screenshot app in Tools does the same for everything outside a game.]]
+
 return {
     title   = "Touch controls",
     section = "Guide",

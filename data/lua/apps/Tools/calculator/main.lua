@@ -224,7 +224,7 @@ local function createBtn(parent, value)
     }
     btn:Label {
         text = value,
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_18,
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
         text_color = fg,
         align = lvgl.ALIGN.CENTER,
     }
@@ -242,7 +242,7 @@ local back_grid_btn = button_grid:Button {
 }
 back_grid_btn:Label {
     text = "<",
-    text_font = lvgl.BUILTIN_FONT.MONTSERRAT_18,
+    text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
     text_color = CLR_TEXT,
     align = lvgl.ALIGN.CENTER,
 }

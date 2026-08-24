@@ -15,7 +15,11 @@
 -- Storage: L:/touch_layouts/<app>.cfg — chosen preset + per-zone GEOMETRY
 -- overrides keyed by zone id (`zone=up,52,118,64,56`, `zone=select,off`).
 -- Outs and labels always come from the launcher's preset, so a launcher
--- update never invalidates saved geometry; unknown ids are ignored.
+-- update never invalidates saved geometry; unknown ids are ignored. A zone
+-- may also carry `,on` (or a bare `zone=<id>,on`), which is what a preset
+-- zone marked default_off needs to say it was deliberately enabled.
+--
+-- Every preset gains a Screenshot pad automatically — see M.new.
 --
 -- Editor: live full-screen preview, drag a pad to move it, W/H steppers in
 -- a two-row control bar that flips to the far half of the screen from the
@@ -28,6 +32,12 @@ local M = {}
 local SCREEN_W, SCREEN_H = 320, 240
 local MIN_SIDE = 24
 local CFG_DIR = "L:/touch_layouts"
+
+-- The Screenshot pad every layout gains (see M.new). 0xFD is a FIRMWARE out
+-- (INPUT_ZONE_SHOT in input_zones.h): the zone layer turns a tap on it into a
+-- capture request, and no app or module ever receives it as a key.
+local SHOT_ID  = "shot"
+local SHOT_OUT = 0xFD
 
 local Pad = {}
 Pad.__index = Pad
@@ -57,14 +67,24 @@ function Pad:_load()
         else
             local id, rest = line:match("^zone=([%w_%-]+),(.+)%s*$")
             if id then
-                local off = false
+                -- off is TRI-STATE here: nil means the line carried no on/off
+                -- marker, which leaves the choice to the preset's default_off.
+                -- Zones that ship disabled (Screenshot) need the explicit "on"
+                -- form; every other zone still reads exactly as it used to.
+                local off = nil
                 local geom = rest
                 if rest == "off" then
                     self.over[id] = { off = true }
                     geom = nil
+                elseif rest == "on" then
+                    self.over[id] = { off = false }
+                    geom = nil
                 elseif rest:sub(-4) == ",off" then
                     off = true
                     geom = rest:sub(1, -5)
+                elseif rest:sub(-3) == ",on" then
+                    off = false
+                    geom = rest:sub(1, -4)
                 end
                 if geom then
                     local x, y, w, h =
@@ -73,7 +93,7 @@ function Pad:_load()
                         self.over[id] = {
                             x = tonumber(x), y = tonumber(y),
                             w = tonumber(w), h = tonumber(h),
-                            off = off or nil,
+                            off = off,
                         }
                     end
                 end
@@ -88,11 +108,16 @@ function Pad:save()
     if not f then return false end
     if self.preset_name then f:write("preset=" .. self.preset_name .. "\n") end
     for id, o in pairs(self.over) do
+        -- An explicit false writes ",on": without it a zone whose preset says
+        -- default_off would come back disabled after the user enabled it.
+        local mark = ""
+        if o.off == true then mark = ",off"
+        elseif o.off == false then mark = ",on" end
         if o.x then
             f:write(string.format("zone=%s,%d,%d,%d,%d%s\n",
-                id, o.x, o.y, o.w, o.h, o.off and ",off" or ""))
-        elseif o.off then
-            f:write(string.format("zone=%s,off\n", id))
+                id, o.x, o.y, o.w, o.h, mark))
+        elseif mark ~= "" then
+            f:write(string.format("zone=%s,%s\n", id, mark:sub(2)))
         end
     end
     f:close()
@@ -111,10 +136,12 @@ end
 -- Effective geometry of one preset zone (override applied, clamped on-screen).
 function Pad:_geom(z)
     local o = self.over[z.id]
+    local off
+    if o and o.off ~= nil then off = o.off else off = z.default_off or false end
     local g = {
         x = (o and o.x) or z.x, y = (o and o.y) or z.y,
         w = (o and o.w) or z.w, h = (o and o.h) or z.h,
-        off = (o and o.off) or false,
+        off = off,
     }
     g.w = clamp(g.w, MIN_SIDE, SCREEN_W)
     g.h = clamp(g.h, MIN_SIDE, SCREEN_H)
@@ -146,6 +173,30 @@ function M.new(opts)
     self.presets = opts.presets or {}
     self.preset_name = self.presets[1] and self.presets[1].name or nil
     self.over = {}
+    -- Added here rather than by each launcher, so every app that has a pad can
+    -- take a screenshot and none can drift out of having one. It ships DISABLED
+    -- (default_off): a pad the user never asked for should not take screen
+    -- space in a game, and a stray tap costs a capture. Enable it per app with
+    -- this editor's Off button, then drag it anywhere.
+    --
+    -- Upper right, one row below the top: QUIT sits at 0,0 in every launcher,
+    -- and the top row itself is full to x=286 in the widest of them (Dos), so
+    -- nothing 54 wide fits up there. The band this occupies is empty in all
+    -- ten. 54 is the width zone_overlay gives a four-letter chip, and a chip
+    -- is centred on its zone and clipped at the screen edge — a narrower pad
+    -- would render as "SHO".
+    for _, p in ipairs(self.presets) do
+        local has = false
+        for _, z in ipairs(p.zones or {}) do
+            if z.id == SHOT_ID then has = true end
+        end
+        if p.zones and not has then
+            p.zones[#p.zones + 1] = {
+                id = SHOT_ID, out = SHOT_OUT, label = "SHOT",
+                x = 266, y = 32, w = 54, h = 30, default_off = true,
+            }
+        end
+    end
     self:_load()
     return self
 end
@@ -243,7 +294,7 @@ function Pad:open(o)
             local b = boxes[sel]
             local o2 = self.over[b.z.id] or {}
             o2.x, o2.y, o2.w, o2.h = b.g.x, b.g.y, b.g.w, b.g.h
-            o2.off = b.g.off or nil
+            o2.off = b.g.off and true or false   -- explicit: nil means "use the preset default"
             self.over[b.z.id] = o2
             dirty = true
         end

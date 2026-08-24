@@ -8,6 +8,7 @@
 #include "punkmesh.h"
 #include "usb_manager.h"   // usb_pool_alloc/free — dynamic USB driver segments
 #include "tdeck_link.h"    // peer link: gblink veneers + module-exit detach
+#include "screenshot.h"    // screen capture staging + PNG writer
 
 #include <Arduino.h>
 #include <Ticker.h>
@@ -183,6 +184,32 @@ static uint32_t         s_zone_quit_since = 0;
 // Key under the finger while the host OSK is open, committed when it lifts.
 static uint8_t          s_osk_hover       = 0;
 #define ZONE_QUIT_HOLD_MS 600
+
+// ── Screenshot capture (SHOT zone 0xFD / the bindable Screenshot key) ──────
+// Both triggers set s_shot_requested; shot_service() (input task) claims the
+// staging buffer, and the blit path fills it from the module's OWN pixels
+// BEFORE the zone/OSK overlays are stamped into them, so a captured frame
+// carries neither. A full-frame push completes a capture on its own; a band
+// renderer's strips are accumulated until every row has been seen, and the
+// timeout ends captures for renderers that never cover the whole panel (a
+// letterboxed band renderer never writes the border rows).
+#define SHOT_ACCUM_MS   250
+#define SHOT_MAX_ROWS   240
+// PSRAM can dip below the frame size for a moment while an emulator works —
+// hw-observed on SNES: one shot in several failed to claim the buffer and the
+// next succeeded. A request that lands at the wrong instant is retried for
+// this long rather than lost.
+#define SHOT_RETRY_MS   1000
+static volatile bool s_shot_requested = false;   // a trigger fired
+static volatile bool s_shot_arming    = false;   // buffer claimed, collecting
+static volatile bool s_shot_full      = false;   // a whole frame arrived
+static volatile bool s_shot_writing   = false;   // writer task alive
+static volatile bool s_shot_feeding   = false;   // a push is inside shot_feed
+static uint8_t       s_shot_rows[(SHOT_MAX_ROWS + 7) / 8];
+static uint32_t      s_shot_start_ms  = 0;
+static bool          s_shot_retrying   = false; // begin() failed, still trying
+static uint32_t      s_shot_first_try  = 0;
+static void shot_service();   // defined with the blit path it feeds from
 // Chips inside the module's frame are stamped into every pushed frame; chip
 // parts in the letterbox borders are pushed directly ONCE (the module never
 // redraws there) — re-armed whenever the module clears the screen. The last
@@ -544,6 +571,12 @@ static void poll_input(bool kb_only = false) {
                 if (cur_state[i]) s_quit_requested = true;
                 continue;
             }
+            // Screenshot binding: swallowed on both edges like quit, so the
+            // module never sees a 0xFD or a release without a press.
+            if (out == INPUT_ZONE_SHOT) {
+                if (cur_state[i]) s_shot_requested = true;
+                continue;
+            }
             if (out)
                 kq_push(out, cur_state[i] ? 1 : 0);
         }
@@ -577,6 +610,10 @@ static void poll_input(bool kb_only = false) {
             uint8_t cur[INPUT_DEV_TOUCH_MAX];
             int cn = input_zones_held_all(cur, INPUT_DEV_TOUCH_MAX);
 
+            // A SHOT zone tap is a plain edge (the zone layer already
+            // debounced it); only quit needs a hold.
+            if (input_zones_shot_take()) s_shot_requested = true;
+
             // Quit needs a deliberate unbroken hold; lifting cancels it.
             if (input_zones_out_held(HOST_KEY_QUIT)) {
                 if (!s_zone_quit_since) s_zone_quit_since = millis();
@@ -601,9 +638,9 @@ static void poll_input(bool kb_only = false) {
                 if (zout != s_zone_prev_out) {
                     uint8_t prev = s_zone_prev_out;
                     s_zone_prev_out = zout;
-                    if (prev && prev < INPUT_ZONE_MODE)
+                    if (zone_out_is_key(prev))
                         host_osk_key_feedback(prev, false, display_dev_blit);
-                    if (zout && zout < INPUT_ZONE_MODE)
+                    if (zone_out_is_key(zout))
                         host_osk_key_feedback(zout, true, display_dev_blit);
                 }
                 if (np > 0) {
@@ -611,7 +648,7 @@ static void poll_input(bool kb_only = false) {
                 } else if (s_osk_hover) {
                     uint8_t k = s_osk_hover; // the key it lifted on
                     s_osk_hover = 0;
-                    if (k < INPUT_ZONE_MODE) { kq_push(k, 1); kq_push(k, 0); }
+                    if (zone_out_is_key(k)) { kq_push(k, 1); kq_push(k, 0); }
                 }
             } else {
                 // Controller: diff the held SET so a direction and a button
@@ -623,14 +660,14 @@ static void poll_input(bool kb_only = false) {
                     uint8_t o = s_zone_prev[i];
                     bool still = false;
                     for (int j = 0; j < cn && !still; j++) still = (cur[j] == o);
-                    if (!still && o && o < INPUT_ZONE_MODE) kq_push(o, 0);
+                    if (!still && zone_out_is_key(o)) kq_push(o, 0);
                 }
                 for (int j = 0; j < cn; j++) {
                     uint8_t o = cur[j];
                     bool was = false;
                     for (int i = 0; i < s_zone_prev_n && !was; i++)
                         was = (s_zone_prev[i] == o);
-                    if (!was && o && o < INPUT_ZONE_MODE) kq_push(o, 1);
+                    if (!was && zone_out_is_key(o)) kq_push(o, 1);
                 }
                 s_zone_prev_out = cn > 0 ? cur[0] : 0;
             }
@@ -663,7 +700,7 @@ static void poll_input(bool kb_only = false) {
             // must not fire into the mode being switched to.
             if (!host_osk_active()) {
                 for (int i = 0; i < s_zone_prev_n; i++)   // release every held
-                    if (s_zone_prev[i] && s_zone_prev[i] < INPUT_ZONE_MODE)
+                    if (zone_out_is_key(s_zone_prev[i]))
                         kq_push(s_zone_prev[i], 0);        // across table swaps
             }
             s_zone_prev_out = 0;
@@ -708,6 +745,7 @@ static void elf_input_task_body(void* param) {
     while (s_input_task_run) {
         bool do_trackball = (tick % ELF_INPUT_TRK_EVERY) == 0;
         poll_input(/*kb_only=*/!do_trackball);
+        shot_service();
         tick++;
         vTaskDelayUntil(&last, pdMS_TO_TICKS(ELF_INPUT_PERIOD_MS));
     }
@@ -730,6 +768,7 @@ static void elf_input_start() {
     s_legacy_hist[0] = s_legacy_hist[1] = s_legacy_hist[2] = 0;
     s_legacy_flip_req = false;
     s_quit_requested = false;
+    s_shot_requested = false;
     s_osk_hover = 0;
     // The zone layer may still hold a LUA layout: Lua teardown is C-side and
     // never ran touchlayout's disarm if the launching app had zones armed.
@@ -787,6 +826,18 @@ static void elf_input_stop() {
 // those buffers, which is exactly why host_osk_close() does NOT free — this
 // is the single point that does. No panel work: LVGL repaints on resume.
 static void elf_zones_teardown() {
+    // A capture still collecting when the module exits would strand the
+    // staging buffer AND make every later screenshot_begin refuse, so cancel
+    // it here — safe for the same reason the zone buffers are freed here: no
+    // blit, and therefore no shot_feed, can be in flight. A capture already
+    // handed to the writer task is left alone; that task owns the buffer.
+    s_shot_requested = false;
+    s_shot_retrying  = false;
+    if (s_shot_arming) {
+        s_shot_arming = false;
+        screenshot_end();
+        SLog.println("[shot] capture cancelled: module exited");
+    }
     host_osk_free();
     input_zones_enable(false);
     input_zones_clear();
@@ -817,6 +868,10 @@ void elf_input_inject(unsigned char key, int pressed) {
     }
     if (out == HOST_KEY_QUIT) {
         if (pressed) s_quit_requested = true;
+        return;
+    }
+    if (out == INPUT_ZONE_SHOT) {
+        if (pressed) s_shot_requested = true;
         return;
     }
     if (out) kq_push(out, pressed ? 1 : 0);
@@ -892,6 +947,91 @@ void elf_usb_driver_unload(void* mod) {
     usb_ulog("drv: unloaded (pool %uB free)", (unsigned)usb_pool_free_bytes());
 }
 
+// ── Screenshot capture ──────────────────────────────────────────────────────
+
+// Copy one push into the staging buffer and note the rows it covered. Called
+// from the module task (host_blit_*) and the blit task, never from both at
+// once: a module hands over a frame through one path or the other.
+static void shot_feed(const uint16_t* px, int x, int y, int w, int h, bool whole) {
+    // Claim first, THEN re-test: shot_service clears s_shot_arming and waits
+    // for this flag before handing the buffer to the writer task, so a push
+    // that started before the hand-off finishes and one that starts after it
+    // does nothing. Testing first would leave a window where both run.
+    s_shot_feeding = true;
+    if (s_shot_arming) {
+        screenshot_feed_be565(px, x, y, w, h);
+        for (int r = y; r < y + h; r++)
+            if (r >= 0 && r < SHOT_MAX_ROWS)
+                s_shot_rows[r >> 3] |= (uint8_t)(1 << (r & 7));
+        if (whole) s_shot_full = true;
+    }
+    s_shot_feeding = false;
+}
+
+static void elf_shot_task(void* param) {
+    (void)param;
+    char path[96];
+    if (screenshot_finish_to_disk(path, sizeof(path))) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Screenshot saved: %s", path);
+        notify_post(msg);
+        notify_kbd_blink();
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Screenshot failed: %s", path);
+        notify_post(msg);
+    }
+    s_shot_writing = false;
+    vTaskDelete(nullptr);
+}
+
+// Drive one capture from the input task: claim the buffer on a request, then
+// decide when enough of the frame has arrived and hand the write to its own
+// task so the module keeps running.
+static void shot_service() {
+    if (s_shot_arming) {
+        bool rows_done = true;
+        int rows = display_dev_height();
+        if (rows > SHOT_MAX_ROWS) rows = SHOT_MAX_ROWS;
+        for (int r = 0; r < rows && rows_done; r++)
+            if (!(s_shot_rows[r >> 3] & (1 << (r & 7)))) rows_done = false;
+        bool timeout = (uint32_t)(millis() - s_shot_start_ms) >= SHOT_ACCUM_MS;
+        if (!s_shot_full && !rows_done && !timeout) return;
+        s_shot_arming = false;
+        while (s_shot_feeding) vTaskDelay(1);   // let an in-flight push finish
+        s_shot_writing = true;
+        // Priority 1 and Core 1: below the mesh task, off the module's core.
+        if (xTaskCreatePinnedToCore(elf_shot_task, "elf_shot", 6144, nullptr,
+                                    1, nullptr, 1) != pdPASS) {
+            s_shot_writing = false;
+            screenshot_end();
+            notify_post("Screenshot failed: no task memory");
+        }
+        return;
+    }
+    if (!s_shot_requested) return;
+    if (s_shot_writing) {                // previous shot still going to disk
+        s_shot_requested = false;
+        s_shot_retrying  = false;
+        return;
+    }
+    if (!screenshot_begin()) {
+        if (!s_shot_retrying) { s_shot_retrying = true; s_shot_first_try = millis(); }
+        if (millis() - s_shot_first_try < SHOT_RETRY_MS) return;   // keep the request
+        s_shot_requested = false;
+        s_shot_retrying  = false;
+        notify_post(screenshot_busy() ? "Screenshot skipped: previous one still saving"
+                                      : "Screenshot failed: low memory");
+        return;
+    }
+    s_shot_requested = false;
+    s_shot_retrying  = false;
+    memset(s_shot_rows, 0, sizeof(s_shot_rows));
+    s_shot_full = false;
+    s_shot_start_ms = millis();
+    s_shot_arming = true;
+}
+
 // ---------------------------------------------------------------------------
 // Host function implementations
 // ---------------------------------------------------------------------------
@@ -906,6 +1046,9 @@ void host_blit_frame(const uint16_t* rgb565, int w, int h) {
     if (x_offset < 0) x_offset = 0;
     int y_offset = (display_dev_height() - h) / 2;
     if (y_offset < 0) y_offset = 0;
+    // Screenshot: the module's pixels as it drew them, taken before the
+    // stamps below write indicator pixels into this same buffer.
+    if (s_shot_arming) shot_feed(rgb565, x_offset, y_offset, w, h, true);
     // Controller-mode indicators: stamped into the module's own buffer just
     // before the push (transparent — only outline/label pixels are written).
     // Writing into it is safe on this path — a full-frame renderer rewrites
@@ -943,6 +1086,7 @@ void host_blit_rect(const uint16_t* rgb565, int x, int y, int w, int h) {
     if (!rgb565 || w <= 0 || h <= 0) return;
     if (x < 0 || y < 0 ||
         x + w > display_dev_width() || y + h > display_dev_height()) return;
+    if (s_shot_arming) shot_feed(rgb565, x, y, w, h, false);
     // Controller-mode indicators: transparent-stamp the overlapping chip
     // parts into the strip before it goes out, exactly like the frame path
     // (band renderers re-rasterize every strip, so the stamp is transient).

@@ -211,7 +211,26 @@
 //                  layout) and big symbol mode splits the symbols over two
 //                  pages that its 1# key cycles. lib/osk.lua uses it and
 //                  ships with the firmware, so no store app is affected — an
-//                  app that wants the widget itself needs min_fw=11. NO new
+//                  app that wants the widget itself needs min_fw=11.
+//                  Also in this cycle: screen capture to PNG. _screenshot(obj)
+//                  queues a capture of whatever is on the panel (obj, if given,
+//                  is hidden for it so a trigger button stays out of its own
+//                  picture) and _screenshot_poll() returns nil while pending,
+//                  then the written path or false + reason; files land in
+//                  S:/screenshots (L: with no card, refused while USB drive
+//                  mode owns the card). An app calling either binding needs
+//                  min_fw=11. Out code 0xFD is now RESERVED alongside 0xFE
+//                  (mode) and 0xFF (quit): as a touch zone it queues a capture,
+//                  and as lib/keybind's new Screenshot action (M.SHOT, appended
+//                  to every launcher's Controls like Quit, shipped UNBOUND) the
+//                  ELF host swallows it on both edges, so no module ever
+//                  receives it. lib/padlayout adds a "shot" zone to every
+//                  preset, default_off, which needed one config-format
+//                  addition: `zone=<id>,on` (and the `,on` geometry suffix)
+//                  records a deliberate enable — older configs, which only
+//                  ever wrote `,off`, still load unchanged. Both libs ship with
+//                  the firmware that swallows 0xFD, so no launcher needs a
+//                  min_fw bump for the pad or the binding. NO new
 //                  ELF host_exports this cycle, so no module gains a
 //                  load-time dependency on level 11
 #define MESHPUNK_FW_API 11
