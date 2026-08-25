@@ -2,98 +2,114 @@ local lvgl = require("lvgl")
 local sound = require("lib/sound")
 local apps = require("lib/apps")
 
--- Receive app directory from launcher (e.g. "L:/lua/apps/flappyBird")
+-- Receive app directory from launcher (e.g. "L:/lua/apps/Games/Flappy Bird")
 local app_dir = ...
 
 -- ============================================================
--- T-Deck Flappy Bird
--- All images loaded as PNGs from LittleFS via LVGL FS driver
--- LVGL now uses system malloc -> PSRAM for large allocations
+-- Flappy Bird
+--
+-- Single fixed-step timer drives everything; there are no lvgl
+-- Anims, so the manager's timer teardown covers every exit path
+-- (quit button, home chord, app-to-app launch).
+--
+-- Every PNG is decoded exactly once at startup into app-owned
+-- canvases (the atlas + the two tiled scroll strips). All
+-- runtime rendering references those buffers via get_image(),
+-- so nothing touches the filesystem or LVGL's image cache after
+-- startup. bg_day.png / land.png are 64px-wide repeating tiles
+-- and must be tiled across the strip canvases to cover the
+-- screen.
 -- ============================================================
 
 local W = lvgl.HOR_RES()
 local H = lvgl.VER_RES()
 
--- Game constants tuned for T-Deck 320x240
-local LAND_HEIGHT = 56
-local MOVE_SPEED = W / 8000
-local PIXEL_PER_METER = math.floor(H / 6)
-local TOP_Y = 10
-local BOTTOM_Y = H - LAND_HEIGHT
-local PIPE_COUNT = math.max(3, math.floor(W / 80))
-local PIPE_GAP = 55
-local PIPE_SPACE = math.floor(W / 3)
-
 local IMAGE_PATH = app_dir .. "/"
 
--- ============================================================
--- Central game state
---   running : app is alive. Set false on shutdown BEFORE any widget
---             is deleted, so in-flight anim/timer ticks short-circuit.
---   playing : a round is currently in progress (bird flying, pipes moving).
---   anims/timers: registries used by shutdown() to stop everything
---             without the exit path needing to know which objects exist.
--- ============================================================
+local floor = math.floor
+local random = math.random
+local sin = math.sin
+
+-- Fixed timestep; all speeds are px/second scaled by DT each tick.
+local TICK_MS = 33
+local DT = TICK_MS / 1000
+
+local LAND_H   = 56
+local GROUND_Y = H - LAND_H          -- top edge of the ground strip
+
+-- Bird
+local BIRD_W, BIRD_H = 18, 13
+local BIRD_X    = floor(W / 3) - floor(BIRD_W / 2)
+local HIT_INSET = 2                  -- hitbox shrink per side
+local GRAVITY   = 900                -- px/s^2
+local FLAP_VY   = -260               -- impulse velocity per tap
+local VY_MAX    = 470                -- terminal fall speed
+local CEILING   = 2                  -- top clamp (does not kill)
+
+-- Pipes
+local PIPE_W, PIPE_H = 26, 160
+local PIPE_N     = 4
+local STRIDE     = floor(W / 3) + PIPE_W   -- distance between pipe pairs
+local GAP_MAX    = 70                -- gap at score 0
+local GAP_MIN    = 52
+local GAP_MARGIN = 28                -- min pipe visible above/below the gap
+
+-- World speed
+local SPEED0     = 105               -- px/s at score 0
+local SPEED_MAX  = 150
+local SPEED_RAMP = 1.2               -- px/s gained per point
+local SKY_PARALLAX = 0.25            -- sky scroll fraction of ground speed
+
+local S_MENU, S_READY, S_PLAY, S_DYING, S_OVER = 1, 2, 3, 4, 5
+
 local game = {
-    running = true,
-    playing = false,
-    anims = {},
-    timers = {},
+    running  = true,
+    state    = S_MENU,
+    muted    = false,
+    sounds   = {},
+    flash_t  = 0,
+    over_y   = 0,
+    new_best = false,
 }
 
-function game:alive() return self.running end
+local scene = {}          -- widget handles
+local atlas = {}          -- sprite name -> { src = lightuserdata, w, h }
+local atlas_store         -- hidden container owning the atlas canvases
+local pipes               -- array of { x, gy, gap, scored, xi, top, bot }
+local best, score = 0, 0
+local WING_SEQ            -- bird frame srcs in flap order
+local SKY_TILE_W, LAND_TILE_W = 64, 64
 
-function game:trackAnim(a)
-    if a then table.insert(self.anims, a) end
-    return a
-end
+local bird = {
+    y = 0, vy = 0, rot = 0,
+    frame = 1, ft = 0,        -- wing frame index + tick divider
+    bob = 0, base = 0,        -- menu/ready idle bob
+    last_y = -1,
+}
 
-function game:trackTimer(t)
-    return apps.track_timer(t)   -- manager owns timer teardown
-end
+local world = {
+    speed = SPEED0,
+    land_off = 0, sky_off = 0,
+    land_x = 1, sky_x = 1,    -- last applied int positions
+    phase = 0,                -- 0 = day sky, 1 = night sky
+}
 
-function game:shutdown()
-    if not self.running then return end
-    self.running = false
-    self.playing = false
+local enter_menu, enter_ready, enter_dying, enter_over
 
-    for _, a in ipairs(self.anims) do
-        pcall(function() if a.stop then a:stop() end end)
-    end
-    self.anims = {}
-
-    if self.gameover_snd then pcall(function() self.gameover_snd:delete() end); self.gameover_snd = nil end
-    if self.flap_snd then pcall(function() self.flap_snd:delete() end); self.flap_snd = nil end
-
-    apps.go_home()   -- manager deletes tracked timers, then the root
-end
-
--- Try to load best score from file
+-- ── Persistence (formats shared with v1.x: bare number / "1"/"0") ───────────
 local function load_score()
     local f = io.open(app_dir .. "/save.txt", "r")
-    if f then
-        local txt = f:read("*a")
-        f:close()
-        return tonumber(txt)
-    else
-        print("No existing save found")
-        return
-    end
+    if not f then return 0 end
+    local txt = f:read("*a")
+    f:close()
+    return tonumber(txt) or 0
 end
 
--- Save current best score to file
-local function save_score(score)
+local function save_score(s)
     local f = io.open(app_dir .. "/save.txt", "w")
-    if f then
-        f:write(score)
-        f:close()
-    else
-        print("Failed to write save file")
-    end
+    if f then f:write(tostring(s)) f:close() end
 end
 
--- SFX mute, persisted in its own file ("1"/"0") so save.txt stays a bare
--- score readable by older versions of this app.
 local function load_muted()
     local f = io.open(app_dir .. "/mute.txt", "r")
     if not f then return false end
@@ -104,469 +120,53 @@ end
 
 local function save_muted(m)
     local f = io.open(app_dir .. "/mute.txt", "w")
-    if f then
-        f:write(m and "1" or "0")
-        f:close()
-    end
+    if f then f:write(m and "1" or "0") f:close() end
 end
 
-local function randomY()
-    return math.random(TOP_Y + 20, BOTTOM_Y - PIPE_GAP - 20)
+-- ── Reused property tables ──────────────────────────────────────────────────
+-- obj:set() reads keys at call time, so one table per shape avoids allocating
+-- a table on every tick.
+local T_X   = { x = 0 }
+local T_Y   = { y = 0 }
+local T_XY  = { x = 0, y = 0 }
+local T_SRC = {}
+local T_ROT = { rotation = 0 }
+local T_TXT = {}
+
+local function set_txt(lbl, s)
+    T_TXT.text = s
+    lbl:set(T_TXT)
 end
 
--- One managed root (apps.new_root) for the whole app; every layer after that
--- is a plain child Object. Calling new_root per layer (the old behavior)
--- repointed M._screen and RESET M._timers each time — go_home then deleted
--- only the LAST layer, leaving the sky/land/bird layers orphaned on the
--- screen (the "ground stays over the launcher" bug) with their infinite
--- scroll anims and the lost wing timer still running (the permanent lag).
-local function screenCreate(parent)
-    local props = {
-        w = W, h = H,
-        bg_opa = lvgl.OPA(0),
-        border_width = 0, pad_all = 0
-    }
-    local scr
-    if parent then
-        scr = parent:Object(props)
-        scr:set{ x = 0, y = 0 }
-    else
-        scr = apps.new_root(props)
-    end
-    scr:clear_flag(lvgl.FLAG.SCROLLABLE)
-    scr:clear_flag(lvgl.FLAG.CLICKABLE)
-    return scr
+-- ── Sounds ──────────────────────────────────────────────────────────────────
+local function sfx(s)
+    if s and not game.muted then s:play() end
 end
 
-local function Image(parent, src)
-    local img = {}
-    img.widget = parent:Image{ src = src }
-    img.w, img.h = img.widget:get_img_size()
-    if not img.w or not img.h then
-        error("failed to load image: " .. tostring(src))
-    end
-    return img
-end
-
--- Endless horizontal scroller. The PNG is decoded ONCE into two app-owned
--- Canvas buffers (same pattern as the pipes) and the canvases slide; drawing
--- a canvas is a direct blit of its own pixels. The old version slid two Image
--- widgets, which re-render from the decoder cache every frame — full-screen
--- layers overflow LV_CACHE_DEF_SIZE, and a full cache makes LVGL FAIL the
--- decode: invisible background + per-frame re-decode churn (the lag).
-local function ImageScroll(root, src, animSpeed, y)
-    local probe = Image(root, src)   -- just to read the image dimensions
-    local iw, ih = probe.w, probe.h
-    probe.widget:delete()
-
-    local function makeStrip(x)
-        local c = root:Canvas{
-            w = iw, h = ih,
-            cf = lvgl.COLOR_FORMAT.ARGB8888,
-            x = x, y = y
-        }
-        c:fill_bg("#000000", 0)
-        c:draw_image{ x1 = 0, y1 = 0, x2 = iw - 1, y2 = ih - 1,
-                      src = src, opa = 255 }
-        c:clear_flag(lvgl.FLAG.CLICKABLE)
-        return c
+local function make_sounds()
+    local list = {}
+    local function reg(s)
+        if s then list[#list + 1] = s end
+        return s
     end
 
-    local img = makeStrip(0)
-    local right = makeStrip(W)
+    -- Short blip per tap (no looping tone: taps are instantaneous)
+    game.snd_flap = reg(sound.generateTone(520, 70, {
+        end_freq = 310, waveform = "triangle",
+        attack = 2, decay = 40, sustain = 0.0, release = 20,
+    }))
 
-    local anim = img:Anim{
-        run = true,
-        start_value = 0,
-        end_value = -W,
-        time = W / animSpeed,
-        repeat_count = lvgl.ANIM_REPEAT_INFINITE,
-        path = "linear",
-        exec_cb = function(obj, value)
-            if not game.running then return end
-            img:set{ x = value }
-            right:set{ x = value + W }
-        end
-    }
-    game:trackAnim(anim)
+    game.snd_point = reg(sound.generateMelody({
+        { freq = 988, ms = 45 }, { freq = 0, ms = 15 }, { freq = 1319, ms = 70 },
+    }, { waveform = "square", attack = 2, decay = 30, sustain = 0.5, release = 20 }))
 
-    return {
-        widget = img,
-        anim = anim,
-        stop = function() if anim and anim.stop then anim:stop() end end
-    }
-end
-
-local function Frames(parent, srcs, fps)
-    local frame = Image(parent, srcs[1])
-    fps = fps ~= 0 and fps or 25
-    frame.src = srcs
-    frame.len = #srcs
-    frame.i = 0
-
-    frame.timer = lvgl.Timer {
-        period = 1000 / fps,
-        cb = function(t)
-            if not game.running then return end
-            frame.widget:set{ src = frame.src[frame.i] }
-            frame.i = frame.i + 1
-            if frame.i == frame.len then frame.i = 1 end
-        end
-    }
-    game:trackTimer(frame.timer)
-
-    frame.start = function(self) self.timer:resume() end
-    frame.pause = function(self) self.timer:pause() end
-    return frame
-end
-
-local function ObjInfo(x, y, w, h)
-    return { x = x, y = y, w = w, h = h }
-end
-
-local function Pipes(parent)
-    local pipes = {}
-
-    -- Get pipe image dimensions via a temporary widget
-    local tmp = Image(parent, IMAGE_PATH .. "pipe_up.png")
-    local pipe_w = tmp.w
-    local pipe_h = tmp.h
-    tmp.widget:delete()
-
-    pipes.w = pipe_w
-    pipes.h = pipe_h
-
-    local stride   = PIPE_SPACE + pipe_w
-    local canvas_w = PIPE_COUNT * stride + pipe_w
-    local canvas_h = BOTTOM_Y
-
-    pipes.canvas = parent:Canvas{
-        w = canvas_w, h = canvas_h,
-        cf = lvgl.COLOR_FORMAT.ARGB8888,
-        x = W, y = 0
-    }
-    pipes.canvas:clear_flag(lvgl.FLAG.CLICKABLE)
-
-    for i = 1, PIPE_COUNT do
-        pipes[i] = { canvas_x = (i - 1) * stride, y = randomY(), x = (i - 1) * stride + W }
-    end
-
-    pipes.birdInfo = ObjInfo(0, 0, 0, 0)
-    pipes.gapInfo  = ObjInfo(0, 0, 0, 0)
-
-    local function drawPipes()
-        pipes.canvas:fill_bg("#000000", 0)
-        for i = 1, PIPE_COUNT do
-            local p  = pipes[i]
-            local cx = p.canvas_x
-            pipes.canvas:draw_image{
-                x1 = cx, y1 = p.y - pipe_h,
-                x2 = cx + pipe_w - 1, y2 = p.y - 1,
-                src = IMAGE_PATH .. "pipe_up.png", opa = 255
-            }
-            pipes.canvas:draw_image{
-                x1 = cx, y1 = p.y + PIPE_GAP,
-                x2 = cx + pipe_w - 1, y2 = p.y + PIPE_GAP + pipe_h - 1,
-                src = IMAGE_PATH .. "pipe_down.png", opa = 255
-            }
-        end
-    end
-
-    local function pipesPosinit()
-        for i = 1, PIPE_COUNT do
-            pipes[i].canvas_x = (i - 1) * stride
-            pipes[i].y        = randomY()
-            pipes[i].x        = (i - 1) * stride + W
-        end
-        pipes.scroll_offset   = 0
-        pipes.canvas_widget_x = W
-        pipes.front           = 1
-        pipes.last            = PIPE_COUNT
-        pipes.canvas:set{ x = W }
-        drawPipes()
-    end
-
-    pipesPosinit()
-
-    pipes.score      = 0
-    pipes.objPassing = -1
-
-    function pipes:setObjInfo(x, y, w, h)
-        self.birdInfo.x = x
-        self.birdInfo.y = y
-        if w then self.birdInfo.w = w end
-        if h then self.birdInfo.h = h end
-    end
-
-    local function setGapInfo(x, y, w, h)
-        pipes.gapInfo.x = x
-        pipes.gapInfo.y = y
-        pipes.gapInfo.w = w
-        pipes.gapInfo.h = h
-    end
-
-    local function isBirdCollision()
-        local bird = pipes.birdInfo
-        local gap  = pipes.gapInfo
-        if bird.x + bird.w < gap.x then return false end
-        if bird.x > gap.x + gap.w  then return false end
-        if (bird.y > gap.y) and (bird.y + bird.h < gap.y + gap.h) then return false end
-        return true
-    end
-
-    local function checkScore(i)
-        local bird    = pipes.birdInfo
-        local gap     = pipes.gapInfo
-        local passing = pipes.objPassing
-        if bird.x + bird.w < gap.x or bird.x > gap.x + gap.w then
-            if passing > 0 and i == passing then
-                pipes.score = pipes.score + 1
-                passing = -1
-                pipes.scoreUpdateCB(pipes.score)
-            end
-        else
-            if passing < 0 then passing = i end
-        end
-        pipes.objPassing = passing
-    end
-
-    local function collisionDetect()
-        local first = (pipes.last % PIPE_COUNT) + 1
-        for idx = 0, PIPE_COUNT - 1 do
-            local i    = (first + idx - 1) % PIPE_COUNT + 1
-            local pipe = pipes[i]
-            setGapInfo(pipe.x, pipe.y, pipes.w, PIPE_GAP)
-            if isBirdCollision() then
-                if pipes.collisionCB then pipes.collisionCB() end
-            end
-            checkScore(i)
-        end
-    end
-
-    pipes.preValue = 0
-    pipes.anim = pipes.canvas:Anim{
-        run = false,
-        start_value = 0,
-        end_value = W,
-        time = W / MOVE_SPEED,
-        repeat_count = lvgl.ANIM_REPEAT_INFINITE,
-        path = "linear",
-        exec_cb = function(obj, value)
-            if not game.running or not game.playing then return end
-            local x = pipes.preValue
-            local d
-            if value < x then d = value + W - x else d = value - x end
-            pipes.preValue = value
-
-            pipes.scroll_offset   = pipes.scroll_offset + d
-            pipes.canvas_widget_x = W - pipes.scroll_offset
-            pipes.canvas:set{ x = pipes.canvas_widget_x }
-
-            for i = 1, PIPE_COUNT do
-                pipes[i].x = pipes[i].canvas_x + pipes.canvas_widget_x
-            end
-
-            local front_pipe = pipes[pipes.front]
-            if front_pipe.canvas_x + pipes.canvas_widget_x + pipe_w < 0 then
-                local prev_idx      = (pipes.front - 2 + PIPE_COUNT) % PIPE_COUNT + 1
-                front_pipe.canvas_x = pipes[prev_idx].canvas_x + stride
-                front_pipe.y        = randomY()
-                pipes.last          = pipes.front
-                pipes.front         = pipes.front % PIPE_COUNT + 1
-                -- Shift all canvas_x left by stride to keep within canvas bounds
-                for i = 1, PIPE_COUNT do
-                    pipes[i].canvas_x = pipes[i].canvas_x - stride
-                end
-                pipes.scroll_offset   = pipes.scroll_offset - stride
-                pipes.canvas_widget_x = W - pipes.scroll_offset
-                -- Recompute screen positions after the shift
-                for i = 1, PIPE_COUNT do
-                    pipes[i].x = pipes[i].canvas_x + pipes.canvas_widget_x
-                end
-                drawPipes()
-                pipes.canvas:set{ x = pipes.canvas_widget_x }
-            end
-
-            collisionDetect()
-        end
-    }
-    game:trackAnim(pipes.anim)
-
-    function pipes:start() self.anim:start() end
-    function pipes:stop()  self.anim:stop()  end
-    function pipes:reset()
-        pipesPosinit()
-        pipes.score      = 0
-        pipes.preValue   = 0
-        pipes.objPassing = -1
-    end
-    function pipes:setCollisionCB(cb)    self.collisionCB    = cb end
-    function pipes:setScoreUpdateCB(cb) self.scoreUpdateCB = cb end
-
-    return pipes
-end
-
-local function Bird(parent, birdMovedCB)
-    local bird = Frames(parent,
-        {IMAGE_PATH .. "bird1.png", IMAGE_PATH .. "bird2.png", IMAGE_PATH .. "bird3.png"}, 5)
-
-    local function birdVarInit()
-        bird.x = math.floor(W / 3 - bird.w / 2)
-        bird.y = math.floor(H / 2 - bird.h / 2)
-        bird.widget:set{ x = bird.x, y = bird.y }
-        bird.head = 0
-        bird.force = 0
-        bird.velocity = 0
-        bird.time = 0
-        bird.moving = false
-    end
-
-    birdVarInit()
-
-    bird.setY = function(self) bird.widget:set{ y = bird.y } end
-    bird.setHead = function(self) bird.widget:set{ rotation = self.head } end
-
-    bird.applyForce = function(self, force)
-        self.force = force
-        if bird.moving then return end
-        bird.moving = true
-        self.y_anim:start()
-    end
-
-    bird.pressed = function(self) bird:applyForce(-9); bird.velocity = 0 end
-    bird.released = function(self) bird:applyForce(5); bird.velocity = 0 end
-
-    local function velocity2HeadAngle(v) return v * 60 end
-
-    bird.y_anim = bird.widget:Anim{
-        run = false,
-        start_value = 0, end_value = 1000,
-        time = 1000,
-        repeat_count = lvgl.ANIM_REPEAT_INFINITE,
-        path = "linear",
-        exec_cb = function(obj, tNow)
-            if not game.running then return end
-            if tNow < bird.time then tNow = tNow + 1000 end
-            local v = bird.velocity
-            local t = tNow < bird.time and tNow + 1000 - bird.time or tNow - bird.time
-            t = t * 0.001
-
-            v = bird.force * t + v
-            if v > 10 then v = 10 end
-            if v < -10 then v = -10 end
-
-            local y = bird.y + v * t * PIXEL_PER_METER
-            if y > BOTTOM_Y - bird.h then y = BOTTOM_Y - bird.h; v = 0 end
-            if y < TOP_Y then y = TOP_Y; v = 0 end
-
-            bird.y = y
-            bird.time = tNow
-            bird.velocity = v
-            bird.head = velocity2HeadAngle(v)
-
-            birdMovedCB(bird.x, bird.y)
-            bird:setY()
-            bird:setHead()
-        end
-    }
-    game:trackAnim(bird.y_anim)
-
-    function bird:stop() bird.y_anim:stop() end
-    function bird:gameOver() bird.released() end
-    function bird:start() bird.y_anim:start() end
-    function bird:reset() bird.stop(); birdVarInit() end
-
-    return bird
-end
-
-local function Background(root, bgEventCB)
-    local bgLayer = screenCreate(root)
-    bgLayer:add_flag(lvgl.FLAG.CLICKABLE)
-    bgLayer:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
-    local group = lvgl.group.get_default()
-    group:add_obj(bgLayer)
-    lvgl.group.focus_obj(bgLayer)
-
-    local bg = ImageScroll(bgLayer, IMAGE_PATH .. "bg_day.png", MOVE_SPEED * 0.4, 0)
-    local pipes = Pipes(bgLayer)
-    local land = ImageScroll(bgLayer, IMAGE_PATH .. "land.png", MOVE_SPEED, BOTTOM_Y)
-
-    bgLayer:onevent(lvgl.EVENT.PRESSED, function(obj, code)
-        if not game.running then return end
-        bgEventCB(lvgl.EVENT.PRESSED)
-    end)
-    bgLayer:onevent(lvgl.EVENT.RELEASED, function(obj, code)
-        if not game.running then return end
-        bgEventCB(lvgl.EVENT.RELEASED)
-    end)
-
-    return {bgLayer = bgLayer, pipes = pipes, bg = bg, land = land }
-end
-
-local function SysLayer(root) return screenCreate(root) end
-
-local function createPlayBtn(sysLayer, onEvent)
-    local playBtn = Image(sysLayer, IMAGE_PATH .. "button_play.png").widget
-    playBtn:add_flag(lvgl.FLAG.CLICKABLE)
-    playBtn:set{ align = { type = lvgl.ALIGN.CENTER, y_ofs = math.floor(H / 6) } }
-    playBtn:onevent(lvgl.EVENT.PRESSED, function(obj, code)
-        if not game.running then return end
-        onEvent(obj, code)
-    end)
-    return playBtn
-end
-
-local function createQuitBtn(sysLayer)
-    local quitBtn = Image(sysLayer, IMAGE_PATH .. "button_quit.png").widget
-    quitBtn:add_flag(lvgl.FLAG.CLICKABLE)
-    quitBtn:set{ align = { type = lvgl.ALIGN.TOP_RIGHT } }
-    quitBtn:onevent(lvgl.EVENT.PRESSED, function()
-        -- Single exit point: shutdown flips game.running=false FIRST so any
-        -- in-flight anim/timer tick short-circuits, then stops and deletes.
-        game:shutdown()   -- ends with apps.go_home()
-    end)
-    return quitBtn
-end
-
--- SFX mute chip, below the quit button (64x60, TOP_RIGHT). Parented to the
--- app root, NOT the gridnav'd sysLayer: during play sysLayer has no focusable
--- children, and a focusable chip there would let trackball focus wander off
--- the flap layer mid-round. Touch-only as a result.
-local function createMuteBtn(parent)
-    local btn = parent:Label{
-        text = game.sfx_muted and "SFX OFF" or "SFX ON",
-        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
-        text_color = "#FFFFFF",
-        bg_color = "#000000", bg_opa = 120,
-        radius = 4, pad_all = 4,
-        align = { type = lvgl.ALIGN.TOP_RIGHT, y_ofs = 64, x_ofs = -4 },
-    }
-    btn:add_flag(lvgl.FLAG.CLICKABLE)
-    btn:onevent(lvgl.EVENT.PRESSED, function()
-        if not game.running then return end
-        game.sfx_muted = not game.sfx_muted
-        save_muted(game.sfx_muted)
-        if game.sfx_muted then
-            if game.flap_snd then game.flap_snd:stop() end
-            if game.gameover_snd then game.gameover_snd:stop() end
-        end
-        btn:set{ text = game.sfx_muted and "SFX OFF" or "SFX ON" }
-    end)
-    return btn
-end
-
-local function entry()
-    local scr = screenCreate()   -- apps.new_root inside: already registered
-    game.scr = scr
-    local bird, pipes, sysLayer
-    local gameStart, gameOver
-    local scoreBest = load_score() or 0
-    local scoreNow = 0
-    local debouncing = false
-    game.sfx_muted = load_muted()
+    game.snd_hit = reg(sound.generateTone(200, 90, {
+        end_freq = 70, waveform = "square",
+        attack = 1, decay = 60, sustain = 0.3, release = 30,
+    }))
 
     -- Game over: chromatic descent, plays once
-    game.gameover_snd = sound.generateMelody({
+    game.snd_die = reg(sound.generateMelody({
         {freq=659, ms=250}, {freq=0, ms=30},
         {freq=622, ms=250}, {freq=0, ms=30},
         {freq=587, ms=250}, {freq=0, ms=30},
@@ -575,206 +175,677 @@ local function entry()
         {freq=440, ms=250}, {freq=0, ms=30},
         {freq=392, ms=400}, {freq=0, ms=50},
         {freq=330, ms=700},
-    }, { waveform = "square", attack = 10, decay = 80, sustain = 0.4, release = 100 })
+    }, { waveform = "square", attack = 10, decay = 80, sustain = 0.4, release = 100 }))
 
-    -- Flap sound: 600ms to match 3-frame @ 5fps wing animation cycle
-    game.flap_snd = sound.generateTone(200, 600, {
-        end_freq = 100,
-        waveform = "triangle",
-        attack = 5,
-        decay = 150,
-        sustain = 0.0,
-        release = 50,
-    })
-    if game.flap_snd then game.flap_snd:setLoop(true) end
+    game.sounds = list
+end
 
-    local scoreLabel
-    local function createScoreLabel()
-        if not scoreLabel then
-            scoreLabel = sysLayer:Label{
-                text = "000",
-                text_font = lvgl.BUILTIN_FONT.MONTSERRAT_28,
-                align = { type = lvgl.ALIGN.TOP_LEFT, x_ofs = 0, y_ofs = 50 }
-            }
+-- ── Sprite atlas ────────────────────────────────────────────────────────────
+local SPRITES = {
+    "bird1", "bird2", "bird3", "pipe_up", "pipe_down",
+    "medals", "score", "text_game_over", "title",
+    "button_play", "button_quit",
+}
+
+local function load_sprites(root)
+    atlas_store = root:Object{ w = 1, h = 1, bg_opa = 0, border_width = 0, pad_all = 0 }
+    atlas_store:clear_flag(lvgl.FLAG.SCROLLABLE)
+    atlas_store:add_flag(lvgl.FLAG.HIDDEN)
+
+    local probe = atlas_store:Image{}
+    for _, name in ipairs(SPRITES) do
+        local path = IMAGE_PATH .. name .. ".png"
+        local w, h = probe:get_img_size(path)
+        if not w or not h then
+            error("asset failed to load: " .. name .. ".png", 0)
         end
+        local c = atlas_store:Canvas{ w = w, h = h, cf = lvgl.COLOR_FORMAT.ARGB8888 }
+        c:fill_bg("#000000", 0)
+        c:draw_image{ x1 = 0, y1 = 0, x2 = w - 1, y2 = h - 1, src = path, opa = 255 }
+        atlas[name] = { src = c:get_image(), w = w, h = h }
     end
-    local scoreUpdateCB = function(score)
-        if not game.running then return end
-        if scoreLabel then scoreLabel:set{ text = string.format("%03d", score) } end
-        scoreNow = score
+    probe:delete()
+end
+
+local function decorate_night(c, w, h)
+    c:draw_rect{ x1 = 0, y1 = 0, x2 = w - 1, y2 = h - 1,
+                 bg_color = "#0a1233", bg_opa = 165 }
+    for _ = 1, 42 do
+        local sx = random(0, w - 2)
+        local sy = random(3, floor(h * 0.55))
+        local s = random(1, 2)
+        c:draw_rect{ x1 = sx, y1 = sy, x2 = sx + s - 1, y2 = sy + s - 1,
+                     bg_color = "#FFFFFF", bg_opa = random(120, 255) }
     end
+end
 
-    gameStart = function()
-        if not game.running or game.playing then return end
-        bird:reset()
-        pipes:reset()
-        pipes:start()
-        bird:start()
-        game.playing = true
-        if game.gameover_snd then game.gameover_snd:stop() end
-        scoreNow = 0
-        createScoreLabel()
+-- Tile a strip image across a canvas one tile wider than the screen; scrolling
+-- wraps x over one tile width so the seam never shows. Opaque tiles -> RGB565.
+local function make_scroll_strip(root, path, y, night)
+    local probe = atlas_store:Image{}
+    local tw, th = probe:get_img_size(path)
+    probe:delete()
+    if not tw or not th then
+        error("asset failed to load: " .. path, 0)
     end
-
-    gameOver = function()
-        if not game.running or not game.playing then return end
-        debouncing = true
-        game.playing = false
-        if game.flap_snd then game.flap_snd:stop() end
-        if game.gameover_snd and not game.sfx_muted then game.gameover_snd:play() end
-        pipes:stop()
-        bird:gameOver()
-        if scoreNow > scoreBest then
-            scoreBest = scoreNow
-            save_score(scoreBest)
-        end
-        if scoreLabel then scoreLabel:delete() scoreLabel = nil end
-
-        game.gameoverImg = Image(sysLayer, IMAGE_PATH .. "text_game_over.png").widget
-        game.gameoverImg:set{ align = { type = lvgl.ALIGN.TOP_MID, y_ofs = math.floor(H * 0.2) } }
-
-        game.gameoverImgAnim = game.gameoverImg:Anim{
-            run = true, start_value = 0, end_value = 3600,
-            time = 5000, repeat_count = 2, path = "bounce",
-            exec_cb = function(obj, value)
-                if not game.running then return end
-                obj:set{ rotation = value }
-            end
-        }
-        game:trackAnim(game.gameoverImgAnim)
-
-        local scoreImg = Image(sysLayer, IMAGE_PATH .. "score.png").widget
-        scoreImg:set{ align = { type = lvgl.ALIGN.TOP_LEFT, y_ofs = 0 } }
-        local scoreImgAnim = scoreImg:Anim{
-            run = true, start_value = H, end_value = 0,
-            time = 1000, repeat_count = 1, path = "ease_in",
-            exec_cb = function(obj, value)
-                if not game.running then return end
-                obj:set{ align = { type = lvgl.ALIGN.TOP_LEFT, x_ofs = 0, y_ofs = value } }
-            end
-        }
-        game:trackAnim(scoreImgAnim)
-
-        scoreImg:Label{
-            text = string.format("%03d", scoreNow),
-            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
-            align = { type = lvgl.ALIGN.TOP_LEFT, x_ofs = 15, y_ofs = 25 }
-        }
-
-        scoreImg:Label{
-            text = string.format("%03d", scoreBest),
-            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
-            align = { type = lvgl.ALIGN.BOTTOM_LEFT, x_ofs = 15, y_ofs = -5 }
-        }
-        scoreNow = 0
-
-        local playBtn
-        local quitBtn
-        playBtn = createPlayBtn(sysLayer, function(obj, code)
-            if debouncing then return end
-            gameStart()
-            quitBtn:delete(); quitBtn = nil
-            playBtn:delete(); playBtn = nil
-            game.gameoverImgAnim:delete(); game.gameoverImgAnim = nil
-            game.gameoverImg:delete(); game.gameoverImg = nil
-            scoreImg:delete(); scoreImg = nil
-
-            createScoreLabel()
-
-            local grp = lvgl.group.get_default()
-            grp:add_obj(bgLayer.bgLayer)
-            lvgl.group.focus_obj(bgLayer.bgLayer)
-        end)
-
-        quitBtn = createQuitBtn(sysLayer)
-        _gridnav_add(sysLayer, GRIDNAV_ROLLOVER)
-        local grp = lvgl.group.get_default()
-        grp:add_obj(sysLayer)
-
-        local debTimer = lvgl.Timer {
-            period = 1000,
-            cb = function(t)
-                t:delete()
-                if not game.running then return end
-                debouncing = false
-            end
-        }
-        game:trackTimer(debTimer)
+    local w = W + tw
+    local c = root:Canvas{ w = w, h = th, cf = lvgl.COLOR_FORMAT.RGB565, x = 0, y = y }
+    for x = 0, w - 1, tw do
+        c:draw_image{ x1 = x, y1 = 0, x2 = x + tw - 1, y2 = th - 1, src = path, opa = 255 }
     end
+    if night then decorate_night(c, w, th) end
+    return c, tw
+end
 
-    local bgEventCB = function(event)
-        if not game.running or not game.playing then return end
-        if event == lvgl.EVENT.PRESSED then
-            bird:pressed()
-            if game.flap_snd and not game.sfx_muted then game.flap_snd:play() end
-        else
-            bird:released()
-            if game.flap_snd then game.flap_snd:stop() end
-        end
+-- ── Small helpers ───────────────────────────────────────────────────────────
+local function gap_for(s)
+    local g = GAP_MAX - floor(s / 3) * 2
+    if g < GAP_MIN then g = GAP_MIN end
+    return g
+end
+
+local function rand_gap_y(gap)
+    return random(GAP_MARGIN, GROUND_Y - gap - GAP_MARGIN)
+end
+
+local function place_pipe(p)
+    local xi = floor(p.x)
+    p.xi = xi
+    T_XY.x = xi
+    T_XY.y = p.gy - PIPE_H
+    p.top:set(T_XY)
+    T_XY.y = p.gy + p.gap
+    p.bot:set(T_XY)
+end
+
+local function set_phase(phase)
+    if phase == world.phase then return end
+    world.phase = phase
+    if phase == 1 then
+        scene.sky_day:add_flag(lvgl.FLAG.HIDDEN)
+        scene.sky_night:clear_flag(lvgl.FLAG.HIDDEN)
+    else
+        scene.sky_night:add_flag(lvgl.FLAG.HIDDEN)
+        scene.sky_day:clear_flag(lvgl.FLAG.HIDDEN)
     end
+end
 
-    local birdMovedCB = function(x, y)
-        if not game.running then return end
-        pipes:setObjInfo(bird.x, bird.y)
+local function scroll_world(dx)
+    local w = world
+    w.land_off = (w.land_off + dx) % LAND_TILE_W
+    local lx = -floor(w.land_off)
+    if lx ~= w.land_x then
+        w.land_x = lx
+        T_X.x = lx
+        scene.land:set(T_X)
     end
-
-    local collisionCB = function()
-        if not game.running then return end
-        local t = lvgl.Timer { period = 10, cb = function(t)
-            t:delete()
-            if not game.running then return end
-            gameOver()
-        end }
-        game:trackTimer(t)
+    w.sky_off = (w.sky_off + dx * SKY_PARALLAX) % SKY_TILE_W
+    local sx = -floor(w.sky_off)
+    if sx ~= w.sky_x then
+        w.sky_x = sx
+        T_X.x = sx
+        scene.sky_day:set(T_X)
+        scene.sky_night:set(T_X)
     end
+end
 
-    -- background layer (scrolling sky + pipes + scrolling land)
-    local bgLayer = Background(scr, bgEventCB)
-    game.bgLayer = bgLayer
-    pipes = bgLayer.pipes
-    game.pipes = pipes
-    pipes:setCollisionCB(collisionCB)
-    pipes:setScoreUpdateCB(scoreUpdateCB)
+local function animate_wings()
+    bird.ft = bird.ft + 1
+    if bird.ft >= 4 then
+        bird.ft = 0
+        local f = bird.frame % 4 + 1
+        bird.frame = f
+        T_SRC.src = WING_SEQ[f]
+        scene.bird:set(T_SRC)
+    end
+end
 
-    -- main layer (bird)
-    local mainLayer = screenCreate(scr)
-    bird = Bird(mainLayer, birdMovedCB)
-    game.bird = bird
-    pipes:setObjInfo(bird.x, bird.y, bird.w, bird.h)
+-- ── Overlays (menu / game over) ─────────────────────────────────────────────
+local function quit_app()
+    if not game.running then return end
+    game.running = false
+    apps.go_home()   -- runs the on_close cleanup, then deletes timers + root
+end
 
-    -- system layer (UI overlays)
-    sysLayer = SysLayer(scr)
-    game.sysLayer = sysLayer
+local function close_overlay()
+    if scene.overlay then
+        scene.overlay:delete()
+        scene.overlay = nil
+        lvgl.group.focus_obj(scene.root)
+    end
+end
 
-    local title = Image(sysLayer, IMAGE_PATH .. "title.png").widget
-    title:set{ align = { type = lvgl.ALIGN.TOP_MID, y_ofs = math.floor(H * 0.15) } }
+local function make_overlay()
+    local cont = scene.root:Object{ w = W, h = H, bg_opa = 0, border_width = 0, pad_all = 0 }
+    cont:clear_flag(lvgl.FLAG.CLICKABLE)
+    cont:clear_flag(lvgl.FLAG.SCROLLABLE)
+    scene.overlay = cont
+    return cont
+end
 
-    local playBtn
-    local quitBtn
-    playBtn = createPlayBtn(sysLayer, function()
-        quitBtn:delete(); quitBtn = nil
-        playBtn:delete(); playBtn = nil
-        title:delete(); title = nil
-
-        local medal = Image(sysLayer, IMAGE_PATH .. "medals.png").widget
-        medal:set{ align = { type = lvgl.ALIGN.TOP_LEFT, y_ofs = 4, x_ofs = 4 } }
-        createScoreLabel()
-
-        local grp = lvgl.group.get_default()
-        grp:add_obj(bgLayer.bgLayer)
-        lvgl.group.focus_obj(bgLayer.bgLayer)
-
-        gameStart()
-    end)
-
-    quitBtn = createQuitBtn(sysLayer)
-    _gridnav_add(sysLayer, GRIDNAV_ROLLOVER)
+-- Buttons must be direct children of the gridnav'd container.
+local function arm_overlay(cont)
+    _gridnav_add(cont, GRIDNAV_ROLLOVER)
     local grp = lvgl.group.get_default()
-    grp:add_obj(sysLayer)
+    grp:add_obj(cont)
+    lvgl.group.focus_obj(cont)
+end
 
-    -- Created last on the root: z-topmost, survives the menu/play/game-over
-    -- button churn (only explicitly-deleted widgets go).
-    createMuteBtn(scr)
+local function image_button(parent, sprite, cb)
+    local btn = parent:Image{ src = sprite.src }
+    -- gridnav focus needs CLICKABLE and CLICK_FOCUSABLE together; image
+    -- widgets carry neither by default.
+    btn:add_flag(lvgl.FLAG.CLICKABLE)
+    btn:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+    btn:onevent(lvgl.EVENT.PRESSED, function()
+        if not game.running then return end
+        cb()
+    end)
+    return btn
+end
+
+-- ── Input ───────────────────────────────────────────────────────────────────
+local function flap()
+    bird.vy = FLAP_VY
+    bird.rot = -300           -- tenths of a degree
+    T_ROT.rotation = -300
+    scene.bird:set(T_ROT)
+    sfx(game.snd_flap)
+end
+
+local function start_play()
+    game.state = S_PLAY
+    scene.ready1:add_flag(lvgl.FLAG.HIDDEN)
+    scene.ready2:add_flag(lvgl.FLAG.HIDDEN)
+end
+
+local function on_tap()
+    if not game.running then return end
+    local st = game.state
+    if st == S_PLAY then
+        flap()
+    elseif st == S_READY then
+        start_play()
+        flap()
+    end
+end
+
+-- Any key flaps except the trackball's arrow keys (nudging the trackball must
+-- not count as a tap). Trackball click arrives as PRESSED, not KEY.
+local function on_key()
+    if not game.running then return end
+    local indev = lvgl.indev.get_act()
+    local key = indev and indev:get_key() or 0
+    if key == lvgl.KEY.UP or key == lvgl.KEY.DOWN
+       or key == lvgl.KEY.LEFT or key == lvgl.KEY.RIGHT
+       or key == lvgl.KEY.ESC then
+        return
+    end
+    on_tap()
+end
+
+-- ── Scoring ─────────────────────────────────────────────────────────────────
+local function add_score()
+    score = score + 1
+    set_txt(scene.score, tostring(score))
+    sfx(game.snd_point)
+    if score % 10 == 0 then
+        set_phase(floor(score / 10) % 2)
+    end
+    world.speed = SPEED0 + score * SPEED_RAMP
+    if world.speed > SPEED_MAX then world.speed = SPEED_MAX end
+end
+
+-- ── State transitions ───────────────────────────────────────────────────────
+enter_menu = function()
+    game.state = S_MENU
+    local cont = make_overlay()
+
+    local title = cont:Image{ src = atlas.title.src }
+    title:set{ align = { type = lvgl.ALIGN.TOP_MID, y_ofs = floor(H * 0.15) } }
+
+    local play = image_button(cont, atlas.button_play, enter_ready)
+    play:set{ align = { type = lvgl.ALIGN.CENTER, y_ofs = floor(H / 6) } }
+
+    local quit = image_button(cont, atlas.button_quit, quit_app)
+    quit:set{ align = { type = lvgl.ALIGN.TOP_RIGHT } }
+
+    arm_overlay(cont)
+end
+
+enter_ready = function()
+    close_overlay()
+    game.state = S_READY
+    score = 0
+    game.new_best = false
+    world.speed = SPEED0
+
+    bird.vy = 0
+    bird.rot = 0
+    bird.frame = 1
+    bird.ft = 0
+    bird.bob = 0
+    bird.y = bird.base
+    bird.last_y = bird.base
+    T_XY.x = BIRD_X
+    T_XY.y = bird.base
+    scene.bird:set(T_XY)
+    T_ROT.rotation = 0
+    scene.bird:set(T_ROT)
+    T_SRC.src = WING_SEQ[1]
+    scene.bird:set(T_SRC)
+
+    -- Park the pipes off the right edge; they enter once play starts.
+    for i = 1, PIPE_N do
+        local p = pipes[i]
+        p.x = W + 60 + (i - 1) * STRIDE
+        p.gap = GAP_MAX
+        p.gy = rand_gap_y(GAP_MAX)
+        p.scored = false
+        place_pipe(p)
+    end
+
+    set_txt(scene.score, "0")
+    scene.score:clear_flag(lvgl.FLAG.HIDDEN)
+    scene.ready1:clear_flag(lvgl.FLAG.HIDDEN)
+    scene.ready2:clear_flag(lvgl.FLAG.HIDDEN)
+    set_phase(0)
+end
+
+enter_dying = function()
+    game.state = S_DYING
+    game.flash_t = 2
+    scene.flash:clear_flag(lvgl.FLAG.HIDDEN)
+    if bird.vy < -120 then bird.vy = -120 end
+    sfx(game.snd_hit)
+    game.new_best = score > 0 and score > best
+    if score > best then
+        best = score
+        save_score(best)
+    end
+end
+
+enter_over = function()
+    game.state = S_OVER
+    scene.score:add_flag(lvgl.FLAG.HIDDEN)
+    sfx(game.snd_die)
+
+    local cont = make_overlay()
+
+    local go = cont:Image{ src = atlas.text_game_over.src }
+    go:set{ align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 14 } }
+
+    local panel = cont:Image{ src = atlas.score.src, x = 155, y = 70 }
+    panel:Label{
+        text = tostring(score),
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
+        text_color = "#FFFFFF",
+        align = { type = lvgl.ALIGN.TOP_LEFT, x_ofs = 15, y_ofs = 25 },
+    }
+    panel:Label{
+        text = tostring(best),
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
+        text_color = "#FFFFFF",
+        align = { type = lvgl.ALIGN.BOTTOM_LEFT, x_ofs = 15, y_ofs = -5 },
+    }
+
+    if score >= 10 then
+        local medal = cont:Image{ src = atlas.medals.src, x = 95, y = 96 }
+        local tier
+        if score >= 40 then
+            tier = "PLATINUM"
+            medal:set{ image_recolor = "#E8F4F8", image_recolor_opa = 200 }
+        elseif score >= 30 then
+            tier = "GOLD"
+        elseif score >= 20 then
+            tier = "SILVER"
+            medal:set{ image_recolor = "#C9CDD4", image_recolor_opa = 200 }
+        else
+            tier = "BRONZE"
+            medal:set{ image_recolor = "#A9642C", image_recolor_opa = 190 }
+        end
+        cont:Label{
+            text = tier,
+            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+            text_color = "#FFFFFF",
+            x = 117 - #tier * 4, y = 146,
+        }
+    end
+
+    if game.new_best then
+        cont:Label{
+            text = "NEW\nBEST!",
+            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+            text_color = "#FF5050",
+            bg_color = "#000000", bg_opa = 120,
+            radius = 4, pad_all = 4,
+            x = 20, y = 100,
+        }
+    end
+
+    local restart = image_button(cont, atlas.button_play, enter_ready)
+    restart:set{ align = { type = lvgl.ALIGN.BOTTOM_MID, x_ofs = -45, y_ofs = -2 } }
+    local quit = image_button(cont, atlas.button_quit, quit_app)
+    quit:set{ align = { type = lvgl.ALIGN.BOTTOM_MID, x_ofs = 55, y_ofs = -6 } }
+
+    arm_overlay(cont)
+
+    -- Slide the whole board in from above; tick_over eases it to 0.
+    game.over_y = -H
+    T_Y.y = -H
+    cont:set(T_Y)
+end
+
+-- ── Per-state ticks ─────────────────────────────────────────────────────────
+local function tick_menu_ready()
+    scroll_world(SPEED0 * DT)
+    animate_wings()
+    bird.bob = bird.bob + 0.16
+    local y = bird.base + floor(sin(bird.bob) * 4 + 0.5)
+    if y ~= bird.last_y then
+        bird.last_y = y
+        T_Y.y = y
+        scene.bird:set(T_Y)
+    end
+end
+
+local function tick_play()
+    local dx = world.speed * DT
+    scroll_world(dx)
+    animate_wings()
+
+    -- Bird physics
+    local b = bird
+    b.vy = b.vy + GRAVITY * DT
+    if b.vy > VY_MAX then b.vy = VY_MAX end
+    b.y = b.y + b.vy * DT
+    if b.y < CEILING then
+        b.y = CEILING
+        b.vy = 0
+    end
+    local yi = floor(b.y)
+    if yi ~= b.last_y then
+        b.last_y = yi
+        T_Y.y = yi
+        scene.bird:set(T_Y)
+    end
+
+    -- Nose follows the fall; flap() snaps it back up.
+    if b.vy > 0 then
+        local target = floor(b.vy * 3) - 150
+        if target > 900 then target = 900 end
+        if target > b.rot then
+            b.rot = b.rot + 60
+            if b.rot > target then b.rot = target end
+            T_ROT.rotation = b.rot
+            scene.bird:set(T_ROT)
+        end
+    end
+
+    if b.y + BIRD_H >= GROUND_Y then
+        enter_dying()
+        return
+    end
+
+    -- Pipes: move, recycle, collide, score
+    local bx1 = BIRD_X + HIT_INSET
+    local bx2 = BIRD_X + BIRD_W - HIT_INSET
+    local by1 = b.y + HIT_INSET
+    local by2 = b.y + BIRD_H - HIT_INSET
+    for i = 1, PIPE_N do
+        local p = pipes[i]
+        p.x = p.x - dx
+        if p.x < -PIPE_W then
+            p.x = p.x + PIPE_N * STRIDE
+            p.gap = gap_for(score)
+            p.gy = rand_gap_y(p.gap)
+            p.scored = false
+            place_pipe(p)
+        else
+            local xi = floor(p.x)
+            if xi ~= p.xi then
+                p.xi = xi
+                T_X.x = xi
+                p.top:set(T_X)
+                p.bot:set(T_X)
+            end
+        end
+        if bx2 > p.x and bx1 < p.x + PIPE_W then
+            if by1 < p.gy or by2 > p.gy + p.gap then
+                enter_dying()
+                return
+            end
+        elseif not p.scored and p.x + PIPE_W < bx1 then
+            p.scored = true
+            add_score()
+        end
+    end
+end
+
+local function tick_dying()
+    if game.flash_t > 0 then
+        game.flash_t = game.flash_t - 1
+        if game.flash_t == 0 then scene.flash:add_flag(lvgl.FLAG.HIDDEN) end
+    end
+
+    -- World frozen; the bird tumbles to the ground.
+    local b = bird
+    b.vy = b.vy + GRAVITY * DT
+    if b.vy > VY_MAX then b.vy = VY_MAX end
+    b.y = b.y + b.vy * DT
+    local floor_y = GROUND_Y - BIRD_H
+    local landed = false
+    if b.y >= floor_y then
+        b.y = floor_y
+        landed = true
+    end
+    local yi = floor(b.y)
+    if yi ~= b.last_y then
+        b.last_y = yi
+        T_Y.y = yi
+        scene.bird:set(T_Y)
+    end
+    if b.rot < 900 then
+        b.rot = b.rot + 120
+        if b.rot > 900 then b.rot = 900 end
+        T_ROT.rotation = b.rot
+        scene.bird:set(T_ROT)
+    end
+
+    if landed then enter_over() end
+end
+
+local function tick_over()
+    local oy = game.over_y
+    if oy < 0 and scene.overlay then
+        oy = oy * 0.6
+        if oy > -2 then oy = 0 end
+        game.over_y = oy
+        T_Y.y = floor(oy)
+        scene.overlay:set(T_Y)
+    end
+end
+
+local function tick()
+    if not game.running then return end
+    local st = game.state
+    if st == S_PLAY then
+        tick_play()
+    elseif st == S_MENU or st == S_READY then
+        tick_menu_ready()
+    elseif st == S_DYING then
+        tick_dying()
+    elseif st == S_OVER then
+        tick_over()
+    end
+end
+
+-- ── Scene construction ──────────────────────────────────────────────────────
+local function make_mute_chip(root)
+    -- Touch-only on purpose: the chip is in no group, so trackball focus can
+    -- never wander onto it mid-round.
+    local chip = root:Label{
+        text = game.muted and "SFX OFF" or "SFX ON",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        text_color = "#FFFFFF",
+        bg_color = "#000000", bg_opa = 120,
+        radius = 4, pad_all = 4,
+        align = { type = lvgl.ALIGN.TOP_RIGHT, y_ofs = 64, x_ofs = -4 },
+    }
+    chip:add_flag(lvgl.FLAG.CLICKABLE)
+    chip:onevent(lvgl.EVENT.PRESSED, function()
+        if not game.running then return end
+        game.muted = not game.muted
+        save_muted(game.muted)
+        if game.muted then
+            for _, s in ipairs(game.sounds) do s:stop() end
+        end
+        set_txt(chip, game.muted and "SFX OFF" or "SFX ON")
+    end)
+    return chip
+end
+
+local function build(root)
+    load_sprites(root)
+    WING_SEQ = { atlas.bird1.src, atlas.bird2.src, atlas.bird3.src, atlas.bird2.src }
+
+    -- Back-to-front: skies, pipes, land (covers pipe bottoms), bird, flash, UI.
+    scene.sky_day, SKY_TILE_W = make_scroll_strip(root, IMAGE_PATH .. "bg_day.png", 0, false)
+    scene.sky_night = make_scroll_strip(root, IMAGE_PATH .. "bg_day.png", 0, true)
+    scene.sky_night:add_flag(lvgl.FLAG.HIDDEN)
+
+    pipes = {}
+    for i = 1, PIPE_N do
+        pipes[i] = {
+            x = W + 60, gy = 100, gap = GAP_MAX, scored = false, xi = nil,
+            -- pipe_up.png's cap is at its bottom edge -> it hangs from the top;
+            -- pipe_down.png's cap is at its top edge -> it stands below the gap.
+            top = root:Image{ src = atlas.pipe_up.src, x = W + 60, y = 100 - PIPE_H },
+            bot = root:Image{ src = atlas.pipe_down.src, x = W + 60, y = 100 + GAP_MAX },
+        }
+    end
+
+    scene.land, LAND_TILE_W = make_scroll_strip(root, IMAGE_PATH .. "land.png", GROUND_Y, false)
+
+    bird.base = floor(H / 2 - BIRD_H / 2)
+    scene.bird = root:Image{ src = atlas.bird1.src, x = BIRD_X, y = bird.base }
+
+    scene.flash = root:Object{
+        w = W, h = H, x = 0, y = 0,
+        bg_color = "#FFFFFF", bg_opa = 200,
+        border_width = 0, pad_all = 0,
+    }
+    scene.flash:clear_flag(lvgl.FLAG.CLICKABLE)
+    scene.flash:clear_flag(lvgl.FLAG.SCROLLABLE)
+    scene.flash:add_flag(lvgl.FLAG.HIDDEN)
+
+    local ui = root:Object{ w = W, h = H, x = 0, y = 0, bg_opa = 0, border_width = 0, pad_all = 0 }
+    ui:clear_flag(lvgl.FLAG.CLICKABLE)
+    ui:clear_flag(lvgl.FLAG.SCROLLABLE)
+    scene.ui = ui
+
+    scene.score = ui:Label{
+        text = "0",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_28,
+        text_color = "#FFFFFF",
+        bg_color = "#000000", bg_opa = 110,
+        radius = 6, pad_all = 5,
+        align = { type = lvgl.ALIGN.TOP_MID, y_ofs = 6 },
+    }
+    scene.score:add_flag(lvgl.FLAG.HIDDEN)
+
+    scene.ready1 = ui:Label{
+        text = "GET READY",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_28,
+        text_color = "#FFFFFF",
+        bg_color = "#000000", bg_opa = 120,
+        radius = 6, pad_all = 6,
+        align = { type = lvgl.ALIGN.CENTER, y_ofs = -34 },
+    }
+    scene.ready1:add_flag(lvgl.FLAG.HIDDEN)
+
+    scene.ready2 = ui:Label{
+        text = "tap or press any key to flap",
+        text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+        text_color = "#FFFFFF",
+        bg_color = "#000000", bg_opa = 120,
+        radius = 4, pad_all = 4,
+        align = { type = lvgl.ALIGN.CENTER, y_ofs = 4 },
+    }
+    scene.ready2:add_flag(lvgl.FLAG.HIDDEN)
+
+    scene.mute = make_mute_chip(root)
+
+    -- The root is the tap catcher and key sink; overlay buttons sit above it
+    -- and win the hit test. Not CLICK_FOCUSABLE: focus is managed on state
+    -- changes, and a background tap during a menu must not steal focus from
+    -- the overlay's gridnav.
+    root:add_flag(lvgl.FLAG.CLICKABLE)
+    root:onevent(lvgl.EVENT.PRESSED, on_tap)
+    root:onevent(lvgl.EVENT.KEY, on_key)
+    local grp = lvgl.group.get_default()
+    grp:add_obj(root)
+
+    print("[flappy] scene ready: " .. #SPRITES .. " sprites, strips "
+          .. (W + SKY_TILE_W) .. "x" .. H .. " + " .. (W + LAND_TILE_W) .. "x" .. LAND_H)
+end
+
+-- ── Entry ───────────────────────────────────────────────────────────────────
+local function entry()
+    local root = apps.new_root{
+        w = W, h = H,
+        bg_color = "#000000", bg_opa = lvgl.OPA(255),
+        border_width = 0, pad_all = 0,
+    }
+    root:clear_flag(lvgl.FLAG.SCROLLABLE)
+    scene.root = root
+
+    game.muted = load_muted()
+    best = load_score()
+
+    local ok, err = pcall(build, root)
+    if not ok then
+        -- Degraded screen instead of raising out of the loader.
+        print("[flappy] build failed: " .. tostring(err))
+        root:Label{
+            text = "Flappy Bird failed to start:\n" .. tostring(err),
+            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_14,
+            text_color = "#FFFFFF",
+            align = { type = lvgl.ALIGN.CENTER, y_ofs = -24 },
+        }
+        local back = root:Label{
+            text = "  Back  ",
+            text_font = lvgl.BUILTIN_FONT.MONTSERRAT_22,
+            text_color = "#FFFFFF",
+            bg_color = "#333333", bg_opa = 255,
+            radius = 6, pad_all = 8,
+            align = { type = lvgl.ALIGN.CENTER, y_ofs = 36 },
+        }
+        back:add_flag(lvgl.FLAG.CLICKABLE)
+        back:add_flag(lvgl.FLAG.CLICK_FOCUSABLE)
+        back:onevent(lvgl.EVENT.PRESSED, quit_app)
+        _gridnav_add(root, GRIDNAV_ROLLOVER)
+        local grp = lvgl.group.get_default()
+        grp:add_obj(root)
+        lvgl.group.focus_obj(root)
+        return
+    end
+
+    make_sounds()
+    apps.add_timer{ period = TICK_MS, cb = tick }
+    enter_menu()
 end
 
 entry()
+
+-- Cleanup for EVERY exit path (quit button, home chord, app-to-app launch):
+-- go_home runs this before deleting timers and the root, so it must not touch
+-- UI. Registered after entry() because apps.new_root clears any earlier
+-- callback.
+apps.set_on_close(function()
+    game.running = false
+    for _, s in ipairs(game.sounds) do
+        pcall(function() s:delete() end)
+    end
+    game.sounds = {}
+end)
