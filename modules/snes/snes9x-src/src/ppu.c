@@ -10,6 +10,7 @@
 #include "srtc.h"
 #include "fxinst.h"
 #include "fxemu.h"
+#include "sa1.h"
 
 extern const uint8_t mul_brightness [16][32];
 
@@ -631,6 +632,13 @@ void S9xSetPPU(uint8_t Byte, uint16_t Address)
    {
       if (Address == 0x2801 && Settings.SRTC) /* Dai Kaijyu Monogatari II */
          S9xSetSRTC(Byte, Address);
+      else if (Settings.SA1 && Address >= 0x2200 && Address < 0x2400)
+      {
+         /* MESHPUNK: SA-1 control registers — sa1.c stores the FillRAM
+          * mirror itself. */
+         S9xSetSA1(Byte, Address);
+         return;
+      }
       else if (Address >= 0x3000 && Address < 0x3300)
       {
          /* MESHPUNK: SuperFX register file. Writes used to be discarded
@@ -885,6 +893,10 @@ uint8_t S9xGetPPU(uint16_t Address)
    {
       if (Settings.SRTC && Address == 0x2800)
          return S9xGetSRTC(Address);
+
+      /* MESHPUNK: SA-1 status/result registers. */
+      if (Settings.SA1 && Address >= 0x2200 && Address < 0x2400)
+         return S9xGetSA1(Address);
 
       if (Address <= 0x2fff || Address >= 0x3300)
       {
@@ -1746,6 +1758,11 @@ void S9xResetPPU()
 
    for (c = 0; c < 0x8000; c += 0x100)
    {
+      /* MESHPUNK: SA-1 control registers at 0x2200-0x23FF hold S9xSA1Init's
+       * defaults (MMC banks, reset-held flag) — the pattern fill would
+       * clobber them, this reset runs after CommonS9xReset. */
+      if (Settings.SA1 && (uint32_t) c >= 0x2200 && (uint32_t) c < 0x2400)
+         continue;
       if (!Settings.SuperFX)
          memset(&Memory.FillRAM [c], c >> 8, 0x100);
       else if ((uint32_t) c < 0x3000 || (uint32_t) c >= 0x3300) /* Don't overwrite SFX pvRegisters at 0x3000-0x32FF, they were set in FxReset. */

@@ -118,6 +118,9 @@ void gnuboy_set_soundbuffer(void *buffer, size_t length);
 
 void gnuboy_get_time(int *day, int *hour, int *minute, int *second);
 void gnuboy_set_time(int day, int hour, int minute, int second);
+/* MESHPUNK: apply elapsed real time to the MBC3 clock after loading.
+ * Needs gb_host_unix_time() from the platform glue (0 = clock unknown). */
+void gnuboy_rtc_catchup(void);
 int  gnuboy_get_hwtype(void);
 void gnuboy_set_hwtype(gb_hwtype_t type);
 int  gnuboy_get_palette(void);

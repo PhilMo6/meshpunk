@@ -2,11 +2,12 @@
 //
 // Core 0 runs Arduino loop() with LVGL + Lua. Core 1 runs the mesh
 // dispatcher here. They communicate through:
-//   rx_event_queue  : Core 1 -> Core 0  (incoming messages for Lua)
 //   tx_cmd_queue    : Core 0 -> Core 1  (reserved; not used yet)
 //   gps_event_queue : Core 1 -> Core 0  (reserved; see meshpunk_gps_task)
+// (Mesh RX events queue inside the protocol module; the protocol's lua_tick
+// drains them on Core 0.)
 //
-// The mesh task takes MESH_LOCK around the_mesh.loop() so that Lua
+// The mesh task takes MESH_LOCK around lora_proto_loop() so that Lua
 // bindings on Core 0 (which also take MESH_LOCK) cannot race against
 // dispatcher internals. The bus mutex (SPI_LOCK) is taken inside the
 // RadioLib wrappers at the actual SPI transaction sites.
@@ -16,12 +17,13 @@
 #include <freertos/task.h>
 
 #include "meshpunk_sync.h"
-#include "punkmesh.h"
-#include "ble_companion.h"
+#include "radio/proto_loader.h"
+#include "radio/ble_proto.h"
 #include "notify.h"
+#include <helpers/ArduinoHelpers.h>   // VolatileRTCClock
 #include <esp_heap_caps.h>
 
-extern PunkMesh* the_mesh;
+extern VolatileRTCClock* host_rtc;    // host-owned device clock (main.cpp)
 extern volatile uint32_t g_lua_arena_spill_count;   // main.cpp: Lua allocs that missed the arena
 
 static TaskHandle_t s_mesh_task_handle = nullptr;
@@ -45,22 +47,22 @@ static void mesh_task_body(void *param) {
     // serviced on the first loop() after resume.
     if (mesh_task_paused) {
       MESH_LOCK();
-      the_mesh->getRTCClock()->tick();
+      host_rtc->tick();
       MESH_UNLOCK();
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
 
     // MESH_LOCK serializes against Lua bindings on Core 0. Short critical
-    // section — dispatcher work is bounded per call.
+    // section — protocol work is bounded per call (ABI contract; MeshCore's
+    // loop() is the dispatcher pass it always was).
     MESH_LOCK();
-    the_mesh->loop();
-    the_mesh->getRTCClock()->tick();
+    lora_proto_loop();
+    host_rtc->tick();
     MESH_UNLOCK();
 
-#if BLE_COMPANION_ENABLED
-    if (ble_companion) ble_companion->loop();
-#endif
+    // BLE protocol slot: the selected protocol's tick (companion today).
+    ble_proto_loop();
 
     static uint32_t last_heap_log = 0;
     uint32_t now = millis();

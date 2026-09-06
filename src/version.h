@@ -230,13 +230,46 @@
 //                  records a deliberate enable — older configs, which only
 //                  ever wrote `,off`, still load unchanged. Both libs ship with
 //                  the firmware that swallows 0xFD, so no launcher needs a
-//                  min_fw bump for the pad or the binding. NO new
+//                  min_fw bump for the pad or the binding. Also in this
+//                  cycle: the pluggable radio-stack groundwork. _radio_stack()
+//                  returns (active, requested) stack ids and _device_caps
+//                  gains a "stack" field (always "meshcore" until module
+//                  stacks ship); the persisted choice is firmware_prefs
+//                  radio_stack=. Packet capture is now stack-agnostic with
+//                  universal names _pkt_capture/_pkt_poll (the _mesh_pkt_*
+//                  names remain as aliases). An app reading any of these
+//                  needs min_fw=11. NO new
 //                  ELF host_exports this cycle, so no module gains a
 //                  load-time dependency on level 11
-#define MESHPUNK_FW_API 11
+// 12 (unreleased): the protocol-packages fold — one level for the whole
+//                  A→E campaign plus the cutover. The firmware is
+//                  protocol-free: MeshCore runs only as the installed
+//                  protocol package (lora_protos/meshcore, LoraProtoOps ABI
+//                  v3 + BleProtoOps v1); a selected-but-missing protocol
+//                  boots the no-radio floor with a notice. New/changed app
+//                  surface: lib/reboot_prompt.lua; the id-keyed app registry
+//                  (.version "id=" line — split display names need it);
+//                  _ble_proto_list now lists installed .bleproto.elf
+//                  packages (registry rows died with the builtin);
+//                  _store_summaries serves DM threads only unless the
+//                  active protocol overrides it; offline protocol settings
+//                  (_lora_proto_config_* by id) and the two-slot BLE picker.
+//                  VOCABULARY RENAME (pre-release, nothing fielded used the
+//                  old names beyond level 11's meshcore-only defaults): the
+//                  level-11 names _radio_stack/_device_caps.stack and the
+//                  radio_stack= pref are REPLACED by _lora_proto (+_set/
+//                  _list/_info/_send_channel/_send_text/_peers/_config_get/
+//                  _config_set), _device_caps.lora_proto, and the
+//                  lora_protocol= pref (an absent pref = meshcore, exactly
+//                  what any fielded device ran); packages live in
+//                  lora_protos/<id>/ as .loraproto.elf exporting
+//                  loraproto_ops. Apps relying on any of this need
+//                  min_fw=12.
+#define MESHPUNK_FW_API 12
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
-// ble_companion.cpp). Versioned separately from MESHPUNK_FW_API on purpose:
+// the meshcore package's ble_companion.cpp, which compiles against this
+// header). Versioned separately from MESHPUNK_FW_API on purpose:
 // this tracks what BLE client apps understand, not what store apps need.
 #define MESHPUNK_FW_VER_CODE     11
 #define MESHPUNK_FW_VERSION      "v1.15.0"

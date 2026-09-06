@@ -9,6 +9,7 @@
 #include "dma.h"
 #include "srtc.h"
 #include "obc1.h"
+#include "sa1.h"
 
 void S9xResetCPU()
 {
@@ -73,6 +74,10 @@ static void CommonS9xReset()
       S9xInitC4();
    if (Settings.SuperFX)
       S9xResetSuperFX();
+   /* MESHPUNK: arms the held-in-reset state; the game's $2200 write with
+    * bit 5 cleared is what actually starts the SA-1 (S9xSA1Reset). */
+   if (Settings.SA1)
+      S9xSA1Init();
 }
 
 void S9xReset()

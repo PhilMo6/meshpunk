@@ -26,6 +26,10 @@ SPIClass& board_sd_spi(void);
 #define MESHPUNK_BOARD_NAME "tdeck"
 // Display form of the same, used to build the default node name.
 #define MESHPUNK_BOARD_LABEL "T-Deck"
+// Meshtastic HardwareModel enum value for this board (forwarded to the
+// mtlite protocol for its NodeInfo broadcasts): T_DECK = 50 in
+// meshtastic/protobufs mesh.proto.
+#define MESHPUNK_MT_HW_MODEL 50
 
 // LoRa radio (SX1262) — RadioLib Module pins
 #define PIN_LORA_CS    RADIO_CS_PIN
@@ -55,6 +59,10 @@ SPIClass& board_sd_spi(void);
 #define MESHPUNK_BOARD_NAME "heltec_v4"
 // Display form of the same, used to build the default node name.
 #define MESHPUNK_BOARD_LABEL "Heltec V4"
+// Meshtastic HardwareModel enum value for this board (forwarded to the
+// mtlite protocol for its NodeInfo broadcasts): HELTEC_V4_R8 = 132 in
+// meshtastic/protobufs mesh.proto.
+#define MESHPUNK_MT_HW_MODEL 132
 
 // LoRa radio (SX1262) — RadioLib Module pins. The radio has FSPI to itself
 // on this board (the panel is on HSPI); the FEM control lines are separate

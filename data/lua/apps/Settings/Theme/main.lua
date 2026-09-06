@@ -277,7 +277,7 @@ build_downloads = function()
                     return
                 end
                 load_err = "Cannot fetch catalog.\n\n"
-                    .. "Check WiFi in Settings > Wireless, then Refresh."
+                    .. "Check WiFi in Settings > Wifi, then Refresh."
                 build_downloads()
             end)
             return

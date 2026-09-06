@@ -11,6 +11,15 @@
 // Set in the far future for VBA-M support
 #define RTC_BASE 1893456000
 
+/* MESHPUNK: wall clock supplied by the host module; returns 0 while the
+ * device clock is unknown. Timestamps below GB_RTC_WALL_FLOOR are treated
+ * as unset. The pre-catch-up save format wrote RTC_BASE + the rtc counter
+ * into the footer's timestamp slots, so any value >= RTC_BASE carries no
+ * real time: a valid saved wall clock lies in [GB_RTC_WALL_FLOOR, RTC_BASE). */
+extern uint32_t gb_host_unix_time(void);
+#define GB_RTC_WALL_FLOOR 1704067200 /* 2024-01-01 */
+static uint32_t rtc_loaded_wall;
+
 #define BANK_SIZE 0x4000
 
 
@@ -574,12 +583,83 @@ int gnuboy_load_sram(const char *file)
 				.regs = {rtc_buf[5], rtc_buf[6], rtc_buf[7], rtc_buf[8], rtc_buf[9]},
 			};
 			MESSAGE_INFO("Loaded RTC section %03d %02d:%02d:%02d.\n", cart.rtc.d, cart.rtc.h, cart.rtc.m, cart.rtc.s);
+			/* MESHPUNK: stash the saved wall clock for gnuboy_rtc_catchup().
+			 * Real timestamps fit 32 bits, so the high word is zero. */
+			rtc_loaded_wall = (rtc_buf[11] == 0) ? rtc_buf[10] : 0;
 		}
 	}
 
 	fclose(f);
 
 	return cart.sram_saved ? 0 : -1;
+}
+
+
+/* MESHPUNK: advance the MBC3 clock by the real time that passed since the
+ * .sav was written, as the cart's battery-backed clock does while the
+ * console is off. Call once after ALL loading — a savestate restores the
+ * rtc counters too, so a catch-up applied before gnuboy_load_state() would
+ * be overwritten. No-op when either timestamp is missing or implausible
+ * (see rtc_loaded_wall's range comment), or while the MBC3 halt flag is
+ * set (a halted clock does not tick while powered off either). */
+void gnuboy_rtc_catchup(void)
+{
+	uint32_t saved = rtc_loaded_wall;
+	uint32_t now = gb_host_unix_time();
+	uint32_t el, s, m, h, d;
+
+	rtc_loaded_wall = 0;
+
+	if (!cart.has_rtc)
+		return;
+
+	/* Always print the decision for an RTC cart: a silent skip cannot be
+	 * told apart from the pre-catch-up code in a serial log. */
+	if (saved < GB_RTC_WALL_FLOOR || saved >= RTC_BASE)
+	{
+		MESSAGE_INFO("RTC catch-up skipped: saved wall %u (0 = footer absent/blank, >= %u = old format).\n",
+			(unsigned)saved, (unsigned)RTC_BASE);
+		return;
+	}
+	if (now < GB_RTC_WALL_FLOOR)
+	{
+		MESSAGE_INFO("RTC catch-up skipped: no wall clock from host (now=%u).\n",
+			(unsigned)now);
+		return;
+	}
+	if (now <= saved)
+	{
+		MESSAGE_INFO("RTC catch-up skipped: no time elapsed (now=%u saved=%u).\n",
+			(unsigned)now, (unsigned)saved);
+		return;
+	}
+	if (cart.rtc.flags & 0x40)
+	{
+		MESSAGE_INFO("RTC catch-up skipped: clock halted (flags=%02x).\n",
+			(unsigned)cart.rtc.flags);
+		return;
+	}
+
+	el = now - saved;
+	s = (uint32_t)cart.rtc.s + el % 60;
+	m = (uint32_t)cart.rtc.m + (el / 60) % 60;
+	h = (uint32_t)cart.rtc.h + (el / 3600) % 24;
+	d = (uint32_t)cart.rtc.d + el / 86400;
+	if (s >= 60) { s -= 60; m++; }
+	if (m >= 60) { m -= 60; h++; }
+	if (h >= 24) { h -= 24; d++; }
+	if (d >= 365)
+	{
+		cart.rtc.flags |= 0x80; // day-counter overflow, same as rtc_tick's wrap
+		d %= 365;
+	}
+	cart.rtc.s = s;
+	cart.rtc.m = m;
+	cart.rtc.h = h;
+	cart.rtc.d = d;
+
+	MESSAGE_INFO("RTC catch-up +%us -> %03d %02d:%02d:%02d.\n",
+		(unsigned)el, cart.rtc.d, cart.rtc.h, cart.rtc.m, cart.rtc.s);
 }
 
 
@@ -620,7 +700,11 @@ int gnuboy_save_sram(const char *file, bool quick_save)
 
 	if (cart.has_rtc)
 	{
-		uint64_t rt = RTC_BASE + cart.rtc.s + (cart.rtc.m * 60) + (cart.rtc.h * 3600) + (cart.rtc.d * 86400);
+		/* MESHPUNK: the real wall clock (0 = unknown) replaces the original
+		 * RTC_BASE + counter value; gnuboy_rtc_catchup() reads it back to
+		 * advance the clock by the elapsed off time. Same footer slots and
+		 * sizes, so readers of the old format are unaffected. */
+		uint64_t rt = gb_host_unix_time();
 		uint32_t *rtp = (uint32_t*)&rt;
 		uint32_t rtc_buf[12] = {
 			cart.rtc.s,

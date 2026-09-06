@@ -12,10 +12,10 @@
 --     its chat view is open, and drop it again on the way out
 --   * live dispatch from C++ (__dispatch / __dispatch_dm) appends only to an
 --     open bucket and keeps the summaries fresh
---   * unread counters live C-SIDE (punkmesh.cpp bumps them at mesh-task RX),
---     so they keep counting while Lua is torn down for an ELF run; the
---     unread*/markSeen/clearUnread methods below just wrap the _mesh_unread_*
---     bindings
+--   * unread counters live C-SIDE (bumped at mesh-task RX), so they keep
+--     counting while Lua is torn down for an ELF run; the unread*/markSeen/
+--     clearUnread methods below wrap the universal _store_unread_* bindings
+--     (NAME-keyed — channel arguments are channel names, not slot indexes)
 --   * fires onMessage / onDirectMessage / onAnyMessage callbacks
 
 local M = {
@@ -76,19 +76,19 @@ end
 function M:setMaxMessages(n)
     n = tonumber(n)
     if not n or n <= 0 then return end
-    if _mesh_set_max_messages then
-        _mesh_set_max_messages(math.floor(n))
+    if _store_set_max_messages then
+        _store_set_max_messages(math.floor(n))
     end
 end
 
 -- ── Conversation summaries (the inbox model) ────────────────────────────────
 -- One tiny entry per stored conversation ({count, last message}) built C-side
--- by _mesh_get_msg_summaries — a whole busy mesh is a few KB, where the old
--- loadPersisted materialized EVERY history (~1.7MB) and overflowed the Lua
+-- by the universal _store_summaries — a whole busy mesh is a few KB, where the
+-- old loadPersisted materialized EVERY history (~1.7MB) and overflowed the Lua
 -- arena into the shared PSRAM heap. Kept fresh by live dispatch below.
 function M:loadSummaries()
     local sums = { channels = {}, dms = {} }
-    local ok, list = pcall(_mesh_get_msg_summaries)
+    local ok, list = pcall(_store_summaries)
     if ok and type(list) == "table" then
         for _, e in ipairs(list) do
             if e.kind == "channel" then sums.channels[e.idx] = e
@@ -112,7 +112,7 @@ function M:openThread(target)
     M:closeThread()
     -- No in-RAM bucket is loaded: the chat view pages its history straight from
     -- the log file, windowed and bounded (see the Messenger's build_chat, which
-    -- calls _mesh_chat_page_channel/_dm). A busy thread never materializes as Lua
+    -- calls _store_chat_page_channel/_dm). A busy thread never materializes as Lua
     -- tables. The marker only records which thread is open, so live dispatch's
     -- bucket-append (guarded by `if list then`) stays a no-op while it's up.
     if target.type == "channel" then
@@ -659,40 +659,41 @@ end
 -- badge. The counters live C-side (bumped at mesh-task RX, own echoes never
 -- count), so this stays correct across ELF runs that tear Lua down.
 function M:countUnread()
-    local ok, n = pcall(_mesh_unread_total)
+    local ok, n = pcall(_store_unread_total)
     return (ok and n) or 0
 end
 
--- Per-thread unread counts. "Unread" means "arrived while you weren't looking
--- at that conversation" — C++ bumps at RX and these reset when the chat opens.
-function M:unreadInChannel(ch_idx)
-    local ok, n = pcall(_mesh_unread_channel, ch_idx)
+-- Per-thread unread counts, NAME-keyed. "Unread" means "arrived while you
+-- weren't looking at that conversation" — C bumps at RX and these reset when
+-- the chat opens.
+function M:unreadInChannel(ch_name)
+    local ok, n = pcall(_store_unread_channel, ch_name)
     return (ok and n) or 0
 end
 
 function M:unreadInDM(name)
-    local ok, n = pcall(_mesh_unread_dm, name)
+    local ok, n = pcall(_store_unread_dm, name)
     return (ok and n) or 0
 end
 
 -- Badge reset — used by the open chat's live listener so a thread you're
 -- actively viewing never accrues unread.
-function M:clearUnreadChannel(ch_idx)
-    pcall(_mesh_unread_clear_channel, ch_idx)
+function M:clearUnreadChannel(ch_name)
+    pcall(_store_unread_clear_channel, ch_name)
 end
 
 function M:clearUnreadDM(name)
-    pcall(_mesh_unread_clear_dm, name)
+    pcall(_store_unread_clear_dm, name)
 end
 
 -- Called once when a chat view opens. Clears the thread's unread counter, which
 -- (summed) is the topbar's global badge — so opening a thread tidies it.
-function M:markChannelSeen(ch_idx)
-    pcall(_mesh_unread_clear_channel, ch_idx)
+function M:markChannelSeen(ch_name)
+    pcall(_store_unread_clear_channel, ch_name)
 end
 
 function M:markDMSeen(name)
-    pcall(_mesh_unread_clear_dm, name)
+    pcall(_store_unread_clear_dm, name)
 end
 
 -- Public-channel history (idx 0, which also holds unknown-channel messages).

@@ -8,6 +8,9 @@
 //   -scale       : 1x = 160x144 centered, fit = 240x216 (default),
 //                  full = 320x240 stretch
 //   -resume 0|1  : load/save a full state next to the ROM on start/exit
+//   -unixtime N  : current unix time from the launcher; drives MBC3 cart-clock
+//                  catch-up (libc time() reads a clock nothing sets). 0/absent
+//                  = unknown, catch-up is skipped
 
 #include "gnuboy-src/gnuboy.h"
 
@@ -28,6 +31,7 @@
 extern void     host_blit_frame_async(const uint16_t* rgb565, int w, int h);
 extern void     host_clear_screen(void);
 extern uint32_t host_get_ticks_us(void);
+extern uint32_t host_get_ticks_ms(void);
 extern void     host_sleep_ms(uint32_t ms);
 extern int      host_get_key(int* pressed, unsigned char* key);
 extern int      host_should_exit(void);
@@ -42,6 +46,20 @@ extern int      host_link_status(void);
 extern int      host_link_gb_send(int cmd, int data_ctrl, unsigned ts);
 extern int      host_link_gb_poll(unsigned* ts_out);
 extern int      host_link_gb_wait(unsigned timeout_ms);
+
+// ---------------------------------------------------------------------------
+// Wall clock for the MBC3 cart-clock catch-up (gnuboy_rtc_catchup). Seeded
+// by the launcher's -unixtime; ms ticks wrap at 49.7 days, far past any
+// session. 0 = launcher sent nothing usable, gnuboy skips the catch-up.
+// ---------------------------------------------------------------------------
+static uint32_t s_epoch0 = 0;   // unix time at launch
+static uint32_t s_ticks0 = 0;   // host ms tick at launch
+
+uint32_t gb_host_unix_time(void)
+{
+    if (!s_epoch0) return 0;
+    return s_epoch0 + (host_get_ticks_ms() - s_ticks0) / 1000;
+}
 
 // ---------------------------------------------------------------------------
 // Link debug log — every number the lockstep decides on, written to SD so a
@@ -644,6 +662,9 @@ int main(int argc, char** argv) {
             scale_mode = argv[++i];
         } else if (strcmp(argv[i], "-resume") == 0 && i + 1 < argc) {
             resume = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-unixtime") == 0 && i + 1 < argc) {
+            s_epoch0 = (uint32_t)strtoul(argv[++i], NULL, 10);
+            s_ticks0 = host_get_ticks_ms();
         } else if (argv[i][0] == '-') {
             // Unknown flag (-keymap/-trkball are host-consumed but stay in
             // argv): skip it and its value so the value isn't taken as the ROM
@@ -657,8 +678,8 @@ int main(int argc, char** argv) {
         host_log("gameboy: no ROM path given");
         return 1;
     }
-    printf("[gameboy] rom=%s scale=%s pal=%d resume=%d\n",
-           rom_path, scale_mode, pal, resume);
+    printf("[gameboy] rom=%s scale=%s pal=%d resume=%d unixtime=%u\n",
+           rom_path, scale_mode, pal, resume, (unsigned)s_epoch0);
     printf("[gameboy] psram largest free: %u\n",
            (unsigned)host_psram_largest_free());
 
@@ -696,6 +717,9 @@ int main(int argc, char** argv) {
         printf("[gameboy] loaded battery save %s\n", s_sav_path);
     if (resume && gnuboy_load_state(s_sta_path) == 0)
         printf("[gameboy] resumed state %s\n", s_sta_path);
+    // After BOTH loads: a savestate restores the rtc counters too, so an
+    // earlier catch-up would be overwritten. Prints itself when it acts.
+    gnuboy_rtc_catchup();
 
     host_clear_screen();
     host_log("gameboy: entering main loop");

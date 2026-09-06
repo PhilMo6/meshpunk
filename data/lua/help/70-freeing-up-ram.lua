@@ -12,8 +12,8 @@ If an app or game fails to launch with a low-RAM message:
 
 If it still won't launch, switch off what you are not using. Each of these frees a modest amount, so use them together:
 
-- WiFi (Settings > Wireless): leave it off unless you are downloading map tiles, apps, or the extended emoji set.
-- BLE companion (Settings > Wireless): off unless a phone app is connected to the device.
+- WiFi (Settings > Wifi): leave it off unless you are downloading map tiles, apps, or the extended emoji set.
+- BLE (Settings > BLE): set the protocol to none unless a phone app is connected to the device.
 - USB host mode (Tools > USB Host): press Stop when you are done with a USB device. Its own memory use is small, but it also runs background tasks while it is on.
 
 A restart is by far the biggest win here - try that first, every time.]],

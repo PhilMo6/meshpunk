@@ -161,6 +161,16 @@ struct elf_module {
     const char* dynstr;
     uint32_t    dynsym_count;
 
+    // C++ static-constructor lists (.ctors reversed / .init_array forward),
+    // recorded at load (pointers into the loaded segment, entries already
+    // relocated data-side). Run only when the caller asks (elf_run_ctors):
+    // the radio-stack/BLE-proto loaders do; game modules keep their own
+    // historical self-init behavior untouched.
+    uint32_t*   ctors;                 // .ctors entries (run in REVERSE)
+    uint32_t    ctors_count;
+    uint32_t*   init_array;            // .init_array entries (run forward)
+    uint32_t    init_array_count;
+
     // Host export table (borrowed pointer, not owned)
     const elf_symbol_t* exports;
 
@@ -211,6 +221,16 @@ static void* elf_alloc(size_t size, bool executable) {
 // Forward declaration — defined after module struct
 static uint32_t remap_if_text(const elf_module_t* mod, uint32_t addr);
 
+// Cross-module import fallback: a dependent module may import symbols an
+// already-loaded module exports (the BLE-slot protocol elf importing the
+// radio stack elf's). Consulted only after the host exports and the module
+// itself miss; the host sets it around a dependent load and clears it after.
+static void* (*s_symbol_fallback)(const char* name) = NULL;
+
+void elf_set_symbol_fallback(void* (*fn)(const char* name)) {
+    s_symbol_fallback = fn;
+}
+
 static void* resolve_symbol(const elf_module_t* mod,
                              const Elf32_Sym* sym,
                              const char* name) {
@@ -228,6 +248,9 @@ static void* resolve_symbol(const elf_module_t* mod,
         uint32_t addr = sym->st_value + mod->base;
         return (void*)remap_if_text(mod, addr);
     }
+
+    if (s_symbol_fallback)
+        return s_symbol_fallback(name);
 
     return NULL;
 }
@@ -450,6 +473,19 @@ elf_module_t* elf_load_ex(const void* data, size_t size,
         if (ehdr->e_shstrndx < ehdr->e_shnum)
             shstr = (const char*)(raw + shdr[ehdr->e_shstrndx].sh_offset);
         for (int i = 0; i < ehdr->e_shnum; i++) {
+            // C++ static-constructor lists: record their loaded locations
+            // (entries are relocated with the segment). elf_run_ctors()
+            // executes them on the caller's explicit request.
+            if (shstr && shdr[i].sh_size >= 4) {
+                const char* nm = shstr + shdr[i].sh_name;
+                if (strcmp(nm, ".ctors") == 0) {
+                    mod->ctors = (uint32_t*)(shdr[i].sh_addr + mod->base);
+                    mod->ctors_count = shdr[i].sh_size / 4;
+                } else if (strcmp(nm, ".init_array") == 0) {
+                    mod->init_array = (uint32_t*)(shdr[i].sh_addr + mod->base);
+                    mod->init_array_count = shdr[i].sh_size / 4;
+                }
+            }
             if (shdr[i].sh_type == SHT_PROGBITS &&
                 (shdr[i].sh_flags & SHF_EXECINSTR)) {
                 uint32_t sec_start = shdr[i].sh_addr + mod->base;
@@ -612,6 +648,45 @@ void* elf_lookup(elf_module_t* mod, const char* name) {
         }
     }
     return NULL;
+}
+
+// elf_lookup with code addresses returned INSTRUCTION-side: what a
+// cross-module import must receive (calls jump straight to it). Data
+// symbols pass through unchanged — remap_if_text only touches the code
+// segment range.
+void* elf_lookup_remapped(elf_module_t* mod, const char* name) {
+    void* a = elf_lookup(mod, name);
+    return a ? (void*)remap_if_text(mod, (uint32_t)a) : NULL;
+}
+
+// Run the module's C++ static constructors. Without this, no crt exists to
+// do it and any static object with a vtable keeps a NULL vptr — surfacing
+// as a LoadProhibited on the first virtual call (a NULL+slot-offset vtable
+// read; the 5f companion boot loop). GNU order: .ctors REVERSED, then
+// .init_array forward. Entries are relocated data-side; calls need
+// instruction-side. 0 / -1 crt sentinels are skipped defensively (these
+// links carry none). Explicit-call design: game modules keep their
+// historical no-ctors behavior; the stack/BLE-proto loaders invoke this.
+void elf_run_ctors(elf_module_t* mod) {
+    if (!mod) return;
+    int ran = 0;
+    if (mod->ctors) {
+        for (int32_t j = (int32_t)mod->ctors_count - 1; j >= 0; j--) {
+            uint32_t fp = mod->ctors[j];
+            if (fp == 0 || fp == 0xFFFFFFFFu) continue;
+            ((void (*)(void))remap_if_text(mod, fp))();
+            ran++;
+        }
+    }
+    if (mod->init_array) {
+        for (uint32_t j = 0; j < mod->init_array_count; j++) {
+            uint32_t fp = mod->init_array[j];
+            if (fp == 0 || fp == 0xFFFFFFFFu) continue;
+            ((void (*)(void))remap_if_text(mod, fp))();
+            ran++;
+        }
+    }
+    if (ran) LOG_I("ran %d static ctor(s)", ran);
 }
 
 void elf_text_range(elf_module_t* mod, uint32_t* start, uint32_t* end) {

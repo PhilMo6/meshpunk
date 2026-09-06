@@ -61,6 +61,8 @@ extern mapintf_t map79_intf;
 extern mapintf_t map85_intf;
 extern mapintf_t map94_intf;
 extern mapintf_t map99_intf;
+extern mapintf_t map162_intf; /* MESHPUNK: map163.c */
+extern mapintf_t map163_intf; /* MESHPUNK: map163.c */
 extern mapintf_t map231_intf;
 
 /* implemented mapper interfaces */
@@ -75,6 +77,7 @@ mapintf_t *mappers[] =
         &map7_intf,
         &map8_intf,
         &map9_intf,
+        &map10_intf, /* MESHPUNK: shipped by upstream but left out of this table */
         &map11_intf,
         &map15_intf,
         &map16_intf,
@@ -99,6 +102,8 @@ mapintf_t *mappers[] =
         &map85_intf,
         &map94_intf,
         &map99_intf,
+        &map162_intf, /* MESHPUNK: map163.c */
+        &map163_intf, /* MESHPUNK: map163.c */
         &map231_intf,
         NULL};
 

@@ -3771,6 +3771,14 @@ static void OpCB(void)
 #ifdef SA1_OPCODES
    SA1.WaitingForInterrupt = true;
    SA1.PC--;
+   /* MESHPUNK: park instead of re-executing WAI repeatedly. A pending IRQ
+    * keeps the chip running — the main-loop head must dispatch it (a
+    * parked chip's loop is never entered). Wakers that set Executing
+    * again: $2200 message IRQ, the $220a arming paths, and the S-CPU
+    * mailbox/SA1RAM stores (getset.c); a non-IRQ wake just re-parks
+    * here, which matches WAI semantics. */
+   if (!(SA1.Flags & IRQ_PENDING_FLAG))
+      SA1.Executing = false;
 #else /* SA_OPCODES */
    CPU.WaitingForInterrupt = true;
    CPU.PC--;

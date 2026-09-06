@@ -6,7 +6,7 @@ return {
 After flashing:
 
 1. Use an SD card - it persists your mesh and firmware settings (highly recommended).
-2. Open Settings > Radio and set the radio to your local defaults.
+2. Open Meshcore > Radio and set the radio to your local defaults.
 3. Set your extra settings: RX boost, Contact Overwrite, and Message Repeat.
 4. Get meshing!
 5. Install apps from the App Library.

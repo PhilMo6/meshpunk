@@ -4,9 +4,12 @@
 #include "meshpunk_sync.h"
 #include "sound.h"
 #include "notify.h"
-#include "ble_companion.h"
-#include "punkmesh.h"
 #include "usb_manager.h"   // usb_pool_alloc/free — dynamic USB driver segments
+#include "radio/proto_pool.h"  // proto_pool_alloc/free — protocol module segments
+#include "radio/radio_capture.h"  // rcap:: (meshcore package capture exports)
+#include "mesh_store.h"           // mstore:: + normalize_smart_quotes (proto_exports)
+#include "emoji_font.h"           // emoji_compose (meshcore package export)
+#include "../lib/ed25519/ed_25519.h"  // ed25519_key_exchange (proto_exports)
 #include "tdeck_link.h"    // peer link: gblink veneers + module-exit detach
 #include "screenshot.h"    // screen capture staging + PNG writer
 
@@ -947,6 +950,328 @@ void elf_usb_driver_unload(void* mod) {
     usb_ulog("drv: unloaded (pool %uB free)", (unsigned)usb_pool_free_bytes());
 }
 
+// ── LoRa-protocol modules (.loraproto.elf) ──────────────────────────────────
+// Symbols a protocol module may import. Richer than driver_exports
+// (protocols persist NodeDB/config via stdio-over-VFS and format text), but
+// still no malloc — module memory comes from MeshHostApi mem_alloc (the
+// protocol pool). APPEND-ONLY: fielded protocol elfs resolve against this
+// table; the module build.ps1 UND audit is what grows it (e.g. mbedtls
+// entry points for the vendor crypto).
+
+// src/radio/proto_crypto.cpp — the meshtastic-lite crypto seam.
+extern "C" {
+void mesh_aes_block_encrypt(const uint8_t*, int, const uint8_t*, uint8_t*);
+void mesh_sha256(const uint8_t*, size_t, uint8_t*);
+bool mesh_ccm_encrypt(const uint8_t*, const uint8_t*, const uint8_t*, size_t, uint8_t*, uint8_t*, size_t);
+bool mesh_ccm_decrypt(const uint8_t*, const uint8_t*, const uint8_t*, size_t, const uint8_t*, size_t, uint8_t*);
+bool mesh_x25519_dh(const uint8_t*, const uint8_t*, uint8_t*);
+bool mesh_generate_keypair(uint8_t*, uint8_t*);
+}
+
+// Defined further down (with the game-module stdio wrappers they share
+// bounce/lock machinery with); the table needs the names now. Their
+// definitions sit in the file's extern "C" region — linkage must match.
+extern "C" {
+FILE*  elf_fopen(const char* path, const char* mode);
+int    elf_fclose(FILE* f);
+int    elf_fseek(FILE* f, long offset, int whence);
+long   elf_ftell(FILE* f);
+size_t elf_fread(void* dst, size_t size, size_t nmemb, FILE* f);
+size_t elf_fwrite(const void* src, size_t size, size_t nmemb, FILE* f);
+static FILE* proto_fopen(const char* path, const char* mode);
+static int   proto_fclose(FILE* f);
+static char* proto_fgets(char* s, int n, FILE* f);
+static int   proto_fprintf(FILE* f, const char* fmt, ...);
+static int   proto_fputs(const char* s, FILE* f);
+static int   proto_fflush(FILE* f);
+static int   proto_remove(const char* path);
+static int   proto_rename(const char* a, const char* b);
+static int   proto_mkdir(const char* path);
+}
+extern "C" void mesh_lock(void);
+extern "C" void mesh_unlock(void);
+extern "C" int  mcs_channel_msg_path(const char* name, char* out, int out_sz);
+extern "C" int  mcs_dm_msg_path(const char* peer, char* out, int out_sz);
+extern "C" int  mcs_messages_dir_path(char* out, int out_sz);
+extern "C" void mcs_append_extra_path(const char* msg_log_path,
+                                      const uint8_t* hash,
+                                      const ObservedPath* op);
+extern "C" int  mcs_read_one_stored_msg(const char* path, uint32_t offset,
+                                        StoredMsg* m);
+
+static const elf_symbol_t proto_exports[] = {
+    { "memcpy",    (void*)memcpy },
+    { "memset",    (void*)memset },
+    { "memcmp",    (void*)memcmp },
+    { "memmove",   (void*)memmove },
+    { "strlen",    (void*)strlen },
+    { "strcmp",    (void*)strcmp },
+    { "strncmp",   (void*)strncmp },
+    { "strcasecmp",  (void*)strcasecmp },
+    { "strncasecmp", (void*)strncasecmp },
+    { "strcpy",    (void*)strcpy },
+    { "strncpy",   (void*)strncpy },
+    { "strchr",    (void*)strchr },
+    { "strrchr",   (void*)strrchr },
+    { "strstr",    (void*)strstr },
+    { "strtol",    (void*)strtol },
+    { "atoi",      (void*)atoi },
+    // Vendor packet-id/CSMA randomness (mtlite srand()s from the host TRNG
+    // at init — this rand feeds protocol jitter, not key material).
+    { "rand",      (void*)rand },
+    { "srand",     (void*)srand },
+    { "snprintf",  (void*)snprintf },
+    { "vsnprintf", (void*)vsnprintf },
+    { "sscanf",    (void*)sscanf },
+    // stdio over VFS: config/NodeDB persistence on the protocol's storage.
+    // All SPI-locked (shared bus with TFT/SD) via the proto_ wrappers above;
+    // fread/fwrite additionally bounce PSRAM buffers through internal RAM
+    // (the pool is PSRAM, SD DMA is not PSRAM-safe).
+    { "fopen",     (void*)proto_fopen },
+    { "fclose",    (void*)proto_fclose },
+    { "fread",     (void*)elf_fread },   // locked + PSRAM bounce, no tracking inside
+    { "fwrite",    (void*)elf_fwrite },  // locked + PSRAM bounce, no tracking inside
+    { "fseek",     (void*)elf_fseek },
+    { "ftell",     (void*)elf_ftell },
+    { "fgets",     (void*)proto_fgets },
+    { "fprintf",   (void*)proto_fprintf },
+    { "fputs",     (void*)proto_fputs },   // gcc rewrites constant fprintf into this
+    { "fflush",    (void*)proto_fflush },
+    { "remove",    (void*)proto_remove },
+    { "rename",    (void*)proto_rename },
+    // newlib errno accessor (libm error paths reference it).
+    { "__errno",   (void*)__errno },
+    // Lua C API (ABI v2 lua_open surface): the protocol registers its own
+    // bindings into the firmware's lua_State. The common macro forms resolve
+    // to these (lua_pushcfunction→pushcclosure, lua_pcall→pcallk,
+    // lua_tostring→tolstring, luaL_checkstring→checklstring,
+    // lua_newtable→createtable, lua_tonumber/integer→*x).
+    { "lua_gettop",        (void*)lua_gettop },
+    { "lua_settop",        (void*)lua_settop },
+    { "lua_pushvalue",     (void*)lua_pushvalue },
+    { "lua_checkstack",    (void*)lua_checkstack },
+    { "lua_pushnil",       (void*)lua_pushnil },
+    { "lua_pushboolean",   (void*)lua_pushboolean },
+    { "lua_pushinteger",   (void*)lua_pushinteger },
+    { "lua_pushnumber",    (void*)lua_pushnumber },
+    { "lua_pushstring",    (void*)lua_pushstring },
+    { "lua_pushlstring",   (void*)lua_pushlstring },
+    { "lua_pushcclosure",  (void*)lua_pushcclosure },
+    { "lua_toboolean",     (void*)lua_toboolean },
+    { "lua_tointegerx",    (void*)lua_tointegerx },
+    { "lua_tonumberx",     (void*)lua_tonumberx },
+    { "lua_tolstring",     (void*)lua_tolstring },
+    { "lua_type",          (void*)lua_type },
+    { "lua_createtable",   (void*)lua_createtable },
+    { "lua_getfield",      (void*)lua_getfield },
+    { "lua_setfield",      (void*)lua_setfield },
+    { "lua_gettable",      (void*)lua_gettable },
+    { "lua_settable",      (void*)lua_settable },
+    { "lua_rawgeti",       (void*)lua_rawgeti },
+    { "lua_rawseti",       (void*)lua_rawseti },
+    { "lua_next",          (void*)lua_next },
+    { "lua_getglobal",     (void*)lua_getglobal },
+    { "lua_setglobal",     (void*)lua_setglobal },
+    { "lua_pcallk",        (void*)lua_pcallk },
+    { "lua_error",         (void*)lua_error },
+    { "lua_rotate",        (void*)lua_rotate },   // lua_remove/insert macros
+    { "luaL_error",        (void*)luaL_error },
+    { "luaL_ref",          (void*)luaL_ref },
+    { "luaL_unref",        (void*)luaL_unref },
+    { "luaL_checklstring", (void*)luaL_checklstring },
+    { "luaL_optlstring",   (void*)luaL_optlstring },
+    { "luaL_checkinteger", (void*)luaL_checkinteger },
+    { "luaL_optinteger",   (void*)luaL_optinteger },
+    { "luaL_checknumber",  (void*)luaL_checknumber },
+    { "luaL_optnumber",    (void*)luaL_optnumber },
+    // Identity crypto (lib/ed25519, stays firmware — ABI doc D-3). The
+    // meshcore package's mesh::Identity resolves these; mtlite uses the
+    // mesh_* primitives below instead (raw-Curve25519 format).
+    { "ed25519_key_exchange",   (void*)ed25519_key_exchange },
+    { "ed25519_create_keypair", (void*)ed25519_create_keypair },
+    { "ed25519_derive_pub",     (void*)ed25519_derive_pub },
+    { "ed25519_sign",           (void*)ed25519_sign },
+    // ── meshcore package surface ─────────────────────────────────────────
+    // libc stragglers its punkmesh port pulls (free pairs emoji_compose's
+    // firmware malloc), locks, FreeRTOS queue API (kernel objects work
+    // cross-boundary; the RxEvent queue is module-owned), emoji composer.
+    { "qsort",     (void*)qsort },
+    { "strtoul",   (void*)strtoul },
+    { "atof",      (void*)atof },
+    { "sprintf",   (void*)sprintf },
+    { "malloc",    (void*)malloc },
+    { "free",      (void*)free },
+    // L: filesystem stats (the phone app's storage figures — real values).
+    { "_Z14mp_littlefs_dfPjS_", (void*)&mp_littlefs_df },
+    { "mkdir",     (void*)proto_mkdir },   // SPI-locked (VFS metadata write)
+    { "mesh_lock",   (void*)mesh_lock },
+    { "mesh_unlock", (void*)mesh_unlock },
+    { "vTaskDelay",         (void*)vTaskDelay },
+    { "xQueueGenericSend",  (void*)xQueueGenericSend },
+    { "xQueueReceive",      (void*)xQueueReceive },
+    { "xQueueGenericCreate",(void*)xQueueGenericCreate },
+    { "emoji_compose",      (void*)emoji_compose },
+    { "emoji_decompose",    (void*)emoji_decompose },
+    // mstore + capture + text utils, exported by MANGLED name (both sides
+    // are the same xtensa g++; the package build's UND audit hard-fails on
+    // any drift). String/fs::FS-typed mstore calls do NOT cross this way —
+    // shim types are not layout-compatible — they use the mcs_* C bridges.
+    { "_Z22normalize_smart_quotesPKcPcj", (void*)&normalize_smart_quotes },
+    { "_ZN4rcap4pushEh",   (void*)static_cast<PktCapture*(*)(uint8_t)>(&rcap::push) },
+    { "_ZN4rcap6newestEv", (void*)&rcap::newest },
+    { "_ZN4rcap5startEv",  (void*)&rcap::start },
+    { "_ZN4rcap4stopEv",   (void*)&rcap::stop },
+    { "_ZN4rcap10pop_oldestEP10PktCapture", (void*)&rcap::pop_oldest },
+    { "_ZN4rcap12take_droppedEv",           (void*)&rcap::take_dropped },
+    { "_ZN6mstore16set_max_messagesEi",     (void*)&mstore::set_max_messages },
+    { "_ZN6mstore22append_channel_messageEPKciS1_S1_jffhbtPKhS3_j", (void*)&mstore::append_channel_message },
+    { "_ZN6mstore17append_dm_messageEPKcS1_S1_jffhbtPKhS3_S3_j",    (void*)&mstore::append_dm_message },
+    { "_ZN6mstore19unread_bump_channelEPKc",  (void*)&mstore::unread_bump_channel },
+    { "_ZN6mstore14unread_bump_dmEPKc",       (void*)&mstore::unread_bump_dm },
+    { "_ZN6mstore14unread_channelEPKc",       (void*)&mstore::unread_channel },
+    { "_ZN6mstore9unread_dmEPKc",             (void*)&mstore::unread_dm },
+    { "_ZN6mstore20unread_clear_channelEPKc", (void*)&mstore::unread_clear_channel },
+    { "_ZN6mstore15unread_clear_dmEPKc",      (void*)&mstore::unread_clear_dm },
+    { "_ZN6mstore12unread_totalEv",           (void*)&mstore::unread_total },
+    { "_ZN6mstore21push_channel_messagesEP9lua_StatePKci", (void*)&mstore::push_channel_messages },
+    { "_ZN6mstore16push_dm_messagesEP9lua_StatePKci",      (void*)&mstore::push_dm_messages },
+    { "_ZN6mstore20push_dm_thread_namesEP9lua_State",      (void*)&mstore::push_dm_thread_names },
+    { "_ZN6mstore22push_chat_page_channelEP9lua_StatePKciji", (void*)&mstore::push_chat_page_channel },
+    { "_ZN6mstore17push_chat_page_dmEP9lua_StatePKciji",      (void*)&mstore::push_chat_page_dm },
+    { "_ZN6mstore18push_msg_summariesEP9lua_StatePK13MStoreChanRefi", (void*)&mstore::push_msg_summaries },
+    { "_ZN6mstore18push_routing_queryEP9lua_StatePKcjj",   (void*)&mstore::push_routing_query },
+    { "_ZN6mstore20push_routing_sendersEP9lua_StatePKci",  (void*)&mstore::push_routing_senders },
+    { "_ZN6mstore15push_path_tableEP9lua_StatetPKh",       (void*)&mstore::push_path_table },
+    { "_ZN6mstore22lookup_persisted_pathsEP9lua_StatePKcS3_S3_", (void*)&mstore::lookup_persisted_paths },
+    { "_ZN6mstore21read_stored_msgs_fromEPKcjP9StoredMsgPjiS4_S4_", (void*)&mstore::read_stored_msgs_from },
+    { "_ZN6mstore20read_all_stored_msgsEPKcP9StoredMsgi",  (void*)&mstore::read_all_stored_msgs },
+    { "_ZN6mstore23enumerate_message_filesEP11MsgFileInfoi", (void*)&mstore::enumerate_message_files },
+    { "_ZN6mstore24offset_of_newest_recordsEPKcji",        (void*)&mstore::offset_of_newest_records },
+    // Type-boundary bridges (definitions above the table).
+    { "mcs_channel_msg_path",     (void*)mcs_channel_msg_path },
+    { "mcs_dm_msg_path",          (void*)mcs_dm_msg_path },
+    { "mcs_messages_dir_path",    (void*)mcs_messages_dir_path },
+    { "mcs_append_extra_path",    (void*)mcs_append_extra_path },
+    { "mcs_read_one_stored_msg",  (void*)mcs_read_one_stored_msg },
+    // meshtastic-lite crypto seam (src/radio/proto_crypto.cpp): the vendor
+    // headers' software-fallback externs, implemented host-side with the
+    // firmware's mbedtls (hw AES) + esp_random TRNG.
+    { "mesh_aes_block_encrypt", (void*)mesh_aes_block_encrypt },
+    { "mesh_sha256",            (void*)mesh_sha256 },
+    { "mesh_ccm_encrypt",       (void*)mesh_ccm_encrypt },
+    { "mesh_ccm_decrypt",       (void*)mesh_ccm_decrypt },
+    { "mesh_x25519_dh",         (void*)mesh_x25519_dh },
+    { "mesh_generate_keypair",  (void*)mesh_generate_keypair },
+    ELF_SYMBOL_END
+};
+
+static void* proto_seg_alloc(size_t size, void*) { return proto_pool_alloc(size); }
+static void  proto_seg_free(void* p, void*)      { proto_pool_free(p); }
+
+// Load one LoRa-protocol module from a drive-prefixed path
+// ("L:/meshpunk/lora_protos/mtlite/mtlite.loraproto.elf"). Returns the
+// module handle (NULL on any failure, reason logged) and the exported ops
+// struct via out_ops. Boot context (setup(), before the mesh task exists).
+// The loaded LoRa-protocol module (dependent BLE-protocol elfs resolve their
+// leftover imports against its exports — see ble_import_fallback below).
+static void* s_lora_proto_mod = nullptr;
+
+void* elf_loraproto_load(const char* path, const void** out_ops) {
+    *out_ops = NULL;
+    uint32_t size = 0;
+    void* buf = meshpunk_read_all(path, &size);
+    if (!buf) { SLog.printf("[PROTO] read failed: %s\n", path); return NULL; }
+
+    elf_module_t* mod = elf_load_ex(buf, size, proto_exports,
+                                    proto_seg_alloc, proto_seg_free, NULL);
+    heap_caps_free(buf);
+    if (!mod) {
+        SLog.printf("[PROTO] elf load failed (%s) — pool free %uB\n",
+                    path, (unsigned)proto_pool_free_bytes());
+        return NULL;
+    }
+
+    const void* ops = elf_lookup(mod, "loraproto_ops");
+    if (!ops) {
+        SLog.printf("[PROTO] no loraproto_ops export: %s\n", path);
+        elf_unload(mod);
+        return NULL;
+    }
+    s_lora_proto_mod = mod;
+
+    // C++ statics with vtables need their constructors run (no crt in
+    // module land); host-independent by contract — MeshHostApi arrives
+    // later, at init().
+    elf_run_ctors(mod);
+
+    uint32_t ts = 0, te = 0;
+    elf_text_range(mod, &ts, &te);
+    SLog.printf("[PROTO] loaded %s text %08X-%08X pool %uB free\n",
+                path, (unsigned)ts, (unsigned)te, (unsigned)proto_pool_free_bytes());
+    *out_ops = ops;
+    return mod;
+}
+
+void elf_loraproto_unload(void* mod) {
+    if (!mod) return;
+    if (mod == s_lora_proto_mod) s_lora_proto_mod = nullptr;
+    elf_unload((elf_module_t*)mod);
+    SLog.printf("[PROTO] unloaded (pool %uB free)\n", (unsigned)proto_pool_free_bytes());
+}
+
+// ── BLE-slot protocol modules (.bleproto.elf) ───────────────────────────────
+// Same pool, same export table, plus ONE addition: unresolved imports fall
+// back to the LOADED LoRa-protocol elf's own exports (instruction-side).
+// That is how a coupled protocol (the meshcore companion importing PunkMesh)
+// links against its LoRa protocol at load time — and how the dependency
+// enforces itself: under any other LoRa protocol those imports miss and the
+// load is refused, loudly. Standalone BLE protocols import nothing extra.
+
+static void* ble_import_fallback(const char* name) {
+    return s_lora_proto_mod
+               ? elf_lookup_remapped((elf_module_t*)s_lora_proto_mod, name)
+               : nullptr;
+}
+
+void* elf_bleproto_load(const char* path, const void** out_ops) {
+    *out_ops = NULL;
+    uint32_t size = 0;
+    void* buf = meshpunk_read_all(path, &size);
+    if (!buf) { SLog.printf("[BLEPROTO] read failed: %s\n", path); return NULL; }
+
+    elf_set_symbol_fallback(ble_import_fallback);
+    elf_module_t* mod = elf_load_ex(buf, size, proto_exports,
+                                    proto_seg_alloc, proto_seg_free, NULL);
+    elf_set_symbol_fallback(NULL);
+    heap_caps_free(buf);
+    if (!mod) {
+        SLog.printf("[BLEPROTO] elf load failed (%s) — pool free %uB\n",
+                    path, (unsigned)proto_pool_free_bytes());
+        return NULL;
+    }
+
+    const void* ops = elf_lookup(mod, "bleproto_ops");
+    if (!ops) {
+        SLog.printf("[BLEPROTO] no bleproto_ops export: %s\n", path);
+        elf_unload(mod);
+        return NULL;
+    }
+
+    elf_run_ctors((elf_module_t*)mod);   // static vptrs (the 5f boot loop)
+
+    SLog.printf("[BLEPROTO] loaded %s, pool %uB free\n",
+                path, (unsigned)proto_pool_free_bytes());
+    *out_ops = ops;
+    return mod;
+}
+
+void elf_bleproto_unload(void* mod) {
+    if (!mod) return;
+    elf_unload((elf_module_t*)mod);
+    SLog.printf("[BLEPROTO] unloaded (pool %uB free)\n",
+                (unsigned)proto_pool_free_bytes());
+}
+
 // ── Screenshot capture ──────────────────────────────────────────────────────
 
 // Copy one push into the staging buffer and note the rows it covered. Called
@@ -1505,6 +1830,110 @@ FILE* elf_fopen(const char* path, const char* mode) {
     SPI_UNLOCK();
     mod_track_file(f);
     return f;
+}
+
+// ── Protocol-module stdio (SPI-locked, UNTRACKED) ───────────────────────────
+// Protocol modules run for the whole boot on the mesh task, with their data
+// on the shared-SPI storage (SD when the user selected it) and their buffers
+// in the PSRAM pool — so their stdio needs the same SPI locking (and fread/
+// fwrite PSRAM bouncing) as game modules. They must NOT use the tracked
+// fopen/fclose above: the tracking table feeds the game-exit leak sweep,
+// which would close a protocol's file mid-write from another core.
+// Protocols never unload, so there is nothing to sweep.
+static FILE* proto_fopen(const char* path, const char* mode) {
+    SPI_LOCK();
+    FILE* f = fopen(path, mode);
+    SPI_UNLOCK();
+    return f;
+}
+static int proto_fclose(FILE* f) {
+    SPI_LOCK();
+    int r = fclose(f);
+    SPI_UNLOCK();
+    return r;
+}
+static char* proto_fgets(char* s, int n, FILE* f) {
+    SPI_LOCK();
+    char* r = fgets(s, n, f);
+    SPI_UNLOCK();
+    return r;
+}
+static int proto_fprintf(FILE* f, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    SPI_LOCK();
+    int r = vfprintf(f, fmt, ap);
+    SPI_UNLOCK();
+    va_end(ap);
+    return r;
+}
+static int proto_fputs(const char* s, FILE* f) {
+    SPI_LOCK();
+    int r = fputs(s, f);
+    SPI_UNLOCK();
+    return r;
+}
+static int proto_fflush(FILE* f) {
+    SPI_LOCK();
+    int r = fflush(f);
+    SPI_UNLOCK();
+    return r;
+}
+static int proto_remove(const char* path) {
+    SPI_LOCK();
+    int r = remove(path);
+    SPI_UNLOCK();
+    return r;
+}
+static int proto_rename(const char* a, const char* b) {
+    SPI_LOCK();
+    int r = rename(a, b);
+    SPI_UNLOCK();
+    return r;
+}
+static int proto_mkdir(const char* path) {
+    SPI_LOCK();
+    int r = mkdir(path, 0777);
+    SPI_UNLOCK();
+    return r;
+}
+
+// The firmware mesh mutex for protocol packages (their bindings run on Core 0
+// against protocol state the mesh task mutates — same recursive mutex the
+// firmware bindings take).
+extern "C" void mesh_lock(void)   { MESH_LOCK(); }
+extern "C" void mesh_unlock(void) { MESH_UNLOCK(); }
+
+// ── meshcore package type-boundary bridges (mcs_*) ──────────────────────────
+// The String/fs::FS-typed mstore calls re-expressed in C: the package's shim
+// String/FS classes are NOT layout-compatible with the firmware's, so those
+// values never cross raw. Paths cross as char*; the storage backend is the
+// firmware's own (mstore::storage()).
+extern "C" int mcs_channel_msg_path(const char* name, char* out, int out_sz) {
+    String p = mstore::channel_msg_path_for(name);
+    int n = snprintf(out, out_sz, "%s", p.c_str());
+    return (n > 0 && n < out_sz) ? n : 0;
+}
+extern "C" int mcs_dm_msg_path(const char* peer, char* out, int out_sz) {
+    String p = mstore::dm_msg_path_for(peer);
+    int n = snprintf(out, out_sz, "%s", p.c_str());
+    return (n > 0 && n < out_sz) ? n : 0;
+}
+extern "C" int mcs_messages_dir_path(char* out, int out_sz) {
+    String p = mstore::messages_dir_path();
+    int n = snprintf(out, out_sz, "%s", p.c_str());
+    return (n > 0 && n < out_sz) ? n : 0;
+}
+extern "C" void mcs_append_extra_path(const char* msg_log_path,
+                                      const uint8_t* hash,
+                                      const ObservedPath* op) {
+    if (!msg_log_path || !hash || !op) return;
+    mstore::append_extra_path(String(msg_log_path), hash, *op);
+}
+extern "C" int mcs_read_one_stored_msg(const char* path, uint32_t offset,
+                                       StoredMsg* m) {
+    if (!path || !m) return 0;
+    return mstore::read_one_stored_msg(mstore::storage(), path, offset, *m);
 }
 
 int elf_fclose(FILE* f) {
@@ -2362,20 +2791,10 @@ int elf_host_run_pending(void) {
     heap_caps_free(elf_data); // raw ELF data no longer needed
     elf_data = NULL;
 
-    // Dump mesh object pointer region to detect corruption
-    extern PunkMesh* the_mesh;
-    SLog.printf("[elf_host] the_mesh=%p, first 16 bytes:", the_mesh);
-    if (the_mesh) {
-        uint8_t* p = (uint8_t*)the_mesh;
-        for (int i = 0; i < 16; i++) SLog.printf(" %02x", p[i]);
-    }
-    SLog.println();
-
     int result = -1;
     if (mod) {
         SLog.printf("[elf_host] heap OK before run: %s\n",
                       heap_caps_check_integrity(MALLOC_CAP_SPIRAM, false) ? "yes" : "NO!");
-        SLog.printf("[elf_host] the_mesh at: 0x%08x\n", (uint32_t)the_mesh);
 
         // Run the module on a dedicated large-stack task pinned to Core 0
         // (the UI core; LVGL is idle and Lua is torn down, so Core 0 is

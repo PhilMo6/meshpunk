@@ -362,7 +362,7 @@ end
 
 function M.create()
     -- The topbar only needs the live unread COUNTERS (countUnread reads the
-    -- C-side _mesh_unread_total, bumped at mesh-task RX — so the count keeps
+    -- C-side _store_unread_total, bumped at mesh-task RX — so the count keeps
     -- accruing even while Lua is torn down for an ELF run) — it never reads
     -- message history. Histories don't sit in Lua at all anymore: the Messenger
     -- runs its inbox on C-side summaries (messages:loadSummaries) and loads a
@@ -429,6 +429,11 @@ function M.create()
                 -- Bell badge every tick (one C int read): also catches room
                 -- msgs and future non-mesh posts with no event plumbing.
                 M.updateNotif()
+                -- Unread badge too (also one C int read since the counters
+                -- moved into the shared store): protocol modules bump the
+                -- counter with NO RxEvent plumbing, so the event callbacks
+                -- above never fire for them — the timer is their only path.
+                M.updateUnread()
                 sat_tick = sat_tick + 1
                 if sat_tick >= sat_tick_max then
                     sat_tick = 0

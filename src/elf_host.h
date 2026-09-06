@@ -33,6 +33,17 @@ void elf_input_inject(unsigned char key, int pressed);
 void* elf_usb_driver_load(const char* path, const void** out_ops);
 void  elf_usb_driver_unload(void* mod);
 
+// LoRa-protocol module load/unload (segments in the protocol pool; ops
+// struct is the module's exported `loraproto_ops`). See
+// src/radio/proto_loader.cpp.
+void* elf_loraproto_load(const char* path, const void** out_ops);
+void  elf_loraproto_unload(void* mod);
+// BLE-slot protocol modules: same pool/exports, plus unresolved imports fall
+// back to the loaded LoRa protocol elf (coupled protocols link against it at
+// load; the miss under any other LoRa protocol IS the dependency check).
+void* elf_bleproto_load(const char* path, const void** out_ops);
+void  elf_bleproto_unload(void* mod);
+
 // ---------------------------------------------------------------------------
 // Host functions exported to loaded ELF modules.
 // These are resolved by name via the elf_loader symbol table.

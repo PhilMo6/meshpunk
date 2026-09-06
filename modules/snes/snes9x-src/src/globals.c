@@ -10,12 +10,16 @@
 #include "gfx.h"
 #include "soundux.h"
 #include "fxemu.h"
+#include "sa1.h"
 
 SICPU ICPU;
 SCPUState CPU;
 
 /* MESHPUNK: fxemu.h declares this extern; it is the GSU's link to the cart. */
 struct FxInfo_s SuperFX;
+
+/* MESHPUNK: sa1.h declares this extern — the SA-1's whole state. */
+SSA1 SA1;
 
 
 

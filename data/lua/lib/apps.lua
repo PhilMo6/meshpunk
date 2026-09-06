@@ -43,6 +43,7 @@ local lvgl = require("lvgl")
 local utils = require("lib/utils")
 local topbar = require("lib/topbar")
 local background = require("lib/background")
+local fileman = require("lib/fileman")
 
 local M = {}
 
@@ -141,6 +142,23 @@ end
 -- The folder path component used to scan a category's contents.
 local function folder_key(item) return item.raw_name or item.name end
 
+-- Registry key for an app: the catalog id from its .version "id=" line
+-- (written at install; format owned by lib/downloader), else the folder
+-- name. The id key is what lets two categories each hold a same-named
+-- folder (e.g. a per-protocol "Settings"). Recorded on the item as .id.
+local function index_key(app)
+    local data = fileman.read(app.dir .. "/.version")
+    if data then
+        for ln in data:gmatch("[^\r\n]+") do
+            if ln:sub(1, 3) == "id=" and #ln > 3 then
+                app.id = ln:sub(4)
+                return app.id
+            end
+        end
+    end
+    return app.name
+end
+
 -- (Re)build the registry cache. Call at boot and whenever apps are added/removed.
 function M.refresh()
     M._top = scan_level(nil)
@@ -153,12 +171,12 @@ function M.refresh()
             M._cats[folder_key(item)] = contents
             for _, app in ipairs(contents) do
                 if not app.is_category then
-                    M._index[app.name] = app
+                    M._index[index_key(app)] = app
                     app_count = app_count + 1
                 end
             end
         else
-            M._index[item.name] = item
+            M._index[index_key(item)] = item
             app_count = app_count + 1
         end
     end
@@ -173,7 +191,9 @@ function M.list(subfolder)
     return M._top
 end
 
--- Cached lookup of any launchable app by name (top-level or inside a category).
+-- Cached lookup of any launchable app by registry key: its catalog id when
+-- the installed .version carries one, else its folder name (identical for
+-- every app whose catalog id equals its name).
 function M.get(name)
     if not M._top then M.refresh() end
     return M._index[name]
@@ -663,6 +683,43 @@ function M.launch(name_or_record)
         end
 
         finish_ok(); return true
+    end)
+    return true
+end
+
+-- ── LoRa-protocol gate ───────────────────────────────────────────────────────
+-- Gate an app to one LoRa protocol. Call FIRST in the app's main.lua, before
+-- any other top-level code:
+--   if apps.proto_gate("meshcore") then return end
+-- Wrong protocol -> builds a full-screen notice and returns true (the app's
+-- chunk must return without building anything). Right protocol -> returns
+-- false with no UI touched. The active protocol is fixed per boot (firmware
+-- lora_protocol pref).
+function M.proto_gate(required)
+    local active = (type(_lora_proto) == "function") and _lora_proto() or "meshcore"
+    if active == required then return false end
+    local lvgl  = require("lvgl")
+    local theme = require("lib/theme")
+    local root = M.new_root()
+    root:set { w = lvgl.HOR_RES(), h = lvgl.VER_RES(), pad_all = 12, border_width = 0, bg_opa = 0 }
+    root:clear_flag(lvgl.FLAG.SCROLLABLE)
+    theme.show_background()
+    local box = root:Object {
+        flex = { flex_direction = "column" },
+        w = lvgl.HOR_RES() - 24, h = lvgl.SIZE_CONTENT,
+        align = lvgl.ALIGN.CENTER, border_width = 0, pad_all = 8, bg_opa = 0,
+    }
+    box:Label { text = "LoRa protocol needed: " .. required, w = lvgl.PCT(100) }
+    box:Label { text = "Running now: " .. active, w = lvgl.PCT(100) }
+    -- Width-constrained labels wrap by default (luavgl sets LONG_WRAP).
+    box:Label {
+        text = "This app talks to the '" .. required .. "' LoRa protocol, which is not running. Switch protocols in Settings > Lora (takes a reboot).",
+        w = lvgl.PCT(100),
+    }
+    local close_btn = box:Button { w = lvgl.PCT(100), h = 32 }
+    close_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+    close_btn:onClicked(function()
+        M.go_home()
     end)
     return true
 end

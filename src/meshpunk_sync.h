@@ -13,8 +13,8 @@
 // append_stored_msg -> trim_msg_file).
 extern SemaphoreHandle_t spi_bus_mutex;
 
-// Guards PunkMesh logical state (prefs, contacts, channels, send SM) accessed
-// from Lua bindings on Core 0 while mesh_task runs on Core 1.
+// Guards the LoRa protocol's logical state (prefs, contacts, channels, send SM)
+// accessed from Lua bindings on Core 0 while mesh_task runs on Core 1.
 // Nesting order is MESH -> SPI (never the reverse). Also recursive: a few
 // Lua send bindings call into methods that themselves take the lock.
 extern SemaphoreHandle_t the_mesh_mutex;
@@ -24,11 +24,10 @@ extern SemaphoreHandle_t the_mesh_mutex;
 // log line can be bracketed with SLOG_LOCK()/SLOG_UNLOCK().
 extern SemaphoreHandle_t serial_mutex;
 
-// Cross-core event plumbing.
-// rx_event_queue : Core 1 (mesh_task) -> Core 0 (UI loop)
+// Cross-core event plumbing. (The mesh RX event queue lives inside the
+// protocol module; its Lua drain is the protocol's lua_tick.)
 // tx_cmd_queue   : Core 0 (UI/Lua)    -> Core 1 (mesh_task)  [reserved for step 7]
 // gps_event_queue: Core 1 (gps_task)  -> Core 0 (UI loop)
-extern QueueHandle_t rx_event_queue;
 extern QueueHandle_t tx_cmd_queue;
 extern QueueHandle_t gps_event_queue;
 
@@ -113,29 +112,6 @@ inline void sd_spi_take()    { SPI_LOCK();   }
 // its body becomes SPI_UNLOCK() + the old TFT recovery (harmless).
 
 // Event structs shuttled across the cores.
-struct RxEvent {
-  enum Kind : uint8_t { DIRECT_MSG, CHANNEL_MSG, CONTACT_UPDATE, ACK,
-                        ROOM_MSG, CLI_RESPONSE, LOGIN_RESULT, STATUS_TEXT,
-                        SEND_RETRY, CONN_LOST } kind;
-  uint8_t  hops;          // LOGIN_RESULT: permissions byte from the server
-                          // SEND_RETRY: attempt number now in flight (1-based)
-  int8_t   channel_idx;   // -1 for DM; LOGIN_RESULT: 1 = success, 0 = fail
-                          // SEND_RETRY: total attempts in the ladder
-  bool     direct;
-  char     sender[32];    // ROOM_MSG/CLI_RESPONSE/LOGIN_RESULT/STATUS_TEXT: server contact name (thread key)
-  char     origin[32];    // ROOM_MSG only: resolved author display name
-  char     text[160];
-  uint32_t timestamp;
-  float    snr;
-  float    rssi;
-  uint16_t path_len;
-  uint8_t  path[MAX_PATH_SIZE];
-  uint8_t  pkt_hash[MAX_HASH_SIZE];
-  uint32_t ack;           // ACK: the expected-ack CRC this delivery matches
-                          // LOGIN_RESULT: keep-alive interval in seconds (0 = none)
-  int32_t  rtt;           // ACK: round-trip ms (>=0 delivered, <0 failed/timeout)
-};
-
 struct TxCommand {
   enum Kind : uint8_t { SEND_PUBLIC, SEND_DIRECT, SEND_CHANNEL, UPDATE_PREFS } kind;
   uint8_t  channel_idx;
@@ -154,7 +130,7 @@ struct GpsEvent {
 // the mutexes/queues. Safe to call under normal Arduino init order.
 void meshpunk_sync_init();
 
-// Spawn the Core 1 mesh task. Call once after the_mesh->begin(), once the
+// Spawn the Core 1 mesh task. Call once after lora_proto_start(), once the
 // radio is initialized and Lua is up. Defined in meshpunk_tasks.cpp.
 void meshpunk_spawn_mesh_task();
 
@@ -169,13 +145,6 @@ void gps_notify_wake();
 // available, leaving lat/lon untouched. Safe to call from the mesh task.
 // Defined in main.cpp.
 bool meshpunk_gps_last_fix(double* lat, double* lon);
-
-// Apply LoRa settings to the live radio (defined in main.cpp, where the
-// radio objects live). Mirrors the reference targets' radio_set_params()/
-// radio_set_tx_power(). Safe from either core: the whole sequence runs under
-// SPI_LOCK, and RX is re-armed by the dispatcher's next recvRaw().
-void radio_apply_params(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr);
-void radio_apply_tx_power(int8_t dbm);
 
 // ── Clock authority tiers ────────────────────────────────────────
 // The T-Deck has no battery-backed RTC; the mesh needs time ASAP, but no

@@ -45,6 +45,16 @@ int elf_run(elf_module_t* mod, int argc, char** argv);
 // Look up a symbol exported by the loaded module (e.g. a callback).
 // Returns the address, or NULL if not found.
 void* elf_lookup(elf_module_t* mod, const char* name);
+// Code addresses returned instruction-side (cross-module imports call them).
+void* elf_lookup_remapped(elf_module_t* mod, const char* name);
+// Run the module's C++ static constructors (.ctors reversed + .init_array).
+// Explicit by design — see the definition; stack/BLE-proto loads call it,
+// game modules keep their historical behavior.
+void elf_run_ctors(elf_module_t* mod);
+// Import fallback for dependent modules (a BLE protocol elf importing the
+// loaded radio stack's symbols): consulted after host exports + self miss.
+// Host sets around a dependent load, clears after; NULL disables.
+void elf_set_symbol_fallback(void* (*fn)(const char* name));
 
 // Executable range of the loaded module (instruction-side addresses) — for
 // crash attribution of PCs to a resident driver module.

@@ -47,6 +47,9 @@ $LDFLAGS = @(
 # the firmware sound task.
 $hot = @(
     "cpuexec.c", "cpuops.c", "getset.c",
+    # SA-1: the second 65816 interpreter and its bus accessors — same
+    # rationale as cpuops/getset.
+    "sa1.c", "sa1cpu.c",
     "ppu.c", "gfx.c", "tile.c", "dma.c",
     "spc700.c", "apu_blargg.c", "dsp.c",
     "soundux.c", "fastrender.c",
@@ -98,6 +101,9 @@ foreach ($src in ($core_sources + ($glue_sources | ForEach-Object { (Get-Item $_
     $extra = if ($srcname -eq "fastrender.c") { @("-mtext-section-literals") }
              elseif ($srcname -eq "fxemu.c") { @("-mtext-section-literals", "-fno-jump-tables") }
              elseif ($srcname -eq "getset.c") { @("-mtext-section-literals", "-fno-jump-tables") }
+             # sa1.c/sa1cpu.c: SA1_HOT functions land in .iram.text (sa1.h).
+             elseif ($srcname -eq "sa1.c") { @("-mtext-section-literals", "-fno-jump-tables") }
+             elseif ($srcname -eq "sa1cpu.c") { @("-mtext-section-literals", "-fno-jump-tables") }
              else { @() }
     Write-Host "  CC $srcname ($opt)"
     & $CC $CFLAGS $opt $extra -c -o $obj $src

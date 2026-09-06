@@ -3,6 +3,11 @@ local messages = require("lib/mesh/messages")
 local apps = require("lib/apps")
 local utils = require("lib/utils")  -- utils.now() = device RTC (os.time() isn't RTC-synced)
 
+-- Runs under ANY LoRa protocol: the MeshCore-specific layers (live contacts,
+-- replay, meshprint) degrade to empty under other protocols (every _mesh_* call
+-- is pcall/nil-guarded), while the per-protocol node layers below draw from
+-- FILES via _map_nodes — both protocols at once, for comparison.
+
 print("[Map] starting")
 
 local W = lvgl.HOR_RES()
@@ -49,6 +54,8 @@ local function load_map_prefs()
         mp_second = false,     -- also collect/show 2nd-hop repeaters
         mp_second_calc = false,-- feed 2nd-hop repeaters into triangulation + cull
         mp_cull = 3,           -- final-cull multiplier (0=off, 2/3/4×): drop outliers
+        proto_mc = false,      -- MeshCore node layer (from contacts files)
+        proto_mt = false,      -- MTLite node layer (from its peers file)
     }
     local f = io.open(PREFS_PATH, "r")
     if not f then return prefs end
@@ -56,6 +63,8 @@ local function load_map_prefs()
     f:close()
     if string.find(txt, "anim=0", 1, true) then prefs.anim = false end
     if string.find(txt, "arch=1", 1, true) then prefs.archived = true end
+    if string.find(txt, "pmc=1", 1, true) then prefs.proto_mc = true end
+    if string.find(txt, "pmt=1", 1, true) then prefs.proto_mt = true end
     if string.find(txt, "trail=0", 1, true) then prefs.trail = false end
     if string.find(txt, "hashes=0", 1, true) then prefs.hashes = false end
     if string.find(txt, "mp2nd=1", 1, true) then prefs.mp_second = true end
@@ -86,6 +95,8 @@ local function save_map_prefs()
     f:write(table.concat({
         map_prefs.anim and "anim=1" or "anim=0",
         map_prefs.archived and "arch=1" or "arch=0",
+        map_prefs.proto_mc and "pmc=1" or "pmc=0",
+        map_prefs.proto_mt and "pmt=1" or "pmt=0",
         map_prefs.trail and "trail=1" or "trail=0",
         map_prefs.hashes and "hashes=1" or "hashes=0",
         "color=" .. map_prefs.anim_color,
@@ -721,6 +732,39 @@ local update_status       -- forward declaration (defined after refresh_tiles)
 local marker_cache = { zoom = nil, dirty = true, pts = {}, n = 0 }
 local function invalidate_markers() marker_cache.dirty = true end
 
+-- Cross-protocol node layers: positions from per-protocol FILES via
+-- _map_nodes(), so both protocols draw at once no matter which protocol this
+-- boot runs (comparison view). Fetched on toggle-on / app open; refreshed at
+-- most every 120s from the draw path; re-projected on zoom change like the
+-- archived layer. Small tables (peers files are bounded), no canvas of their
+-- own — they share the marker canvas draw pass.
+local proto_layers = {
+    { key = "meshcore", pref = "proto_mc", color = "#ff6644", on = false,
+      pts = {}, zoom = nil, fetched = 0 },
+    { key = "mtlite",   pref = "proto_mt", color = "#ff44ff", on = false,
+      pts = {}, zoom = nil, fetched = 0 },
+}
+
+local function proto_layer_fetch(pl)
+    local ok, nodes = pcall(_map_nodes, pl.key)
+    pl.pts = {}
+    if ok and type(nodes) == "table" then
+        for _, nd in ipairs(nodes) do
+            pl.pts[#pl.pts + 1] = { lat = nd.lat, lon = nd.lon, name = nd.name,
+                                    prec = nd.prec }
+        end
+    end
+    pl.zoom = nil        -- force re-projection at next draw
+    pl.fetched = utils.now()
+end
+
+for _, pl in ipairs(proto_layers) do
+    if map_prefs[pl.pref] then
+        pl.on = true
+        proto_layer_fetch(pl)
+    end
+end
+
 -- Progressive archived-marker loader. When "show archived" is on, archived
 -- contacts are streamed from the disk log in batches (one per timer tick) and
 -- drawn onto the marker canvas as they arrive — the live map stays interactive
@@ -1069,6 +1113,52 @@ redraw_markers = function()
                     bg_color = "#888888", bg_opa = 255, radius = 4,
                     border_color = "#ffffff", border_width = 1, border_opa = 255,
                 })
+            end
+        end
+    end
+
+    -- Cross-protocol node layers (proto_layers above): MeshCore keeps its
+    -- established red (the live-marker color); magenta = MTLite peers file.
+    for _, pl in ipairs(proto_layers) do
+        if pl.on then
+            if utils.now() - pl.fetched > 120 then proto_layer_fetch(pl) end
+            if pl.zoom ~= map.zoom then
+                for _, p in ipairs(pl.pts) do
+                    p.px, p.py = lat_lon_to_world_px(p.lat, p.lon, map.zoom)
+                    -- Accuracy circle radius in pixels: half the precision
+                    -- cell (Meshtastic precision_bits semantics), projected
+                    -- through the map's own mercator at this zoom.
+                    p.rpx = nil
+                    if p.prec and p.prec >= 1 and p.prec <= 31 then
+                        local half_cell_deg = (2 ^ (32 - p.prec)) * 1e-7 / 2
+                        local _, py2 = lat_lon_to_world_px(p.lat + half_cell_deg, p.lon, map.zoom)
+                        local r = math.floor(math.abs(p.py - py2) + 0.5)
+                        if r >= 6 then p.rpx = math.min(r, 250) end
+                    end
+                end
+                pl.zoom = map.zoom
+            end
+            for _, p in ipairs(pl.pts) do
+                local cx = p.px - view_left + MARKER_PAD
+                local cy = p.py - view_top + MARKER_PAD
+                local m = (p.rpx or 4)
+                if cx >= -m and cx < MCANVAS_W + m and cy >= -m and cy < MCANVAS_H + m then
+                    if p.rpx then
+                        -- Blurred position: translucent accuracy disc — the
+                        -- node is somewhere in here, not at the pin.
+                        marker_canvas:draw_rect({
+                            x1 = cx - p.rpx, y1 = cy - p.rpx,
+                            x2 = cx + p.rpx - 1, y2 = cy + p.rpx - 1,
+                            bg_color = pl.color, bg_opa = 36, radius = p.rpx,
+                            border_color = pl.color, border_width = 1, border_opa = 160,
+                        })
+                    end
+                    marker_canvas:draw_rect({
+                        x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
+                        bg_color = pl.color, bg_opa = 255, radius = 4,
+                        border_color = "#ffffff", border_width = 1, border_opa = 255,
+                    })
+                end
             end
         end
     end
@@ -1596,7 +1686,7 @@ local function start_replay(window_secs, name_filter, skip_1byte)
     -- traffic only (no DMs) carrying { from, timestamp, lat, lon, path }.
     local list = {}
     do
-        local ok, recs = pcall(_mesh_routing_query, nil, cutoff, 0)
+        local ok, recs = pcall(_store_routing_query, nil, cutoff, 0)
         if ok and type(recs) == "table" then
             for _, m in ipairs(recs) do
                 -- All hashes in one packet's path share a size; 1-byte
@@ -1850,7 +1940,7 @@ run_meshprint = function(node_name, want_second, algo, skip_1byte, cull_mult, ca
     -- { from, timestamp, lat, lon, path } shape the scan loop expects.
     local all_msgs = {}
     do
-        local okm, recs = pcall(_mesh_routing_query, nl, 0, 0)  -- nl: trimmed, lowercased
+        local okm, recs = pcall(_store_routing_query, nl, 0, 0)  -- nl: trimmed, lowercased
         if okm and type(recs) == "table" then all_msgs = recs end
     end
 
@@ -3058,7 +3148,7 @@ show_meshprint_screen = function()
     -- aren't already in `seen`; append unique finds to `names`, then re-render.
     -- Self-cancels if the screen closes; superseded if a new search starts.
     local function scan_message_senders(q, names, seen)
-        -- Sender names come straight from the routing index: _mesh_routing_senders
+        -- Sender names come straight from the routing index: _store_routing_senders
         -- streams the .idx files in C (one at a time, dropped before the next) and
         -- returns only distinct matching names — no message bodies are ever pulled
         -- into RAM (the old "load every channel's full history" path was a multi-MB
@@ -3067,7 +3157,7 @@ show_meshprint_screen = function()
         search_scan_timer = lvgl.Timer({ period = 10, cb = function(t)
             t:delete(); search_scan_timer = nil
             if not meshprint_overlay then return end
-            local okm, more = pcall(_mesh_routing_senders, q, 40)
+            local okm, more = pcall(_store_routing_senders, q, 40)
             if okm and type(more) == "table" then
                 for _, nm in ipairs(more) do
                     local lk = nm:lower()
@@ -3491,6 +3581,27 @@ local function show_settings_screen()
         invalidate_markers()
         redraw_markers()  -- reflect immediately (archived fill in progressively)
     end)
+
+    -- Cross-protocol node layers: both drawable at once (comparison), fed
+    -- from files so neither needs its protocol running.
+    for _, pl in ipairs(proto_layers) do
+        local disp = (pl.key == "meshcore") and "MeshCore nodes (red)"
+                                            or "MTLite nodes (magenta)"
+        local function pl_text()
+            return (pl.on and "[x]" or "[ ]") .. " " .. disp
+        end
+        local pb = settings_overlay:Button({ w = W - 16, h = 32 })
+        local pl_lbl = pb:Label({ text = pl_text(), align = lvgl.ALIGN.LEFT_MID })
+        pb:onClicked(function()
+            pl.on = not pl.on
+            map_prefs[pl.pref] = pl.on
+            save_map_prefs()
+            pl_lbl:set({ text = pl_text() })
+            if pl.on then proto_layer_fetch(pl) end
+            invalidate_markers()
+            redraw_markers()
+        end)
+    end
 
     -- Replay packet paths from message history
     local replay_btn = settings_overlay:Button({ w = W - 16, h = 32 })

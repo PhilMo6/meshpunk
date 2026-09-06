@@ -7,6 +7,7 @@ local utils = require("lib/utils")
 local apps = require("lib/apps")
 local nav = require("lib/nav")
 local theme = require("lib/theme")
+local reboot_prompt = require("lib/reboot_prompt")
 
 local ok2, storage = pcall(_storage_get_info)
 if not ok2 or not storage then
@@ -113,6 +114,9 @@ apply_btn:onClicked(function()
         else
             status_label.text = "Switched to LittleFS"
         end
+        -- The shared store moved live; the protocol's own data home
+        -- (identity/prefs/archive index) is fixed at boot.
+        reboot_prompt.show("Protocol data follows the new storage after reboot")
     else
         status_label.text = "Error: " .. tostring(err)
     end

@@ -4,6 +4,7 @@
 #include "dsp.h"
 #include "cpuexec.h"
 #include "obc1.h"
+#include "sa1.h"
 
 extern uint8_t OpenBus;
 
@@ -58,6 +59,7 @@ GS_HOT uint8_t S9xGetByte(uint32_t Address)
    case MAP_C4:
       return S9xGetC4(Address & 0xffff);
    case MAP_BWRAM:
+      return Memory.BWRAM[(Address & 0x7fff) - 0x6000];
    case MAP_SPC7110_ROM:
    case MAP_SPC7110_DRAM:
    case MAP_OBC_RAM:
@@ -118,6 +120,9 @@ GS_HOT uint16_t S9xGetWord(uint32_t Address)
    case MAP_C4:
       return S9xGetC4(Address & 0xffff) | (S9xGetC4((Address + 1) & 0xffff) << 8);
    case MAP_BWRAM:
+      /* The window wraps per byte, so no 16-bit load. */
+      return *(Memory.BWRAM + ((Address & 0x7fff) - 0x6000)) |
+             (*(Memory.BWRAM + (((Address + 1) & 0x7fff) - 0x6000)) << 8);
    case MAP_SPC7110_ROM:
    case MAP_SPC7110_DRAM:
    case MAP_OBC_RAM:
@@ -144,6 +149,13 @@ GS_HOT void S9xSetByte(uint8_t Byte, uint32_t Address)
    if (SetAddress >= (uint8_t*) MAP_LAST)
    {
       SetAddress += Address & 0xffff;
+      /* MESHPUNK (SA-1): a store to a watched mailbox byte wakes the parked
+       * chip. NULL for non-SA-1 carts, so the compares never match there. */
+      if (SetAddress == SA1.WaitByteAddress1 || SetAddress == SA1.WaitByteAddress2)
+      {
+         SA1.Executing = SA1.S9xOpcodes != NULL;
+         SA1.WaitCounter = 0;
+      }
       *SetAddress = Byte;
       return;
    }
@@ -174,9 +186,12 @@ GS_HOT void S9xSetByte(uint8_t Byte, uint32_t Address)
       }
       return;
    case MAP_BWRAM:
+      *(Memory.BWRAM + ((Address & 0x7fff) - 0x6000)) = Byte;
+      CPU.SRAMModified = true;
       return;
    case MAP_SA1RAM:
       *(Memory.SRAM + (Address & 0xffff)) = Byte;
+      SA1.Executing = !SA1.Waiting;
       break;
    case MAP_C4:
       S9xSetC4(Byte, Address & 0xffff);
@@ -214,6 +229,12 @@ GS_HOT void S9xSetWord(uint16_t Word, uint32_t Address)
    if (SetAddress >= (uint8_t*) MAP_LAST)
    {
       SetAddress += Address & 0xffff;
+      /* MESHPUNK (SA-1): see S9xSetByte. */
+      if (SetAddress == SA1.WaitByteAddress1 || SetAddress == SA1.WaitByteAddress2)
+      {
+         SA1.Executing = SA1.S9xOpcodes != NULL;
+         SA1.WaitCounter = 0;
+      }
 #ifdef FAST_LSB_WORD_ACCESS
       *(uint16_t*)SetAddress = Word;
 #else
@@ -258,10 +279,15 @@ GS_HOT void S9xSetWord(uint16_t Word, uint32_t Address)
       }
       return;
    case MAP_BWRAM:
+      /* The window wraps per byte, so no 16-bit store. */
+      *(Memory.BWRAM + ((Address & 0x7fff) - 0x6000)) = (uint8_t) Word;
+      *(Memory.BWRAM + (((Address + 1) & 0x7fff) - 0x6000)) = (uint8_t)(Word >> 8);
+      CPU.SRAMModified = true;
       return;
    case MAP_SA1RAM:
       *(Memory.SRAM + (Address & 0xffff)) = (uint8_t) Word;
       *(Memory.SRAM + ((Address + 1) & 0xffff)) = (uint8_t)(Word >> 8);
+      SA1.Executing = !SA1.Waiting;
       break;
    case MAP_C4:
       S9xSetC4(Word & 0xff, Address & 0xffff);
@@ -296,7 +322,7 @@ uint8_t* GetBasePointer(uint32_t Address)
    case MAP_SETA_DSP:
       return Memory.SRAM;
    case MAP_BWRAM:
-      return NULL;
+      return Memory.BWRAM - 0x6000;
    case MAP_HIROM_SRAM:
       return Memory.SRAM - 0x6000;
    case MAP_C4:
@@ -324,7 +350,7 @@ uint8_t* S9xGetMemPointer(uint32_t Address)
    case MAP_LOROM_SRAM:
       return Memory.SRAM + (Address & 0xffff);
    case MAP_BWRAM:
-      return NULL;
+      return Memory.BWRAM - 0x6000 + (Address & 0xffff);
    case MAP_HIROM_SRAM:
       return Memory.SRAM - 0x6000 + (Address & 0xffff);
    case MAP_C4:
@@ -358,9 +384,9 @@ void S9xSetPCBase(uint32_t Address)
       case MAP_DSP:
          CPU.PCBase = Memory.FillRAM - 0x6000;
          break;
-      // case MAP_BWRAM:
-      //    CPU.PCBase = Memory.BWRAM - 0x6000;
-      //    break;
+      case MAP_BWRAM:
+         CPU.PCBase = Memory.BWRAM - 0x6000;
+         break;
       case MAP_HIROM_SRAM:
          CPU.PCBase = Memory.SRAM - 0x6000;
          break;

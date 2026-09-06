@@ -110,6 +110,9 @@ typedef struct
    uint8_t* ROM;
    uint8_t* VRAM;
    uint8_t* SRAM;
+   /* MESHPUNK: the S-CPU's $6000-$7FFF BW-RAM window on SA-1 carts — an
+    * offset into SRAM, moved by $2224 writes (sa1.c). */
+   uint8_t* BWRAM;
    uint8_t* FillRAM;
    uint8_t* C4RAM;
    bool     HiROM;

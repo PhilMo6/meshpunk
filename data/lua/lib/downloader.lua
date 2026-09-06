@@ -5,14 +5,19 @@
   here so the catalog format, staging discipline and .version bookkeeping
   can never diverge between them.
 
-  The repo's catalog.toml carries three TOML table-arrays with identical
-  entry shape: "apps", "themes" and "drivers" (USB .drv.elf modules) — id
-  (repo folder), name, version, author, description, type, category (apps
-  only), files (relative paths to download from <base_url>/<kind>/<id>/),
-  min_fw (optional integer: the minimum firmware API level — the _FW_API Lua
-  global — the entry's files need), drivers (apps only, optional: a list of
-  ids from the drivers table-array that the app depends on; the App Library
-  auto-installs missing ones right after the app, to the app's location).
+  The repo's catalog.toml carries four TOML table-arrays with identical
+  entry shape: "apps", "themes", "drivers" (USB .drv.elf modules) and
+  "protocols" (LoRa .loraproto.elf packages) — id (repo folder), name,
+  version, author, description, type, category (apps only), files (relative
+  paths to download from <base_url>/<kind>/<id>/), min_fw (optional
+  integer: the minimum firmware API level — the _FW_API Lua global — the
+  entry's files need), drivers (apps only, optional: a list of ids from the
+  drivers table-array that the app depends on; the App Library auto-installs
+  missing ones right after the app, to the app's location),
+  requires_protocol (apps only, optional: the LoRa protocol id the app runs
+  under — the App Library asks to download it first when it is missing;
+  never automatic), apps (protocols only, optional: the protocol's primary
+  app ids, offered for download right after the protocol installs).
   NOTE: never write double-square-bracket TOML names inside this header —
   it is a Lua long comment and two adjacent closing square brackets in the
   text terminate it early (that exact bug has now happened twice).
@@ -24,8 +29,8 @@
     * staging dirs live OUTSIDE the apps/themes bases (partial downloads must
       never be discovered), on the SAME drive as the destination so the final
       fileman.rename() is one atomic hop;
-    * a .version file (version\nlocation\ncategory) inside the installed dir
-      marks it store-managed and drives update detection;
+    * a .version file (version\nlocation\ncategory[\nlocked]\nid=<id>) inside
+      the installed dir marks it store-managed and drives update detection;
     * callers own any post-install cache refresh (apps.refresh() for apps;
       themes need none — lib/theme rescans on every list/apply).
 
@@ -107,6 +112,15 @@ local function sanitize_list(list)
             e.author = e.author and tostring(e.author) or nil
             e.description = e.description and tostring(e.description) or nil
             e.min_fw = tonumber(e.min_fw)   -- nil = no firmware requirement
+            -- Optional LoRa-protocol dependency: the app only runs under this
+            -- installed protocol package (the App Library offers the protocol
+            -- download first when it is missing).
+            e.requires_protocol = (e.requires_protocol and safe_segment(e.requires_protocol))
+                and e.requires_protocol or nil
+            -- Optional legacy install key: the pre-id installed-tracking key
+            -- (folder name) this entry migrates from after an id change.
+            -- ONLY entries carrying `was` join old un-id'd installs by name.
+            e.was = (e.was and safe_segment(e.was)) and e.was or nil
             -- Optional USB-driver dependencies: ids from the [[drivers]]
             -- list. Installed automatically after the app (App Library).
             if type(e.drivers) == "table" then
@@ -133,6 +147,7 @@ function M.parse_catalog(body)
     parsed.apps = sanitize_list(parsed.apps)
     parsed.themes = sanitize_list(parsed.themes)
     parsed.drivers = sanitize_list(parsed.drivers)   -- [[drivers]]: USB .drv.elf
+    parsed.protocols = sanitize_list(parsed.protocols)   -- LoRa protocol packages
     return parsed
 end
 
@@ -234,6 +249,10 @@ end
 -- empty for a top-level app), 4 "locked" when the app must not be removable
 -- (e.g. the App Library itself). Split must PRESERVE empty interior lines so
 -- a locked top-level app (empty line 3) still reads its lock on line 4.
+-- An "id=<catalog id>" line may follow (prefix-tagged, position-independent):
+-- the device-side registry identity, letting `name` (= folder + display)
+-- repeat across categories. Absent on old markers -> callers key by folder
+-- name. Old readers ignore it (their line-4 check is the exact "locked").
 function M.read_version(dir)
     local data = fileman.read(dir .. "/.version")
     if not data then return nil end
@@ -249,11 +268,16 @@ function M.read_version(dir)
             break
         end
     end
+    local id = nil
+    for _, ln in ipairs(lines) do
+        if ln:sub(1, 3) == "id=" and #ln > 3 then id = ln:sub(4) break end
+    end
     return {
         version  = (lines[1] ~= "" and lines[1]) or "?",
         location = (lines[2] ~= "" and lines[2]) or "?",
         category = (lines[3] ~= "" and lines[3]) or nil,
         locked   = lines[4] == "locked",
+        id       = id,
     }
 end
 
@@ -298,12 +322,16 @@ end
 
 -- Download + install a catalog entry. opts:
 --   entry     catalog entry ({id, name, version, files, category?, ...})
---   kind      "apps" | "themes" — the repo subdir the files download from
+--   kind      "apps" | "themes" | "drivers" | "protocols" — the repo subdir
+--             the files download from
 --   loc       "sd" | "internal" — which drive (staging + .version location)
 --   final_dir full drive-prefixed destination dir
---   old_dir   set for an update: staging completes first, then each staged
---             file is copied OVER the live dir (manifest files only — user
---             data living inside the app dir, e.g. saves/configs, survives)
+--   old_dir   set for an update. old_dir == final_dir: staging completes,
+--             then each staged file is copied OVER the live dir (manifest
+--             files only — user data living inside the app dir, e.g.
+--             saves/configs, survives). old_dir ~= final_dir (the entry's
+--             category moved): a fresh install at final_dir, then old_dir
+--             is removed — in-dir user data does NOT survive a migration.
 --   on_done   fn(err) — err nil on success, "cancelled" on user cancel
 --             (failed staging is cleaned up silently either way)
 --
@@ -328,6 +356,7 @@ function M.run_install(root, opts)
     -- Kind-prefixed staging name so ids can never collide across kinds.
     local prefix = (kind == "themes" and "th_")
                 or (kind == "drivers" and "dr_")
+                or (kind == "protocols" and "pr_")
                 or "app_"
     local staging = fileman.normalize(M.STAGING[loc] .. "/" .. prefix .. entry.id)
     local files = entry.files
@@ -427,17 +456,21 @@ function M.run_install(root, opts)
                     if not fileman.write(staging .. "/.version",
                         tostring(entry.version or "?") .. "\n" .. loc .. "\n"
                         .. tostring(entry.category or "")
-                        .. (entry.locked and "\nlocked" or "")) then
+                        .. (entry.locked and "\nlocked" or "")
+                        .. "\nid=" .. tostring(entry.id)) then
                         t:delete()
                         close("Cannot write .version")
                         return
                     end
-                    if old_dir then
+                    if old_dir and old_dir == final_dir then
                         phase = "apply"
                         apply_list = {}
                         for i = 1, #files do apply_list[i] = files[i] end
                         apply_list[#apply_list + 1] = ".version"   -- committed last
                     else
+                        -- Fresh install, or a category MIGRATION (old_dir set
+                        -- but the entry's home moved): rename to the new home,
+                        -- then the finish branch removes the old one.
                         phase = "finish"
                     end
                     return
@@ -491,21 +524,31 @@ function M.run_install(root, opts)
         if phase == "cleanup" then
             local done = cleanup_task.step()
             if not done then return end
-            -- Leftover staging is non-fatal; the startup sweep gets it.
+            -- Removes staging after an in-place update, or the OLD location
+            -- after a category migration. Leftovers are non-fatal either way
+            -- (staging: the startup sweep; an old dir: retried next update).
             t:delete()
             close(nil)
             return
         end
 
         -- finish: destination parent, then the atomic same-drive rename.
-        t:delete()
         local parent = fileman.parent(final_dir)
         if parent then fileman.mkdir(parent) end
         local ok, err = fileman.rename(staging, final_dir)
         if not ok then
+            t:delete()
             close("Install failed: " .. tostring(err))
             return
         end
+        if old_dir and old_dir ~= final_dir then
+            -- Category migration: the update landed at its new home; remove
+            -- the old location like an uninstall.
+            phase = "cleanup"
+            cleanup_task = fileman.task_remove(old_dir)
+            return
+        end
+        t:delete()
         close(nil)
     end }
 end

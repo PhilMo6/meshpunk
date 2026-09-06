@@ -28,6 +28,7 @@ your hardware.
 - Loads Lua scripts from the filesystem automatically as apps
 - Full MeshCore support
 - Room server and repeater support: log in, sync messages, and run admin commands right from the Messenger app
+- Swappable radio protocols — the LoRa protocol is an installable package. MeshCore comes preinstalled; MTLite, a Meshtastic-compatible protocol (channels with PSKs, direct messages, channel URL/QR sharing), installs from the App Library. See [Radio protocols](#radio-protocols).
 - Full emoji support! Type emoji with the alt key layer (customize per-key in Settings > Emoji), plus a downloadable extended emoji set that lives on SD
 - Map app with offline tile caching, message path animations, message path replay, and meshprint sender triangulation!
 - Lua games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of development)
@@ -99,6 +100,20 @@ Notes:
 - Use `-launcher.bin` only. `-firmware.bin` (the bare app) installs but does not boot: it declares no partition layout, so the Launcher creates no data partition and MeshPunk has nowhere to unpack its files. `-merged.bin` is a full-flash image for the web flasher, not for the Launcher.
 - Works with Launcher 2.7.2 and newer.
 - This path is only for devices running the Launcher. For a normal install, use the flasher steps above.
+
+## Radio protocols
+
+The LoRa protocol is not baked into the firmware — it runs as an installable protocol package:
+
+- **MeshCore** comes preinstalled and is the default; everything works out of the box.
+- **MTLite**, a Meshtastic-compatible protocol, installs from the App Library's LoRa Protocols category over WiFi — installing it offers its Messenger, Radio, Notifications and Identity apps, which land in an MTLite launcher category. It speaks to standard Meshtastic networks: channels with PSKs, encrypted direct messages, node discovery, positions on the Map. Share or join a whole network the official way with a channel URL — the device generates the QR code for a phone to scan, or imports a pasted link.
+- Pick the boot protocol in **Settings > Lora**. The switch happens at the next reboot, and each protocol keeps its own messages and settings — nothing mixes.
+- "None" is a real choice: the device boots with the LoRa radio parked and everything else works.
+- If the selected protocol is not installed, the device boots with the radio off and says so with a notification — nothing is substituted silently.
+
+Bluetooth is its own slot (**Settings > Ble**): the MeshCore phone-app link is a BLE protocol that requires the MeshCore LoRa protocol running. There is no Meshtastic BLE protocol yet, so phone apps only pair while MeshCore is active.
+
+Protocols update through the App Library like apps do; a protocol update takes effect at the next reboot. Nothing about protocols installs in the background: picking a protocol app whose protocol is missing asks first, and installing a protocol asks before downloading its apps.
 
 ## Map App
 

@@ -11,6 +11,9 @@
 #include "gfx.h"
 #include "apu.h"
 #include "dma.h"
+#include "sa1.h"
+
+static int sa1_slice = 0;     /* MESHPUNK: SA-1 batch counter (see loop) */
 
 
 void S9xMainLoop()
@@ -61,6 +64,17 @@ void S9xMainLoop()
       CPU.PCAtOpcodeStart = CPU.PC;
       CPU.Cycles += CPU.MemSpeed;
       (*ICPU.S9xOpcodes [*CPU.PC++].S9xOpcode)();
+      /* MESHPUNK: SA-1 interleave, batched — one call per 4 S-CPU opcodes
+       * with a 12-op budget in S9xSA1MainLoop keeps the 10.74/3.58 MHz
+       * ratio while paying the call + IRQ-head overhead a quarter as
+       * often, and each interpreter gets longer icache runs. A wake lands
+       * at most 3 S-CPU opcodes before the batch runs. Executing is false
+       * on every non-SA-1 cart. */
+      if (SA1.Executing && ++sa1_slice >= 4)
+      {
+         sa1_slice = 0;
+         S9xSA1MainLoop();
+      }
       if (CPU.Cycles >= CPU.NextEvent)
          S9xDoHBlankProcessing();
    } while(true);

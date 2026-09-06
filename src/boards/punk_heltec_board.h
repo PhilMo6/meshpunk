@@ -54,7 +54,7 @@ public:
 
 // Radiated dBm -> SX1262 chip dBm, inverting the FEM gain curve. The UI and
 // prefs store RADIATED power (cap MAX_LORA_TX_POWER=22); this is applied at
-// the single choke point radio_apply_tx_power() in main.cpp.
+// the single choke point in radio_hal.cpp.
 static inline int8_t heltec_radiated_to_chip_dbm(int8_t radiated) {
   if (radiated > 28) radiated = 28;
   // Walk chip power up until chip + gain(chip) reaches the request.

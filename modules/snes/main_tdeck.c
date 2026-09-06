@@ -554,7 +554,10 @@ int main(int argc, char **argv)
     // to tear down after this returns.
     host_audio_set_pull(NULL, 0);
     snes_sndq_active = 0;
-    if (sram_pending) srm_save();
+    // Unconditional (not just when the dirty debounce is pending): SA-1
+    // carts write BW-RAM through direct map pointers the dirty counter
+    // cannot see, so the exit save is the guarantee.
+    if (s_sram_size) srm_save();
     S9xDeinitDisplay();
     host_clear_screen();
     return 0;
