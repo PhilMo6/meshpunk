@@ -33,8 +33,13 @@
 //               Session up/down resets all reliability state on both sides.
 //
 // Services: 0 = control (session), 1 = gblink (GameBoy link cable — see the
-// gnuboy module). Future: file transfer, remote serial (reliable delivery
-// comes free from the seq/ack layer).
+// gnuboy module), 2 = dgram (module-to-module datagrams, see below). Future:
+// file transfer, remote serial (reliable delivery comes free from the seq/ack
+// layer).
+//
+// A frame's payload is at most TDL_MAX_PAYLOAD (57) bytes: the whole frame
+// is then 64 bytes = exactly one full-speed bulk packet, which is the most
+// the tdeck USB driver hands to one pipe transfer.
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -42,6 +47,7 @@
 // Service ids
 #define TDL_SVC_CTRL    0
 #define TDL_SVC_GBLINK  1
+#define TDL_SVC_DGRAM   2
 
 // Control commands (svc 0)
 #define TDL_C_HELLO     1     // payload: [proto_version]
@@ -118,3 +124,21 @@ int  tdeck_link_gb_poll(uint32_t* ts_out);
 // Block until a gblink event is delivered or timeout_ms elapses. Called from
 // the ELF module's master-wait / lockstep-stall loops (Core 0). Returns 0.
 int  tdeck_link_gb_wait(uint32_t timeout_ms);
+
+// dgram service (svc 2, wrapped by the host_link_dgram_* exports): datagrams
+// of up to TDL_DGRAM_MAX bytes between the modules running on the two decks,
+// fire-and-forget like UDP — the module's own protocol supplies whatever
+// reliability it needs (Doom's netcode does). On the wire a datagram is a
+// run of frames whose cmd byte carries the fragment index (bits 0-6) with
+// bit 7 set on the last fragment; the receiver reassembles in order and
+// drops the whole datagram on any gap. Complete datagrams queue in a PSRAM
+// ring the module drains. open/close mark a module as listening (fragments
+// arriving while closed are dropped) and apply the same quiet + mesh-pause
+// policy as a linked GameBoy game. Callable from any task.
+#define TDL_DGRAM_MAX   1500
+bool tdeck_link_dgram_open();
+void tdeck_link_dgram_close();
+bool tdeck_link_dgram_send(const uint8_t* d, uint32_t n);
+// Next queued datagram copied into buf (truncated to max); returns its full
+// length, or -1 when none is waiting.
+int  tdeck_link_dgram_recv(uint8_t* buf, uint32_t max);

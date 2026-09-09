@@ -2,6 +2,7 @@
 // Wraps doomgeneric_Create/Tick and traps exit() so it doesn't kill the firmware.
 
 #include "doomgeneric-src/doomgeneric/doomgeneric.h"
+#include "net_tdeck.h"
 #include <setjmp.h>
 
 // Host functions
@@ -9,6 +10,7 @@ extern int      host_should_exit(void);
 extern void     host_log(const char* msg);
 extern uint32_t host_get_ticks_ms(void);
 extern void     host_sleep_ms(uint32_t ms);
+extern int      strcmp(const char*, const char*);
 
 // Jump buffer for trapping exit() calls from Doom
 static jmp_buf exit_jmp;
@@ -29,6 +31,8 @@ void abort(void) {
 }
 
 int main(int argc, char** argv) {
+    int i;
+
     host_log("doom: module starting");
 
     // Set up exit trap
@@ -36,6 +40,16 @@ int main(int argc, char** argv) {
         // Returned here from exit() call
         host_log("doom: exit() caught, returning to launcher");
         return exit_code_val;
+    }
+
+    // Netgame: the launcher's choices arrive as one "-netgame <spec>"
+    // argument (net_tdeck.h); parsed here, applied inside D_DoomMain.
+    TDeck_NetParseSpec(NULL);
+    for (i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "-netgame") == 0) {
+            TDeck_NetParseSpec(argv[i + 1]);
+            break;
+        }
     }
 
     // Initialize Doom

@@ -16,7 +16,7 @@ $CFLAGS = @(
     "-DDOOMGENERIC_RESX=320",
     "-DDOOMGENERIC_RESY=200",
     "-DNDEBUG",                # assert() in vendored opl/ code would pull __assert_func
-    "-I$DG", "-Iopl",
+    "-I$DG", "-Iopl", "-Inet", "-I.",
     "-Wno-implicit-function-declaration",
     "-Wno-int-conversion",
     "-Wno-pointer-to-int-cast"
@@ -39,7 +39,10 @@ $DG_EXCLUDE = @(
     # w_file_stdc.c is INCLUDED — uses streaming fopen/fread (SPI-locked by host)
     "i_sdlmusic.c", "i_sdlsound.c",  # no SDL
     "i_allegromusic.c", "i_allegrosound.c",  # no Allegro
-    "icon.c"                   # SDL icon, not needed
+    "icon.c",                  # SDL icon, not needed
+    "dummy.c"                  # doomgeneric's stand-ins for the netcode
+                               # globals (drone, net_client_connected) —
+                               # the real ones come from net/net_client.c
 )
 
 $dg_sources = Get-ChildItem "$DG\*.c" | Where-Object {
@@ -50,8 +53,13 @@ $dg_sources = Get-ChildItem "$DG\*.c" | Where-Object {
 $tdeck_sources = @(
     "main_tdeck.c",
     "doomgeneric_tdeck.c",
-    "i_tdeck_sound.c"
+    "i_tdeck_sound.c",
+    "net_tdeck.c",          # UDP (WiFi) + USB-cable transports, -netgame spec
+    "net_tdeck_wait.c"      # status screen + connect/launch waits
 )
+
+# Multiplayer: Chocolate Doom 2.2.1 netcode (net/), transports above
+$net_sources = Get-ChildItem "net\*.c" | ForEach-Object { $_.FullName }
 
 # OPL music: chocolate-doom 2.2.1 player + DBOPL synth + T-Deck backend
 $opl_sources = @(
@@ -62,7 +70,7 @@ $opl_sources = @(
     "opl/midifile.c"
 )
 
-$all_sources = $tdeck_sources + $opl_sources + $dg_sources
+$all_sources = $tdeck_sources + $opl_sources + $net_sources + $dg_sources
 
 Write-Host "Compiling Doom module ($($all_sources.Count) source files)..."
 Write-Host "  Resolution: 320x200"
@@ -116,10 +124,17 @@ if ($LASTEXITCODE -eq 0) {
     }
     Write-Host ""
 
-    # Copy to LittleFS data dir so it's included in firmware flash
-    $dest = "..\..\data\lua\apps\Games\Doom\doom.app.elf"
-    Copy-Item $OUT $dest -Force
-    Write-Host "Copied to $dest"
+    # Publish: Doom is a store app — the elf lives in meshpunk-apps/apps/Doom
+    # and its module-src mirror (the firmware data tree has no Doom dir).
+    foreach ($dest in @("..\..\..\meshpunk-apps\apps\Doom\doom.app.elf",
+                        "..\..\..\meshpunk-apps\module-src\doom\doom.app.elf")) {
+        if (Test-Path (Split-Path $dest)) {
+            Copy-Item $OUT $dest -Force
+            Write-Host "Copied to $dest"
+        } else {
+            Write-Host "Skipped $dest (directory missing)"
+        }
+    }
 } else {
     Write-Host "Link failed!"
     exit 1

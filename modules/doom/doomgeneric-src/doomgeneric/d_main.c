@@ -67,6 +67,7 @@
 #include "net_client.h"
 #include "net_dedicated.h"
 #include "net_query.h"
+#include "net_tdeck.h"   // MESHPUNK: launcher netgame spec
 
 #include "p_setup.h"
 #include "r_local.h"
@@ -1178,64 +1179,10 @@ void D_DoomMain (void)
     DEH_printf("Z_Init: Init zone memory allocation daemon. \n");
     Z_Init ();
 
-#ifdef FEATURE_MULTIPLAYER
-    //!
-    // @category net
-    //
-    // Start a dedicated server, routing packets but not participating
-    // in the game itself.
-    //
-
-    if (M_CheckParm("-dedicated") > 0)
-    {
-        printf("Dedicated server mode.\n");
-        NET_DedicatedServer();
-
-        // Never returns
-    }
-
-    //!
-    // @category net
-    //
-    // Query the Internet master server for a global list of active
-    // servers.
-    //
-
-    if (M_CheckParm("-search"))
-    {
-        NET_MasterQuery();
-        exit(0);
-    }
-
-    //!
-    // @arg <address>
-    // @category net
-    //
-    // Query the status of the server running on the given IP
-    // address.
-    //
-
-    p = M_CheckParmWithArgs("-query", 1);
-
-    if (p)
-    {
-        NET_QueryAddress(myargv[p+1]);
-        exit(0);
-    }
-
-    //!
-    // @category net
-    //
-    // Search the local LAN for running servers.
-    //
-
-    if (M_CheckParm("-localsearch"))
-    {
-        NET_LANQuery();
-        exit(0);
-    }
-
-#endif
+    // MESHPUNK: the -dedicated / -search / -query / -localsearch console
+    // utilities are gone — a T-Deck has no console to print to, and the
+    // dedicated server (net_dedicated.c) is not vendored. Netgame setup
+    // comes from the launcher's -netgame spec (net_tdeck.h).
 
     //!
     // @vanilla
@@ -1720,6 +1667,35 @@ void D_DoomMain (void)
             {
                 startmap = 1;
             }
+        }
+        autostart = true;
+    }
+
+    // MESHPUNK: the launcher's netgame choices (net_tdeck.h). Applied here,
+    // after -warp, because episode/map depend on gamemode. Only the host's
+    // values matter — the server sends its controller's settings to every
+    // client (net_server.c), so a joiner's options are never consulted.
+    if (tdeck_netopts.mode == TDN_MODE_HOST)
+    {
+        if (tdeck_netopts.deathmatch > 0)
+            deathmatch = tdeck_netopts.deathmatch;
+        if (tdeck_netopts.skill >= 1 && tdeck_netopts.skill <= 5)
+            startskill = (skill_t) (tdeck_netopts.skill - 1);
+        if (tdeck_netopts.nomonsters)
+            nomonsters = true;
+        if (tdeck_netopts.respawn)
+            respawnparm = true;
+        if (tdeck_netopts.fast)
+            fastparm = true;
+        if (tdeck_netopts.timer > 0)
+            timelimit = tdeck_netopts.timer;
+        if (tdeck_netopts.map > 0)
+        {
+            startmap = tdeck_netopts.map;
+            if (gamemode == commercial)
+                startepisode = 1;
+            else if (tdeck_netopts.episode > 0)
+                startepisode = tdeck_netopts.episode;
         }
         autostart = true;
     }

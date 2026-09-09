@@ -12,12 +12,17 @@
 #include "tdeck_link.h"
 
 #include <Arduino.h>
+#include <esp_heap_caps.h>   // dgram ring lives in PSRAM
 #include "meshpunk_sync.h"
 
 // ── Frame constants ──────────────────────────────────────────────────────────
 
 #define TDL_MAGIC        0xA5
-#define TDL_MAX_PAYLOAD  16
+// 57 makes the largest frame exactly 64 bytes = one full-speed bulk packet,
+// the most the tdeck USB driver's link_send() accepts per pipe transfer
+// (it rejects anything over the endpoint's 64-byte max packet size). gblink
+// frames stay tiny; the dgram service fills frames to this limit.
+#define TDL_MAX_PAYLOAD  57
 #define TDL_HDR          5                      // magic svc cmd seq len
 #define TDL_CRC_LEN      2                      // CRC-16-CCITT, little-endian
 #define TDL_MAX_FRAME    (TDL_HDR + TDL_MAX_PAYLOAD + TDL_CRC_LEN)
@@ -42,6 +47,7 @@ static volatile bool s_session       = false;   // HELLO exchanged, peer alive
 static volatile bool s_remote_gb     = false;   // peer's game ATTACHed
 static volatile bool s_local_gb      = false;   // our game running
 static volatile bool s_usb_backend   = false;   // host role: driver registered
+static volatile bool s_dgram_open    = false;   // a module listens on svc 2
 
 // Volatile: tdeck_link_status() (module task, Core 0) evaluates the
 // session/lease timeouts from these at READ time, so a starved tdl_task
@@ -57,15 +63,18 @@ static volatile uint32_t s_last_remote_attach_ms = 0;
 volatile bool g_slog_quiet = false;
 
 static void update_quiet() {
-    g_slog_quiet = !s_usb_backend && s_session && s_local_gb;
+    // A linked game = a GameBoy game attached OR a module listening on the
+    // dgram service (Doom netplay over the cable): same wire, same policy.
+    bool linked_game = s_local_gb || s_dgram_open;
+    g_slog_quiet = !s_usb_backend && s_session && linked_game;
     // Mesh radio pause (both roles): a live cable session + our game running
-    // = a GameBoy link session — park the mesh dispatcher (radio SPI polling,
+    // = a link session — park the mesh dispatcher (radio SPI polling,
     // storage writes, BLE loop) so the link has the SPI bus and Core 1 to
     // itself. Everything stays in memory; the mesh task keeps ticking the
     // RTC and resumes the moment the game detaches, the cable is pulled, or
     // the session dies (elf_host's force-DETACH covers the crash path). The
     // radio stays in RX — a packet flagged mid-pause is serviced on resume.
-    mesh_task_paused = s_session && s_local_gb;
+    mesh_task_paused = s_session && linked_game;
 }
 
 static bool (*s_usb_send)(const uint8_t*, uint32_t) = nullptr;
@@ -92,6 +101,26 @@ struct GbEv {
 static GbEv             s_gbq[GBQ_SIZE];
 static volatile int     s_gbq_head = 0, s_gbq_tail = 0;
 static portMUX_TYPE     s_gbq_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// dgram service ring: producer = tdl_task (Core 1, reassembled datagrams),
+// consumer = ELF module task (Core 0). Slots + the reassembly buffer live in
+// PSRAM, allocated once at boot (~26KB) so the ring never has to be freed
+// underneath a producer mid-copy: open/close only flip s_dgram_open and
+// reset the indices. Each slot is one whole datagram.
+#define DGQ_SIZE 16
+struct DgSlot {
+    uint16_t len;
+    uint8_t  data[TDL_DGRAM_MAX];
+};
+static DgSlot*          s_dgq = nullptr;
+static volatile int     s_dgq_head = 0, s_dgq_tail = 0;
+static portMUX_TYPE     s_dgq_mux = portMUX_INITIALIZER_UNLOCKED;
+// (s_dgram_open lives with the session flags above: update_quiet reads it.)
+// Fragment reassembly — tdl_task only.
+#define TDL_DGRAM_LAST  0x80                    // cmd bit 7: last fragment
+static uint8_t*         s_dg_asm = nullptr;     // TDL_DGRAM_MAX bytes
+static uint32_t         s_dg_asm_len = 0;
+static int              s_dg_asm_next = -1;     // expected index, -1 = idle
 
 // ── Frame build + backend send (callable from any task) ─────────────────────
 
@@ -397,6 +426,55 @@ int tdeck_link_gb_wait(uint32_t timeout_ms) {
     return 0;
 }
 
+// ── Public: module-facing dgram service ─────────────────────────────────────
+
+bool tdeck_link_dgram_open() {
+    if (!s_dgq) return false;                   // boot allocation failed
+    portENTER_CRITICAL(&s_dgq_mux);
+    s_dgq_head = s_dgq_tail = 0;                // drop anything stale
+    s_dgram_open = true;
+    portEXIT_CRITICAL(&s_dgq_mux);
+    update_quiet();
+    return true;
+}
+
+void tdeck_link_dgram_close() {
+    s_dgram_open = false;
+    update_quiet();
+}
+
+// Fire-and-forget: every fragment rides a seq-0 frame. A fragment the
+// backend can't take (CDC buffer full, pipe busy) loses the whole datagram —
+// UDP semantics, which is what the module protocols on top expect.
+bool tdeck_link_dgram_send(const uint8_t* d, uint32_t n) {
+    if (!s_session || n == 0 || n > TDL_DGRAM_MAX) return false;
+    uint32_t off = 0;
+    uint8_t  idx = 0;
+    while (off < n) {
+        uint32_t chunk = n - off;
+        if (chunk > TDL_MAX_PAYLOAD) chunk = TDL_MAX_PAYLOAD;
+        bool last = (off + chunk == n);
+        uint8_t cmd = (uint8_t)(idx | (last ? TDL_DGRAM_LAST : 0));
+        if (!tdl_send(TDL_SVC_DGRAM, cmd, d + off, (uint8_t)chunk)) return false;
+        off += chunk;
+        idx++;
+    }
+    return true;
+}
+
+int tdeck_link_dgram_recv(uint8_t* buf, uint32_t max) {
+    if (!s_dgq || s_dgq_head == s_dgq_tail) return -1;
+    __sync_synchronize();
+    const DgSlot& s = s_dgq[s_dgq_tail];
+    uint32_t len = s.len;
+    uint32_t n = len < max ? len : max;
+    memcpy(buf, s.data, n);
+    portENTER_CRITICAL(&s_dgq_mux);
+    s_dgq_tail = (s_dgq_tail + 1) % DGQ_SIZE;
+    portEXIT_CRITICAL(&s_dgq_mux);
+    return (int)len;
+}
+
 // ── Protocol (tdl_task only) ─────────────────────────────────────────────────
 
 // Returns false when the ring is full. For reliable frames the caller MUST
@@ -419,6 +497,43 @@ static bool gbq_push(uint8_t cmd, uint8_t data, uint8_t ctrl, uint32_t ts) {
     // Wake the module's wait/stall loop (tdeck_link_gb_wait).
     if (ok && s_gb_wake) xSemaphoreGive(s_gb_wake);
     return ok;
+}
+
+// Queue one reassembled datagram for the module. The producer owns the slot
+// at head until it publishes the index, so the copy runs outside the lock.
+// Full ring = drop (the module protocol resends; same as a lost UDP packet).
+static bool dgq_push(const uint8_t* d, uint32_t n) {
+    int head = s_dgq_head;
+    int next = (head + 1) % DGQ_SIZE;
+    if (next == s_dgq_tail) return false;
+    DgSlot& s = s_dgq[head];
+    s.len = (uint16_t)n;
+    memcpy(s.data, d, n);
+    __sync_synchronize();
+    portENTER_CRITICAL(&s_dgq_mux);
+    bool ok = s_dgram_open;                     // closed meanwhile: discard
+    if (ok) s_dgq_head = next;
+    portEXIT_CRITICAL(&s_dgq_mux);
+    return ok;
+}
+
+// One dgram fragment off the wire (tdl_task). Fragments arrive in order on
+// a serial link, so reassembly is a running index: 0 starts a datagram, any
+// other mismatch (a lost fragment) discards it until the next index 0.
+static void dgram_on_fragment(uint8_t cmd, const uint8_t* p, uint8_t len) {
+    if (!s_dgram_open || !s_dg_asm) { s_dg_asm_next = -1; return; }
+    int  idx  = cmd & 0x7F;
+    bool last = (cmd & TDL_DGRAM_LAST) != 0;
+    if (idx == 0) { s_dg_asm_len = 0; s_dg_asm_next = 0; }
+    if (idx != s_dg_asm_next) { s_dg_asm_next = -1; return; }
+    if (s_dg_asm_len + len > TDL_DGRAM_MAX) { s_dg_asm_next = -1; return; }
+    memcpy(s_dg_asm + s_dg_asm_len, p, len);
+    s_dg_asm_len += len;
+    s_dg_asm_next++;
+    if (last) {
+        dgq_push(s_dg_asm, s_dg_asm_len);
+        s_dg_asm_next = -1;
+    }
 }
 
 static uint32_t le32(const uint8_t* p) {
@@ -446,6 +561,7 @@ static void session_down(const char* why) {
     s_session   = false;
     s_remote_gb = false;
     rel_reset(s_rel_gb);            // in-flight frames die with the session
+    s_dg_asm_next = -1;             // a half-built datagram dies with it too
     update_quiet();
     if (was) SLog.printf("[tdl] peer session down (%s)\r\n", why); // post-unmute
 }
@@ -524,6 +640,8 @@ static void on_frame(uint8_t svc, uint8_t cmd,
                 break;
             default: break;
         }
+    } else if (svc == TDL_SVC_DGRAM) {
+        dgram_on_fragment(cmd, p, len);
     }
     // unknown services: ignored (forward compatibility)
 }
@@ -654,7 +772,8 @@ static void tdl_task_body(void*) {
         // has the headroom, and this loop is microseconds of work per wake.
         // Wake on RX (xTaskNotifyGive from tdeck_link_usb_rx) or after the
         // timeout for retransmit/keepalive housekeeping.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((s_session && s_local_gb) ? 1 : 5));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(
+            (s_session && (s_local_gb || s_dgram_open)) ? 1 : 5));
     }
 }
 
@@ -662,6 +781,13 @@ void tdeck_link_init() {
     // Send serializer — must exist before the task (and any module send).
     s_send_mux = xSemaphoreCreateMutex();
     s_gb_wake  = xSemaphoreCreateBinary();   // module wait/stall wakeup
+    // dgram ring + reassembly buffer: PSRAM, kept for the firmware's
+    // lifetime (see the DgSlot comment). Internal SRAM untouched.
+    s_dgq    = (DgSlot*)heap_caps_malloc(sizeof(DgSlot) * DGQ_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_dg_asm = (uint8_t*)heap_caps_malloc(TDL_DGRAM_MAX,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_dgq || !s_dg_asm) SLog.println("[tdl] dgram ring alloc failed");
     // 6KB, not 3KB: the deepest chain (parse_byte -> on_frame -> session_up
     // -> SLog.printf + the ATTACH re-announce through Serial/HWCDC) runs
     // printf machinery, and 3072 overflowed into the neighboring heap block

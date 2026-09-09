@@ -37,6 +37,7 @@
 #include "deh_main.h"
 
 #include "d_loop.h"
+#include "net_tdeck.h"
 
 ticcmd_t *netcmds;
 
@@ -249,7 +250,7 @@ void D_CheckNetGame (void)
     D_RegisterLoopCallbacks(&doom_loop_interface);
 
     SaveGameSettings(&settings);
-    D_StartNetGame(&settings, NULL);
+    D_StartNetGame(&settings, TDeck_NetStartCallback);   // MESHPUNK: status screen
     LoadGameSettings(&settings);
 
     DEH_printf("startskill %i  deathmatch: %i  startmap: %i  startepisode: %i\n",

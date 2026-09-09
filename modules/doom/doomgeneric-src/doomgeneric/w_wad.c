@@ -35,6 +35,7 @@
 #include "z_zone.h"
 
 #include "w_wad.h"
+#include "net_tdeck.h"   // MESHPUNK: TDeck_NetPump in W_ReadLump
 
 typedef struct
 {
@@ -347,7 +348,12 @@ void W_ReadLump(unsigned int lump, void *dest)
 {
     int c;
     lumpinfo_t *l;
-	
+
+    // MESHPUNK: every I/O-bound engine phase (init, sound precache, level
+    // loads) funnels through here with the netcode unpumped, and a netgame
+    // connection drops after 30s without traffic — keep it serviced.
+    TDeck_NetPump();
+
     if (lump >= numlumps)
     {
 	I_Error ("W_ReadLump: %i >= numlumps", lump);

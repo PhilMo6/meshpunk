@@ -10,7 +10,8 @@
 #include "mesh_store.h"           // mstore:: + normalize_smart_quotes (proto_exports)
 #include "emoji_font.h"           // emoji_compose (meshcore package export)
 #include "../lib/ed25519/ed_25519.h"  // ed25519_key_exchange (proto_exports)
-#include "tdeck_link.h"    // peer link: gblink veneers + module-exit detach
+#include "tdeck_link.h"    // peer link: gblink + dgram veneers, module-exit detach
+#include "net_bridge.h"    // module sockets: close-all after every run
 #include "screenshot.h"    // screen capture staging + PNG writer
 
 #include <Arduino.h>
@@ -2220,6 +2221,26 @@ int host_link_gb_wait(unsigned int timeout_ms) {
     return tdeck_link_gb_wait(timeout_ms);
 }
 
+// Peer link, dgram service — veneers over tdeck_link's svc 2 (contract in
+// elf_host.h). The module task polls recv once per frame or tic.
+int host_link_dgram_open(void) {
+    return tdeck_link_dgram_open() ? 1 : 0;
+}
+
+void host_link_dgram_close(void) {
+    tdeck_link_dgram_close();
+}
+
+int host_link_dgram_send(const void* data, int len) {
+    if (!data || len <= 0) return 0;
+    return tdeck_link_dgram_send((const uint8_t*)data, (uint32_t)len) ? 1 : 0;
+}
+
+int host_link_dgram_recv(void* buf, int max) {
+    if (!buf || max <= 0) return -1;
+    return tdeck_link_dgram_recv((uint8_t*)buf, (uint32_t)max);
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -2265,6 +2286,24 @@ static const elf_symbol_t host_exports[] = {
     { "host_link_gb_send",  (void*)host_link_gb_send },
     { "host_link_gb_poll",  (void*)host_link_gb_poll },
     { "host_link_gb_wait",  (void*)host_link_gb_wait },
+    // Level 13: peer-link datagrams + WiFi sockets (contract in elf_host.h;
+    // sockets implemented in net_bridge.cpp)
+    { "host_link_dgram_open",  (void*)host_link_dgram_open },
+    { "host_link_dgram_close", (void*)host_link_dgram_close },
+    { "host_link_dgram_send",  (void*)host_link_dgram_send },
+    { "host_link_dgram_recv",  (void*)host_link_dgram_recv },
+    { "host_net_status",    (void*)host_net_status },
+    { "host_net_local_ip",  (void*)host_net_local_ip },
+    { "host_net_resolve",   (void*)host_net_resolve },
+    { "host_udp_open",      (void*)host_udp_open },
+    { "host_udp_send",      (void*)host_udp_send },
+    { "host_udp_recv",      (void*)host_udp_recv },
+    { "host_tcp_connect",   (void*)host_tcp_connect },
+    { "host_tcp_listen",    (void*)host_tcp_listen },
+    { "host_tcp_accept",    (void*)host_tcp_accept },
+    { "host_tcp_send",      (void*)host_tcp_send },
+    { "host_tcp_recv",      (void*)host_tcp_recv },
+    { "host_net_close",     (void*)host_net_close },
 
     // C library: stdio
     { "printf",             (void*)printf },
@@ -2872,6 +2911,11 @@ int elf_host_run_pending(void) {
         // itself, but the exit()-longjmp path can skip that — make sure the
         // peer never sees a ghost game.
         tdeck_link_gb_send(TDL_GB_DETACH, 0, 0);
+        // Same for the dgram service and any WiFi sockets the module opened:
+        // a listening flag or a socket left behind would keep the mesh paused
+        // / modem sleep off / a port bound after the module is gone.
+        tdeck_link_dgram_close();
+        net_bridge_close_all();
         // The pull callback (and the Audio state it reads) lives in module
         // memory; unregister before any of it is freed. Blocks until the
         // mixer is outside the callback. The module normally does this in

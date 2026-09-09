@@ -207,6 +207,12 @@ void I_InitGraphics (void)
     int i, gfxmodeparm;
     char *mode;
 
+    // MESHPUNK: idempotent. The netgame wait screen (net_tdeck_wait.c)
+    // brings graphics up early to draw status text with the game's own
+    // font; D_DoomLoop's later call must not allocate a second buffer.
+    if (I_VideoBuffer != NULL)
+        return;
+
 	memset(&s_Fb, 0, sizeof(struct FB_ScreenInfo));
 	s_Fb.xres = DOOMGENERIC_RESX;
 	s_Fb.yres = DOOMGENERIC_RESY;

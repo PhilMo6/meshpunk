@@ -265,7 +265,25 @@
 //                  lora_protos/<id>/ as .loraproto.elf exporting
 //                  loraproto_ops. Apps relying on any of this need
 //                  min_fw=12.
-#define MESHPUNK_FW_API 12
+// 13 (unreleased since the v0.4.0 tag, which shipped level 12): NETWORK
+//                  ACCESS FOR ELF MODULES — new host_exports (a load-time
+//                  dependency: a module importing any of them fails to load
+//                  on level 12, so min_fw=13 is mandatory for it). The peer
+//                  link's dgram service: host_link_dgram_open / close /
+//                  send / recv carry fire-and-forget datagrams of up to 1500
+//                  bytes between the modules on two cabled decks (svc 2 in
+//                  tdeck_link; frames grew to 64 bytes = one bulk packet, the
+//                  tdeck driver is unchanged); an open dgram service pauses
+//                  the mesh like a linked GameBoy game. WiFi sockets:
+//                  host_net_status / host_net_local_ip / host_net_resolve,
+//                  UDP host_udp_open / send / recv, TCP host_tcp_connect /
+//                  listen / accept / send / recv, and host_net_close — all
+//                  non-blocking (src/net_bridge.cpp), up to 4 per run,
+//                  closed by elf_host after the module exits, WiFi modem
+//                  sleep off while any is open. First consumer: Doom 1.3.0
+//                  multiplayer over the cable and over WiFi. No Lua binding
+//                  changes this cycle.
+#define MESHPUNK_FW_API 13
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // the meshcore package's ble_companion.cpp, which compiles against this

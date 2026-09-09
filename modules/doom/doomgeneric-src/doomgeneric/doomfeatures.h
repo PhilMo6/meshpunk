@@ -28,8 +28,10 @@
 #undef FEATURE_DEHACKED
 
 // Enables multiplayer support (network games)
+// MESHPUNK: on — Chocolate Doom's netcode is vendored in modules/doom/net
+// and carried by the T-Deck transports in net_tdeck.c.
 
-#undef FEATURE_MULTIPLAYER
+#define FEATURE_MULTIPLAYER
 
 // Enables sound output
 

@@ -103,6 +103,49 @@ int host_link_status(void);
 int host_link_gb_send(int cmd, int data_ctrl, unsigned int ts);
 int host_link_gb_poll(unsigned int* ts_out);
 
+// T-Deck peer link, dgram service (tdeck_link.h TDL_SVC_DGRAM): datagrams of
+// up to 1500 bytes to the module running on the other deck, fire-and-forget
+// like UDP. open marks this module as listening (and pauses the mesh for the
+// linked session, like a GameBoy link game); close undoes it — elf_host also
+// closes after every module run. send: 1 handed to the wire, 0 dropped (no
+// session, or the transport was full). recv: the next datagram's length
+// (copied into buf, truncated to max), or -1 when none is waiting. Whether a
+// peer is present is host_link_status() & 3 >= 1, as for gblink.
+int  host_link_dgram_open(void);
+void host_link_dgram_close(void);
+int  host_link_dgram_send(const void* data, int len);
+int  host_link_dgram_recv(void* buf, int max);
+
+// WiFi sockets (src/net_bridge.cpp). IPv4 addresses are host-order u32
+// (192.168.1.5 = 0xC0A80105); ports host-order ints. Every socket is
+// non-blocking; a module polls. Up to 4 sockets per run; elf_host closes
+// any left open after the module exits. While a module socket is open,
+// WiFi modem sleep is off (it adds up to a beacon interval of receive
+// latency per packet), and restored at the last close.
+// host_net_status: 1 while the station is connected with an address.
+// host_net_resolve: dotted quad or DNS name -> address, 0 on failure
+// (DNS needs the station connected; blocks for the lookup).
+int      host_net_status(void);
+unsigned host_net_local_ip(void);
+unsigned host_net_resolve(const char* name);
+// UDP: open binds port (0 = any) with broadcast enabled -> socket or -1.
+// send -> bytes sent, 0 would-block, -1 error. recv -> bytes, 0 none,
+// -1 error; *ip/*port receive the sender (either may be NULL).
+int  host_udp_open(int port);
+int  host_udp_send(int sock, unsigned ip, int port, const void* data, int len);
+int  host_udp_recv(int sock, unsigned* ip, int* port, void* buf, int max);
+// TCP: connect blocks up to timeout_ms -> socket or -1 (Nagle off). listen
+// -> listening socket or -1; accept -> a connected socket (Nagle off) or -1
+// when nothing is pending. send -> bytes accepted (may be short), 0
+// would-block, -1 closed/error. recv -> bytes, 0 none yet, -1 closed/error.
+int  host_tcp_connect(unsigned ip, int port, int timeout_ms);
+int  host_tcp_listen(int port);
+int  host_tcp_accept(int lsock, unsigned* ip, int* port);
+int  host_tcp_send(int sock, const void* data, int len);
+int  host_tcp_recv(int sock, void* buf, int max);
+// Close any socket from the calls above (UDP or TCP).
+void host_net_close(int sock);
+
 #ifdef __cplusplus
 }
 #endif

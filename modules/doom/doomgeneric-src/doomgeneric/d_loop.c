@@ -37,8 +37,15 @@
 #include "net_io.h"
 #include "net_query.h"
 #include "net_server.h"
-#include "net_sdl.h"
+#include "net_tdeck.h"   // MESHPUNK: T-Deck transports + launcher spec
 #include "net_loop.h"
+
+// Maximum time that we wait in TryRunTics() for netgame data to be
+// received before we bail out and render a frame anyway.
+// Vanilla Doom used 20 for this value, but we use a smaller value
+// instead for better responsiveness of the menu when we're stuck.
+// (MESHPUNK: Chocolate Doom 2.2.1's rule, restored with the netcode.)
+#define MAX_NETGAME_STALL_TICS  5
 
 // The complete set of data for a particular tic.
 
@@ -307,9 +314,10 @@ void D_StartGameLoop(void)
     lasttime = GetAdjustedTime() / ticdup;
 }
 
-#if ORIGCODE
 //
 // Block until the game start message is received from the server.
+// (MESHPUNK: back in use — the netcode is vendored; the callback is the
+// T-Deck status screen.)
 //
 
 static void BlockUntilStart(net_gamesettings_t *settings,
@@ -335,12 +343,9 @@ static void BlockUntilStart(net_gamesettings_t *settings,
     }
 }
 
-#endif
-
 void D_StartNetGame(net_gamesettings_t *settings,
                     netgame_startup_callback_t callback)
 {
-#if ORIGCODE
     int i;
 
     offsetms = 0;
@@ -436,26 +441,11 @@ void D_StartNetGame(net_gamesettings_t *settings,
     //{
     //    printf("Syncing netgames like Vanilla Doom.\n");
     //}
-#else
-    settings->consoleplayer = 0;
-	settings->num_players = 1;
-	settings->player_classes[0] = player_class;
-	settings->new_sync = 0;
-	settings->extratics = 1;
-	settings->ticdup = 1;
-
-	ticdup = settings->ticdup;
-	new_sync = settings->new_sync;
-#endif
 }
 
 boolean D_InitNetGame(net_connect_data_t *connect_data)
 {
     boolean result = false;
-#ifdef FEATURE_MULTIPLAYER
-    net_addr_t *addr = NULL;
-    int i;
-#endif
 
     // Call D_QuitNetGame on exit:
 
@@ -464,88 +454,11 @@ boolean D_InitNetGame(net_connect_data_t *connect_data)
     player_class = connect_data->player_class;
 
 #ifdef FEATURE_MULTIPLAYER
-
-    //!
-    // @category net
-    //
-    // Start a multiplayer server, listening for connections.
-    //
-
-    if (M_CheckParm("-server") > 0
-     || M_CheckParm("-privateserver") > 0)
-    {
-        NET_SV_Init();
-        NET_SV_AddModule(&net_loop_server_module);
-        NET_SV_AddModule(&net_sdl_module);
-        NET_SV_RegisterWithMaster();
-
-        net_loop_client_module.InitClient();
-        addr = net_loop_client_module.ResolveAddress(NULL);
-    }
-    else
-    {
-        //!
-        // @category net
-        //
-        // Automatically search the local LAN for a multiplayer
-        // server and join it.
-        //
-
-        i = M_CheckParm("-autojoin");
-
-        if (i > 0)
-        {
-            addr = NET_FindLANServer();
-
-            if (addr == NULL)
-            {
-                I_Error("No server found on local LAN");
-            }
-        }
-
-        //!
-        // @arg <address>
-        // @category net
-        //
-        // Connect to a multiplayer server running on the given
-        // address.
-        //
-
-        i = M_CheckParmWithArgs("-connect", 1);
-
-        if (i > 0)
-        {
-            net_sdl_module.InitClient();
-            addr = net_sdl_module.ResolveAddress(myargv[i+1]);
-
-            if (addr == NULL)
-            {
-                I_Error("Unable to resolve '%s'\n", myargv[i+1]);
-            }
-        }
-    }
-
-    if (addr != NULL)
-    {
-        if (M_CheckParm("-drone") > 0)
-        {
-            connect_data->drone = true;
-        }
-
-        if (!NET_CL_Connect(addr, connect_data))
-        {
-            I_Error("D_InitNetGame: Failed to connect to %s\n",
-                    NET_AddrToString(addr));
-        }
-
-        printf("D_InitNetGame: Connected to %s\n", NET_AddrToString(addr));
-
-        // Wait for launch message received from server.
-
-        NET_WaitForLaunch();
-
-        result = true;
-    }
+    // MESHPUNK: role and transport come from the launcher's -netgame spec
+    // (net_tdeck.h); net_tdeck_wait.c brings up the server or finds the
+    // host, connects, and waits for the launch — status text only, no
+    // dialogs. Returns false for single player.
+    result = TDeck_NetConnect(connect_data);
 #endif
 
     return result;
@@ -773,15 +686,22 @@ void TryRunTics (void)
 	if (lowtic < gametic/ticdup)
 	    I_Error ("TryRunTics: lowtic < gametic");
 
-        // Don't stay in this loop forever.  The menu is still running,
-        // so return to update the screen
+        // Still no tics to run? Sleep until some are available.
+        // (MESHPUNK: Chocolate Doom 2.2.1's netgame stall rule — up to
+        // MAX_NETGAME_STALL_TICS before rendering a frame anyway, instead
+        // of doomgeneric's return-after-one-tic.)
+        if (lowtic < gametic/ticdup + counts)
+        {
+            // If we're in a netgame, we might spin forever waiting for
+            // new network data to be received. So don't stay in here
+            // forever - give the menu a chance to work.
+            if (I_GetTime() / ticdup - entertic >= MAX_NETGAME_STALL_TICS)
+            {
+                return;
+            }
 
-	if (I_GetTime() / ticdup - entertic > 0)
-	{
-	    return;
-	}
-
-        I_Sleep(1);
+            I_Sleep(1);
+        }
     }
 
     // run the count * ticdup dics

@@ -28,7 +28,9 @@
 // NET_MAXPLAYERS, as there may be observers that are not participating
 // (eg. left/right monitors)
 
-#define MAXNETNODES 16
+// MESHPUNK: 4, not 16 — sizes the server's per-client tables only (each
+// carries a BACKUPTICS-deep send queue, ~26KB), never the wire format.
+#define MAXNETNODES 4
 
 // The maximum number of players, multiplayer/networking.
 // This is the maximum supported by the networking code; individual games
