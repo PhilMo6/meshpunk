@@ -1,5 +1,7 @@
 # MeshPunk - LVGL with Lua for LoRa handhelds
 
+Join the MeshPunk Discord: https://discord.gg/cmJKV5gEdP
+
 ## Supported devices
 
 | Device | PlatformIO env | Inputs |
