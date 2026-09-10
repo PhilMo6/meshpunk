@@ -6,13 +6,21 @@ import subprocess
 import sys
 Import("env")
 
-# Flash offsets - MUST stay in lockstep with meshpunk_custom_16Mb.csv.
+# Flash offsets of the direct-flash layout (merged.bin) - MUST stay in lockstep
+# with meshpunk_custom_16Mb.csv.
 OFFSETS = {
     "bootloader": "0x0000",
     "partitions": "0x8000",
-    "firmware":   "0x10000",
-    "littlefs":   "0x590000",
+    "otadata":    "0xE000",     # boot_app0.bin: otadata selecting main (ota_0)
+    "firmware":   "0x10000",    # main (ota_0)
+    "updater":    "0x590000",   # updater (factory)
+    "littlefs":   "0x610000",   # assets
 }
+
+# The Launcher image has its own table (build_launcher_partition_table) and
+# its own file layout; both are independent of the CSV.
+LAUNCHER_FIRMWARE_OFFSET = "0x10000"
+LAUNCHER_FS_OFFSET       = "0x590000"
 
 def git_version(project_dir):
     try:
@@ -41,6 +49,15 @@ BOARD_SLUG = {
 RELEASE_ENVS  = {"meshpunk_release", "meshpunk_heltec_release"}
 LAUNCHER_ENVS = {"meshpunk_release"}   # bmorcelli Launcher exists for T-Deck only
 
+# The updater firmware of each board (src/updater/main_updater.cpp), built by
+# its own env and included in merged.bin at OFFSETS["updater"].
+UPDATER_ENV = {
+    "meshpunk":                "meshpunk_updater",
+    "meshpunk_release":        "meshpunk_updater",
+    "meshpunk_heltec":         "meshpunk_heltec_updater",
+    "meshpunk_heltec_release": "meshpunk_heltec_updater",
+}
+
 # Launcher build (bmorcelli/Launcher): a merged image of bootloader + table +
 # the RELEASE app + the littlefs payload. The table declares the data partition
 # as "assets"; the Launcher creates it and copies the payload.
@@ -60,6 +77,9 @@ LAUNCHER_ENVS = {"meshpunk_release"}   # bmorcelli Launcher exists for T-Deck on
 #            firmware reformats it; the app's embedded pack (MESHPUNK_EMBED_PACK)
 #            then repopulates it on first boot.
 #
+# The payload is the whole littlefs image of the build, so its size follows the
+# assets partition of meshpunk_custom_16Mb.csv.
+#
 # This label matches the one in meshpunk_custom_16Mb.csv, so Launcher and direct
 # flashes land on the same partition name; the firmware only falls back to
 # "spiffs" on tables written before that rename. Do NOT relabel this "spiffs":
@@ -73,7 +93,10 @@ LAUNCHER_FS_THRESHOLD = 0x500000  # Launcher <=2.7.2 LAUNCHER_DEFAULT_SPIFFS_THR
 def build_launcher_partition_table(fs_size):
     # ESP32 partition table: 32-byte entries (magic 0x50AA, type, subtype,
     # offset, size, 16-byte label, flags), MD5 entry, 0xFF padding to 0xC00.
-    # Offsets/sizes MUST stay in lockstep with meshpunk_custom_16Mb.csv.
+    # These entries are the Launcher's input (it creates its own partitions
+    # from them); they are not the device's table and are independent of
+    # meshpunk_custom_16Mb.csv. The updater partition is not part of this
+    # image: Launcher installs update through the Launcher.
     entries = [
         (0x01, 0x02, 0x9000,   0x5000,   b"nvs"),
         (0x00, 0x00, 0x10000,  0x580000, b"app0"),
@@ -99,10 +122,15 @@ def merge_bin(source, target, env):
     output      = os.path.join(releases_dir,
                                "meshpunk-%s-%s-merged.bin" % (slug, version))
 
+    framework_dir = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
+    updater_env   = UPDATER_ENV.get(pioenv, "meshpunk_updater")
+
     bins = {
         "bootloader": os.path.join(build_dir, "bootloader.bin"),
         "partitions": os.path.join(build_dir, "partitions.bin"),
+        "otadata":    os.path.join(framework_dir, "tools", "partitions", "boot_app0.bin"),
         "firmware":   os.path.join(build_dir, "firmware.bin"),
+        "updater":    os.path.join(os.path.dirname(build_dir), updater_env, "firmware.bin"),
         "littlefs":   os.path.join(build_dir, "littlefs.bin"),
     }
 
@@ -118,7 +146,11 @@ def merge_bin(source, target, env):
 
     for name, path in bins.items():
         if not os.path.isfile(path):
-            print("merge_bin: missing %s - run 'pio run --target buildfs' first?" % name)
+            if name == "updater":
+                print("merge_bin: missing updater firmware %s - run 'pio run -e %s' first"
+                      % (path, updater_env))
+            else:
+                print("merge_bin: missing %s - run 'pio run --target buildfs' first?" % name)
             return
 
     esptool = os.path.join(
@@ -136,7 +168,9 @@ def merge_bin(source, target, env):
         "--flash_size", "keep",
         OFFSETS["bootloader"], bins["bootloader"],
         OFFSETS["partitions"], bins["partitions"],
+        OFFSETS["otadata"],    bins["otadata"],
         OFFSETS["firmware"],   bins["firmware"],
+        OFFSETS["updater"],    bins["updater"],
         OFFSETS["littlefs"],   bins["littlefs"],
     ]
 
@@ -149,6 +183,13 @@ def merge_bin(source, target, env):
     shutil.copy2(bins["littlefs"], littlefs_out)
     print("merge_bin: copied full littlefs image to %s" % littlefs_out)
 
+    # Updater firmware alone (flash at OFFSETS["updater"] to refresh just it).
+    updater_out = os.path.join(releases_dir,
+                               "meshpunk-%s-%s-updater.bin" % (slug, version))
+    shutil.copy2(bins["updater"], updater_out)
+    print("merge_bin: copied updater firmware to %s (flash offset %s)"
+          % (updater_out, OFFSETS["updater"]))
+
     # Distribution artifacts below require a release env: its app embeds the
     # data pack (MESHPUNK_EMBED_PACK) and is self-contained. A dev app has no
     # pack, so publishing it as firmware.bin/launcher.bin would install with an
@@ -160,9 +201,11 @@ def merge_bin(source, target, env):
         print("merge_bin: done")
         return
 
-    # Self-contained app binary: THE universal file. Flash at the app offset
-    # (0x10000) via any flasher, or install through the Launcher; it populates
-    # its own filesystem on first boot.
+    # Self-contained app binary. Flash at the app offset (0x10000) via any
+    # flasher, or hand it to the on-device updater (Settings/Firmware, which
+    # downloads exactly this file from the release page); it populates its own
+    # filesystem on first boot. Not for the Launcher: it carries no partition
+    # table, so the Launcher creates no data partition for it.
     firmware_out = os.path.join(releases_dir,
                                 "meshpunk-%s-%s-firmware.bin" % (slug, version))
     shutil.copy2(bins["firmware"], firmware_out)
@@ -202,10 +245,10 @@ def merge_bin(source, target, env):
         "--flash_mode", "keep",
         "--flash_freq", "keep",
         "--flash_size", "keep",
-        OFFSETS["bootloader"], bins["bootloader"],
-        OFFSETS["partitions"], launcher_table,
-        OFFSETS["firmware"],   bins["firmware"],
-        OFFSETS["littlefs"],   bins["littlefs"],
+        OFFSETS["bootloader"],    bins["bootloader"],
+        OFFSETS["partitions"],    launcher_table,
+        LAUNCHER_FIRMWARE_OFFSET, bins["firmware"],
+        LAUNCHER_FS_OFFSET,       bins["littlefs"],
     ]
     print("merge_bin: creating Launcher image %s" % launcher_img)
     subprocess.check_call(launcher_cmd)

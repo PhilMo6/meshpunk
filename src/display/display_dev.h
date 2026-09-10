@@ -18,9 +18,14 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// Panel init: driver begin + rotation + clear to black. Call AFTER all other
-// SPI peripherals are set up when the display shares the bus (T-Deck).
+// Panel init: driver begin + rotation + clear to black. Called right after
+// the shared SPI bus is begun in setup(), before the SD card and the radio.
 void display_dev_init(void);
+
+// Boot splash: the MeshPunk wordmark centered on the cleared panel, drawn
+// with the panel driver's own font before LVGL exists. LVGL's first frame
+// replaces it.
+void display_dev_splash(void);
 
 // Active (post-rotation) panel dimensions in pixels.
 int display_dev_width(void);

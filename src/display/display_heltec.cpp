@@ -27,6 +27,7 @@
 #include <TFT_eSPI.h>
 
 #include "display_dev.h"
+#include "splash_logo.h"       // generated boot logo bitmap
 #include "../boards/board_pins.h"
 #include "../meshpunk_sync.h"  // SPI_LOCK/SPI_UNLOCK
 
@@ -62,6 +63,20 @@ void display_dev_init(void) {
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
+}
+
+// The logo bitmap (splash_logo.h, generated from meshpunk-logo.svg) is
+// stored in the flush path's word order, so it goes out exactly like an
+// LVGL buffer.
+void display_dev_splash(void) {
+  SPI_LOCK();
+  tft.fillScreen(TFT_BLACK);
+  tft.startWrite();
+  tft.setAddrWindow((320 - SPLASH_LOGO_W) / 2, (240 - SPLASH_LOGO_H) / 2,
+                    SPLASH_LOGO_W, SPLASH_LOGO_H);
+  tft.pushColors((uint16_t*)kSplashLogo, SPLASH_LOGO_W * SPLASH_LOGO_H, false);
+  tft.endWrite();
+  SPI_UNLOCK();
 }
 
 // Rotation 1 (landscape): the panel's native 240x320 becomes 320 wide by

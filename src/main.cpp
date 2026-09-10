@@ -38,6 +38,7 @@
 #include "img_bridge.h"
 #include "usb_manager.h"
 #include "usb_fs.h"
+#include "ota_update.h"
 #include "tdeck_link.h"
 
 // Radio + MeshCore helper classes (the protocol itself lives in the meshcore
@@ -4713,6 +4714,9 @@ void setupLuaVGL() {
   // USB-OTG host manager (_usb_*) — used by Tools/USB (also PHY boot self-heal)
   usb_manager_register_lua(L);
 
+  // On-device firmware update (_ota_*, ota_update.cpp) — used by Settings/Firmware
+  ota_register_lua(L);
+
   // System
   lua_register(L, "_system_reboot", [](lua_State *L) -> int {
     SLog.println("[SYSTEM] Reboot requested from Lua");
@@ -6255,7 +6259,15 @@ void setup() {
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
 
 
+  // Boot splash: panel and backlight now, so the screen shows life through
+  // the mesh bring-up instead of staying dark until the home screen. LVGL
+  // paints over it once the UI exists; the saved brightness is applied again
+  // when the prefs load below.
   SLog.println("Initializing display");
+  display_dev_init();
+  display_dev_splash();
+  display_dev_backlight_init();
+  display_dev_brightness(display_brightness);
 
   // Initialize filesystem. Both the CSV and merge_bin.py declare our data
   // partition as "assets"; "spiffs" is only reached on devices whose partition
@@ -6333,6 +6345,7 @@ void setup() {
 
     // Load firmware preferences (tz, use_sd, clock_fmt)
     firmware_prefs_load();
+    display_dev_brightness(display_brightness);   // splash at the saved level
     // Alt emoji layer per-key map (defaults + /emoji_keymap overrides)
     input_ui_emoji_map_load();
     // Push the selection-highlight preferences into the live theme (the theme is
@@ -6385,6 +6398,10 @@ void setup() {
   } else {
     SLog.println("[SD] Card mount FAILED");
   }
+
+  // Partition layout, installed release and staged-image report; removes a
+  // leftover update job (ota_update.cpp).
+  ota_init_report();
 
   // LoRa-protocol selection: reserve the module pool, then resolve the
   // firmware_prefs lora_protocol= choice (module load + validation live in
@@ -6524,10 +6541,6 @@ void setup() {
   mstore::prune_mark_due();
 
   log_boot_mem("after mesh begin");
-
-  //Initialize the disply only after all other spi bus setup is finished
-  SLog.println("Initialize display");
-  display_dev_init();
 
   // LVGL tick function
   lvgl_ticker.attach_ms(5, []() {

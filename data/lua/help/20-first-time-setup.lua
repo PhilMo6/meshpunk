@@ -3,6 +3,8 @@ return {
     section = "Guide",
     order   = 20,
     body    = [[
+The MeshPunk logo shows while the device starts up - the mesh takes a while to come up, so give it a moment. The first start after an install also unpacks the bundled files, which takes about a minute before the home screen appears.
+
 After flashing:
 
 1. Use an SD card - it persists your mesh and firmware settings (highly recommended).

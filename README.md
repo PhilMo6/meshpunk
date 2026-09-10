@@ -49,16 +49,17 @@ your hardware.
 - Themes! make Meshpunk look the way you want. 15 themes are included!
 - File manager (Tools > Files) for both internal flash and SD
 - App Library — browse and install apps and themes straight from GitHub over WiFi, and update the ones you already have, no reflash needed
+- On-device firmware updates (Settings > Firmware) — install new releases over WiFi or from the SD card, no computer needed; see [Updating on the device](#updating-on-the-device)
 
 
 ## Installation 
 
 1. Download the release file you want to install from the release page. **Releases are built per device — the filenames carry the board name** (`meshpunk-tdeck-<version>-…` / `meshpunk-heltec_v4-<version>-…`); a build for the wrong board will not run correctly.
 - For a first-time install download the -merged.bin file
-- For updates download the -firmware.bin: it updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept)
+- For updates you no longer need a computer: Settings > Firmware on the device checks GitHub over WiFi and installs the new release, or installs a -firmware.bin copied to the SD card (see "Updating on the device" below). Flashing the -firmware.bin here works too: it updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept)
 2. Go to https://meshcore.io/flasher scroll to bottom and click on Custom Firmware
 3. Select the firmware release you downloaded. If it is the merged firmware it will erase your filesystem to replace it with the Meshpunk one! The flasher will give you a warning about this.
-4. Flash the firmware and wait.
+4. Flash the firmware and wait. The MeshPunk logo shows while the device starts up; the first start after an install also unpacks the bundled files, which takes about a minute before the home screen appears.
 5. It is highly suggested to use a SD card to persist your mesh and firmware settings.
 6. Go to the radio settings and set them to your local default.
 7. Set your extra settings, RX boost, Contact Overwrite, and Message Repeat
@@ -88,6 +89,19 @@ If a game misbehaves: **Audio rate** (the `?` next to it explains) trades pitch 
 
 MP3s go onto the sd card in /Music. The Music app can auto-sort tagged files into /Music/Artist/Album for you, and playlists live in /Music/Playlists.
 
+## Updating on the device
+
+Settings > Firmware updates MeshPunk without a computer:
+
+- **Check for update** looks up the latest release on GitHub over WiFi and downloads this device's `-firmware.bin` to the SD card (to internal flash when no card is present).
+- **Scan SD card for a release file** finds a `meshpunk-<board>-<version>-firmware.bin` you copied to the card (root, `/meshpunk` or `/meshpunk/ota`), for example through USB drive mode.
+- Every file is verified (image header and built-in SHA-256) before **Restart to install** hands it to the updater partition, which writes it, restarts, and unpacks the new bundled files on the first boot. Settings, messages and contacts are kept.
+- A device flashed before the updater existed shows "layout predates on-device updates": flash the `-merged.bin` once by USB, then updates work from the page.
+- Recovery: if the main firmware ever fails to start, copy a release `-firmware.bin` for the device into `/meshpunk/ota/` on the SD card and restart; the updater installs it.
+- The updater has its own screen: it shows the job, verifies the file again, draws a progress bar while writing, and restarts when done. Do not power off while it writes; if that happens anyway, it simply runs the same job again on the next start.
+- Only releases from the one that introduced the updater onward can be installed this way. Each image carries a board tag, and the page refuses files built for the other board or from before the tag existed. Older releases still flash by USB.
+- Devices installed through the Launcher update through the Launcher instead; the page says so and offers nothing there.
+
 ## Using with the Launcher (optional, T-Deck only)
 
 MeshPunk can also be installed through [bmorcelli's Launcher](https://github.com/bmorcelli/Launcher) — a multi-firmware boot menu that lets you keep several firmwares on one device and choose which to boot. If you run the Launcher, install the **`-launcher.bin`** release, not the other files.
@@ -101,6 +115,7 @@ Notes:
 - The MeshPunk app carries its own files and populates its filesystem by itself, so no extra steps are needed in the Launcher. Launcher 2.7.x may ask whether to copy SPIFFS during the install — either answer works.
 - Use `-launcher.bin` only. `-firmware.bin` (the bare app) installs but does not boot: it declares no partition layout, so the Launcher creates no data partition and MeshPunk has nowhere to unpack its files. `-merged.bin` is a full-flash image for the web flasher, not for the Launcher.
 - Works with Launcher 2.7.2 and newer.
+- Updates come through the Launcher too (its LauncherHub entry tracks MeshPunk releases). The on-device Firmware page detects a Launcher install and offers nothing there.
 - This path is only for devices running the Launcher. For a normal install, use the flasher steps above.
 
 ## Radio protocols
@@ -192,6 +207,13 @@ System apps (App Library, Files, Map, Messenger, and the Settings pages) are non
    pio run -e meshpunk_heltec --target upload # Heltec V4
    ```
    This will upload only the firmware, not the filesystem data.
+   Once per device, also upload the updater firmware that lives in its own
+   partition and performs on-device updates (the Firmware settings page
+   refuses to run until it is there):
+   ```
+   pio run -e meshpunk_updater --target upload        # T-Deck
+   pio run -e meshpunk_heltec_updater --target upload # Heltec V4
+   ```
 6. To upload the filesystem data (when changing lua scripts)
    ```
    pio run --target uploadfs
@@ -203,10 +225,15 @@ System apps (App Library, Files, Map, Messenger, and the Settings pages) are non
    pio run -e meshpunk_release        # T-Deck  -> meshpunk-tdeck-<ver>-*.bin + launcher
    pio run -e meshpunk_heltec_release # Heltec  -> meshpunk-heltec_v4-<ver>-*.bin
    ```
-   Each produces the board's `-merged`, `-firmware` and `-littlefs` binaries;
-   the Launcher image is T-Deck only and keeps its original
-   `meshpunk-<ver>-launcher.bin` name (its LauncherHub catalog entry depends
-   on it). If a build reports missing littlefs, run
+   Build the board's updater env first (`pio run -e meshpunk_updater` or
+   `pio run -e meshpunk_heltec_updater`): the merged image includes it, and
+   the artifact step refuses to run without it.
+   Each produces the board's `-merged`, `-firmware`, `-littlefs` and
+   `-updater` binaries; the Launcher image is T-Deck only and keeps its
+   original `meshpunk-<ver>-launcher.bin` name (its LauncherHub catalog entry
+   depends on it). The `-firmware.bin` is also what the on-device updater
+   downloads, by that exact name, so release builds must come from the clean
+   tagged commit. If a build reports missing littlefs, run
    `pio run [-e <env>] -t buildfs` first; if the firmware was already up to
    date, force the artifact step with `pio run -e <release env> -t mergebin`.
 
@@ -336,6 +363,7 @@ MIT
 - LVGL: https://lvgl.io/
 - LilyGo for the T-Deck hardware
 - Heltec for the WiFi LoRa 32 V4 hardware and Expansion Kit
+- MTLite's Meshtastic-compatible wire protocol via meshtastic-lite by jstockdale (Off by One) https://github.com/jstockdale/meshtastic-lite (BSD-3-Clause)
 - Emojis from https://github.com/googlefonts/noto-emoji
 - Emoji converted to .bin with ImageMagick
 - doomgeneric https://github.com/ozkl/doomgeneric
