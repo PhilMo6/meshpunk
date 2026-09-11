@@ -77,8 +77,12 @@ UPDATER_ENV = {
 #            firmware reformats it; the app's embedded pack (MESHPUNK_EMBED_PACK)
 #            then repopulates it on first boot.
 #
-# The payload is the whole littlefs image of the build, so its size follows the
-# assets partition of meshpunk_custom_16Mb.csv.
+# The payload is a SEPARATE littlefs image of data/ sized LAUNCHER_FS_SIZE, not
+# the build's assets image: the Launcher's T-Deck table keeps 0x1A0000 of the
+# 16 MB flash for itself (nvs, otadata, its 1.5 MB app, coredump), so an
+# install has 0xE60000 bytes for our declared 0x580000 app plus this image.
+# 0x600000 fits (0xB80000 total); the CSV's 0x9F0000 assets image does not
+# (0xF70000), and the Launcher then refuses the install for lack of space.
 #
 # This label matches the one in meshpunk_custom_16Mb.csv, so Launcher and direct
 # flashes land on the same partition name; the firmware only falls back to
@@ -89,6 +93,7 @@ UPDATER_ENV = {
 # It is also the ESP32 default name, so on a multi-firmware device it can belong
 # to another firmware entirely.
 LAUNCHER_FS_THRESHOLD = 0x500000  # Launcher <=2.7.2 LAUNCHER_DEFAULT_SPIFFS_THRESHOLD
+LAUNCHER_FS_SIZE      = 0x600000  # the Launcher payload image (see above)
 
 def build_launcher_partition_table(fs_size):
     # ESP32 partition table: 32-byte entries (magic 0x50AA, type, subtype,
@@ -225,7 +230,22 @@ def merge_bin(source, target, env):
     # partition table at file offset 0x8000, creates the partitions it declares,
     # and copies the payloads that exist in the file. The declared size must
     # equal the littlefs image size -- see the note at the constants above.
-    fs_size = os.path.getsize(bins["littlefs"])
+    mklittlefs = os.path.join(
+        env.PioPlatform().get_package_dir("tool-mklittlefs"), "mklittlefs"
+    )
+    if os.path.isfile(mklittlefs + ".exe"):
+        mklittlefs += ".exe"
+    launcher_fs = os.path.join(build_dir, "littlefs_launcher.bin")
+    print("merge_bin: building %s (0x%X) for the Launcher image"
+          % (launcher_fs, LAUNCHER_FS_SIZE))
+    subprocess.check_call([
+        mklittlefs, "-c", os.path.join(project_dir, "data"),
+        "-s", str(LAUNCHER_FS_SIZE), "-p", "256", "-b", "4096", launcher_fs,
+    ])
+    fs_size = os.path.getsize(launcher_fs)
+    if fs_size != LAUNCHER_FS_SIZE:
+        print("merge_bin: Launcher fs image is %d bytes, expected %d" % (fs_size, LAUNCHER_FS_SIZE))
+        return
     if fs_size <= LAUNCHER_FS_THRESHOLD:
         print("merge_bin: WARNING: declared fs %.1f MB is <= 5 MB; Launcher"
               " <=2.7.2 would create a 1 MB partition, too small for the pack"
@@ -248,7 +268,7 @@ def merge_bin(source, target, env):
         OFFSETS["bootloader"],    bins["bootloader"],
         OFFSETS["partitions"],    launcher_table,
         LAUNCHER_FIRMWARE_OFFSET, bins["firmware"],
-        LAUNCHER_FS_OFFSET,       bins["littlefs"],
+        LAUNCHER_FS_OFFSET,       launcher_fs,
     ]
     print("merge_bin: creating Launcher image %s" % launcher_img)
     subprocess.check_call(launcher_cmd)
