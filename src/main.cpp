@@ -2790,6 +2790,13 @@ static void pack_mkdirs(const String &path) {
 static bool pack_write_file(const String &path, const uint8_t *stored, uint32_t stored_size,
                             uint32_t raw_size, uint16_t flags) {
   pack_mkdirs(path);
+  // littlefs is copy-on-write: opening with "w" keeps the old blocks
+  // referenced until the new file commits, so a rewrite needs the file's
+  // full size in free blocks on top of the old copy. Removing first frees
+  // them. Safe here because /.pack_version is written last: an interruption
+  // anywhere leaves the marker missing and the next boot re-extracts before
+  // any pack file is read.
+  LittleFS.remove(path);
   File out = LittleFS.open(path, "w", true);
   if (!out) {
     SLog.printf("[PACK] open failed: %s\n", path.c_str());
