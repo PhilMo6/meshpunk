@@ -115,6 +115,14 @@ local function show_staged_rows(header, label, verify, install, cancel)
     show(cancel_btn, cancel)
 end
 
+-- Scroll the page so `obj` (the lowest row of the staged-image block) is on
+-- screen: the block sits below the fold, and rows that were just un-hidden
+-- get their position at the next layout pass, so the layout runs first.
+local function reveal(obj)
+    content:update_layout()
+    pcall(function() obj:scroll_to_view(1) end)
+end
+
 local function stop_stepping()
     if step_timer then
         step_timer:delete()
@@ -146,6 +154,7 @@ local function on_ready(r)
     progress_lbl.text = string.format("Verified: %d KB", (r.total or 0) // 1024)
     staged_lbl.text = "Ready: " .. tostring(r.path)
     show_staged_rows(true, true, false, true, true)
+    reveal(cancel_btn)
     status.text = "Image verified. Restart to install."
 end
 
@@ -155,6 +164,7 @@ local function on_error(r)
     refresh_staged()
     show(progress_lbl, true)
     progress_lbl.text = "Failed: " .. tostring(r.error)
+    reveal(staged_path ~= "" and cancel_btn or progress_lbl)
 end
 
 local function start_stepping()
@@ -166,6 +176,7 @@ local function start_stepping()
     show(verify_btn, false)
     show(install_btn, false)
     show(cancel_btn, true)
+    reveal(cancel_btn)
     step_timer = apps.add_timer { period = 30, cb = function(t)
         local ok, r = pcall(_ota_step)
         if not ok or type(r) ~= "table" then

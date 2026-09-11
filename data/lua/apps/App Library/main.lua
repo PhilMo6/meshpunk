@@ -4,9 +4,10 @@
 
   How it works:
     * lib/downloader is the engine (shared with the theme downloads in
-      Settings/Theme): catalog fetch/parse/cache, staging discipline, atomic
-      installs, .version bookkeeping. This app is the UI + the apps-specific
-      bits: install targets under the apps bases (category = subfolder), the
+      Settings/Theme): catalog parse, staging discipline, atomic installs,
+      .version bookkeeping. This app is the UI + the apps-specific bits:
+      the catalog fetch and its on-card cache (see Startup below), install
+      targets under the apps bases (category = subfolder), the
       launcher-registry scan, and apps.refresh() after installs/removes so
       the launcher sees changes immediately — no reboot.
     * A .version file inside the installed app marks it store-managed
@@ -23,6 +24,13 @@
 
   UI structure mirrors Tools/Files: one root, swap_view for pages, modal() over
   nav.push for dialogs, fileman tasks driven from a timer for recursive deletes.
+
+  Startup is a stepper (run_steps): the catalog fetch, its parse, the
+  installed scan and the browse page each take their own LVGL timer ticks,
+  and the catalog cache is written to the card in 2 KB chunks after the page
+  is up. At most one SD call runs per tick (plus a few internal-flash
+  reads): Lua cannot yield mid-callback, and a slow card inside one long
+  callback holds the UI core past the 5 s task watchdog.
 ]]
 
 local lvgl    = require("lvgl")
@@ -233,25 +241,57 @@ local function find_inst(entry)
         or (entry.was and store.installed[entry.was]) or nil
 end
 
+-- Read one registry record's .version marker into `installed` (no-op for
+-- untracked apps).
+local function note_installed(installed, rec)
+    local v = dl.read_version(rec.dir)
+    if not v then return end
+    local clean = rec.raw_name or rec.name
+    installed[v.id or clean] = {
+        name     = clean,
+        id       = v.id,
+        version  = v.version,
+        location = v.location,
+        category = v.category,
+        locked   = v.locked,
+        dir      = rec.dir,
+        display  = rec.name,
+    }
+end
+
+-- Synchronous scan, used by the install/remove completion paths (the card
+-- has just completed a write there).
 local function scan_installed()
     local installed = {}
-    for _, rec in ipairs(apps.all()) do
-        local v = dl.read_version(rec.dir)
-        if v then
-            local clean = rec.raw_name or rec.name
-            installed[v.id or clean] = {
-                name     = clean,
-                id       = v.id,
-                version  = v.version,
-                location = v.location,
-                category = v.category,
-                locked   = v.locked,
-                dir      = rec.dir,
-                display  = rec.name,
-            }
+    for _, rec in ipairs(apps.all()) do note_installed(installed, rec) end
+    store.installed = installed
+end
+
+-- The same scan as a run_steps step: a tick ends after the first card read
+-- or after SCAN_BATCH reads, whichever comes first, so no tick holds the UI
+-- core for more than one SD operation plus a few internal-flash reads.
+-- store.installed is replaced only once the walk completes.
+local SCAN_BATCH = 8
+
+local function scan_step()
+    local list, i, installed = nil, 0, {}
+    return function()
+        list = list or apps.all()
+        local reads = 0
+        while true do
+            i = i + 1
+            local rec = list[i]
+            if not rec then
+                store.installed = installed
+                return true
+            end
+            note_installed(installed, rec)
+            reads = reads + 1
+            if reads >= SCAN_BATCH or fileman.split(rec.dir) == "S" then
+                return false
+            end
         end
     end
-    store.installed = installed
 end
 
 -- Catalog entries whose installed version differs from the catalog version.
@@ -1456,52 +1496,155 @@ refresh_view = function()
 end
 
 -- ── Startup flow ─────────────────────────────────────────────────────────────
+-- run_steps: one unit of work per LVGL tick. `steps` is an array of
+-- functions; a step returns true when finished (advance), false to run again
+-- next tick, or STEP_STOP to end the run. Returning to loop() between steps
+-- is the only yield Lua has here: the keyboard indev read blocks in the I2C
+-- driver every refresh period, which is when the idle task runs and feeds
+-- the task watchdog. start() bumps start_gen, so a run left over from before
+-- a Refresh or Retry deletes itself on its next tick. A step that raises
+-- ends the run (the error still surfaces through luavgl's handler).
+local STEP_STOP = {}
+local start_gen = 0
 
-local function fetch_and_show()
-    show_loading("Fetching catalog...")
-    -- One tick so the label actually renders before the synchronous fetch.
-    apps.add_timer { period = 50, cb = function(t)
-        t:delete()
-        local cat, err = dl.fetch_catalog()
-        if cat then
-            store.catalog = cat
-            store.offline = false
-            scan_installed()
-            show_browse()
-            return
+local function run_steps(steps)
+    local gen, i = start_gen, 1
+    apps.add_timer { period = 5, cb = function(t)
+        if gen ~= start_gen then t:delete() return end
+        local step = steps[i]
+        if not step then t:delete() return end
+        local ok, r = pcall(step)
+        if not ok then
+            t:delete()
+            error(r, 0)
         end
-        local cached = dl.load_cached_catalog()
-        if cached then
-            store.catalog = cached
-            store.offline = true
-            scan_installed()
-            toast("Offline — showing cached catalog")
-            show_browse()
-            return
-        end
-        show_error("Cannot fetch catalog:\n" .. tostring(err)
-            .. "\n\nCheck WiFi in Settings > Wifi.")
+        if r == STEP_STOP then t:delete() return end
+        if r then i = i + 1 end
     end }
 end
 
-start = function()
-    show_loading("Connecting to WiFi...")
-    dl.wifi_wait(WIFI_WAIT_MS, function(connected)
-        if connected then
-            fetch_and_show()
-            return
+-- Cache the raw catalog text on the card for offline browsing (the file
+-- dl.load_cached_catalog reads), as one run_steps step: mkdir, then per
+-- 2 KB chunk one open/append/close, then the old file is removed and the
+-- .part renamed into place. get_body() is read on the first tick (nil or
+-- empty = nothing to cache). Skipped without a card; silent on failure (a
+-- stale .part is removed by the next run's clear phase).
+local CACHE_CHUNK = 2048
+
+local function cache_write_step(get_body)
+    local cache = dl.STAGING.sd .. "/catalog.toml"
+    local part  = cache .. ".part"
+    local body, phase, pos = nil, "mkdir", 1
+    return function()
+        if phase == "mkdir" then
+            body = get_body()
+            if not body or body == "" then return true end
+            if not fileman.mkdir(dl.STAGING.sd) then return true end
+            phase = "clear"
+        elseif phase == "clear" then
+            fileman.remove(part)
+            phase = "chunk"
+        elseif phase == "chunk" then
+            if pos > #body then
+                phase = "replace"
+                return false
+            end
+            local f = io.open(part, "a")
+            if not f then return true end
+            local chunk = body:sub(pos, pos + CACHE_CHUNK - 1)
+            local n = f:write(chunk)
+            f:close()
+            if n ~= #chunk then
+                fileman.remove(part)
+                return true
+            end
+            pos = pos + #chunk
+        elseif phase == "replace" then
+            fileman.remove(cache)
+            phase = "rename"
+        else
+            fileman.rename(part, cache)
+            return true
+        end
+        return false
+    end
+end
+
+-- Bring the catalog up and show it. Online: fetch + parse, falling back to
+-- the card's cached copy; offline: the cached copy only. Then the spread
+-- installed scan, the browse page and, when a fresh catalog came in, the
+-- cache write.
+local function load_and_show(online)
+    local body, err = nil, nil
+    local steps = {}
+
+    if online then
+        show_loading("Fetching catalog...")
+        steps[#steps + 1] = function()
+            local res = _wifi_fetch(dl.base_url() .. "/catalog.toml")
+            if not (res and res.success) then
+                err = (res and res.error) or "Fetch failed"
+            elseif res.status ~= 200 then
+                err = "HTTP " .. tostring(res.status)
+            else
+                body = res.body or ""
+            end
+            return true
+        end
+    end
+
+    steps[#steps + 1] = function()
+        if body then
+            local cat, perr = dl.parse_catalog(body)
+            if cat then
+                store.catalog, store.offline = cat, false
+                return true
+            end
+            body, err = nil, perr
         end
         local cached = dl.load_cached_catalog()
         if cached then
-            store.catalog = cached
-            store.offline = true
-            scan_installed()
-            toast("No WiFi — showing cached catalog")
-            show_browse()
+            store.catalog, store.offline = cached, true
+            return true
+        end
+        if online then
+            show_error("Cannot fetch catalog:\n" .. tostring(err)
+                .. "\n\nCheck WiFi in Settings > Wifi.")
         else
             show_error("WiFi not connected.\n\n"
                 .. "Connect in Settings > Wifi, then Retry.")
         end
+        return STEP_STOP
+    end
+
+    steps[#steps + 1] = scan_step()
+
+    steps[#steps + 1] = function()
+        show_browse()
+        if store.offline then
+            toast(online and "Offline — showing cached catalog"
+                          or "No WiFi — showing cached catalog")
+        end
+        return true
+    end
+
+    steps[#steps + 1] = cache_write_step(function() return body end)
+
+    -- One tick so the loading label renders before the synchronous fetch.
+    local gen = start_gen
+    apps.add_timer { period = 50, cb = function(t)
+        t:delete()
+        if gen == start_gen then run_steps(steps) end
+    end }
+end
+
+start = function()
+    start_gen = start_gen + 1
+    local gen = start_gen
+    show_loading("Connecting to WiFi...")
+    dl.wifi_wait(WIFI_WAIT_MS, function(connected)
+        if gen ~= start_gen then return end
+        load_and_show(connected)
     end)
 end
 
