@@ -35,7 +35,8 @@ local disp_label = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
 local DISP_SEGS = 16
 local disp_bar = content:Object {
     flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
+    w = lvgl.PCT(100), h = 18, border_width = 0, pad_hor = 0, pad_ver = 2,
+    pad_column = 1,
 }
 disp_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 disp_bar:clear_flag(lvgl.FLAG.CLICKABLE)
@@ -151,7 +152,7 @@ local KBD_STEP = 32
 local KBD_SEGS = 8
 local kbd_bar = content:Object {
     flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
+    w = lvgl.PCT(100), h = 18, border_width = 0, pad_hor = 0, pad_ver = 2,
 }
 kbd_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 kbd_bar:clear_flag(lvgl.FLAG.CLICKABLE)
@@ -305,7 +306,7 @@ local trk_label = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
 
 local trk_bar = content:Object {
     flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
+    w = lvgl.PCT(100), h = 18, border_width = 0, pad_hor = 0, pad_ver = 2,
     pad_column = 1,
 }
 trk_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
@@ -354,7 +355,7 @@ local roll_label = content:Label { text = "", w = lvgl.PCT(100), h = 16 }
 
 local roll_bar = content:Object {
     flex = { flex_direction = "row", flex_wrap = "nowrap" },
-    w = lvgl.PCT(100), h = 18, border_width = 0, pad_all = 0,
+    w = lvgl.PCT(100), h = 18, border_width = 0, pad_hor = 0, pad_ver = 2,
     pad_column = 1,
 }
 roll_bar:clear_flag(lvgl.FLAG.SCROLLABLE)

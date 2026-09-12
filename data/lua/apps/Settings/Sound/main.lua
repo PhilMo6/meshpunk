@@ -54,7 +54,9 @@ local bar_row = content:Object {
     w = lvgl.PCT(100),
     h = 18,
     border_width = 0,
-    pad_all = 0,
+    pad_hor = 0,
+    pad_ver = 2,
+    pad_column = 1,
 }
 bar_row:clear_flag(lvgl.FLAG.SCROLLABLE)
 bar_row:clear_flag(lvgl.FLAG.CLICKABLE)
