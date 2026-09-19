@@ -391,7 +391,19 @@
 //                  LV_FONT_UNSCII_16 is compiled in (lib/lv_conf.h), so
 //                  lvgl.Font("unscii", 16) resolves — the Web app's
 //                  monospace for pre/code. No ELF host_export.
-#define MESHPUNK_FW_API 14
+// 15 (unreleased since v0.4.3, which shipped level 14): lib/fileman gains
+//                  `fileman.dofile(path, ...)` — load and RUN a Lua file
+//                  from EITHER drive, returning the chunk's results (or
+//                  nil, err) and passing extra args through. Lua's own
+//                  loadfile/dofile read LittleFS only, so an installed
+//                  app's sibling modules fail to load the moment the user
+//                  puts the app on the SD card; this routes an "S:" path
+//                  to _dofile_sd (which streams the source rather than
+//                  materializing it) and an "L:" path to loadfile. Apps
+//                  that call it need min_fw 15 — the Web and IRC apps
+//                  carry their own loader instead, so they keep running
+//                  on level 14. No ELF host_export.
+#define MESHPUNK_FW_API 15
 
 // BLE companion protocol identity (reported in the DEVICE_INFO frame — see
 // the meshcore package's ble_companion.cpp, which compiles against this

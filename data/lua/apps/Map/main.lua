@@ -173,16 +173,16 @@ end
 -- tilesource.folder() = bare SD folder path or nil; tilesource.tile_path()
 -- = the tile file for the active source. UI hooks are wired by the
 -- tilesource.bind_ui call further down, after the views exist.
--- app_dir carries the "L:" drive prefix (lib/apps.lua dir field) but
--- loadfile wants the bare VFS path the entrypoint uses — strip it. The
--- extra parens around the gsub truncate its second return (the count),
--- which would otherwise land in loadfile's mode parameter.
-local tilesource = assert(loadfile(((app_dir .. "/tilesource.lua"):gsub("^[Ll]:", ""))))({
+-- fileman.dofile runs the chunk from whichever drive the app was installed
+-- to and passes the context through; Lua's own loadfile reads LittleFS only,
+-- so a copy on the card needs the streaming SD loader instead.
+-- required inline: this chunk is near Lua's 200-local limit.
+local tilesource = assert(require("lib/fileman").dofile(app_dir .. "/tilesource.lua", {
     W = W, H = H,
     map_prefs = map_prefs,
     save_map_prefs = save_map_prefs,
     tile_bin_path = tile_bin_path,
-})
+}))
 
 local function tile_img_src(z, tx, ty)
     return "S:" .. tilesource.tile_path(z, tx, ty)

@@ -28,6 +28,8 @@
       fileman.read(path)             -> data|nil, err
       fileman.write(path, data)      -> ok, err            (parent must exist)
       fileman.df(drive)              -> total, used | nil  (drive = "L"|"S")
+      fileman.dofile(path, ...)      -> chunk results|nil, err   (runs a Lua
+                                        file from EITHER drive — see below)
 
   Bulk ops (a whole tree) MUST use a task so the UI/watchdog stay alive:
 
@@ -224,6 +226,40 @@ function M.write(path, data)
     f:write(data or "")
     f:close()
     return true
+end
+
+-- Load and RUN a Lua file from either drive, returning what the chunk
+-- returned (nil, err on failure). Extra arguments are passed to the chunk:
+--
+--     local core = fileman.dofile(app_dir .. "/core.lua", app_dir)
+--
+-- This exists because Lua's own loadfile/dofile read LittleFS ONLY — handing
+-- them an "S:" path fails with "cannot open S:/...", which is how a multi-file
+-- app breaks as soon as it is installed to the card. The SD side goes through
+-- _dofile_sd, which streams the source in 1KB blocks; reading the file here
+-- and calling load() instead would rebuild the whole-file allocation that
+-- truncates large modules under heap pressure.
+--
+-- It runs the chunk rather than returning one because the SD loader loads and
+-- executes in a single step: there is no chunk to hand back without
+-- materializing the source.
+function M.dofile(path, ...)
+    local drive, bare = M.split(M.normalize(path))
+    if drive == "S" then
+        if type(_dofile_sd) ~= "function" then
+            return nil, "no SD loader on this firmware"
+        end
+        local ok, res = pcall(_dofile_sd, bare, ...)
+        if not ok then return nil, res end
+        return res
+    elseif drive ~= "L" then
+        return nil, "cannot run Lua from drive " .. drive
+    end
+    local chunk, err = loadfile(bare)
+    if not chunk then return nil, err end
+    local ok, res = pcall(chunk, ...)
+    if not ok then return nil, res end
+    return res
 end
 
 -- ── Presentation helpers ─────────────────────────────────────────────────────

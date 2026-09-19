@@ -3,7 +3,7 @@
 -- screens. Lives in its own chunk because main.lua's main chunk is near
 -- Lua's 200-local limit.
 --
--- Loaded by main.lua as: loadfile(app_dir .. "/tilesource.lua")(ctx) with
+-- Loaded by main.lua as: fileman.dofile(app_dir .. "/tilesource.lua", ctx) with
 -- ctx = { W, H, map_prefs, save_map_prefs, tile_bin_path }. UI dependencies
 -- arrive later through M.bind_ui (main builds them after this module loads).
 local lvgl = require("lvgl")
