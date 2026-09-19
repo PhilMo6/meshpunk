@@ -29,6 +29,12 @@ typedef struct _gd_GIF {
     lv_fs_file_t fd;
     const char * data;
     uint8_t is_file;
+    /* MESHPUNK: bounds for memory mode. Upstream memcpy's blindly from
+     * `data`, which reads past the end of a truncated or malformed file;
+     * meshpunk decodes GIFs downloaded over the network, so reads are
+     * clamped and `oob` records that it happened. */
+    uint32_t data_len;
+    uint8_t oob;
     uint32_t f_rw_p;
     int32_t anim_start;
     uint16_t width, height;
@@ -55,6 +61,10 @@ typedef struct _gd_GIF {
 gd_GIF * gd_open_gif_file(const char * fname);
 
 gd_GIF * gd_open_gif_data(const void * data);
+
+/* MESHPUNK: gd_open_gif_data with the buffer length known, so reads cannot
+ * run off the end. Prefer it for any data that did not come from the build. */
+gd_GIF * gd_open_gif_data_len(const void * data, uint32_t len);
 
 void gd_render_frame(gd_GIF * gif, uint8_t * buffer);
 

@@ -9,6 +9,8 @@ return {
             grey     = "#0f486d",
             accent   = "#8fe9ff",
             btn_text = "#000b12",
+            highlight   = "#ff7fb0",
+            accent_text = "#c9a0ff",
             dark     = true,
         }
         

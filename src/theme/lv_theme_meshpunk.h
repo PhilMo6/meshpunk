@@ -44,17 +44,35 @@ lv_theme_t * lv_theme_meshpunk_init(lv_display_t * disp, lv_color_t color_primar
  * (lv_obj_report_style_change). Colors are 0xRRGGBB. Safe to call repeatedly —
  * it is a no-op when the palette is unchanged. Used by the Lua theme manager so
  * a theme can be switched at runtime without a reboot.
- * @param scr      screen background
- * @param card     card / panel background
- * @param text     default text color
- * @param grey     borders / muted chrome
- * @param accent   button background / highlight (the old hotpink slot)
- * @param btn_text button label color
- * @param dark     true for a dark base, false for light
+ * @param scr         screen background
+ * @param card        card / panel background
+ * @param text        default text color
+ * @param grey        borders / muted chrome
+ * @param accent      button background + selection-tint source (the old
+ *                    hotpink slot)
+ * @param btn_text    button label color (the text-on-accent role)
+ * @param highlight   strong emphasized text, e.g. an unread conversation
+ *                    name. No theme style consumes it — apps read it back
+ *                    via lv_theme_meshpunk_get_palette / _theme_palette_get.
+ * @param accent_text secondary emphasized text, e.g. unread counters, links,
+ *                    status lines. App-consumed like highlight.
+ * @param dark        true for a dark base, false for light
  */
 void lv_theme_meshpunk_set_palette(uint32_t scr, uint32_t card, uint32_t text,
                                    uint32_t grey, uint32_t accent, uint32_t btn_text,
+                                   uint32_t highlight, uint32_t accent_text,
                                    bool dark);
+
+/**
+ * Read back the palette last pushed with lv_theme_meshpunk_set_palette.
+ * Every out-pointer may be NULL; colors are written as 0xRRGGBB.
+ * @return false (writing nothing) if no palette was ever pushed — the theme
+ *         is still on its built-in boot colors.
+ */
+bool lv_theme_meshpunk_get_palette(uint32_t * scr, uint32_t * card, uint32_t * text,
+                                   uint32_t * grey, uint32_t * accent, uint32_t * btn_text,
+                                   uint32_t * highlight, uint32_t * accent_text,
+                                   bool * dark);
 
 /**
  * Set the selection/focus highlight fill style, a global preference applied to

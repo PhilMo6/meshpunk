@@ -96,6 +96,22 @@ void lv_gridnav_remove(lv_obj_t * obj)
 
 }
 
+/* MESHPUNK: see the header. Same dsc lookup lv_gridnav_set_focused uses. */
+lv_obj_t * lv_gridnav_get_focused(lv_obj_t * cont)
+{
+    if(cont == NULL) return NULL;
+
+    uint32_t event_cnt = lv_obj_get_event_count(cont);
+    for(uint32_t i = 0; i < event_cnt; i++) {
+        lv_event_dsc_t * event_dsc = lv_obj_get_event_dsc(cont, i);
+        if(lv_event_dsc_get_cb(event_dsc) == gridnav_event_cb) {
+            lv_gridnav_dsc_t * dsc = lv_event_dsc_get_user_data(event_dsc);
+            return dsc ? dsc->focused_obj : NULL;
+        }
+    }
+    return NULL;
+}
+
 void lv_gridnav_set_focused(lv_obj_t * cont, lv_obj_t * to_focus, lv_anim_enable_t anim_en)
 {
     LV_ASSERT_NULL(to_focus);

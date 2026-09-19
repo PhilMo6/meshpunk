@@ -33,6 +33,7 @@ your hardware.
 - Swappable radio protocols — the LoRa protocol is an installable package. MeshCore comes preinstalled; MTLite, a Meshtastic-compatible protocol (channels with PSKs, direct messages, channel URL/QR sharing), installs from the App Library. See [Radio protocols](#radio-protocols).
 - Full emoji support! Type emoji with the alt key layer (customize per-key in Settings > Emoji), plus a downloadable extended emoji set that lives on SD
 - Map app with offline tile caching, message path animations, message path replay, and meshprint sender triangulation!
+- Web browser! Installs from the App Library's Network category. Real pages over HTTP and verified HTTPS, rendered as clean readable text while they download — forms, section links, images, bookmarks, history and find-in-page, with small-web search engines built in. No JavaScript.
 - Lua games! Comes with Flappy Bird, Snake, and Scorched Earth (all games are in progress of development)
 - Elf file loader
 - Doom! Now with music and sound effects! you must provide your own .wad files. PWADs require a valid IWAD. Place doom wads onto SD card.
@@ -134,7 +135,7 @@ Protocols update through the App Library like apps do; a protocol update takes e
 
 ## Map App
 
-The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. Tiles are downloaded over WiFi, converted to RGB565 `.bin` format, and cached on SD card for offline use.
+The Map app displays OpenStreetMap tiles with mesh contact positions overlaid. Tiles are downloaded over WiFi, converted to RGB565 `.bin` format, and cached on SD card for offline use. Alternatively, the map can use a folder of 256x256 `z/x/y` PNG tiles already on the SD card (map settings > Pick tile source).
 
 - Map app touch controls
 
@@ -155,7 +156,11 @@ Drag to pan; the on-screen buttons cover zoom and the map menu. Long-press a con
 
 - Pre-cache Downloads
 
-In the map settings you can download map tiles to bulk-download tiles for offline use. Choose an area size and zoom range, then download. Tiles are written atomically to SD so interrupted downloads won't leave corrupt files.
+Under map settings > Pick tile source you can bulk-download tiles for offline use. Choose an area size and zoom range, then download. Tiles are written atomically to SD so interrupted downloads won't leave corrupt files.
+
+- Your Own Tiles
+
+If you already have a folder of OpenStreetMap-style `z/x/y` PNG tiles (256x256) on the SD card, pick it under map settings > Pick tile source and the map uses those instead of downloading. "Use downloaded tiles" there switches back.
 
 - Contact Selection
 
@@ -165,6 +170,51 @@ Long-press on a contact marker (touchscreen) or center the trackball on one and 
 
 With enough mesh data you can run a meshprint on the sender of a message to try to capture the first and second hop repeaters which will then be used to triangulate the senders general location.
 The more data you have the better your results will be!
+
+## Web Browser
+
+The Web app installs from the App Library's Network category over WiFi; it needs firmware API level 14 or newer. It fetches real pages over HTTP and HTTPS and renders them as text you can read on a 320x240 screen — headings, paragraphs, lists, quotes, code blocks, links and form fields. Pages appear while they are still downloading rather than after, and HTTPS is verified against the firmware's certificate bundle (the status line shows `tls` on a secure page). There is no JavaScript and no CSS layout, so sites that need either will not work here; articles, wikis, docs and the small web do.
+
+- The address bar
+
+The bar lives on its own layer to keep the screen for the page: press `m`, or tap the thin status strip at the top, and the same tap (or its `v` button) puts it away. It also closes itself whenever a page loads. The field spans the full width, with buttons under it — `<` `>` back/forward, `Go`, `H` home, `v` hide on the first row, `Book`, `Menu` and `x` (close the app) on the second. Everything works without a keyboard.
+
+Type a URL, or type anything else to search. The home view shows which search engine is in use and lets you change it: DuckDuckGo (its no-JavaScript HTML endpoint), Marginalia, Wiby or FrogFind.
+
+- The Menu button
+
+| Item | What it does |
+|------|--------------|
+| Find in page | Searches the loaded page; the matching block scrolls into view and flashes |
+| History | The pages you have visited, newest first — tap one to reopen it |
+| Bookmarks | Everything you kept with `Book` |
+| Reader mode | Re-fetches the page through FrogFind's reader, which strips it to the article text |
+| Clear cookies | Empties the session cookie jar without closing the app |
+| Clear history | Empties the visited list |
+
+Reader mode is the one action that leaves the device's own network path: FrogFind's server fetches the page for you over plain HTTP, so it is neither private nor able to handle every site (Wikipedia refuses it).
+
+- Reading a page
+
+Links are underlined, and the focused one is brighter. Tap a link to open it; if a block holds several links, a chooser lists them. Links to a section of the same page jump straight there. Tap an `[image]` placeholder to fetch that image and view it full screen — PNG, JPEG and GIF (first frame) — then tap to close, or drag to pan when zoomed. Form fields are real inputs: tap one to type, then press the form's own button to submit.
+
+Bookmarks, history and your engine choice live in `L:/browser/` and survive restarts. Pages over 512 KB are truncated with a note at the end.
+
+- Web app Keyboard Shortcuts (boards with a keyboard, or a USB one)
+
+| Key | Action |
+|-----|--------|
+| `m` | Show the address bar |
+| Arrows | Scroll the page |
+| `n` / `Space` | Focus the next link |
+| `p` | Focus the previous link |
+| `Enter` | Open the focused link |
+| `q` / `Backspace` | Back |
+| `b` | Bookmark this page (again to remove) |
+| `h` | Home view |
+| `f` / `/` | Find in page |
+| `r` | Reader mode |
+| `Home` / `End` | Jump to the top or bottom of the page |
 
 ## App Library
 

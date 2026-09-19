@@ -50,8 +50,10 @@ local COL_ME_TX       = "#d7f5e6"
 local COL_THEM_BG     = "#262626"   -- received message bubble
 local COL_THEM_TX     = "#f0f0f0"
 local COL_META        = "#9aa0a6"   -- muted metadata
-local COL_ACCENT      = "#7fb3ff"   -- unread / links
-local COL_FOCUS       = "#ffffff"
+local PAL             = theme.palette()
+local COL_ACCENT      = PAL.accent_text   -- unread counters / links
+local COL_HILITE      = PAL.highlight     -- unread conversation names
+local COL_FOCUS       = "#ffffff"   -- focus border (images), not a text color
 local NAME_COLORS = {
     "#7fb3ff", "#ffb37f", "#a0e57f", "#e57fb3",
     "#7fe5e5", "#e5e57f", "#c79fff", "#ff9f9f",
@@ -864,7 +866,7 @@ show_inbox = function()
         end
         local left = row:Label { align = lvgl.ALIGN.LEFT_MID }
         left.text = prefix .. utils.emojiText(c.name) .. (preview ~= "" and ("  " .. preview) or "")
-        if c.unread and c.unread > 0 then left:set { text_color = COL_FOCUS } end
+        if c.unread and c.unread > 0 then left:set { text_color = COL_HILITE } end
         local right = row:Label { align = lvgl.ALIGN.RIGHT_MID, text_color = COL_META }
         local rt = (c.ts and c.ts > 0) and utils.relTime(c.ts) or ""
         if c.unread and c.unread > 0 then

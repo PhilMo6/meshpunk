@@ -72,6 +72,20 @@ gd_open_gif_data(const void * data)
     return gif_open(&gif_base);
 }
 
+/* MESHPUNK: length-aware memory open; see gifdec.h. */
+gd_GIF *
+gd_open_gif_data_len(const void * data, uint32_t len)
+{
+    gd_GIF gif_base;
+    memset(&gif_base, 0, sizeof(gif_base));
+
+    bool res = f_gif_open(&gif_base, data, false);
+    if(!res) return NULL;
+    gif_base.data_len = len;
+
+    return gif_open(&gif_base);
+}
+
 static gd_GIF * gif_open(gd_GIF * gif_base)
 {
     uint8_t sigver[3];
@@ -615,6 +629,14 @@ read_image(gd_GIF * gif)
     gif->fy = read_num(gif);
     gif->fw = read_num(gif);
     gif->fh = read_num(gif);
+    /* MESHPUNK: the frame rect comes from the file unvalidated upstream,
+     * and both the LZW writer and render_frame_rect index canvas/frame
+     * through it — a rect past the logical screen writes out of bounds.
+     * Clamping is a no-op for a valid GIF (fx+fw <= width always). */
+    if(gif->fx > gif->width) gif->fx = gif->width;
+    if(gif->fy > gif->height) gif->fy = gif->height;
+    if(gif->fw > gif->width - gif->fx) gif->fw = gif->width - gif->fx;
+    if(gif->fh > gif->height - gif->fy) gif->fh = gif->height - gif->fy;
     f_gif_read(gif, &fisrz, 1);
     interlace = fisrz & 0x40;
     /* Ignore Sort Flag. */
@@ -766,6 +788,18 @@ static void f_gif_read(gd_GIF * gif, void * buf, size_t len)
         lv_fs_read(&gif->fd, buf, len, NULL);
     }
     else {
+        /* MESHPUNK: clamp to the buffer. data_len 0 = unbounded, which is
+         * what gd_open_gif_data (build-time C arrays) still gets. */
+        if(gif->data_len && (gif->f_rw_p > gif->data_len
+                             || len > gif->data_len - gif->f_rw_p)) {
+            uint32_t avail = (gif->f_rw_p < gif->data_len)
+                             ? gif->data_len - gif->f_rw_p : 0;
+            if(avail) memcpy(buf, &gif->data[gif->f_rw_p], avail);
+            memset((uint8_t *)buf + avail, 0, len - avail);
+            gif->f_rw_p += len;
+            gif->oob = 1;
+            return;
+        }
         memcpy(buf, &gif->data[gif->f_rw_p], len);
         gif->f_rw_p += len;
     }

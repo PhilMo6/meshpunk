@@ -9,6 +9,8 @@ t.set_palette {
     grey     = "#0f3b3f",  -- muted trace lines / inactive components
     accent   = "#158520",  -- primary neon trace glow (circuit highlights)
     btn_text = "#c2c4c5",  -- dark contrast for neon buttons
+    highlight   = "#39ff14",  -- chip-label neon (strong emphasized text)
+    accent_text = "#2de2e6",  -- routed-trace cyan (secondary emphasized text)
     dark     = true,
 }
         

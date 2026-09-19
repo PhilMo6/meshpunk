@@ -83,8 +83,17 @@ static int luavgl_obj_on_event(lua_State *L)
   /* Check if the event code already exists, only one callback per code. */
   for (int i = 0; i < size; i++) {
     if (events[i]->code == code) {
-      luaL_unref(L, LUA_REGISTRYINDEX, event->ref);
+      /* MESHPUNK: reuse this entry for the new callback — release its Lua
+       * ref and detach its old dsc first (the tail below installs fresh
+       * ones; a still-attached old dsc would fire the entry twice per
+       * event). */
       event = events[i];
+      luaL_unref(L, LUA_REGISTRYINDEX, event->ref);
+      event->ref = LUA_NOREF;
+      if (event->dsc != NULL) {
+        lv_obj_remove_event_dsc(obj, event->dsc);
+        event->dsc = NULL;
+      }
       break;
     }
 
@@ -112,7 +121,13 @@ static int luavgl_obj_on_event(lua_State *L)
   event->ref = luavgl_check_continuation(L, 3);
   event->dsc = lv_obj_add_event_cb(obj, luavgl_obj_event_cb, code, event);
   if (event->dsc == NULL) {
-    lv_free(event);
+    /* MESHPUNK: the entry is referenced from the events array (reused, or
+     * pushed above) — mark it removed for later reuse instead of freeing
+     * it, and drop the ref taken just above. */
+    luaL_unref(L, LUA_REGISTRYINDEX, event->ref);
+    event->ref = LUA_NOREF;
+    event->L = NULL;
+    event->code = LV_EVENT_LAST;
     return luaL_error(L, "Failed to add event callback");
   }
 

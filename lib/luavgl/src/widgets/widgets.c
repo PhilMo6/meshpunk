@@ -49,6 +49,11 @@
 #include "button.c"
 #endif
 
+/* MESHPUNK: spangroup binding (inline mixed-style text; Web app links) */
+#if LV_USE_SPAN
+#include "spangroup.c"
+#endif
+
 static int luavgl_obj_create(lua_State *L);
 
 static const luaL_Reg widget_create_methods[] = {
@@ -101,6 +106,11 @@ static const luaL_Reg widget_create_methods[] = {
 #if LV_USE_TEXTAREA
     {"Button",   luavgl_button_create  },
 #endif
+
+/* MESHPUNK: spangroup */
+#if LV_USE_SPAN
+    {"Spangroup", luavgl_spangroup_create},
+#endif
     {NULL,       NULL                  }
 };
 
@@ -152,5 +162,10 @@ static void luavgl_widgets_init(lua_State *L)
 
 #if LV_USE_DROPDOWN
   luavgl_button_init(L);
+#endif
+
+/* MESHPUNK: spangroup */
+#if LV_USE_SPAN
+  luavgl_spangroup_init(L);
 #endif
 }

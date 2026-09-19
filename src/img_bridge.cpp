@@ -1,6 +1,6 @@
 // In-memory image buffers: Lua -> C++.
 //
-// Loads a PNG, a baseline JPEG or an LVGL .bin into ONE app-owned PSRAM RGB565
+// Loads a PNG, a baseline JPEG, a GIF or an LVGL .bin into ONE app-owned RGB565
 // buffer and hands Lua a light-userdata lv_image_dsc_t* that works anywhere an
 // image source is accepted (img:set_src(dsc), canvas:draw_image{ src = dsc }).
 // LVGL draws it through the "use directly" path (lv_bin_decoder), so nothing
@@ -40,6 +40,10 @@
 //   JPEG  TJpgDec streams MCU by MCU and descales as it goes (JD_USE_SCALE,
 //         see docs/LVGL_LOCAL_PATCHES.md #6), so only the compressed file and
 //         the final buffer are ever live. A 12MP photo opens at 1/8.
+//   GIF   gifdec (LV_USE_GIF, lib/lvgl/src/libs/gif) decodes the FIRST frame
+//         only — no animation. One lv_malloc of 5*w*h holds its canvas and
+//         frame; the canvas doubles as the ARGB8888 render target, so no
+//         second full-size buffer is needed. 89a only (gifdec rejects 87a).
 //   .bin  read straight through (tightly packed RGB565 only).
 //
 // Decoding is synchronous and blocks the LVGL thread (~1s for a megapixel PNG,
@@ -59,6 +63,10 @@
 // Driven directly (jd_prepare/jd_decomp), not through LVGL's lv_tjpgd decoder:
 // that one re-decodes from the file on every redraw, which panning cannot use.
 #include "../lib/lvgl/src/libs/tjpgd/tjpgd.h"
+
+// Same reasoning for GIF: the lv_gif widget animates from its own timer, while
+// this bridge wants one still frame in a buffer it owns.
+#include "../lib/lvgl/src/libs/gif/gifdec.h"
 
 extern "C" {
 #include <lua.h>
@@ -154,7 +162,8 @@ static int push_err(lua_State* L, const char* msg) {
 
 // ── Source probing ──────────────────────────────────────────────────────────
 
-enum ImgKind : uint8_t { IMG_NONE = 0, IMG_PNG, IMG_JPG, IMG_BIN };
+enum ImgKind : uint8_t { IMG_NONE = 0, IMG_PNG, IMG_JPG, IMG_BIN, IMG_GIF,
+                         IMG_GIF87 };
 
 static uint32_t be32(const uint8_t* p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
@@ -186,6 +195,15 @@ static ImgKind img_probe(const char* path, uint32_t* w, uint32_t* h) {
 
     if (head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF) return IMG_JPG;
 
+    // GIF: logical screen size is LE at bytes 6..9. gifdec accepts 89a only,
+    // so 87a is reported separately rather than as an unknown format.
+    if (rd >= 10 && memcmp(head, "GIF8", 4) == 0) {
+        *w = (uint32_t)head[6] | ((uint32_t)head[7] << 8);
+        *h = (uint32_t)head[8] | ((uint32_t)head[9] << 8);
+        if (!*w || !*h) return IMG_NONE;
+        return memcmp(head + 4, "9a", 2) == 0 ? IMG_GIF : IMG_GIF87;
+    }
+
     lv_image_header_t hdr;
     memcpy(&hdr, head, sizeof(hdr));
     if (hdr.magic == LV_IMAGE_HEADER_MAGIC && hdr.cf == LV_COLOR_FORMAT_RGB565
@@ -199,17 +217,20 @@ static ImgKind img_probe(const char* path, uint32_t* w, uint32_t* h) {
 
 // ── Pixel conversion ────────────────────────────────────────────────────────
 
-// ARGB8888 (byte order R,G,B,A) -> native little-endian RGB565, box-averaging
-// each div x div block and compositing alpha over `bg`. Native LE is correct
-// even with LV_COLOR_16_SWAP=1: v9 swaps the whole framebuffer once at flush,
-// so image data itself stays little-endian.
+// 32bpp -> native little-endian RGB565, box-averaging each div x div block and
+// compositing alpha over `bg`. `bgr` selects the source byte order: false =
+// R,G,B,A (lodepng), true = B,G,R,A (gifdec's render_frame_rect). Native LE is
+// correct even with LV_COLOR_16_SWAP=1: v9 swaps the whole framebuffer once at
+// flush, so image data itself stays little-endian.
 static void argb_to_565(const uint8_t* src, uint32_t sstride,
                         uint16_t* dst, uint32_t dw, uint32_t dh,
-                        uint32_t div, uint32_t bg) {
+                        uint32_t div, uint32_t bg, bool bgr) {
     const uint32_t bg_r = (bg >> 16) & 0xFF;
     const uint32_t bg_g = (bg >> 8) & 0xFF;
     const uint32_t bg_b = bg & 0xFF;
     const uint32_t n = div * div;
+    const uint32_t i_r = bgr ? 2 : 0;
+    const uint32_t i_b = bgr ? 0 : 2;
 
     for (uint32_t y = 0; y < dh; y++) {
         for (uint32_t x = 0; x < dw; x++) {
@@ -218,9 +239,9 @@ static void argb_to_565(const uint8_t* src, uint32_t sstride,
                 const uint8_t* p = src + (size_t)(y * div + sy) * sstride + (size_t)(x * div) * 4;
                 for (uint32_t sx = 0; sx < div; sx++, p += 4) {
                     uint32_t a = p[3];
-                    r += (p[0] * a + bg_r * (255 - a)) / 255;
-                    g += (p[1] * a + bg_g * (255 - a)) / 255;
-                    b += (p[2] * a + bg_b * (255 - a)) / 255;
+                    r += (p[i_r] * a + bg_r * (255 - a)) / 255;
+                    g += (p[1]   * a + bg_g * (255 - a)) / 255;
+                    b += (p[i_b] * a + bg_b * (255 - a)) / 255;
                 }
             }
             r /= n; g /= n; b /= n;
@@ -381,7 +402,7 @@ static uint32_t opt_u32(lua_State* L, int idx, const char* key, uint32_t def) {
 static uint32_t psram_free() { return (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM); }
 static uint32_t psram_largest() { return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM); }
 
-static const char* UNSUPPORTED = "not a PNG, JPEG or RGB565 .bin";
+static const char* UNSUPPORTED = "not a PNG, JPEG, GIF or RGB565 .bin";
 
 // The JPEG half of _img_open. Split out because its order of operations is
 // inverted: the file must be read and parsed before the dimensions — and so the
@@ -456,12 +477,13 @@ static int open_jpeg(lua_State* L, const char* path,
     return 4;
 }
 
-// _img_info(path) -> w, h, "png"|"jpg"|"bin" | nil, err
+// _img_info(path) -> w, h, "png"|"jpg"|"gif"|"bin" | nil, err
 static int lua_img_info(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     uint32_t w = 0, h = 0;
     ImgKind kind = img_probe(path, &w, &h);
     if (kind == IMG_NONE) return push_err(L, UNSUPPORTED);
+    if (kind == IMG_GIF87) return push_err(L, "GIF87a is not supported (89a only)");
 
     if (kind == IMG_JPG) {
         // JPEG dimensions sit behind a marker walk, so this costs a full read
@@ -477,7 +499,9 @@ static int lua_img_info(lua_State* L) {
 
     lua_pushinteger(L, w);
     lua_pushinteger(L, h);
-    lua_pushstring(L, kind == IMG_PNG ? "png" : (kind == IMG_JPG ? "jpg" : "bin"));
+    lua_pushstring(L, kind == IMG_PNG ? "png"
+                      : kind == IMG_JPG ? "jpg"
+                      : kind == IMG_GIF ? "gif" : "bin");
     return 3;
 }
 
@@ -492,6 +516,7 @@ static int lua_img_open(lua_State* L) {
     uint32_t w = 0, h = 0;
     ImgKind kind = img_probe(path, &w, &h);
     if (kind == IMG_NONE) return push_err(L, UNSUPPORTED);
+    if (kind == IMG_GIF87) return push_err(L, "GIF87a is not supported (89a only)");
     if (kind == IMG_JPG) {
         // A JPEG's source size costs nothing — TJpgDec streams it and descales
         // on the way out, so only the OUTPUT (max_bytes) needs bounding. The
@@ -530,9 +555,19 @@ static int lua_img_open(lua_State* L) {
     // giving up — this runs on the LVGL thread, so dropping it is safe.
     // The .bin path reads the whole file (w*h*2) before packing the output, so
     // that read — not the smaller output — is its contiguous demand.
-    uint64_t contig = (kind == IMG_PNG) ? (uint64_t)w * h * 4 + 65536 : (uint64_t)w * h * 2;
-    uint64_t total  = (kind == IMG_PNG) ? (uint64_t)w * h * 7 + out_bytes + (512u << 10)
-                                        : (uint64_t)w * h * 2 + out_bytes + (128u << 10);
+    // A GIF's canvas+frame arrive as ONE lv_malloc of 5*w*h, so that block is
+    // both its contiguous and its dominant demand.
+    uint64_t contig, total;
+    if (kind == IMG_PNG) {
+        contig = (uint64_t)w * h * 4 + 65536;
+        total  = (uint64_t)w * h * 7 + out_bytes + (512u << 10);
+    } else if (kind == IMG_GIF) {
+        contig = (uint64_t)w * h * 5 + 65536;
+        total  = (uint64_t)w * h * 5 + out_bytes + (512u << 10);
+    } else {
+        contig = (uint64_t)w * h * 2;
+        total  = (uint64_t)w * h * 2 + out_bytes + (128u << 10);
+    }
     if (psram_largest() < contig || psram_free() < total) {
         lv_image_cache_drop(NULL);
     }
@@ -572,8 +607,35 @@ static int lua_img_open(lua_State* L) {
             return push_err(L, msg);
         }
         argb_to_565((const uint8_t*)decoded->data, decoded->header.stride,
-                    out, ow, oh, div, bg);
+                    out, ow, oh, div, bg, false);
         lv_draw_buf_destroy(decoded);
+    } else if (kind == IMG_GIF) {
+        // gifdec keeps reading from `data`, so it must outlive the decode.
+        // The length-aware open is the MESHPUNK one: these files arrive
+        // over the network (docs/LVGL_LOCAL_PATCHES.md #11).
+        gd_GIF* gif = gd_open_gif_data_len(data, fsize);
+        if (!gif || gif->width != w || gif->height != h) {
+            if (gif) gd_close_gif(gif);
+            heap_caps_free(data);
+            img_free(&block->dsc);
+            return push_err(L, "GIF decode failed");
+        }
+        // gd_render_frame writes only the frame's own rect and skips
+        // transparent pixels, so the canvas starts fully transparent and
+        // whatever the frame leaves untouched composites onto `bg`.
+        memset(gif->canvas, 0, (size_t)w * h * 4);
+        if (gd_get_frame(gif) != 1 || gif->oob) {
+            bool truncated = gif->oob;
+            gd_close_gif(gif);
+            heap_caps_free(data);
+            img_free(&block->dsc);
+            return push_err(L, truncated ? "GIF is truncated"
+                                         : "GIF holds no frame");
+        }
+        gd_render_frame(gif, gif->canvas);
+        argb_to_565(gif->canvas, w * 4, out, ow, oh, div, bg, true);
+        gd_close_gif(gif);
+        heap_caps_free(data);
     } else {
         // .bin: 12-byte header then tightly packed native-LE RGB565.
         if (fsize < sizeof(lv_image_header_t) + (uint64_t)w * h * 2) {

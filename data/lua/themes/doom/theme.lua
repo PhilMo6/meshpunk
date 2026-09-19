@@ -14,6 +14,8 @@ return {
             grey     = "#5a2a1a",   -- rusted border
             accent   = "#8a1414",   -- dark blood red (buttons / highlight)
             btn_text = "#ffe9c0",
+            highlight   = "#ffa030",   -- fire orange (strong emphasized text)
+            accent_text = "#ff5a1a",   -- ember orange-red (secondary emphasized text)
             dark     = true,
         }
 

@@ -13,6 +13,8 @@ return {
             grey     = "#2a2440",
             accent   = "#e8e119",   -- (buttons / highlight)
             btn_text = "#06141c",   -- near-black, readable on the bright cyan
+            highlight   = "#ff4fd8",   -- neon magenta (strong emphasized text)
+            accent_text = "#2de2e6",   -- club cyan (secondary emphasized text)
             dark     = true,
         }
 

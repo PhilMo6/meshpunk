@@ -2,7 +2,7 @@
   Images — image viewer for MeshPunk.
 
   Browsing is lib/fileman (same drives, same listing, same rules as Tools/Files,
-  filtered to the decodable formats: PNG, baseline JPEG and RGB565 .bin).
+  filtered to the decodable formats: PNG, baseline JPEG, GIF and RGB565 .bin).
   Display is lib/imgview, which owns the two view modes:
 
     Fit   whole image scaled to the screen (box-filtered on load, not at
@@ -25,7 +25,7 @@ local H = lvgl.VER_RES()
 
 local MAX_SHOW = 150      -- listing rows built per directory (UI cap)
 local PAN_STEP = 40       -- pixels per arrow-key / trackball nudge
-local EXT = { png = true, jpg = true, jpeg = true, bin = true }
+local EXT = { png = true, jpg = true, jpeg = true, gif = true, bin = true }
 
 -- ── App state ────────────────────────────────────────────────────────────────
 local cur_path = nil      -- current directory, nil = drive picker

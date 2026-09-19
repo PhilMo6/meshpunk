@@ -205,6 +205,8 @@ typedef struct {
     lv_color_t grey;
     lv_color_t accent;
     lv_color_t btn_text;
+    lv_color_t highlight;   /* strong emphasized text (app-consumed, no style) */
+    lv_color_t accent_text; /* secondary emphasized text (app-consumed, no style) */
     bool dark;
     bool valid;
 } meshpunk_palette_t;
@@ -775,20 +777,23 @@ lv_theme_t * lv_theme_meshpunk_init(lv_display_t * disp, lv_color_t color_primar
 
 void lv_theme_meshpunk_set_palette(uint32_t scr, uint32_t card, uint32_t text,
                                    uint32_t grey, uint32_t accent, uint32_t btn_text,
+                                   uint32_t highlight, uint32_t accent_text,
                                    bool dark)
 {
     if(!lv_theme_meshpunk_is_inited()) return;
     my_theme_t * theme = theme_def;
 
     meshpunk_palette_t p;
-    p.scr      = lv_color_hex(scr);
-    p.card     = lv_color_hex(card);
-    p.text     = lv_color_hex(text);
-    p.grey     = lv_color_hex(grey);
-    p.accent   = lv_color_hex(accent);
-    p.btn_text = lv_color_hex(btn_text);
-    p.dark     = dark;
-    p.valid    = true;
+    p.scr         = lv_color_hex(scr);
+    p.card        = lv_color_hex(card);
+    p.text        = lv_color_hex(text);
+    p.grey        = lv_color_hex(grey);
+    p.accent      = lv_color_hex(accent);
+    p.btn_text    = lv_color_hex(btn_text);
+    p.highlight   = lv_color_hex(highlight);
+    p.accent_text = lv_color_hex(accent_text);
+    p.dark        = dark;
+    p.valid       = true;
 
     /* Idempotent: a theme re-applied on every home entry (ensure_background)
      * must not repeatedly walk every widget. Skip the re-cascade if the palette
@@ -800,7 +805,9 @@ void lv_theme_meshpunk_set_palette(uint32_t scr, uint32_t card, uint32_t text,
        lv_color_eq(s_palette.text, p.text) &&
        lv_color_eq(s_palette.grey, p.grey) &&
        lv_color_eq(s_palette.accent, p.accent) &&
-       lv_color_eq(s_palette.btn_text, p.btn_text)) {
+       lv_color_eq(s_palette.btn_text, p.btn_text) &&
+       lv_color_eq(s_palette.highlight, p.highlight) &&
+       lv_color_eq(s_palette.accent_text, p.accent_text)) {
         return;
     }
 
@@ -808,6 +815,24 @@ void lv_theme_meshpunk_set_palette(uint32_t scr, uint32_t card, uint32_t text,
     theme->base.flags = dark ? MODE_DARK : 0;
     style_init(theme);
     lv_obj_report_style_change(NULL);
+}
+
+bool lv_theme_meshpunk_get_palette(uint32_t * scr, uint32_t * card, uint32_t * text,
+                                   uint32_t * grey, uint32_t * accent, uint32_t * btn_text,
+                                   uint32_t * highlight, uint32_t * accent_text,
+                                   bool * dark)
+{
+    if(!s_palette.valid) return false;
+    if(scr)         *scr         = lv_color_to_u32(s_palette.scr) & 0xFFFFFFu;
+    if(card)        *card        = lv_color_to_u32(s_palette.card) & 0xFFFFFFu;
+    if(text)        *text        = lv_color_to_u32(s_palette.text) & 0xFFFFFFu;
+    if(grey)        *grey        = lv_color_to_u32(s_palette.grey) & 0xFFFFFFu;
+    if(accent)      *accent      = lv_color_to_u32(s_palette.accent) & 0xFFFFFFu;
+    if(btn_text)    *btn_text    = lv_color_to_u32(s_palette.btn_text) & 0xFFFFFFu;
+    if(highlight)   *highlight   = lv_color_to_u32(s_palette.highlight) & 0xFFFFFFu;
+    if(accent_text) *accent_text = lv_color_to_u32(s_palette.accent_text) & 0xFFFFFFu;
+    if(dark)        *dark        = s_palette.dark;
+    return true;
 }
 
 void lv_theme_meshpunk_set_focus_solid(bool solid)

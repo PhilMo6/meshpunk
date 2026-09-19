@@ -83,6 +83,17 @@ void lv_gridnav_remove(lv_obj_t * obj);
  */
 void lv_gridnav_set_focused(lv_obj_t * cont, lv_obj_t * to_focus, lv_anim_enable_t anim_en);
 
+/**
+ * MESHPUNK: the child gridnav currently treats as focused, or NULL if `cont`
+ * is not a gridnav container (or nothing is focused yet). A gridnav container
+ * is what the GROUP focuses, so lv_group_get_focused() returns the container
+ * and never the real target — anything deciding by widget type (e.g. "is the
+ * user typing in a textarea?") has to ask here.
+ * @param cont  a gridnav container
+ * @return      the focused child, or NULL
+ */
+lv_obj_t * lv_gridnav_get_focused(lv_obj_t * cont);
+
 /**********************
  *      MACROS
  **********************/

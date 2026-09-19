@@ -15,6 +15,8 @@ return {
             grey     = "#1c2b24",
             accent   = "#3dff8e",
             btn_text = "#04120b",
+            highlight   = "#1f84cc",   -- deep azure (strong emphasized text)
+            accent_text = "#ffb454",   -- amber (secondary emphasized text)
             dark     = true,
         }
         t.background.image(t.dir .. "/wall.png")

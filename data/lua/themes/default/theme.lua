@@ -13,6 +13,8 @@ return {
             grey     = "#2f3237",   -- borders / muted chrome
             accent   = "#101010",   -- near-black buttons (the original primary)
             btn_text = "#ffffff",   -- white button labels
+            highlight   = "#ffffff",   -- strong emphasized text (unread names)
+            accent_text = "#7fb3ff",   -- secondary emphasized text (counters/links)
             dark     = true,
         }
         -- The bundled wide-coverage font (Latin Ext + Cyrillic + Greek).

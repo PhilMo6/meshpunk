@@ -8,7 +8,10 @@ The Map app shows OpenStreetMap tiles with mesh contact positions overlaid. Tile
 Drag to pan. The on-screen buttons cover zoom and the map menu, and a long-press on a contact marker opens its details - name, type, distance, hop count, last seen.
 
 PRE-CACHE DOWNLOADS
-In the map settings you can bulk-download tiles for offline use - choose an area size and zoom range, then download. Tiles are written atomically, so an interrupted download won't leave corrupt files.
+Under map settings > Pick tile source you can bulk-download tiles for offline use - choose an area size and zoom range, then download. Tiles are written atomically, so an interrupted download won't leave corrupt files.
+
+YOUR OWN TILES
+If you already have a folder of OpenStreetMap-style z/x/y PNG tiles (256x256) on the SD card, pick it under map settings > Pick tile source and the map uses those instead of downloading. "Use downloaded tiles" there switches back.
 
 MESHPRINT
 With enough mesh data you can run a meshprint on a message sender to capture the first and second hop repeaters and triangulate the sender's general location. The more data you have, the better the results.]]

@@ -28,11 +28,16 @@
     what survives when its UI closes: a state table (the rendezvous point a
     relaunched instance rebinds to), a UI-FREE tick the manager runs on its own
     timer while backgrounded, a LIVE sound-id provider consulted at sweep time
-    so exit sweeps spare those ids, and an on_close that stops everything
-    without any UI existing. apps.go_background(key) exits keeping all that
+    so exit sweeps spare those ids, an on_close that stops everything
+    without any UI existing, and an on_background that runs before the UI is
+    torn down. apps.go_background(key) exits keeping all that
     alive; apps.close_background(key) is the deliberate close (the launcher
     shows one row per backgrounded app with exactly that as its X button).
     Rules: ticks run inside every other app's frame budget — keep them CHEAP;
+    ANY callback the app installed into its surviving state is a closure over
+    widgets the manager is about to delete — drop them in on_background, or
+    the first event that reaches one builds a widget on a freed parent (a
+    hard LVGL fault the tick's pcall cannot catch);
     re-register on every launch (fresh closures; stops the manager tick while
     the app is foreground); route exits through go_background/close — a plain
     go_home keeps the contract's sounds alive but does not start the tick.
@@ -302,6 +307,9 @@ end
 --   tick     UI-FREE heartbeat run while backgrounded (auto-advance etc.)
 --   sounds   LIVE provider fn -> array of sound ids to spare from exit sweeps
 --   on_close deliberate-close handler; must work with NO UI alive
+--   on_background runs at go_background BEFORE the teardown: drop every
+--            callback the app left in its surviving state that closes over a
+--            widget, because the UI is about to be deleted under them
 --   status   fn -> short line for the launcher's background row
 function M.register_background(c)
     if not (c and c.key) then return nil end
@@ -314,6 +322,7 @@ function M.register_background(c)
     rec.tick     = c.tick
     rec.sounds   = c.sounds
     rec.on_close = c.on_close
+    rec.on_background = c.on_background
     rec.status   = c.status
     M._background[c.key] = rec
     return rec
@@ -553,6 +562,12 @@ function M.go_background(key)
     if not rec then return M.go_home() end
     if M._busy then return end
     M._busy = true
+    -- Before anything is torn down: the app drops the seams that point at
+    -- the UI about to be deleted. A callback the app left in its surviving
+    -- state is a closure over a dead root, and the heartbeat below keeps
+    -- calling into that state — building a widget from one is a hard fault
+    -- in LVGL, which the pcall around tick cannot catch.
+    if rec.on_background then pcall(rec.on_background) end
     M.clear_current()
     _nav_clear()
     local scr, timers = M._screen, M._timers

@@ -10,6 +10,8 @@ return {
             grey     = "#c8ccd2",
             accent   = "#2563eb",
             btn_text = "#ffffff",
+            highlight   = "#1d4ed8",
+            accent_text = "#0e7490",
             dark     = false,
         }
         t.background.fill("#f3f4f6")

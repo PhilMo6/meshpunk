@@ -333,6 +333,64 @@ static void push_contact_table(lua_State *L, const ContactInfo &c, bool archived
   }
 }
 
+// Refresh an existing contact table (stack index `idx`) in place — same fields
+// as push_contact_table, minus the pubkey: that is the identity the caller
+// matched on, and it is the one field whose string is 64 chars, i.e. a LONG
+// Lua string, which is never interned and so costs a fresh allocation every
+// time it is pushed. Names and hashes are short strings (interned) and the
+// rest are scalars, so refreshing a contact whose set position is unchanged
+// allocates nothing. The path array is reused and overwritten rather than
+// rebuilt, for the same reason.
+// The table to refresh must be on TOP of the stack; it stays there.
+// (Absolute index taken by hand: lua_absindex is not in proto_exports[].)
+static void update_contact_table(lua_State *L, const ContactInfo &c) {
+  const int idx = lua_gettop(L);
+
+  lua_pushstring(L, c.name);                    lua_setfield(L, idx, "name");
+  lua_pushinteger(L, c.type);                   lua_setfield(L, idx, "type");
+  lua_pushinteger(L, c.out_path_len);           lua_setfield(L, idx, "path_len");
+  lua_pushinteger(L, c.lastmod);                lua_setfield(L, idx, "last_seen");
+  lua_pushinteger(L, c.lastmod);                lua_setfield(L, idx, "lastmod");
+  lua_pushinteger(L, c.last_advert_timestamp);  lua_setfield(L, idx, "sender_advert_ts");
+  lua_pushstring(L, the_mesh->getTypeName(c.type)); lua_setfield(L, idx, "type_name");
+  lua_pushboolean(L, (c.flags & 0x01) != 0);    lua_setfield(L, idx, "favorite");
+  lua_pushnumber(L, c.gps_lat / 1000000.0);     lua_setfield(L, idx, "lat");
+  lua_pushnumber(L, c.gps_lon / 1000000.0);     lua_setfield(L, idx, "lon");
+
+  // Reuse the existing path array (see push_contact_table for the
+  // OUT_PATH_UNKNOWN sentinel rule); entries are overwritten and any tail
+  // from a longer previous path is cleared.
+  lua_getfield(L, idx, "path");
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, idx, "path");
+  }
+  int n = 0;
+  if (c.out_path_len != OUT_PATH_UNKNOWN) {
+    uint8_t hash_size = (c.out_path_len >> 6) + 1;
+    uint8_t hash_count = c.out_path_len & 63;
+    char h[9];
+    for (int j = 0; j < hash_count && (j + 1) * hash_size <= MAX_PATH_SIZE; j++) {
+      mesh::Utils::toHex(h, &c.out_path[j * hash_size], hash_size);
+      lua_pushstring(L, h);
+      lua_rawseti(L, -2, ++n);
+    }
+  }
+  // Clear any tail left by a longer previous path (walked, since lua_rawlen
+  // is not in proto_exports[]).
+  for (int j = n + 1; ; j++) {
+    lua_rawgeti(L, -1, j);
+    bool was_nil = lua_isnil(L, -1);
+    lua_pop(L, 1);
+    if (was_nil) break;
+    lua_pushnil(L);
+    lua_rawseti(L, -2, j);
+  }
+  lua_pop(L, 1);
+}
+
 // Usage from Lua: local contacts = _mesh_get_contacts([include_archived])
 //
 // Cached: rebuilding ~500 contact tables (pubkey hex, path arrays, ...)
@@ -406,12 +464,64 @@ static int lua_mesh_get_contacts(lua_State *L) {
           return 1;
         }
       } else {
-        lua_newtable(L);
+        // INCREMENTAL refresh. contacts_generation bumps on every contact
+        // mutation — each advert from a known contact funnels through
+        // saveOneContact — so on a busy mesh this branch runs on nearly every
+        // call while the contact SET barely moves. Rebuilding ~500 contact
+        // tables (each with a path array and a 64-char pubkey long string)
+        // churned ~388KB of Lua objects per refresh, overflowing the Lua arena
+        // into the shared PSRAM heap and fragmenting it. Instead: index the
+        // previous master by pubkey and refresh matched contacts in place, so
+        // a steady set costs the new outer array plus a few scalars.
+        // Keyed with lua_get/setfield (not the raw variants — those are not in
+        // proto_exports[]); these are plain tables with no metatables, so the
+        // behaviour is identical.
+        lua_newtable(L);                 // pubkey16 -> previous contact table
+        int map = lua_gettop(L);
+        if (s_contacts_ref != LUA_NOREF) {
+          lua_rawgeti(L, LUA_REGISTRYINDEX, s_contacts_ref);
+          int om = lua_gettop(L);
+          for (int i = 1; i <= s_contacts_count; i++) {
+            lua_rawgeti(L, om, i);
+            if (lua_istable(L, -1)) {
+              lua_getfield(L, -1, "pubkey");
+              const char *pk = lua_tostring(L, -1);
+              if (pk && strlen(pk) >= 16) {
+                char key[17];
+                memcpy(key, pk, 16);
+                key[16] = 0;
+                lua_pop(L, 1);           // pubkey string
+                lua_pushvalue(L, -1);    // the contact table
+                lua_setfield(L, map, key);   // short key: interned, no churn
+              } else {
+                lua_pop(L, 1);
+              }
+            }
+            lua_pop(L, 1);               // entry
+          }
+          lua_pop(L, 1);                 // old master
+        }
+
+        lua_newtable(L);                 // the new master array
+        int arr = lua_gettop(L);
         for (int i = 0; i < nlive; i++) {
-          push_contact_table(L, live[i], false);
-          lua_rawseti(L, -2, i + 1);
+          char key[17];                  // first 8 pubkey bytes identify it
+          mesh::Utils::toHex(key, live[i].id.pub_key, 8);
+          lua_getfield(L, map, key);
+          if (lua_istable(L, -1)) {
+            update_contact_table(L, live[i]);
+            // Drop the key so a prefix collision can't hand the same table to
+            // two contacts; the second one then builds its own.
+            lua_pushnil(L);
+            lua_setfield(L, map, key);
+          } else {
+            lua_pop(L, 1);
+            push_contact_table(L, live[i], false);
+          }
+          lua_rawseti(L, arr, i + 1);
         }
         heap_caps_free(live);
+        lua_remove(L, map);              // sits below arr; arr ends on top
 
         if (s_contacts_ref != LUA_NOREF) {
           luaL_unref(L, LUA_REGISTRYINDEX, s_contacts_ref);

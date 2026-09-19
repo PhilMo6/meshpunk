@@ -97,7 +97,9 @@ t.background.procedural(function(c, w, h)
             text     = "#e6e9ff",
             grey     = "#225255",
             accent   = palette[1],   -- (buttons / highlight)
-            btn_text = "#000000",   
+            btn_text = "#000000",
+            highlight   = palette[5],   -- hot pink (strong emphasized text)
+            accent_text = palette[4],   -- violet (secondary emphasized text)
             dark     = true,
         }
 

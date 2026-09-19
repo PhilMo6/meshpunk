@@ -84,6 +84,8 @@ local function load_map_prefs()
     if hw and hw >= 0 and hw <= 12 then prefs.halo_w = hw end
     local ho = tonumber(string.match(txt, "halo_opa=(%d+)") or "")
     if ho and ho >= 0 and ho <= 255 then prefs.halo_opa = ho end
+    local td = string.match(txt, "tiles=([^\r\n]*)")
+    if td and td ~= "" then prefs.tile_dir = td end
     return prefs
 end
 
@@ -110,6 +112,7 @@ local function save_map_prefs()
         "mptri=" .. map_prefs.mp_tri,
         "mpalgo=" .. map_prefs.mp_algo,
         "mpcull=" .. map_prefs.mp_cull,
+        "tiles=" .. (map_prefs.tile_dir or ""),
     }, "\n"))
     f:close()
 end
@@ -165,8 +168,24 @@ local function tile_bin_path(z, tx, ty)
     return CACHE_ROOT .. "/" .. z .. "/" .. tx .. "/" .. ty .. ".bin"
 end
 
+-- Tile source (downloaded .bin cache vs a user folder of z/x/y PNG tiles)
+-- lives in its own chunk — this main chunk is near Lua's 200-local limit.
+-- tilesource.folder() = bare SD folder path or nil; tilesource.tile_path()
+-- = the tile file for the active source. UI hooks are wired by the
+-- tilesource.bind_ui call further down, after the views exist.
+-- app_dir carries the "L:" drive prefix (lib/apps.lua dir field) but
+-- loadfile wants the bare VFS path the entrypoint uses — strip it. The
+-- extra parens around the gsub truncate its second return (the count),
+-- which would otherwise land in loadfile's mode parameter.
+local tilesource = assert(loadfile(((app_dir .. "/tilesource.lua"):gsub("^[Ll]:", ""))))({
+    W = W, H = H,
+    map_prefs = map_prefs,
+    save_map_prefs = save_map_prefs,
+    tile_bin_path = tile_bin_path,
+})
+
 local function tile_img_src(z, tx, ty)
-    return "S:" .. tile_bin_path(z, tx, ty)
+    return "S:" .. tilesource.tile_path(z, tx, ty)
 end
 
 local function tile_cached(z, tx, ty)
@@ -178,7 +197,8 @@ local function tile_cached(z, tx, ty)
     if bin_cache_n >= BIN_CACHE_CAP then bin_cache = {}; bin_cache_n = 0 end
     -- Tile conversion uses atomic write (.tmp → .bin rename), so any .bin
     -- that exists on SD is guaranteed complete. Simple existence check.
-    local ok, exists = pcall(_file_exists_sd, tile_bin_path(z, tx, ty))
+    -- User-folder PNGs are validated by _tile_show itself.
+    local ok, exists = pcall(_file_exists_sd, tilesource.tile_path(z, tx, ty))
     local result = (ok and exists) and true or false
     bin_cache[key] = result
     bin_cache_n = bin_cache_n + 1
@@ -199,6 +219,7 @@ local function ensure_tile_dirs(z, tx)
 end
 
 local function enqueue_download(z, tx, ty, visible)
+    if tilesource.folder() then return end  -- user folder: nothing to download
     if not map.sd_ok or not map.wifi_ok then return end
     local max_tile = 2 ^ z - 1
     if tx < 0 or ty < 0 or tx > max_tile or ty > max_tile then return end
@@ -215,6 +236,14 @@ end
 
 local tile_imgs = {}  -- forward-declare; populated in UI setup
 local tile_srcs = {}  -- current source path per widget (avoids redundant set_src)
+-- Slot bookkeeping: pool slots are assigned to tiles dynamically, not 1:1
+-- with widgets. When a pan re-bases the grid, a tile that stays visible is
+-- re-POINTED (_tile_point — no disk read, no decode) to the slot already
+-- holding its pixels; only newly-entering tiles load from disk. slot_key[s]
+-- = src key held by slot s; key_slot = its inverse; grid = src-key set of
+-- the current 4x4 grid (rebuilt by refresh_tiles) — only slots holding keys
+-- OUTSIDE the grid are eviction donors for fresh loads.
+local pool_map = { slot_key = {}, key_slot = {}, grid = {} }
 -- Cached margin tiles (in the 4x4 grid but off-screen) waiting to be loaded.
 -- Visible tiles load immediately in refresh_tiles; these trickle in via
 -- dl_timer (1-2 per tick) so each ~50ms SD read never stalls a pan frame.
@@ -288,11 +317,45 @@ local function set_tile_widget(idx, z, tx, ty)
         tile_imgs[idx]:clear_flag(lvgl.FLAG.HIDDEN)
         return true
     end
-    -- Load the .bin into the fixed tile pool slot `idx` and point the widget at
-    -- that slot's in-memory RGB565 descriptor (LVGL draws it directly). No LVGL
-    -- image cache, so no scattered 128KB decode buffers fragmenting PSRAM.
-    local ok, shown = pcall(_tile_show, tile_imgs[idx], idx, tile_bin_path(z, tx, ty))
+    -- Already decoded in some slot (typical after a pan re-base): re-point
+    -- the widget at that slot's descriptor — no disk read, no decode.
+    local held = pool_map.key_slot[src]
+    if held then
+        local okp, pointed = pcall(_tile_point, tile_imgs[idx], held)
+        if okp and pointed then
+            tile_imgs[idx]:clear_flag(lvgl.FLAG.HIDDEN)
+            tile_srcs[idx] = src
+            return true
+        end
+        -- Descriptor gone (fresh pool): drop the stale mapping, load below.
+        pool_map.key_slot[src] = nil
+        pool_map.slot_key[held] = nil
+    end
+    -- Fresh load: pick a donor slot — one holding nothing, or a tile outside
+    -- the current grid. One always exists (the grid has at most 16 keys and
+    -- this one is in no slot, so at most 15 slots hold grid tiles). A donor
+    -- is never on screen: every visible widget shows a grid key.
+    local donor
+    for s = 1, GRID * GRID do
+        local k = pool_map.slot_key[s]
+        if not k or not pool_map.grid[k] then donor = s; break end
+    end
+    if not donor then
+        tile_imgs[idx]:add_flag(lvgl.FLAG.HIDDEN)
+        tile_srcs[idx] = nil
+        return false
+    end
+    local old = pool_map.slot_key[donor]
+    if old then pool_map.key_slot[old] = nil end
+    pool_map.slot_key[donor] = nil
+    -- Load the tile (.bin, or a user-folder PNG) into the donor slot and point
+    -- the widget at that slot's in-memory RGB565 descriptor (LVGL draws it
+    -- directly). No LVGL image cache, so no scattered 128KB decode buffers
+    -- fragmenting PSRAM.
+    local ok, shown = pcall(_tile_show, tile_imgs[idx], donor, tilesource.tile_path(z, tx, ty))
     if ok and shown then
+        pool_map.slot_key[donor] = src
+        pool_map.key_slot[src] = donor
         tile_imgs[idx]:clear_flag(lvgl.FLAG.HIDDEN)
         tile_srcs[idx] = src
         return true
@@ -745,6 +808,16 @@ local proto_layers = {
       pts = {}, zoom = nil, fetched = 0 },
 }
 
+-- The ACTIVE protocol's own layer is not offered: its nodes are already drawn
+-- live from the contact table (and in the same red, for meshcore), so the
+-- toggle could only ever duplicate what is on screen. These layers exist to
+-- show the protocol that is NOT running this boot.
+local active_proto = nil
+do
+    local ok, act = pcall(_lora_proto)
+    if ok and type(act) == "string" then active_proto = act end
+end
+
 local function proto_layer_fetch(pl)
     local ok, nodes = pcall(_map_nodes, pl.key)
     pl.pts = {}
@@ -759,7 +832,7 @@ local function proto_layer_fetch(pl)
 end
 
 for _, pl in ipairs(proto_layers) do
-    if map_prefs[pl.pref] then
+    if map_prefs[pl.pref] and pl.key ~= active_proto then
         pl.on = true
         proto_layer_fetch(pl)
     end
@@ -792,6 +865,24 @@ local arch_load = {
     timer = nil,
 }
 
+-- Largest-free-block floor for one PNG tile decode (~410KB for a 256x256
+-- palette tile: lodepng's scanline buffer + the ARGB8888-sized buffer it
+-- decodes into + the file), with margin.
+local TILE_DECODE_MIN_FREE = 512 * 1024
+
+-- Compact the heap before a batch of tile decodes when the largest free block
+-- has fallen below one decode's need. feed_tile_fetches does the same before a
+-- download burst; a user tile folder never takes that path, and Lua garbage
+-- that overflows its arena lands in this same heap — so collecting is what
+-- returns contiguous space to the decoder. No-op unless actually low.
+local function compact_for_decode()
+    if not tilesource.folder() then return end
+    local okh, _, largest = pcall(_heap_info)
+    if okh and largest and largest < TILE_DECODE_MIN_FREE then
+        collectgarbage("collect")
+    end
+end
+
 local function refresh_tiles()
     if not map.running then return end
     invalidate_markers()  -- settle/boundary/zoom: refresh contact projections
@@ -813,9 +904,26 @@ local function refresh_tiles()
     map.base_ty = base_ty
     map.canvas_zoom = map.zoom
 
+    -- Rebuild the current-grid key set for set_tile_widget's donor scan:
+    -- only slots holding tiles OUTSIDE this set may be evicted by a fresh
+    -- load, so a re-based grid re-points still-loaded tiles instead of
+    -- reloading them.
+    local max_tile_g = 2 ^ map.zoom - 1
+    pool_map.grid = {}
+    for r = 0, GRID - 1 do
+        for c = 0, GRID - 1 do
+            local gtx = base_tx + c
+            local gty = base_ty + r
+            if gtx >= 0 and gty >= 0 and gtx <= max_tile_g and gty <= max_tile_g then
+                pool_map.grid[tile_img_src(map.zoom, gtx, gty)] = true
+            end
+        end
+    end
+
     -- Release tiles that just left the view (or the whole previous zoom layer)
     -- before converting new ones, so the decode buffer has contiguous PSRAM.
     evict_offscreen_tiles()
+    compact_for_decode()
 
     local off_x = base_tx * TILE_SIZE - view_left
     local off_y = base_ty * TILE_SIZE - view_top
@@ -2308,6 +2416,10 @@ local function show_contact_popup(contact)
 end
 
 update_dl_status = function()
+    if tilesource.folder() then
+        dl_label:add_flag(lvgl.FLAG.HIDDEN)  -- user folder: no download status
+        return
+    end
     if not map.sd_ok or not map.wifi_ok then return end  -- other label already shown
     local pending = #map.download_queue + map_inflight
     if pending > 0 then
@@ -2322,6 +2434,10 @@ update_wifi_status = function()
     local st = _wifi_status()
     local was_ok = map.wifi_ok
     map.wifi_ok = (st == "connected")
+
+    -- User folder: tiles come from SD; keep wifi_ok fresh (a mode switch
+    -- reads it) but no Offline label and no re-enqueue on reconnect.
+    if tilesource.folder() then return end
 
     if not map.sd_ok then return end  -- "No SD" takes priority
 
@@ -2408,7 +2524,9 @@ poll_fetch_results = function()
             end
 
             if ok then
-                bin_cache[key] = true
+                -- After a switch to a user tile folder, a late-completing
+                -- fetch only wrote the .bin cache — don't mark it present.
+                if not tilesource.folder() then bin_cache[key] = true end
             elseif stage == "frag" and not p.retried then
                 pcall(_lvgl_image_cache_drop)
                 local url = TILE_URL .. "/" .. p.z .. "/" .. p.tx .. "/" .. p.ty .. ".png"
@@ -2427,7 +2545,9 @@ poll_fetch_results = function()
             if pending_fetches[key] == nil then
                 -- Fetch concluded (success or final failure)
                 if p.kind == "map" then
-                    if ok then show_tile_if_on_grid(p.z, p.tx, p.ty) end
+                    if ok and not tilesource.folder() then
+                        show_tile_if_on_grid(p.z, p.tx, p.ty)
+                    end
                 else
                     pc.completed = pc.completed + 1
                     if ok then
@@ -3497,8 +3617,9 @@ local function show_map_help()
         "data you have, the better the result.")
 
     section("Offline tiles",
-        "In Settings, download map tiles for offline use - pick an area size " ..
-        "and zoom range. Tiles are cached to the SD card.")
+        "Settings > Pick tile source covers both offline options: download " ..
+        "tiles for an area size and zoom range (cached to the SD card), or " ..
+        "use a folder of 256x256 z/x/y PNG tiles already on the SD card.")
 
     -- 'q' / ESC closes the help. While this overlay is the gridnav scope, root
     -- (which owns the map's key handler) isn't focused — so handle the key on
@@ -3509,6 +3630,25 @@ local function show_map_help()
     end)
     _nav_setup(help_overlay, GRIDNAV_ROLLOVER)
 end
+
+-- ---------------------------------------------------------------------------
+-- Tile source module: late UI wiring (screens + probe live in tilesource.lua)
+-- ---------------------------------------------------------------------------
+tilesource.bind_ui({
+    root = root,
+    dl_label = dl_label,
+    refresh_tiles = refresh_tiles,
+    update_wifi_status = update_wifi_status,
+    show_precache_screen = show_precache_screen,
+    -- The per-source caches are main-chunk locals; the module resets them
+    -- through this closure when the source switches.
+    reset_tile_caches = function()
+        bin_cache = {}
+        bin_cache_n = 0
+        map.download_queue = {}
+        margin_pending = {}
+    end,
+})
 
 local settings_overlay = nil
 
@@ -3582,9 +3722,11 @@ local function show_settings_screen()
         redraw_markers()  -- reflect immediately (archived fill in progressively)
     end)
 
-    -- Cross-protocol node layers: both drawable at once (comparison), fed
-    -- from files so neither needs its protocol running.
+    -- Node layer for the protocol that is NOT running this boot, fed from its
+    -- files. The active protocol's own layer is skipped — those nodes are
+    -- already on screen from the live contact table.
     for _, pl in ipairs(proto_layers) do
+      if pl.key ~= active_proto then
         local disp = (pl.key == "meshcore") and "MeshCore nodes (red)"
                                             or "MTLite nodes (magenta)"
         local function pl_text()
@@ -3601,6 +3743,7 @@ local function show_settings_screen()
             invalidate_markers()
             redraw_markers()
         end)
+      end
     end
 
     -- Replay packet paths from message history
@@ -3619,13 +3762,17 @@ local function show_settings_screen()
         show_meshprint_screen()
     end)
 
-    -- Tile pre-cache download (validates SD/WiFi on its own screen)
-    local dl_btn = settings_overlay:Button({ w = W - 16, h = 32 })
-    dl_btn:Label({ text = "Download map tiles...", align = lvgl.ALIGN.LEFT_MID })
-    dl_btn:onClicked(function()
+    -- Tile source home: pre-cache downloads + user PNG tile folders
+    local tiles_btn = settings_overlay:Button({ w = W - 16, h = 32 })
+    tiles_btn:Label({ text = "Pick tile source...", align = lvgl.ALIGN.LEFT_MID })
+    tiles_btn:onClicked(function()
         close_settings_screen()
-        show_precache_screen()
+        tilesource.show_source_screen()
     end)
+    settings_overlay:Label({
+        text = "Source: " .. tilesource.source_label(),
+        text_color = "#AAAAAA", w = W - 16, h = 18,
+    })
 
     -- Controls / help (info mirrors the README)
     local help_btn = settings_overlay:Button({ w = W - 16, h = 32 })
@@ -3802,6 +3949,8 @@ root:onevent(lvgl.EVENT.KEY, function()
             close_replay_screen()
         elseif settings_overlay then
             close_settings_screen()
+        elseif tilesource.screen_open() then
+            tilesource.close_screens()
         elseif meshprint_overlay then
             close_meshprint_screen()  -- close the overlay, NOT the app (scan keeps drawing)
         elseif pc_overlay then
@@ -3950,6 +4099,7 @@ local dl_timer = lvgl.Timer({
         local speed = math.max(math.abs(map.vx), math.abs(map.vy))
         if #map.download_queue == 0 and fetch_outstanding == 0
            and pc.timer == nil and speed <= 8 then
+            if #margin_pending > 0 then compact_for_decode() end
             for _ = 1, 2 do
                 local m = table.remove(margin_pending, 1)
                 if not m then break end
@@ -4058,7 +4208,8 @@ local function init_view()
     -- Tiles need WiFi and the firmware no longer retries in the background
     -- (bounded connect rounds): kick one round now — async no-op when already
     -- connected/disabled — and update_wifi_status flips wifi_ok when it lands.
-    pcall(_wifi_auto_connect)
+    -- A user tile folder needs no WiFi at all, so no kick there.
+    if not tilesource.folder() then pcall(_wifi_auto_connect) end
     local wstatus = _wifi_status()
     map.wifi_ok = (wstatus == "connected")
 
@@ -4068,7 +4219,7 @@ local function init_view()
     if not map.sd_ok then
         dl_label:set({ text = "No SD" })
         dl_label:clear_flag(lvgl.FLAG.HIDDEN)
-    elseif not map.wifi_ok then
+    elseif not map.wifi_ok and not tilesource.folder() then
         dl_label:set({ text = "Offline" })
         dl_label:clear_flag(lvgl.FLAG.HIDDEN)
     end

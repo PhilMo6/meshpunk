@@ -9,7 +9,7 @@
   free PSRAM.
 
   Formats: PNG, baseline JPEG (TJpgDec — progressive JPEGs are rejected with a
-  message) and LVGL RGB565 .bin.
+  message), GIF (89a, first frame only — no animation) and LVGL RGB565 .bin.
 
       local imgview = require("lib/imgview")
 

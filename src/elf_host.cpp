@@ -2987,9 +2987,9 @@ int elf_host_run_pending(void) {
         char msg[192];   // == NOTIFY_LOG_TEXT_MAX (notify.cpp truncates above it)
         if (!mod) {
             snprintf(msg, sizeof(msg),
-                     "App launch failed: %s didn't load - low RAM "
-                     "(PSRAM largest %uKB). Restart and try again; if it keeps "
-                     "failing see Read Me > Freeing up RAM.",
+                     "App launch failed: %s didn't load (PSRAM largest %uKB). "
+                     "Either a damaged app file or low RAM - reinstall the "
+                     "app, or see Read Me > Freeing up RAM.",
                      base,
                      (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
         } else if (result == -2) {

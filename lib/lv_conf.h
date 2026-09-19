@@ -204,7 +204,7 @@
 #define LV_FONT_SIMSUN_16_CJK            0
 
 #define LV_FONT_UNSCII_8  0
-#define LV_FONT_UNSCII_16 0
+#define LV_FONT_UNSCII_16 1
 
 #define LV_FONT_CUSTOM_DECLARE
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
@@ -356,7 +356,9 @@
 #define LV_USE_TJPGD 1
 #define LV_USE_LIBJPEG_TURBO 0
 
-#define LV_USE_GIF 0
+/* GIF: src/img_bridge.cpp drives gifdec directly (gd_open_gif_data +
+ * gd_render_frame) for the first frame; the lv_gif widget is unused. */
+#define LV_USE_GIF 1
 #if LV_USE_GIF
     #define LV_GIF_CACHE_DECODE_DATA 0
 #endif

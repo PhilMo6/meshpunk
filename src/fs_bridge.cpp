@@ -409,6 +409,7 @@ static int lua_fs_copy(lua_State* L) {
         lua_pushstring(L, "cannot open destination");
         return 2;
     }
+    size_t src_size = fsrc.size();
     if (any_sd) sd_spi_release();
 
     const uint32_t PSRAM_CHUNK = 32 * 1024;
@@ -422,20 +423,25 @@ static int lua_fs_copy(lua_State* L) {
 
     const char* err = buf ? NULL : "out of memory";
     int iter = 0;
+    size_t copied = 0;
     while (!err) {
         if (any_sd) sd_spi_take();
         size_t n = fsrc.read(buf, chunk);
         size_t w = (n > 0) ? fdst.write(buf, n) : 0;
         if (any_sd) sd_spi_release();
-        if (n == 0) break;   // EOF
+        // read() returns 0 for EOF and for a failed read alike — the size
+        // check below the loop tells them apart.
+        if (n == 0) break;
         if (w != n) {
             err = "write failed (disk full?)";
             break;
         }
+        copied += n;
         // Yield every 64KB so the idle task feeds the watchdog and Core-1
         // gets bus time even on huge files.
         if (++iter % 2 == 0) vTaskDelay(1);
     }
+    if (!err && copied != src_size) err = "short read (SD error?)";
 
     if (any_sd) sd_spi_take();
     fsrc.close();

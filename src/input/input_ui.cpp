@@ -505,6 +505,14 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   // ── WASD intercept — treat as direction, not character (unless typing) ──
   uint32_t wasd_dir = 0;
   lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
+  // A gridnav scope is what the GROUP focuses, so the focused object is the
+  // container and the real target is the child gridnav tracks: ask it, or a
+  // textarea inside any nav scope never counts as typing and w/a/s/d move
+  // focus away mid-word instead of reaching the field.
+  if (focused && lv_obj_is_valid(focused)) {
+    lv_obj_t *gchild = lv_gridnav_get_focused(focused);
+    if (gchild && lv_obj_is_valid(gchild)) focused = gchild;
+  }
   bool typing = focused && lv_obj_is_valid(focused) && lv_obj_check_type(focused, &lv_textarea_class);
 
   // ── Alt emoji layer — substitute AFTER resolution, only while typing ──

@@ -9,6 +9,8 @@ return {
             grey     = "#3a2a4a",
             accent   = "#ff2bbf",
             btn_text = "#ffffff",
+            highlight   = "#ff4fd0",
+            accent_text = "#39d0ff",
             dark     = true,
         }
         t.background.procedural(function(c, w, h)

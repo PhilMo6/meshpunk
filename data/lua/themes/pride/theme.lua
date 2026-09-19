@@ -17,6 +17,8 @@ return {
             grey     = "#3a3a44",
             accent   = "#ff2d95",   -- hot-pink highlight / buttons
             btn_text = "#ffffff",
+            highlight   = "#ffd75e",
+            accent_text = "#5ab4ff",
             dark     = true,
         }
 

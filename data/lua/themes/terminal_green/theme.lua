@@ -9,6 +9,8 @@ return {
             grey     = "#0a4a0a",
             accent   = "#19a019",
             btn_text = "#001200",
+            highlight   = "#d0ffc0",   -- blooming phosphor (strong emphasized text)
+            accent_text = "#8aff5a",   -- mid phosphor (secondary emphasized text)
             dark     = true,
         }
         t.background.procedural(function(c, w, h)

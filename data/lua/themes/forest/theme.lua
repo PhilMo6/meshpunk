@@ -13,6 +13,8 @@ return {
             grey      = "#2c4030",
             accent   = "#5aa83a",   -- leaf green (buttons / highlight)
             btn_text = "#ffffff",
+            highlight   = "#96e05a",   -- bright leaf (strong emphasized text)
+            accent_text = "#e8c05a",   -- sun amber (secondary emphasized text)
             dark     = true,
         }
 

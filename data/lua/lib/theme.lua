@@ -6,7 +6,11 @@
       return {
         name  = "Hotpink Punk",
         apply = function(t)  -- runs ONCE when the theme is selected
-          t.set_palette{ scr=.., card=.., text=.., grey=.., accent=.., btn_text=.., dark=true }
+          t.set_palette{ scr=.., card=.., text=.., grey=.., accent=.., btn_text=..,
+                         highlight=.., accent_text=.., dark=true }
+          -- highlight / accent_text: emphasized-TEXT colors (strong / secondary)
+          -- read back by apps via M.palette(); missing keys fall back
+          -- accent_text -> highlight -> text.
           t.background.procedural(function(canvas, w, h) ... end)  -- or .image / .fill
           t.set_font(t.dir .. "/font.ttf")            -- optional runtime UI font
           -- or: t.set_font{ file = t.dir .. "/font.ttf", size = 16 }
@@ -51,7 +55,9 @@
 
   Split of responsibilities:
     * palette  -> pushed to the C LVGL theme (_theme_apply_palette). Lives in the
-                  theme styles, survives app launches, costs no PSRAM.
+                  theme styles, survives app launches, costs no PSRAM. Apps read
+                  it back with M.palette() (highlight / accent_text are theirs
+                  to draw with — no C style consumes those two).
     * background-> drawn by lib/background. Freed on every app launch (so heavy
                   apps keep the PSRAM); the launcher redraws it on return home,
                   and any lightweight app may opt in via M.show_background().
@@ -132,7 +138,8 @@ local function make_toolkit(asset_dir)
             return m
         end,
         -- Push the chrome palette to the C theme (live, no reboot). Missing keys
-        -- fall back to the current dark defaults; btn_text falls back to text.
+        -- fall back to the current dark defaults; btn_text falls back to text,
+        -- highlight to text, accent_text to highlight then text.
         set_palette = function(p)
             p = p or {}
             _theme_apply_palette(
@@ -142,6 +149,8 @@ local function make_toolkit(asset_dir)
                 p.grey or "#2f3237",
                 p.accent or "#ff00aa",
                 p.btn_text or p.text or "#ffffff",
+                p.highlight or p.text or "#e6e6e6",
+                p.accent_text or p.highlight or p.text or "#e6e6e6",
                 p.dark ~= false)   -- default dark unless explicitly dark = false
         end,
         -- Optional runtime fonts (TTF), two roles: "ui" (interface chrome —
@@ -300,6 +309,16 @@ end
 -- Id of the last applied theme (for the picker highlight).
 function M.current()
     return current_id
+end
+
+-- The active palette as text_color-ready "#rrggbb" strings plus dark (bool):
+-- { scr, card, text, grey, accent, btn_text, highlight, accent_text, dark }.
+-- highlight / accent_text are the two emphasized-TEXT roles (strong / secondary)
+-- for apps — e.g. the Messenger's unread names and unread counters. Fresh read
+-- from the C theme each call; errors before the boot theme apply (main.lua
+-- applies the saved theme before any app can run).
+function M.palette()
+    return _theme_palette_get()
 end
 
 -- Apply a theme by id: resolve it, run its apply() once, persist, release. Falls

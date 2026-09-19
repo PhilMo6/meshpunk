@@ -39,6 +39,7 @@
 #include "usb_manager.h"
 #include "usb_fs.h"
 #include "ota_update.h"
+#include "lua_net.h"
 #include "tdeck_link.h"
 
 // Radio + MeshCore helper classes (the protocol itself lives in the meshcore
@@ -114,8 +115,11 @@ int luaL_loadfilex(lua_State *L, const char *filename, const char *mode) {
   }
 }
 
-extern "C" unsigned lodepng_decode32(unsigned char **out, unsigned *w, unsigned *h,
-                                     const unsigned char *in, size_t insize);
+// LodePNGState (decoder.color_convert) and LodePNGColorMode are needed to
+// decode to the PNG's own colour format; NO_COMPILE_CPP keeps the header's
+// std::vector API out of the extern "C" block it wraps everything in.
+#define LODEPNG_NO_COMPILE_CPP
+#include "../lib/lvgl/src/libs/lodepng/lodepng.h"
 
 // Radio
 RADIO_CLASS radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
@@ -2727,6 +2731,10 @@ static bool copyFile(fs::FS &srcFS, const char* srcPath, fs::FS &dstFS, const ch
   return true;
 }
 
+// ROM tinfl: used by the release build's pack extraction below AND by the
+// _inflate Lua binding (every env).
+#include "rom/miniz.h"
+
 #ifdef MESHPUNK_EMBED_PACK
 // ==== Self-contained release build ==========================================
 // pack/data_pack.bin (built by make_data_pack.py, linked in via
@@ -2739,7 +2747,6 @@ static bool copyFile(fs::FS &srcFS, const char* srcPath, fs::FS &dstFS, const ch
 // with the ESP32-S3 ROM's tinfl; the pack is read in place from mapped flash.
 #include "esp_flash.h"
 #include "esp_partition.h"
-#include "rom/miniz.h"
 #include "rom/md5_hash.h"
 
 // Symbol names come from objcopy mangling the project-relative source path
@@ -3101,6 +3108,97 @@ static void ensure_data_partition() {
 }
 #endif  // MESHPUNK_EMBED_PACK
 
+// _inflate(data [, max_out]) -> data | data, true | nil, err
+// One-shot decompressor over the ROM's tinfl, for Lua (the Web app's gzip
+// transfer decoding). Accepts a gzip stream (header fields skipped,
+// trailer ignored), a zlib stream, or raw DEFLATE. Output lives in PSRAM
+// and grows up to max_out (default 3MB). A second result of true means
+// the output is partial: the cap was hit, or the stream ended early /
+// went bad after producing data.
+static int lua_inflate(lua_State *L) {
+  size_t in_len = 0;
+  const uint8_t *in = (const uint8_t *)luaL_checklstring(L, 1, &in_len);
+  size_t max_out = (size_t)luaL_optinteger(L, 2, 3 * 1024 * 1024);
+  uint32_t flags = 0;
+
+  if (in_len >= 2 && in[0] == 0x1F && in[1] == 0x8B) {
+    if (in_len < 10) { lua_pushnil(L); lua_pushstring(L, "short gzip"); return 2; }
+    uint8_t flg = in[3];
+    size_t pos = 10;
+    if (flg & 0x04) {  // FEXTRA
+      if (pos + 2 > in_len) { lua_pushnil(L); lua_pushstring(L, "bad gzip"); return 2; }
+      uint16_t xlen = (uint16_t)(in[pos] | (in[pos + 1] << 8));
+      pos += 2 + xlen;
+    }
+    if (flg & 0x08) { while (pos < in_len && in[pos] != 0) pos++; pos++; }  // FNAME
+    if (flg & 0x10) { while (pos < in_len && in[pos] != 0) pos++; pos++; }  // FCOMMENT
+    if (flg & 0x02) { pos += 2; }                                           // FHCRC
+    if (pos >= in_len) { lua_pushnil(L); lua_pushstring(L, "bad gzip"); return 2; }
+    in += pos;
+    in_len -= pos;
+  } else if (in_len >= 2 && in[0] == 0x78) {
+    flags |= TINFL_FLAG_PARSE_ZLIB_HEADER;
+  }
+
+  tinfl_decompressor *inf =
+      (tinfl_decompressor *)heap_caps_malloc(sizeof(tinfl_decompressor),
+                                             MALLOC_CAP_SPIRAM);
+  size_t cap = in_len * 4 + 1024;
+  if (cap > max_out) cap = max_out;
+  uint8_t *out = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+  if (!inf || !out) {
+    free(inf);
+    free(out);
+    lua_pushnil(L);
+    lua_pushstring(L, "no memory");
+    return 2;
+  }
+  tinfl_init(inf);
+
+  size_t in_pos = 0, out_pos = 0;
+  bool partial = false;
+  const char *err = NULL;
+  for (;;) {
+    size_t in_bytes = in_len - in_pos;
+    size_t out_bytes = cap - out_pos;
+    tinfl_status st = tinfl_decompress(
+        inf, in + in_pos, &in_bytes, out, out + out_pos, &out_bytes,
+        flags | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    in_pos += in_bytes;
+    out_pos += out_bytes;
+    if (st == TINFL_STATUS_DONE) break;
+    if (st == TINFL_STATUS_HAS_MORE_OUTPUT) {
+      if (cap >= max_out) { partial = true; break; }
+      size_t ncap = cap * 2;
+      if (ncap > max_out) ncap = max_out;
+      uint8_t *nout =
+          (uint8_t *)heap_caps_realloc(out, ncap, MALLOC_CAP_SPIRAM);
+      if (!nout) { partial = true; break; }
+      out = nout;
+      cap = ncap;
+      continue;
+    }
+    if (st == TINFL_STATUS_NEEDS_MORE_INPUT) { partial = true; break; }
+    err = "corrupt deflate stream";
+    break;
+  }
+
+  free(inf);
+  if (err && out_pos == 0) {
+    free(out);
+    lua_pushnil(L);
+    lua_pushstring(L, err);
+    return 2;
+  }
+  lua_pushlstring(L, (const char *)out, out_pos);
+  free(out);
+  if (partial || err) {
+    lua_pushboolean(L, 1);
+    return 2;
+  }
+  return 1;
+}
+
 // Set whether to use SD card for mesh data storage
 // Usage: _storage_set_use_sd(true)  -- switch to SD
 //        _storage_set_use_sd(false) -- switch to LittleFS
@@ -3413,6 +3511,245 @@ struct ConvertLock {
   SemaphoreHandle_t m_;
 };
 
+// IHDR fields, read straight from the file header at the spec's fixed offsets
+// (8-byte signature, 4-byte chunk length, "IHDR", then width, height, bit
+// depth, colour type). Read before decoding so an unsupported PNG costs no
+// memory and no decode time.
+struct PngInfo {
+  uint32_t w, h;
+  uint8_t  bitdepth, colortype;
+};
+
+static bool png_read_ihdr(const uint8_t *d, uint32_t size, PngInfo *out) {
+  static const uint8_t SIG[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+  if (size < 26 || memcmp(d, SIG, sizeof(SIG)) != 0) return false;
+  out->w = ((uint32_t)d[16] << 24) | ((uint32_t)d[17] << 16) |
+           ((uint32_t)d[18] << 8)  | d[19];
+  out->h = ((uint32_t)d[20] << 24) | ((uint32_t)d[21] << 16) |
+           ((uint32_t)d[22] << 8)  | d[23];
+  out->bitdepth  = d[24];
+  out->colortype = d[25];
+  return out->w != 0 && out->h != 0;
+}
+
+// Samples per pixel for a PNG colour type; 0 for an invalid one.
+static uint32_t png_channels(uint8_t colortype) {
+  switch (colortype) {
+    case 0: return 1;   // greyscale
+    case 2: return 3;   // RGB
+    case 3: return 1;   // palette index
+    case 4: return 2;   // greyscale + alpha
+    case 6: return 4;   // RGBA
+    default: return 0;
+  }
+}
+
+// Native little-endian RGB565: LVGL v9 byte-swaps the whole framebuffer at
+// flush for LV_COLOR_16_SWAP, so image data itself stays little-endian
+// (matches the reference scripts/LVGLImage.py output).
+static inline uint16_t rgb_to_565(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((uint16_t)(r >> 3) << 11) |
+                    ((uint16_t)(g >> 2) << 5)  |
+                    (uint16_t)(b >> 3));
+}
+
+// lodepng's raw output — the PNG's own colour format, unfiltered, with the
+// per-scanline padding bits removed, so sub-8-bit pixels run continuously —
+// packed to RGB565. Alpha is dropped (map tiles are opaque). Returns false
+// for a format this does not handle.
+static bool png_raw_to_565(const uint8_t *raw, const LodePNGColorMode *cm,
+                           uint32_t w, uint32_t h, uint16_t *dst) {
+  const uint32_t n = w * h;
+
+  if (cm->colortype == LCT_PALETTE) {
+    // One lookup table beats a per-pixel palette walk; entries the PNG never
+    // declares stay black.
+    uint16_t lut[256];
+    lv_memzero(lut, sizeof(lut));
+    const uint32_t entries = (cm->palettesize < 256) ? (uint32_t)cm->palettesize : 256;
+    for (uint32_t i = 0; i < entries; i++) {
+      const uint8_t *p = cm->palette + i * 4;    // RGBARGBA... order
+      lut[i] = rgb_to_565(p[0], p[1], p[2]);
+    }
+    switch (cm->bitdepth) {
+      case 8:
+        for (uint32_t i = 0; i < n; i++) dst[i] = lut[raw[i]];
+        return true;
+      case 4:
+        for (uint32_t i = 0; i < n; i++)
+          dst[i] = lut[(raw[i >> 1] >> ((i & 1) ? 0 : 4)) & 0x0F];
+        return true;
+      case 2:
+        for (uint32_t i = 0; i < n; i++)
+          dst[i] = lut[(raw[i >> 2] >> (6 - 2 * (i & 3))) & 0x03];
+        return true;
+      case 1:
+        for (uint32_t i = 0; i < n; i++)
+          dst[i] = lut[(raw[i >> 3] >> (7 - (i & 7))) & 0x01];
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  if (cm->bitdepth != 8) return false;   // 16-bit is refused before the decode
+
+  switch (cm->colortype) {
+    case LCT_RGB:
+      for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *p = raw + i * 3;
+        dst[i] = rgb_to_565(p[0], p[1], p[2]);
+      }
+      return true;
+    case LCT_RGBA:
+      for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *p = raw + i * 4;
+        dst[i] = rgb_to_565(p[0], p[1], p[2]);
+      }
+      return true;
+    case LCT_GREY:
+      for (uint32_t i = 0; i < n; i++) dst[i] = rgb_to_565(raw[i], raw[i], raw[i]);
+      return true;
+    case LCT_GREY_ALPHA:
+      for (uint32_t i = 0; i < n; i++) {
+        const uint8_t g = raw[i * 2];
+        dst[i] = rgb_to_565(g, g, g);
+      }
+      return true;
+    default:
+      return false;
+  }
+}
+
+// One decode attempt in the PNG's own colour format. color_convert = 0 is what
+// keeps lodepng from allocating a SECOND ARGB8888 buffer (for its palette ->
+// RGBA conversion) while the first is still live — that second allocation is
+// what fails once the Map's canvases and mesh tables have taken their share of
+// PSRAM. The caller converts the raw format to RGB565 itself.
+static unsigned png_decode_raw(const uint8_t *png_data, uint32_t png_size,
+                               LodePNGState *state, lv_draw_buf_t **decoded,
+                               unsigned *w, unsigned *h) {
+  lodepng_state_init(state);
+  state->decoder.color_convert = 0;
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+  state->decoder.read_text_chunks = 0;
+  state->decoder.remember_unknown_chunks = 0;
+#endif
+  *decoded = nullptr;
+  return lodepng_decode((unsigned char **)decoded, w, h, state, png_data, png_size);
+}
+
+// Decode a PNG from memory and pack native little-endian RGB565 into dst.
+// Shared by png_buf_to_bin (downloads -> .bin file) and _tile_show (user PNG
+// tiles -> tile pool slot). Does NOT free png_data — the caller owns it.
+// Returns nullptr on success (*out_w / *out_h set), else a stage string:
+//   "frag"   not enough contiguous PSRAM for the decode. When
+//            allow_lvgl_cache_drop is set the image cache was already dropped
+//            and re-measured once; otherwise the caller drops it on the LVGL
+//            thread and retries.
+//   "decode" lodepng failure, unsupported colour format, or output > dst_cap.
+// allow_lvgl_cache_drop: pass true only on the LVGL thread —
+// lv_image_cache_drop() is not thread-safe and must never run on Core 1.
+static const char *png_decode_565(const uint8_t *png_data, uint32_t png_size,
+                                  uint16_t *dst, uint32_t dst_cap,
+                                  bool allow_lvgl_cache_drop,
+                                  unsigned *out_w, unsigned *out_h) {
+  PngInfo info;
+  if (!png_read_ihdr(png_data, png_size, &info)) {
+    SLog.println("[png2bin] FAIL: not a PNG");
+    return "decode";
+  }
+
+  // 16-bit samples decode to 8 bytes/px, which would overrun the ARGB8888-sized
+  // buffer lodepng decodes into (it sizes that at 4 bytes/px whatever the PNG's
+  // own format is). Palette indices are 1/2/4/8 bit; every other type is 8.
+  const uint32_t ch = png_channels(info.colortype);
+  const bool depth_ok = (info.colortype == 3)
+      ? (info.bitdepth == 1 || info.bitdepth == 2 ||
+         info.bitdepth == 4 || info.bitdepth == 8)
+      : (info.bitdepth == 8);
+  if (ch == 0 || !depth_ok) {
+    SLog.printf("[png2bin] FAIL: unsupported PNG colortype=%u bitdepth=%u\n",
+                info.colortype, info.bitdepth);
+    return "decode";
+  }
+
+  if ((uint32_t)info.w * 2 * info.h > dst_cap) {
+    SLog.printf("[png2bin] FAIL: %ux%u exceeds buffer (%u)\n",
+                (unsigned)info.w, (unsigned)info.h, (unsigned)dst_cap);
+    return "decode";
+  }
+
+  // Contiguous PSRAM the decode needs: lodepng's unfiltered scanline buffer,
+  // the ARGB8888-sized buffer it decodes into, and its copy of the IDAT data.
+  const uint32_t bpp       = ch * info.bitdepth;
+  const uint32_t raw_bytes = ((info.w * bpp + 7) / 8 + 1) * info.h;
+  const uint32_t need      = raw_bytes + info.w * info.h * 4 + png_size + 64 * 1024;
+
+  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  if (largest < need && allow_lvgl_cache_drop) {
+    lv_image_cache_drop(NULL);
+    largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  }
+  if (largest < need) {
+    SLog.printf("[png2bin] SKIP: need %u, largest %u\n",
+                (unsigned)need, (unsigned)largest);
+    return "frag";
+  }
+
+  // IMPORTANT: this is LVGL's *patched* lodepng. It does NOT return a raw
+  // pixel buffer like upstream — it returns an lv_draw_buf_t*. The pixels live
+  // in decoded->data, and the whole thing must be released with
+  // lv_draw_buf_destroy() (struct + data are separate allocs). Treating it as
+  // a raw buffer leaks the ~256KB data block every call.
+  LodePNGState state;
+  lv_draw_buf_t *decoded = nullptr;
+  unsigned w = 0, h = 0;
+  unsigned err = png_decode_raw(png_data, png_size, &state, &decoded, &w, &h);
+
+  // err 83 = lodepng alloc failure. Last resort: drop the whole image cache to
+  // coalesce free space and retry once (dropped tiles transparently re-load).
+  if (err == 83 && !decoded) {
+    lodepng_state_cleanup(&state);
+    if (allow_lvgl_cache_drop) {
+      SLog.printf("[png2bin] err=83: drop cache (largest=%u)\n",
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+      lv_image_cache_drop(NULL);
+      err = png_decode_raw(png_data, png_size, &state, &decoded, &w, &h);
+    } else {
+      // Can't touch the LVGL cache from this thread — report frag so the
+      // caller drops it on the LVGL thread and retries the tile.
+      SLog.printf("[png2bin] err=83 on worker (largest=%u)\n",
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+      return "frag";
+    }
+  }
+
+  if (err || !decoded || !decoded->data || w != info.w || h != info.h) {
+    SLog.printf("[png2bin] FAIL: lodepng err=%u decoded=%p %ux%u psram_free=%u\n",
+                  err, (void *)decoded, w, h,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (decoded) lv_draw_buf_destroy(decoded);
+    lodepng_state_cleanup(&state);
+    return "decode";
+  }
+
+  // The palette lives in the state, so convert before cleaning it up.
+  const bool converted = png_raw_to_565((const uint8_t *)decoded->data,
+                                        &state.info_png.color, w, h, dst);
+  lv_draw_buf_destroy(decoded);
+  lodepng_state_cleanup(&state);
+  if (!converted) {
+    SLog.printf("[png2bin] FAIL: convert colortype=%u bitdepth=%u\n",
+                info.colortype, info.bitdepth);
+    return "decode";
+  }
+
+  *out_w = w;
+  *out_h = h;
+  return nullptr;
+}
+
 // Core PNG -> .bin conversion: decode a PNG from memory, pack native
 // little-endian RGB565, write dst_path atomically. Shared by _png_to_bin
 // (file source, LVGL thread) and the Core-1 tile fetch worker (network
@@ -3443,88 +3780,15 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
     }
   }
 
-  // Bail early if PSRAM is too fragmented for lodepng decode.
-  // Decode needs ~256KB contiguous for ARGB8888 + ~192KB for scanlines.
-  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-  if (largest < 512 * 1024) {
-    SLog.printf("[png2bin] SKIP: PSRAM fragmented (largest=%u)\n", (unsigned)largest);
-    return "frag";
-  }
-
-  // IMPORTANT: this is LVGL's *patched* lodepng. lodepng_decode32() does NOT
-  // return a raw pixel buffer like upstream — it returns an lv_draw_buf_t*
-  // (ARGB8888). The pixels live in decoded->data, and the whole thing must be
-  // released with lv_draw_buf_destroy() (struct + data are separate allocs).
-  // Treating it as a raw buffer leaks the ~256KB data block every call.
-  lv_draw_buf_t *decoded = nullptr;
   unsigned w = 0, h = 0;
-  unsigned err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
-                                  png_data, png_size);
+  const char *stage = png_decode_565(png_data, png_size, s_rgb565_buf,
+                                     RGB565_BUF_SIZE, allow_lvgl_cache_drop,
+                                     &w, &h);
+  if (stage) return stage;
 
-  // err 83 = lodepng alloc failure. The decode briefly needs a ~256KB (ARGB8888)
-  // plus ~192KB (scanline) contiguous block. If the RGB565 tile cache has
-  // fragmented PSRAM, that can fail despite ample total free memory. Last-resort:
-  // drop the whole image cache to coalesce free space and retry once (dropped
-  // tiles transparently re-load from their .bin). The Map app also proactively
-  // evicts off-screen / old-zoom tiles, so this should rarely fire.
-  if (err == 83 && !decoded) {
-    if (allow_lvgl_cache_drop) {
-      SLog.printf("[png2bin] err=83 frag fallback: drop cache (largest=%u)\n",
-                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-      lv_image_cache_drop(NULL);
-      err = lodepng_decode32((unsigned char **)&decoded, &w, &h,
-                             png_data, png_size);
-    } else {
-      // Can't touch the LVGL cache from this thread — report frag so the
-      // caller drops it on the LVGL thread and retries the tile.
-      SLog.printf("[png2bin] err=83 on worker (largest=%u)\n",
-                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-      return "frag";
-    }
-  }
-
-  if (err || !decoded) {
-    SLog.printf("[png2bin] FAIL: lodepng err=%u decoded=%p psram_free=%u\n",
-                  err, (void *)decoded,
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    if (decoded) lv_draw_buf_destroy(decoded);
-    return "decode";
-  }
-  SLog.printf("[png2bin] decoded %ux%u\n", w, h);
-
-  // decoded->data is ARGB8888 in byte order R,G,B,A (lodepng_convert /
-  // rgba8ToPixel), stride = 4*w (contiguous). Pack to native little-endian
-  // RGB565: LVGL v9 byte-swaps the whole framebuffer at flush for
-  // LV_COLOR_16_SWAP, so image data itself stays little-endian (matches
-  // the reference scripts/LVGLImage.py output).
-  const uint8_t *argb = (const uint8_t *)decoded->data;
-  if (!argb) {
-    SLog.println("[png2bin] FAIL: decoded->data is NULL");
-    lv_draw_buf_destroy(decoded);
-    return "decode";
-  }
-
-  uint32_t pixel_count = (uint32_t)w * h;
   uint16_t stride = (uint16_t)(w * 2);
   uint32_t data_size = (uint32_t)stride * h;
-
-  if (data_size > RGB565_BUF_SIZE) {
-    SLog.printf("[png2bin] FAIL: tile %ux%u exceeds buffer\n", w, h);
-    lv_draw_buf_destroy(decoded);
-    return "decode";
-  }
-
-  uint16_t *rgb565 = s_rgb565_buf;  // reuse persistent buffer
-
-  for (uint32_t i = 0; i < pixel_count; i++) {
-    uint8_t r = argb[i * 4 + 0];
-    uint8_t g = argb[i * 4 + 1];
-    uint8_t b = argb[i * 4 + 2];
-    rgb565[i] = ((uint16_t)(r >> 3) << 11) |
-                ((uint16_t)(g >> 2) << 5)  |
-                (uint16_t)(b >> 3);
-  }
-  lv_draw_buf_destroy(decoded);
+  uint16_t *rgb565 = s_rgb565_buf;
 
   lv_image_header_t hdr;
   lv_memzero(&hdr, sizeof(hdr));
@@ -4002,10 +4266,12 @@ static int lua_tile_pool_free(lua_State *L) {
   return 0;
 }
 
-// _tile_show(widget, slot1based, sd_bin_path) -> bool. Reads the .bin (header +
-// RGB565 data) into the slot's buffer and points the widget's image src at the
-// in-memory descriptor for that slot. Chunked SD read releasing the SPI bus
-// between chunks (like png2bin's write) so it never stalls the flush/radio.
+// _tile_show(widget, slot1based, sd_path) -> bool. Loads a tile file into the
+// slot's buffer and points the widget's image src at the in-memory descriptor
+// for that slot. Two formats: an LVGL RGB565 .bin (header + data, read straight
+// into the slot) or a 256x256 PNG (staged in the slot's tail, decoded back
+// into the slot). Chunked SD reads releasing the SPI bus between chunks (like
+// png2bin's write) so it never stalls the flush/radio.
 static int lua_tile_show(lua_State *L) {
   luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
   if (!lobj || !lobj->obj) { lua_pushboolean(L, 0); return 1; }
@@ -4015,29 +4281,97 @@ static int lua_tile_show(lua_State *L) {
   if (slot < 0 || slot >= TILE_POOL_SLOTS || !s_tile_slots[slot]) { lua_pushboolean(L, 0); return 1; }
 
   uint8_t *dst = s_tile_slots[slot];
+  uint8_t head[24];   // .bin header, or PNG signature + IHDR through byte 23
   lv_image_header_t hdr;
+  uint32_t data_size = 0;
 
   sd_spi_take();
   File f = SD.open(path, "r");
-  bool ok = f && (f.read((uint8_t *)&hdr, sizeof(hdr)) == (int)sizeof(hdr));
+  bool ok = f && (f.read(head, sizeof(hdr)) == (int)sizeof(hdr));
   sd_spi_release();
   if (!f) { lua_pushboolean(L, 0); return 1; }
 
-  if (ok && (hdr.magic != LV_IMAGE_HEADER_MAGIC || hdr.cf != LV_COLOR_FORMAT_RGB565)) ok = false;
-  uint32_t data_size = ok ? (uint32_t)hdr.stride * hdr.h : 0;
-  if (data_size == 0 || data_size > TILE_POOL_SLOT_BYTES) ok = false;
-
-  uint32_t off = 0;
-  while (ok && off < data_size) {
-    uint32_t n = (data_size - off < 32768u) ? (data_size - off) : 32768u;
+  static const uint8_t PNG_SIG[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+  if (ok && memcmp(head, PNG_SIG, sizeof(PNG_SIG)) == 0) {
+    // PNG tile. IHDR width/height are big-endian u32s at bytes 16..23 —
+    // checked before the bulk read so a wrong-size pack never costs a decode.
+    uint32_t fsize = 0;
+    int more = (int)sizeof(head) - (int)sizeof(hdr);
     sd_spi_take();
-    int rd = f.read(dst + off, n);
+    ok = f.read(head + sizeof(hdr), more) == more;
+    fsize = f.size();
     sd_spi_release();
-    if (rd != (int)n) ok = false;
-    off += n;
+
+    uint32_t pw = ((uint32_t)head[16] << 24) | ((uint32_t)head[17] << 16) |
+                  ((uint32_t)head[18] << 8)  | head[19];
+    uint32_t ph = ((uint32_t)head[20] << 24) | ((uint32_t)head[21] << 16) |
+                  ((uint32_t)head[22] << 8)  | head[23];
+    if (ok && (pw != 256 || ph != 256)) {
+      SLog.printf("[tile_show] refuse %s: %ux%u (need 256x256)\n",
+                  path, (unsigned)pw, (unsigned)ph);
+      ok = false;
+    }
+    if (ok && (fsize < sizeof(head) || fsize > TILE_POOL_SLOT_BYTES)) {
+      SLog.printf("[tile_show] refuse %s: %u bytes (cap %u)\n",
+                  path, (unsigned)fsize, (unsigned)TILE_POOL_SLOT_BYTES);
+      ok = false;
+    }
+    // The compressed PNG is staged in the TAIL of the destination slot — no
+    // separate buffer. The decode consumes the input completely before
+    // png_decode_565's pack loop writes the slot from the front, so the pack
+    // overwriting the staging region is safe.
+    uint8_t *stage_in = nullptr;
+    if (ok) {
+      stage_in = dst + (TILE_POOL_SLOT_BYTES - fsize);
+      memcpy(stage_in, head, sizeof(head));
+      uint32_t off = sizeof(head);
+      while (ok && off < fsize) {
+        uint32_t n = (fsize - off < 32768u) ? (fsize - off) : 32768u;
+        sd_spi_take();
+        int rd = f.read(stage_in + off, n);
+        sd_spi_release();
+        if (rd != (int)n) ok = false;
+        off += n;
+      }
+    }
+    sd_spi_take(); f.close(); sd_spi_release();
+    if (!ok) { lua_pushboolean(L, 0); return 1; }
+
+    unsigned w = 0, h = 0;
+    const char *stage = png_decode_565(stage_in, fsize, (uint16_t *)dst,
+                                       TILE_POOL_SLOT_BYTES, true, &w, &h);
+    if (stage || w != 256 || h != 256) {
+      SLog.printf("[tile_show] png FAIL %s stage=%s %ux%u\n",
+                  path, stage ? stage : "(dims)", w, h);
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    lv_memzero(&hdr, sizeof(hdr));
+    hdr.magic  = LV_IMAGE_HEADER_MAGIC;
+    hdr.cf     = LV_COLOR_FORMAT_RGB565;
+    hdr.w      = w;
+    hdr.h      = h;
+    hdr.stride = (uint16_t)(w * 2);
+    data_size  = (uint32_t)hdr.stride * h;
+  } else {
+    // RGB565 .bin: header + data read straight into the slot.
+    memcpy(&hdr, head, sizeof(hdr));
+    if (ok && (hdr.magic != LV_IMAGE_HEADER_MAGIC || hdr.cf != LV_COLOR_FORMAT_RGB565)) ok = false;
+    data_size = ok ? (uint32_t)hdr.stride * hdr.h : 0;
+    if (data_size == 0 || data_size > TILE_POOL_SLOT_BYTES) ok = false;
+
+    uint32_t off = 0;
+    while (ok && off < data_size) {
+      uint32_t n = (data_size - off < 32768u) ? (data_size - off) : 32768u;
+      sd_spi_take();
+      int rd = f.read(dst + off, n);
+      sd_spi_release();
+      if (rd != (int)n) ok = false;
+      off += n;
+    }
+    sd_spi_take(); f.close(); sd_spi_release();
+    if (!ok) { lua_pushboolean(L, 0); return 1; }
   }
-  sd_spi_take(); f.close(); sd_spi_release();
-  if (!ok) { lua_pushboolean(L, 0); return 1; }
 
   lv_image_dsc_t *d = &s_tile_dsc[slot];
   d->header    = hdr;
@@ -4047,6 +4381,26 @@ static int lua_tile_show(lua_State *L) {
   // Re-point the widget at this slot's (just-updated) descriptor and force a
   // redraw. set_src to the same pointer is a no-op, so clear first; the
   // descriptor is used directly (no decode copy), so this is cheap.
+  lv_image_set_src(img, NULL);
+  lv_image_set_src(img, d);
+  lv_obj_invalidate(img);
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// _tile_point(widget, slot1based) -> bool. Point a grid widget at a slot's
+// EXISTING descriptor — no disk read, no decode. Used when a pan re-bases the
+// grid and a still-visible tile's pixels already sit in a slot. Fails when
+// the slot holds no loaded tile.
+static int lua_tile_point(lua_State *L) {
+  luavgl_obj_t *lobj = (luavgl_obj_t *)lua_touserdata(L, 1);
+  if (!lobj || !lobj->obj) { lua_pushboolean(L, 0); return 1; }
+  lv_obj_t *img = lobj->obj;
+  int slot = (int)luaL_checkinteger(L, 2) - 1;     // 1-based Lua -> 0-based
+  if (slot < 0 || slot >= TILE_POOL_SLOTS || !s_tile_slots[slot]) { lua_pushboolean(L, 0); return 1; }
+  lv_image_dsc_t *d = &s_tile_dsc[slot];
+  if (!d->data) { lua_pushboolean(L, 0); return 1; }
+
   lv_image_set_src(img, NULL);
   lv_image_set_src(img, d);
   lv_obj_invalidate(img);
@@ -4350,6 +4704,7 @@ void setupLuaVGL() {
   lua_register(L, "_wifi_forget_cred", lua_wifi_forget_cred);
   lua_register(L, "_wifi_connect_saved", lua_wifi_connect_saved);
   lua_register(L, "_wifi_auto_connect", lua_wifi_auto_connect);
+  lua_register(L, "_inflate", lua_inflate);
 
   // Mesh bridge: the _mesh_* surface is the active protocol's
   // (lora_proto_lua_open below registers it last); the stub block first, so
@@ -4370,6 +4725,12 @@ void setupLuaVGL() {
   lua_register(L, "_notify_log_get", lua_notify_log_get);
   lua_register(L, "_notify_log_seen", lua_notify_log_seen);
   lua_register(L, "_notify_log_clear", lua_notify_log_clear);
+  // Post a notification from Lua: bell-log record + melody/blink under the
+  // user's notification settings (same path the mesh RX handlers use).
+  lua_register(L, "_notify_post", [](lua_State *L) -> int {
+    notify_post(luaL_checkstring(L, 1));
+    return 0;
+  });
 
   lua_register(L, "_get_battery_mv", [](lua_State *L) -> int {
     lua_pushinteger(L, power_dev_battery_mv());
@@ -4724,6 +5085,9 @@ void setupLuaVGL() {
   // On-device firmware update (_ota_*, ota_update.cpp) — used by Settings/Firmware
   ota_register_lua(L);
 
+  // Lua client TCP/TLS sockets (_tcp_open + handle methods, lua_net.cpp)
+  lua_net_register_lua(L);
+
   // System
   lua_register(L, "_system_reboot", [](lua_State *L) -> int {
     SLog.println("[SYSTEM] Reboot requested from Lua");
@@ -4930,7 +5294,8 @@ void setupLuaVGL() {
     return 1;
   });
 
-  // _theme_apply_palette(scr, card, text, grey, accent, btn_text, dark)
+  // _theme_apply_palette(scr, card, text, grey, accent, btn_text, highlight,
+  //                      accent_text, dark)
   // Each color is a "#rrggbb"/"rrggbb" string or a 0xRRGGBB integer. Re-cascades
   // to every live widget (no reboot); a no-op on the C side if unchanged.
   lua_register(L, "_theme_apply_palette", [](lua_State *L) -> int {
@@ -4943,15 +5308,60 @@ void setupLuaVGL() {
       if (*s == '#') s++;
       return (uint32_t)strtoul(s, nullptr, 16) & 0xFFFFFFu;
     };
-    uint32_t scr      = parse(1);
-    uint32_t card     = parse(2);
-    uint32_t text     = parse(3);
-    uint32_t grey     = parse(4);
-    uint32_t accent   = parse(5);
-    uint32_t btn_text = parse(6);
-    bool dark = lua_isnoneornil(L, 7) ? true : (lua_toboolean(L, 7) != 0);
-    lv_theme_meshpunk_set_palette(scr, card, text, grey, accent, btn_text, dark);
+    uint32_t scr         = parse(1);
+    uint32_t card        = parse(2);
+    uint32_t text        = parse(3);
+    uint32_t grey        = parse(4);
+    uint32_t accent      = parse(5);
+    uint32_t btn_text    = parse(6);
+    uint32_t highlight   = parse(7);
+    uint32_t accent_text = parse(8);
+    bool dark = lua_isnoneornil(L, 9) ? true : (lua_toboolean(L, 9) != 0);
+    lv_theme_meshpunk_set_palette(scr, card, text, grey, accent, btn_text,
+                                  highlight, accent_text, dark);
     lua_pushboolean(L, 1);
+    return 1;
+  });
+
+  // _theme_palette_get() -> { scr, card, text, grey, accent, btn_text,
+  //                           highlight, accent_text = "#rrggbb", dark = bool }
+  // The palette last pushed by _theme_apply_palette, as text_color-ready
+  // strings. Errors before the first apply — main.lua applies the saved theme
+  // at boot before any app runs, so a live call always has one.
+  lua_register(L, "_theme_palette_get", [](lua_State *L) -> int {
+    // One declaration per line: lua_register is a macro, and a bare comma
+    // outside parentheses would be read as a macro-argument separator.
+    uint32_t scr = 0;
+    uint32_t card = 0;
+    uint32_t text = 0;
+    uint32_t grey = 0;
+    uint32_t accent = 0;
+    uint32_t btn_text = 0;
+    uint32_t highlight = 0;
+    uint32_t accent_text = 0;
+    bool dark = false;
+    if (!lv_theme_meshpunk_get_palette(&scr, &card, &text, &grey, &accent,
+                                       &btn_text, &highlight, &accent_text,
+                                       &dark)) {
+      return luaL_error(L, "no theme palette applied yet");
+    }
+    lua_createtable(L, 0, 9);
+    auto put = [&](const char *key, uint32_t rgb) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "#%06x", (unsigned)rgb);
+      lua_pushstring(L, buf);
+      lua_setfield(L, -2, key);
+    };
+    put("scr", scr);
+    put("card", card);
+    put("text", text);
+    put("grey", grey);
+    put("accent", accent);
+    put("btn_text", btn_text);
+    put("highlight", highlight);
+    put("accent_text", accent_text);
+    lua_pushboolean(L, dark);
+    lua_setfield(L, -2, "dark");
     return 1;
   });
 
@@ -5699,6 +6109,7 @@ void setupLuaVGL() {
   lua_register(L, "_tile_pool_alloc", lua_tile_pool_alloc);
   lua_register(L, "_tile_pool_free", lua_tile_pool_free);
   lua_register(L, "_tile_show", lua_tile_show);
+  lua_register(L, "_tile_point", lua_tile_point);
   lua_register(L, "_dofile_sd", lua_dofile_sd);
   lua_register(L, "_list_all", lua_list_all);
   lua_register(L, "_list_all_sd", lua_list_all_sd);
@@ -6100,6 +6511,9 @@ void luaTearDown() {
   MESH_LOCK();
   rcap::stop();
   MESH_UNLOCK();
+  // Lua sockets die with their owner; this also ends the Core-1 net worker,
+  // so its 16KB internal-SRAM stack is free before an ELF module allocates.
+  lua_net_close_all("lua teardown");
   lua_close(dead);                            // GCs luavgl widgets -> lv_obj_del
   // Free the non-Lua global caches that survive lua_close and otherwise leave a
   // persistent mid-heap cluster capping the largest contiguous block:
@@ -6858,6 +7272,9 @@ static void standby_run() {
   bool ble_was_on = ble_proto_running();
   if (ble_was_on) ble_proto_stop();
 #endif
+  // Lua sockets close before the radio drops (TLS close_notify still has a
+  // link); apps see reason "standby" and reconnect after wake.
+  lua_net_close_all("standby");
   bool wifi_was_on = (WiFi.getMode() != WIFI_OFF);
   if (wifi_was_on) WiFi.mode(WIFI_OFF);
   // Halt the I2S DMA + sound task (the ELF-takeover seam) — no peripheral
