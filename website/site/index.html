@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>MeshPunk &mdash; LVGL with Lua for LoRa handhelds</title>
+<meta name="description" content="MeshPunk is firmware for LoRa handhelds: mesh messaging, maps, an app library and games, built on LVGL and Lua.">
+<meta property="og:title" content="MeshPunk">
+<meta property="og:description" content="Firmware for LoRa handhelds, built on LVGL and Lua.">
+<meta property="og:type" content="website">
+<link rel="icon" href="img/meshpunk-icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/site.css">
+<script type="module" src="js/home.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="img/meshpunk-icon.svg" alt="" width="30" height="30">MeshPunk</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Home</a>
+      <a href="flash/">Flash</a>
+      <a href="https://github.com/PhilMo6/meshpunk">GitHub</a>
+      <a href="https://discord.gg/cmJKV5gEdP">Discord</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+
+    <section class="hero">
+      <img class="hero-logo" src="img/meshpunk-logo.svg" alt="MeshPunk" width="960" height="300">
+      <h1>Firmware for LoRa handhelds, built on <em>LVGL and Lua</em></h1>
+      <p class="lede">Mesh messaging, maps, an app library and a shelf of games. The interface is LVGL and the apps are Lua scripts, so the device is yours to change.</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="flash/">Flash MeshPunk</a>
+        <a class="btn" href="https://github.com/PhilMo6/meshpunk">Source on GitHub</a>
+      </div>
+      <p id="versions" class="hero-versions"></p>
+    </section>
+
+    <section class="section" aria-labelledby="h-devices">
+      <h2 id="h-devices">Supported devices</h2>
+      <p class="section-lede">Releases are built per device. The flasher asks which one you have.</p>
+      <div class="grid">
+        <article class="card" data-board="tdeck">
+          <h3>LilyGo T-Deck</h3>
+          <p>Keyboard, trackball and touchscreen.</p>
+          <p class="tagline"></p>
+        </article>
+        <article class="card" data-board="heltec_v4">
+          <h3>Heltec V4 + Expansion Kit V2</h3>
+          <p>Touchscreen, with an on-screen keyboard and on-screen game pads.</p>
+          <p class="tagline"></p>
+        </article>
+        <article class="card" data-board="wio_l2">
+          <h3>Seeed Wio Tracker L2</h3>
+          <p>Touchscreen, with an on-screen keyboard and on-screen game pads.</p>
+          <p class="tagline"></p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="h-features">
+      <h2 id="h-features">What it does</h2>
+      <p class="section-lede">Everything below runs on the device itself. A phone is optional: BLE companion apps work too.</p>
+      <div class="grid">
+        <article class="card">
+          <h3>Mesh messaging</h3>
+          <p>MeshCore comes preinstalled: direct messages, channels, and room server and repeater logins with admin commands, all from the Messenger app.</p>
+        </article>
+        <article class="card">
+          <h3>Swappable LoRa protocols</h3>
+          <p>The LoRa protocol is an installable package. MTLite, a Meshtastic-compatible protocol, installs from the App Library next to MeshCore.</p>
+        </article>
+        <article class="card">
+          <h3>Map</h3>
+          <p>Offline tile caching, message path animations and replay, and sender triangulation.</p>
+        </article>
+        <article class="card">
+          <h3>App Library</h3>
+          <p>Install and update apps, themes and protocols over WiFi, straight from GitHub. No reflash needed.</p>
+        </article>
+        <article class="card">
+          <h3>Updates on the device</h3>
+          <p>New firmware installs over WiFi or from the SD card under Settings &gt; Firmware. No computer needed after the first install.</p>
+        </article>
+        <article class="card">
+          <h3>Apps are Lua</h3>
+          <p>Lua scripts on the filesystem show up as apps. Write one, copy it over, and it runs.</p>
+        </article>
+        <article class="card">
+          <h3>Games and emulators</h3>
+          <p>Doom, PICO-8, Game Boy with link-cable play, NES, SNES, Neo Geo Pocket, Sega 8-bit and a 386 DOS PC. Bring your own ROMs, WADs and carts.</p>
+        </article>
+        <article class="card">
+          <h3>USB host</h3>
+          <p>Plug in a gamepad, keyboard, mouse, thumb drive or USB-C audio adapter.</p>
+        </article>
+        <article class="card">
+          <h3>And the rest</h3>
+          <p>An MP3 player that keeps playing in the background, themes, a file manager, emoji, and a text-mode web browser from the App Library.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="h-shots">
+      <h2 id="h-shots">On a T-Deck</h2>
+      <p class="section-lede">Menus, the Messenger, games and a few of the themes.</p>
+      <div class="shots">
+        <figure><img src="img/shots/home.jpg" alt="MeshPunk home menu on a T-Deck" width="600" height="800" loading="lazy"><figcaption>Home</figcaption></figure>
+        <figure><img src="img/shots/messenger.jpg" alt="Messenger conversation list" width="600" height="800" loading="lazy"><figcaption>Messenger</figcaption></figure>
+        <figure><img src="img/shots/channel.jpg" alt="A channel in the Messenger" width="600" height="800" loading="lazy"><figcaption>A channel</figcaption></figure>
+        <figure><img src="img/shots/flappy-bird.jpg" alt="Flappy Bird title screen" width="600" height="800" loading="lazy"><figcaption>Flappy Bird</figcaption></figure>
+        <figure><img src="img/shots/scorched-earth.jpg" alt="Scorched Earth menu" width="600" height="800" loading="lazy"><figcaption>Scorched Earth</figcaption></figure>
+        <figure><img src="img/shots/theme-doom.jpg" alt="Theme list with the Doom theme applied" width="600" height="800" loading="lazy"><figcaption>Doom theme</figcaption></figure>
+        <figure><img src="img/shots/theme-garden.jpg" alt="Theme list with the Garden theme applied" width="600" height="800" loading="lazy"><figcaption>Garden theme</figcaption></figure>
+        <figure><img src="img/shots/theme-sacred-geometry.jpg" alt="Theme list with the Sacred Geometry theme applied" width="600" height="800" loading="lazy"><figcaption>Sacred Geometry theme</figcaption></figure>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="h-start">
+      <h2 id="h-start">Getting started</h2>
+      <p class="section-lede">A first install takes a USB cable and a desktop browser.</p>
+      <ol class="steps-plain">
+        <li><strong>Flash it</strong>Connect the device and use the <a href="flash/">flasher</a>. The first start unpacks the bundled files, which takes about a minute.</li>
+        <li><strong>Set the radio</strong>Open the radio settings and set them to your local defaults. An SD card is recommended: it keeps your mesh and firmware settings.</li>
+        <li><strong>Add apps</strong>Join WiFi and open the App Library for apps, themes and protocols.</li>
+      </ol>
+    </section>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <span>MeshPunk &mdash; LVGL with Lua for LoRa handhelds</span>
+    <span><a href="https://github.com/PhilMo6/meshpunk">Stable repo</a> &middot; <a href="https://github.com/PhilMo6/meshpunk-dev">Dev repo</a> &middot; <a href="https://github.com/PhilMo6/meshpunk-apps">App Library</a> &middot; <a href="https://discord.gg/cmJKV5gEdP">Discord</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

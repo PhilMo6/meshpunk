@@ -1,0 +1,11 @@
+esptool-js 0.6.1 (Espressif Systems, Apache-2.0)
+
+bundle.js is package/bundle.js from the npm package, unmodified:
+  https://registry.npmjs.org/esptool-js/-/esptool-js-0.6.1.tgz
+  sha256(bundle.js) = ef7d5a237d3f273ecf546bcee65dddad90bd82cf02f22a980d1537e0cd79a152
+
+The bundle includes:
+  pako 2.1.0       (MIT AND Zlib)  LICENSE-pako
+  atob-lite 2.0.0  (MIT)           LICENSE-atob-lite
+
+LICENSE is the esptool-js license.

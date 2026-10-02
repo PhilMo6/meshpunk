@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Flash MeshPunk</title>
+<meta name="description" content="Install MeshPunk on a LoRa handheld over USB, straight from the browser.">
+<link rel="icon" href="../img/meshpunk-icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../css/site.css">
+<script type="module" src="../js/flash.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../"><img src="../img/meshpunk-icon.svg" alt="" width="30" height="30">MeshPunk</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../">Home</a>
+      <a href="./" aria-current="page">Flash</a>
+      <a href="https://github.com/PhilMo6/meshpunk">GitHub</a>
+      <a href="https://discord.gg/cmJKV5gEdP">Discord</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+
+    <div class="page-head">
+      <h1>Flash MeshPunk</h1>
+      <p class="lede">Installs MeshPunk over USB from this page. Connect the device with a USB cable that carries data, then work through the four steps.</p>
+    </div>
+
+    <div id="gate" class="notice notice-warn" hidden>
+      <strong>This browser cannot flash a device.</strong>
+      Flashing needs Web Serial, which desktop Chrome, Edge and Opera have. Open this page in one of those, or use the download links below with another flasher.
+    </div>
+
+    <div id="load-error" class="notice notice-bad" hidden></div>
+
+    <noscript>
+      <div class="notice notice-bad"><strong>JavaScript is off.</strong> The flasher runs in the browser and needs it.</div>
+    </noscript>
+
+    <form id="flasher" class="flasher" hidden>
+      <fieldset id="selection">
+
+        <section class="step" aria-labelledby="h-board">
+          <h2 id="h-board"><span class="num">1</span>Your device</h2>
+          <div id="boards" class="choices" role="radiogroup" aria-labelledby="h-board"></div>
+          <p class="step-hint">Builds are per device. A build for another device will not run correctly.</p>
+        </section>
+
+        <section class="step" aria-labelledby="h-build">
+          <h2 id="h-build"><span class="num">2</span>Build</h2>
+          <div id="builds" class="choices" role="radiogroup" aria-labelledby="h-build"></div>
+          <div id="file-panel" class="panel" hidden>
+            <input type="file" id="file" accept=".bin" aria-label="Firmware file">
+            <p id="file-info" class="file-info muted">Choose a MeshPunk <code>-merged.bin</code> or <code>-firmware.bin</code>.</p>
+          </div>
+          <details id="notes" class="notes" hidden>
+            <summary>What is in <span id="notes-tag"></span></summary>
+            <pre id="notes-text"></pre>
+            <p><a id="notes-link" href="#" rel="noopener">This release on GitHub</a></p>
+          </details>
+        </section>
+
+        <section class="step" aria-labelledby="h-mode">
+          <h2 id="h-mode"><span class="num">3</span>Install type</h2>
+          <div id="modes" class="choices" role="radiogroup" aria-labelledby="h-mode"></div>
+          <p id="file-mode" class="step-hint" hidden></p>
+        </section>
+
+      </fieldset>
+
+      <section class="step" aria-labelledby="h-flash">
+        <h2 id="h-flash"><span class="num">4</span>Flash</h2>
+        <p id="summary" class="summary muted">Pick a device, a build and an install type.</p>
+        <div class="actions">
+          <button type="button" id="flash-btn" class="btn btn-primary" disabled>Flash</button>
+          <label class="check"><input type="checkbox" id="all-ports">Show every serial port</label>
+        </div>
+
+        <div id="run" class="run" hidden>
+          <ol id="stages" class="stages"></ol>
+          <progress id="bar" max="1" value="0" aria-label="Progress"></progress>
+          <p id="result" class="result" role="status" aria-live="polite"></p>
+          <details class="log">
+            <summary>Log</summary>
+            <pre id="log"></pre>
+            <button type="button" id="copy-log" class="btn btn-small">Copy log</button>
+          </details>
+        </div>
+
+        <details id="dlmode" class="help" hidden>
+          <summary>Device not listed, or it will not connect?</summary>
+          <p>The page restarts a running MeshPunk device into download mode by itself. A device that is switched off, in USB host mode or in USB drive mode has no serial port to do that through, so put it in download mode by hand:</p>
+          <ol id="dlmode-steps"></ol>
+        </details>
+      </section>
+    </form>
+
+    <section id="more" class="aside" hidden>
+      <h2>Other ways to install</h2>
+      <div class="card">
+        <h3>Using bmorcelli's Launcher?</h3>
+        <p>A device that boots MeshPunk through the <a href="https://github.com/bmorcelli/Launcher" rel="noopener">Launcher</a> is updated from the Launcher, with the <code>-launcher.bin</code> file. Do not use the steps above on it: they replace the Launcher.</p>
+        <ul id="launcher-files"></ul>
+      </div>
+      <div class="card">
+        <h3>Download the files</h3>
+        <p>The same files, for use with another flasher or for the SD card. Updates also install on the device itself: Settings &gt; Firmware.</p>
+        <ul id="downloads"></ul>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <span>MeshPunk &mdash; LVGL with Lua for LoRa handhelds</span>
+    <span><a href="https://github.com/PhilMo6/meshpunk">Stable repo</a> &middot; <a href="https://github.com/PhilMo6/meshpunk-dev">Dev repo</a> &middot; <a href="https://github.com/PhilMo6/meshpunk-apps">App Library</a> &middot; <a href="https://discord.gg/cmJKV5gEdP">Discord</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

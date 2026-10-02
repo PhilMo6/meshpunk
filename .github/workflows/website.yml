@@ -1,0 +1,99 @@
+name: Website
+
+# Builds website/ and mirrors the newest release of PhilMo6/meshpunk and
+# PhilMo6/meshpunk-dev into GitHub Pages. See website/README.md.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'website/**'
+      - '.github/workflows/website.yml'
+  release:
+    types: [published]
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and deploy even when nothing changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website
+  cancel-in-progress: false
+
+jobs:
+  # A release event runs on the tag ref. This job starts a workflow_dispatch
+  # run on the default branch; build and deploy never run for a release event.
+  kick:
+    name: Rebuild after a release
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Start a run on the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: gh workflow run website.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
+
+  build:
+    name: Build
+    # Scheduled runs are always on the default branch.
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name != 'release' && github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      changed: ${{ steps.site.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Test the generator
+        run: python3 -m unittest discover -s website/tests
+
+      # Prints changed=true or changed=false. Nothing is built when the
+      # deployed build.json carries the fingerprint of what would be built.
+      - id: site
+        name: Build the site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SITE_URL: ${{ steps.pages.outputs.base_url }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: python3 website/build_site.py --out website/_site --live "$SITE_URL" $FORCE >> "$GITHUB_OUTPUT"
+
+      - name: Test the flasher against the built site
+        if: steps.site.outputs.changed == 'true'
+        run: node --test website/tests/core.test.mjs
+
+      - if: steps.site.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: website/_site
+
+  deploy:
+    name: Deploy
+    needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
