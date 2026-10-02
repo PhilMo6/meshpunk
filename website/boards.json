@@ -2,40 +2,16 @@
   "tdeck": {
     "name": "LilyGo T-Deck",
     "chip": "ESP32-S3",
-    "usb": { "vid": "0x303A", "pid": "0x1001" },
-    "download_mode": [
-      "Connect the T-Deck to this computer with a USB cable that carries data.",
-      "Press the trackball in and keep holding it.",
-      "While holding it, press and release the RST button.",
-      "Let go of the trackball. The screen stays dark: the device is in download mode.",
-      "Click the Flash button again and pick the port.",
-      "When flashing ends, press RST once if the device does not restart by itself."
-    ]
+    "usb": { "vid": "0x303A", "pid": "0x1001" }
   },
   "heltec_v4": {
     "name": "Heltec V4 + Expansion Kit V2",
     "chip": "ESP32-S3",
-    "usb": { "vid": "0x303A", "pid": "0x1001" },
-    "download_mode": [
-      "Connect the Heltec to this computer with a USB cable that carries data.",
-      "Press the USER button and keep holding it (it is the same input as PRG on the mainboard).",
-      "While holding it, press and release the RST button.",
-      "Let go of USER. The screen stays dark: the device is in download mode.",
-      "Click the Flash button again and pick the port.",
-      "When flashing ends, press RST once if the device does not restart by itself."
-    ]
+    "usb": { "vid": "0x303A", "pid": "0x1001" }
   },
   "wio_l2": {
     "name": "Seeed Wio Tracker L2",
     "chip": "ESP32-S3",
-    "usb": { "vid": "0x303A", "pid": "0x1001" },
-    "download_mode": [
-      "Connect the Wio Tracker L2 to this computer with a USB cable that carries data.",
-      "Press the USER button and keep holding it.",
-      "While holding it, reset the device.",
-      "Let go of USER. The screen stays dark: the device is in download mode.",
-      "Click the Flash button again and pick the port.",
-      "When flashing ends, reset the device once if it does not restart by itself."
-    ]
+    "usb": { "vid": "0x303A", "pid": "0x1001" }
   }
 }

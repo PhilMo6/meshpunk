@@ -266,10 +266,6 @@ progress::-moz-progress-bar { background: var(--green); }
 .log pre { max-height: 260px; overflow: auto; }
 .log .btn { margin-top: 10px; }
 
-.help ol { margin: 0; padding-left: 1.3em; color: var(--text); }
-.help li { margin: 4px 0; }
-.help p { color: var(--muted); font-size: 0.93rem; margin-bottom: 8px; }
-
 .aside { margin-top: 30px; }
 .aside h2 { font-size: 1.12rem; margin-bottom: 10px; }
 .aside .card + .card { margin-top: 12px; }

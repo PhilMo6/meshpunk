@@ -99,11 +99,9 @@ def load_boards():
             and isinstance(b.get("usb"), dict)
             and isinstance(b["usb"].get("vid"), str)
             and isinstance(b["usb"].get("pid"), str)
-            and isinstance(b.get("download_mode"), list)
-            and all(isinstance(s, str) for s in b["download_mode"])
         )
         if not ok:
-            raise BuildError("boards.json: entry '%s' needs name, chip, usb.vid, usb.pid, download_mode" % slug)
+            raise BuildError("boards.json: entry '%s' needs name, chip, usb.vid, usb.pid" % slug)
     return boards
 
 

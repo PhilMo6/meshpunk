@@ -55,12 +55,12 @@ your hardware.
 
 ## Installation 
 
-1. Download the release file you want to install from the release page. **Releases are built per device — the filenames carry the board name** (`meshpunk-tdeck-<version>-…` / `meshpunk-heltec_v4-<version>-…`); a build for the wrong board will not run correctly.
-- For a first-time install download the -merged.bin file
-- For updates you no longer need a computer: Settings > Firmware on the device checks GitHub over WiFi and installs the new release, or installs a -firmware.bin copied to the SD card (see "Updating on the device" below). Flashing the -firmware.bin here works too: it updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept)
-2. Go to https://meshcore.io/flasher scroll to bottom and click on Custom Firmware
-3. Select the firmware release you downloaded. If it is the merged firmware it will erase your filesystem to replace it with the Meshpunk one! The flasher will give you a warning about this.
-4. Flash the firmware and wait. The MeshPunk logo shows while the device starts up; the first start after an install also unpacks the bundled files, which takes about a minute before the home screen appears.
+1. Open the MeshPunk web flasher in Chrome or another compatible Chromium browser on a computer: https://philmo6.github.io/meshpunk/flash/
+2. Connect the device with a USB cable and pick your device, the build (Stable, or Dev for development builds) and the install type. **Releases are built per device** — a build for the wrong board will not run correctly. Fresh install is for a first-time install: it erases the device and replaces its filesystem with the MeshPunk one! Update replaces the firmware and keeps your settings and messages.
+- For updates you no longer need a computer: Settings > Firmware on the device checks GitHub over WiFi and installs the new release, or installs a -firmware.bin copied to the SD card (see "Updating on the device" below).
+- The meshcore.io flasher works too: download the release file for your device from the release page (the filenames carry the board name, `meshpunk-tdeck-<version>-…` / `meshpunk-heltec_v4-<version>-…`), go to https://meshcore.io/flasher, scroll to the bottom and click on Custom Firmware. The -merged.bin is for a first-time install and erases your filesystem to replace it with the MeshPunk one; the -firmware.bin updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept).
+3. Click the flash button, choose the device's port and wait for the flasher to finish.
+4. The MeshPunk logo shows while the device starts up; the first start after an install also unpacks the bundled files, which takes about a minute before the home screen appears.
 5. It is highly suggested to use a SD card to persist your mesh and firmware settings.
 6. Go to the radio settings and set them to your local default.
 7. Set your extra settings, RX boost, Contact Overwrite, and Message Repeat

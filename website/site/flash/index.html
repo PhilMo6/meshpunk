@@ -34,7 +34,7 @@
 
     <div id="gate" class="notice notice-warn" hidden>
       <strong>This browser cannot flash a device.</strong>
-      Flashing needs Web Serial, which desktop Chrome, Edge and Opera have. Open this page in one of those, or use the download links below with another flasher.
+      Flashing needs Web Serial. Open this page in Chrome or another compatible Chromium browser on a computer, or use the download links below with another flasher.
     </div>
 
     <div id="load-error" class="notice notice-bad" hidden></div>
@@ -81,6 +81,7 @@
           <button type="button" id="flash-btn" class="btn btn-primary" disabled>Flash</button>
           <label class="check"><input type="checkbox" id="all-ports">Show every serial port</label>
         </div>
+        <p class="step-hint">If the device is not listed or fails to connect, put it into download mode and try again.</p>
 
         <div id="run" class="run" hidden>
           <ol id="stages" class="stages"></ol>
@@ -92,12 +93,6 @@
             <button type="button" id="copy-log" class="btn btn-small">Copy log</button>
           </details>
         </div>
-
-        <details id="dlmode" class="help" hidden>
-          <summary>Device not listed, or it will not connect?</summary>
-          <p>The page restarts a running MeshPunk device into download mode by itself. A device that is switched off, in USB host mode or in USB drive mode has no serial port to do that through, so put it in download mode by hand:</p>
-          <ol id="dlmode-steps"></ol>
-        </details>
       </section>
     </form>
 

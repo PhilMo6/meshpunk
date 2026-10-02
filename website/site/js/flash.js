@@ -66,8 +66,6 @@ const ui = {
   logBox: document.querySelector('#run .log'),
   log: $('log'),
   copyLog: $('copy-log'),
-  dlmode: $('dlmode'),
-  dlmodeSteps: $('dlmode-steps'),
   more: $('more'),
   launcherFiles: $('launcher-files'),
   downloads: $('downloads'),
@@ -316,10 +314,6 @@ function renderAction() {
   ui.flashBtn.disabled = !job || !canFlash || state.busy;
   ui.allPorts.disabled = state.busy;
   ui.selection.disabled = state.busy;
-
-  const board = state.board ? state.index.boards[state.board] : null;
-  ui.dlmode.hidden = !board;
-  if (board) ui.dlmodeSteps.replaceChildren(...board.download_mode.map((step) => h('li', { text: step })));
 }
 
 function fileLink(asset) {
@@ -425,10 +419,7 @@ function failureHint(stage, job) {
     case 'download':
       return 'Nothing was written to the device.';
     case 'connect':
-      return (
-        'Nothing was written. If the device is switched off, or in USB host or USB drive mode, put it in download mode ' +
-        '(steps below) and flash again. If its screen went dark, press RST to restart it.'
-      );
+      return 'Nothing was written. If the device keeps failing to connect, put it into download mode and try again.';
     case 'write':
     case 'verify':
       return job.erases
@@ -476,8 +467,7 @@ async function startFlash() {
     ui.stages.replaceChildren();
     ui.bar.value = 0;
     if (error.name === 'NotFoundError') {
-      showResult('', 'No port was chosen.', 'If the device is not in the list, see "Device not listed" below.');
-      ui.dlmode.open = true;
+      showResult('', 'No port was chosen.', 'If the device is not in the list, put it into download mode and try again.');
     } else {
       showResult('bad', `The browser did not open the port chooser: ${error.message}`);
     }
@@ -534,7 +524,6 @@ async function startFlash() {
     log(`Stopped at "${STAGE_LABELS[failedAt]}": ${error.message}`, true);
     showResult('bad', `Stopped at "${STAGE_LABELS[failedAt]}": ${error.message}`, failureHint(failedAt, job));
     ui.logBox.open = true;
-    if (failedAt === 'connect') ui.dlmode.open = true;
   } finally {
     setBusy(false);
   }

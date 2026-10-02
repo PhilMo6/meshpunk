@@ -63,15 +63,13 @@ Add an entry to `boards.json`, keyed by the slug (`MESHPUNK_BOARD_NAME`):
 "tdeck": {
   "name": "LilyGo T-Deck",
   "chip": "ESP32-S3",
-  "usb": { "vid": "0x303A", "pid": "0x1001" },
-  "download_mode": ["step 1", "step 2"]
+  "usb": { "vid": "0x303A", "pid": "0x1001" }
 }
 ```
 
 - `chip` is the name esptool-js reports for the chip; a device reporting
   another chip is refused.
 - `usb` filters the browser's port chooser.
-- `download_mode` is shown on the flasher page once the board is selected.
 
 A release that carries a new slug fails the build until this entry exists.
 
@@ -99,7 +97,7 @@ C:\Users\noahl\.platformio\penv\Scripts\python.exe website\build_site.py --out w
 C:\Users\noahl\.platformio\penv\Scripts\python.exe website\serve.py
 ```
 
-Then open `http://localhost:8137/` in Chrome or Edge. Web Serial works on
+Then open `http://localhost:8137/` in Chrome or another compatible Chromium browser. Web Serial works on
 localhost, so a device can be flashed from the preview. Downloads are cached in
 `website/.cache/`.
 
