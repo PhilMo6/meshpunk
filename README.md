@@ -8,6 +8,7 @@ Join the MeshPunk Discord: https://discord.gg/cmJKV5gEdP
 | --- | --- | --- |
 | LilyGo T-Deck | `meshpunk` | Keyboard, trackball, touchscreen |
 | Heltec V4 + Expansion Kit V2 | `meshpunk_heltec` | Touchscreen only |
+| Seeed Wio Tracker L2 | `meshpunk_wio_l2` | Touchscreen, WAKE button |
 
 Device-specific code lives behind a per-subsystem backend (`src/input`,
 `src/display`, `src/audio`, `src/power`, `src/gps`), so the rest of the
@@ -51,6 +52,8 @@ your hardware.
 - File manager (Tools > Files) for both internal flash and SD
 - App Library — browse and install apps and themes straight from GitHub over WiFi, and update the ones you already have, no reflash needed
 - On-device firmware updates (Settings > Firmware) — install new releases over WiFi or from the SD card, no computer needed; see [Updating on the device](#updating-on-the-device)
+- Flasher app (Tools > Flasher) — flash ESP32 firmware onto another device over a USB cable, from the device itself: MeshPunk, MeshCore, Meshtastic or any image, with partition backup and restore
+- Display orientation (Settings > Device) — landscape or portrait, a quarter turn at a time; the apps follow
 
 
 ## Installation 
@@ -58,7 +61,7 @@ your hardware.
 1. Open the MeshPunk web flasher in Chrome or another compatible Chromium browser on a computer: https://philmo6.github.io/meshpunk/flash/
 2. Connect the device with a USB cable and pick your device, the build (Stable, or Dev for development builds) and the install type. **Releases are built per device** — a build for the wrong board will not run correctly. Fresh install is for a first-time install: it erases the device and replaces its filesystem with the MeshPunk one! Update replaces the firmware and keeps your settings and messages.
 - For updates you no longer need a computer: Settings > Firmware on the device checks GitHub over WiFi and installs the new release, or installs a -firmware.bin copied to the SD card (see "Updating on the device" below).
-- The meshcore.io flasher works too: download the release file for your device from the release page (the filenames carry the board name, `meshpunk-tdeck-<version>-…` / `meshpunk-heltec_v4-<version>-…`), go to https://meshcore.io/flasher, scroll to the bottom and click on Custom Firmware. The -merged.bin is for a first-time install and erases your filesystem to replace it with the MeshPunk one; the -firmware.bin updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept).
+- The meshcore.io flasher works too: download the release file for your device from the release page (the filenames carry the board name, `meshpunk-tdeck-<version>-…` / `meshpunk-heltec_v4-<version>-…` / `meshpunk-wio_l2-<version>-…`), go to https://meshcore.io/flasher, scroll to the bottom and click on Custom Firmware. The -merged.bin is for a first-time install and erases your filesystem to replace it with the MeshPunk one; the -firmware.bin updates the firmware AND refreshes MeshPunk's bundled files automatically on the next boot (your settings and messages are kept).
 3. Click the flash button, choose the device's port and wait for the flasher to finish.
 4. The MeshPunk logo shows while the device starts up; the first start after an install also unpacks the bundled files, which takes about a minute before the home screen appears.
 5. It is highly suggested to use a SD card to persist your mesh and firmware settings.
@@ -102,12 +105,13 @@ Settings > Firmware updates MeshPunk without a computer:
 - The updater has its own screen: it shows the job, verifies the file again, draws a progress bar while writing, and restarts when done. Do not power off while it writes; if that happens anyway, it simply runs the same job again on the next start.
 - Only releases from the one that introduced the updater onward can be installed this way. Each image carries a board tag, and the page refuses files built for the other board or from before the tag existed. Older releases still flash by USB.
 - Devices installed through the Launcher update through the Launcher instead; the page says so and offers nothing there.
+- Channel: the Firmware page checks the stable releases by default. Switching its Channel to dev checks the development repo's `-devN` builds instead, which are unreleased and expected to be rough. Switching back to stable offers the newest stable release as "Switch to" — the way back from a dev build.
 
-## Using with the Launcher (optional, T-Deck only)
+## Using with the Launcher (optional, T-Deck and Wio Tracker L2)
 
 MeshPunk can also be installed through [bmorcelli's Launcher](https://github.com/bmorcelli/Launcher) — a multi-firmware boot menu that lets you keep several firmwares on one device and choose which to boot. If you run the Launcher, install the **`-launcher.bin`** release, not the other files.
 
-1. Download `meshpunk-<version>-launcher.bin` from the releases page.
+1. Download your device's Launcher image from the releases page: `meshpunk-tdeck-<version>-launcher.bin` (T-Deck) or `meshpunk-wio_l2-<version>-launcher.bin` (Wio Tracker L2).
 2. Install it through the Launcher: from a FAT32 SD card, through the WebUI, or as a direct download URL / OTA.
 3. On the first boot MeshPunk sets up its filesystem and unpacks its bundled files (about a minute). After that it boots normally.
 
@@ -115,8 +119,8 @@ Notes:
 
 - The MeshPunk app carries its own files and populates its filesystem by itself, so no extra steps are needed in the Launcher. Launcher 2.7.x may ask whether to copy SPIFFS during the install — either answer works.
 - Use `-launcher.bin` only. `-firmware.bin` (the bare app) installs but does not boot: it declares no partition layout, so the Launcher creates no data partition and MeshPunk has nowhere to unpack its files. `-merged.bin` is a full-flash image for the web flasher, not for the Launcher.
-- Works with Launcher 2.7.2 and newer.
-- Updates come through the Launcher too (its LauncherHub entry tracks MeshPunk releases). The on-device Firmware page detects a Launcher install and offers nothing there.
+- T-Deck: works with Launcher 2.7.2 and newer. Wio Tracker L2: needs a Launcher release that includes L2 support.
+- Updates come through the Launcher too (on the T-Deck, its LauncherHub entry tracks MeshPunk releases). The on-device Firmware page detects a Launcher install and offers nothing there.
 - This path is only for devices running the Launcher. For a normal install, use the flasher steps above.
 
 ## Radio protocols
@@ -222,7 +226,7 @@ The App Library (top-level app) installs apps and themes onto your device over W
 
 **[github.com/PhilMo6/meshpunk-apps](https://github.com/PhilMo6/meshpunk-apps)**
 
-Apps are grouped by category; when an installed app is behind the catalog an **Updates** list appears at the top. Themes have their own downloader under Settings > Theme > Get. Every app and theme that ships with the firmware is tracked here too, so even preinstalled ones can be updated OTA. Contributions (your own apps and themes) are welcome via pull request — see that repo's README.
+Apps are grouped by category; when an installed app or theme is behind the catalog an **Updates** list appears at the top. Themes have their own pinned category next to LoRa Protocols, with Apply right in the detail menu (Settings > Theme stays the quick picker for switching). Every app and theme that ships with the firmware is tracked here too, so even preinstalled ones can be updated OTA. Contributions (your own apps and themes) are welcome via pull request — see that repo's README.
 
 System apps (App Library, Files, Map, Messenger, and the Settings pages) are non-removable, but can still be updated.
 
@@ -237,7 +241,7 @@ System apps (App Library, Files, Map, Messenger, and the Settings pages) are non
 ## Requirements for Development
 
 - PlatformIO
-- A supported device (T-Deck or Heltec V4 + Expansion Kit)
+- A supported device (T-Deck, Heltec V4 + Expansion Kit, or Wio Tracker L2)
 - Git (for submodules)
 
 ## Building and Development
@@ -255,6 +259,7 @@ System apps (App Library, Files, Map, Messenger, and the Settings pages) are non
    ```
    pio run --target upload                    # T-Deck
    pio run -e meshpunk_heltec --target upload # Heltec V4
+   pio run -e meshpunk_wio_l2 --target upload # Wio Tracker L2
    ```
    This will upload only the firmware, not the filesystem data.
    Once per device, also upload the updater firmware that lives in its own
@@ -263,27 +268,29 @@ System apps (App Library, Files, Map, Messenger, and the Settings pages) are non
    ```
    pio run -e meshpunk_updater --target upload        # T-Deck
    pio run -e meshpunk_heltec_updater --target upload # Heltec V4
+   pio run -e meshpunk_wio_l2_updater --target upload # Wio Tracker L2
    ```
 6. To upload the filesystem data (when changing lua scripts)
    ```
    pio run --target uploadfs
    pio run -e meshpunk_heltec --target uploadfs
+   pio run -e meshpunk_wio_l2 --target uploadfs
    ```
 7. To build release artifacts (written to `releases/`): the release envs embed
    the `data/` tree into the app so the published binaries are self-contained
    ```
    pio run -e meshpunk_release        # T-Deck  -> meshpunk-tdeck-<ver>-*.bin + launcher
    pio run -e meshpunk_heltec_release # Heltec  -> meshpunk-heltec_v4-<ver>-*.bin
+   pio run -e meshpunk_wio_l2_release # Wio L2  -> meshpunk-wio_l2-<ver>-*.bin + launcher
    ```
-   Build the board's updater env first (`pio run -e meshpunk_updater` or
-   `pio run -e meshpunk_heltec_updater`): the merged image includes it, and
-   the artifact step refuses to run without it.
+   Build the board's updater env first (`pio run -e meshpunk_updater`,
+   `pio run -e meshpunk_heltec_updater` or `pio run -e meshpunk_wio_l2_updater`):
+   the merged image includes it, and the artifact step refuses to run without it.
    Each produces the board's `-merged`, `-firmware`, `-littlefs` and
-   `-updater` binaries; the Launcher image is T-Deck only and keeps its
-   original `meshpunk-<ver>-launcher.bin` name (its LauncherHub catalog entry
-   depends on it). The `-firmware.bin` is also what the on-device updater
-   downloads, by that exact name, so release builds must come from the clean
-   tagged commit. If a build reports missing littlefs, run
+   `-updater` binaries; the T-Deck and Wio L2 builds also produce the Launcher
+   image, `meshpunk-<board>-<ver>-launcher.bin`. The `-firmware.bin` is also what the
+   on-device updater downloads, by that exact name, so release builds must
+   come from the clean tagged commit. If a build reports missing littlefs, run
    `pio run [-e <env>] -t buildfs` first; if the firmware was already up to
    date, force the artifact step with `pio run -e <release env> -t mergebin`.
 
@@ -311,7 +318,7 @@ Boards without a keyboard get both, built into the firmware:
 - **On-screen keyboard** — opens when a text field is focused; it is the text entry path in apps and in native games alike
 - **On-screen game pad** — native games (Doom, GameBoy, DOS, the emulators) draw a button layout over the game, rendered outline-and-label only so the game stays visible behind it
 
-One control cycles the on-screen input through pad → pad hidden → keyboard → off: the **IO button** on the Heltec, or **Shift+Alt** on a board with a keyboard. The **Touch input** row in Settings → Device does the same cycle — the way in for legacy T-Deck keyboards, which report no modifiers and so cannot chord. A board with a keyboard boots with all of it off; a keyboardless board boots with the pad on.
+One control cycles the on-screen input through pad → pad hidden → keyboard → off: the **IO button** on the Heltec, the **WAKE button** on the Wio Tracker L2, or **Shift+Alt** on a board with a keyboard. The **Touch input** row in Settings → Device does the same cycle — the way in for legacy T-Deck keyboards, which report no modifiers and so cannot chord. A board with a keyboard boots with all of it off; a keyboardless board boots with the pad on.
 
 **Quitting a native game** — any of: hold `Alt`+`Backspace` ~1.5s (needs a keyboard), hold the on-screen **QUIT** button ~1s, or a key bound to quit in the launcher's Controls screen.
 
@@ -413,6 +420,7 @@ MIT
 - LVGL: https://lvgl.io/
 - LilyGo for the T-Deck hardware
 - Heltec for the WiFi LoRa 32 V4 hardware and Expansion Kit
+- Seeed Studio for the Wio Tracker L2 hardware
 - MTLite's Meshtastic-compatible wire protocol via meshtastic-lite by jstockdale (Off by One) https://github.com/jstockdale/meshtastic-lite (BSD-3-Clause)
 - Emojis from https://github.com/googlefonts/noto-emoji
 - Emoji converted to .bin with ImageMagick
@@ -439,6 +447,9 @@ MIT
    Adlib OPL2 via fmopl (LGPL); firmware is SeaBIOS + SeaVGABIOS (LGPL v3)
    The downloadable boot disks are FreeDOS https://www.freedos.org (GPL),
    with HIMEMX, CuteMouse (CTMOUSE) and FreeDOS Edit
+- Pyxel games via a C port of the Pyxel engine by Takashi Kitao https://github.com/kitao/pyxel (MIT)
+   Python by MicroPython (MIT) (c) Damien P. George and contributors https://micropython.org
+   PNG and ZIP support via LodePNG (zlib) by Lode Vandevenne
 
 ## Branch
 This branch of the Meshpunk project focuses on extending functionality.
