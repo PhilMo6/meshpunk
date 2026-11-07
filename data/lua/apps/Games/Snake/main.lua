@@ -427,11 +427,16 @@ do
     local ok, touchlayout = pcall(require, "lib/touchlayout")
     if ok then
         touchlayout.set{
-            { x = 60,  y = 110, w = 70, h = 60, out = 0x77, label = "^" },   -- w
-            { x = 0,   y = 170, w = 70, h = 70, out = 0x61, label = "<" },   -- a
-            { x = 60,  y = 170, w = 70, h = 70, out = 0x73, label = "v" },   -- s
-            { x = 130, y = 170, w = 70, h = 70, out = 0x64, label = ">" },   -- d
-            { x = 240, y = 160, w = 80, h = 80, out = 0x0D, label = "GO" },  -- enter
+            -- Edge-anchored so the layout holds on any screen size (Lua games
+            -- run in the oriented space, unlike ELF pad presets). On screens
+            -- too narrow to fit the action zone beside the d-pad row, it
+            -- moves one row up instead of overlapping ">".
+            { x = 60,  y = H - 130, w = 70, h = 60, out = 0x77, label = "^" },   -- w
+            { x = 0,   y = H - 70,  w = 70, h = 70, out = 0x61, label = "<" },   -- a
+            { x = 60,  y = H - 70,  w = 70, h = 70, out = 0x73, label = "v" },   -- s
+            { x = 130, y = H - 70,  w = 70, h = 70, out = 0x64, label = ">" },   -- d
+            { x = W - 80, y = (W >= 280) and (H - 80) or (H - 160),
+              w = 80, h = 80, out = 0x0D, label = "GO" },                        -- enter
         }
         apps.set_on_close(touchlayout.clear)
     end

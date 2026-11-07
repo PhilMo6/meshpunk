@@ -95,6 +95,43 @@ SPIClass& board_sd_spi(void);
 #define PIN_BOOT_BTN   0
 #define PIN_IO_BTN     46
 
+#elif defined(BOARD_WIO_L2)
+
+// Seeed Wio Tracker L2 (Wio-S3 module: ESP32-S3R8 + SX1262). Pin sources:
+// the Seeed wiki pin table, the Meshtastic seeed_wio_tracker_L2 variant and
+// the wadamesh variants/wio_tracker_l2 port — all three agree on the pins
+// below. Board-only lines (expander, I2C, display, backlight) live in
+// src/boards/wio_l2_board.h.
+
+// Board identity, reported to Lua via _device_caps().
+#define MESHPUNK_BOARD_NAME "wio_l2"
+// Display form of the same, used to build the default node name.
+#define MESHPUNK_BOARD_LABEL "Wio L2"
+// Meshtastic HardwareModel enum value for this board (forwarded to the
+// mtlite protocol for its NodeInfo broadcasts): SEEED_WIO_TRACKER_L2 = 137
+// (custom_meshtastic_hw_model in the Meshtastic variant).
+#define MESHPUNK_MT_HW_MODEL 137
+
+// LoRa radio (SX1262) — RadioLib Module pins. The radio has FSPI to itself:
+// the panel is on its own QSPI bus (SPI3) and the microSD slot is SDMMC.
+#define PIN_LORA_CS    21
+#define PIN_LORA_DIO1  9
+#define PIN_LORA_RST   7
+#define PIN_LORA_BUSY  8
+
+// FSPI bus (radio only)
+#define PIN_SPI_SCK    4
+#define PIN_SPI_MISO   5
+#define PIN_SPI_MOSI   6
+
+// PIN_SD_CS and PIN_TFT_CS stay undefined: the SD slot is 1-bit SDMMC
+// (CLK 2 / CMD 3 / D0 1, not SPI) and the panel CS belongs to the display
+// backend's own bus.
+
+// USER button = GPIO0, active LOW (Meshtastic BUTTON_PIN 0). The WAKE
+// button sits on the I/O expander (P00), not on a GPIO.
+#define PIN_BOOT_BTN   0
+
 #else
 #error "No board selected: define BOARD_<NAME> in platformio.ini build_flags"
 #endif

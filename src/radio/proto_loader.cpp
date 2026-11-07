@@ -3,7 +3,7 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <LittleFS.h>
-#include <SD.h>
+#include "../storage/sd_dev.h"
 #include <esp_random.h>
 #include <stdarg.h>
 
@@ -201,7 +201,7 @@ void lora_proto_select_and_load(void) {
     const char* pkg_mount = "/littlefs";
     if (!find_package_elf(LittleFS, dir, elfname, sizeof(elfname)) && sd_mounted) {
         sd_spi_take();
-        bool on_sd = find_package_elf(SD, dir, elfname, sizeof(elfname));
+        bool on_sd = find_package_elf(sd_dev_fs(), dir, elfname, sizeof(elfname));
         sd_spi_release();
         if (on_sd) {
             drv = "S";
@@ -241,7 +241,7 @@ void lora_proto_select_and_load(void) {
         ok = false;
     }
     if (ok) {
-        const char* mount = (mstore::storage() == &SD) ? "/sd" : "/littlefs";
+        const char* mount = (mstore::storage() == &sd_dev_fs()) ? "/sd" : "/littlefs";
         if (meshcore_req) {
             // The meshcore PACKAGE owns the store ROOT — every file exactly
             // where it has always lived (the zero-migration promise). No
@@ -371,7 +371,7 @@ int lora_proto_offline_config_get(const char* id, const char* key,
 
     char path[128];
     offline_path(id, notify_file, path, sizeof(path));
-    bool is_sd = (fs == &SD);
+    bool is_sd = (fs == &sd_dev_fs());
     if (is_sd) sd_spi_take();
 
     int n = 0;
@@ -419,7 +419,7 @@ bool lora_proto_offline_config_set(const char* id, const char* key, const char* 
     char tmp[136];
     offline_path(id, notify_file, path, sizeof(path));
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    bool is_sd = (fs == &SD);
+    bool is_sd = (fs == &sd_dev_fs());
     UsbFlashGuardIf _g(!is_sd);   // LittleFS backend: internal-flash write
     if (is_sd) sd_spi_take();
 

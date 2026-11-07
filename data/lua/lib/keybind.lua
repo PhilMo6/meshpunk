@@ -219,17 +219,32 @@ function Kb:get(id) return self.bind[id] end
 -- "OUT=IN[+ALT_IN],..." — the firmware keymap is a pure remapper (unmapped
 -- codes pass through unchanged), so only real bindings are emitted. nil when
 -- nothing is bound: the caller then omits -keymap entirely.
-function Kb:keymap_string()
+--
+-- opts (optional): opts.outs = { [action id] = out code } replaces those
+-- actions' outs for this launch, and opts.skip = { [key code] = true } leaves
+-- those keys unbound on the actions opts.outs names, so they reach the module
+-- as themselves.
+function Kb:keymap_string(opts)
+    local outs = opts and opts.outs or {}
+    local skip = opts and opts.skip or {}
     local parts = {}
     for _, a in ipairs(self.actions) do
         local b = self.bind[a.id]
-        if b and (b.key1 or b.key2) then
-            local s = string.format("%02X=", a.out)
-            if b.key1 then
-                s = s .. string.format("%02X", b.key1)
-                if b.key2 then s = s .. string.format("+%02X", b.key2) end
+        local k1, k2 = b and b.key1, b and b.key2
+        local out = outs[a.id]
+        if out then
+            if k1 and skip[k1] then k1 = nil end
+            if k2 and skip[k2] then k2 = nil end
+        else
+            out = a.out
+        end
+        if k1 or k2 then
+            local s = string.format("%02X=", out)
+            if k1 then
+                s = s .. string.format("%02X", k1)
+                if k2 then s = s .. string.format("+%02X", k2) end
             else
-                s = s .. string.format("%02X", b.key2)
+                s = s .. string.format("%02X", k2)
             end
             parts[#parts + 1] = s
         end

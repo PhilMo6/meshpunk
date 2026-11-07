@@ -2,7 +2,7 @@
 
 // ── T-Deck ↔ T-Deck peer link ────────────────────────────────────────────────
 // A service-multiplexed byte channel between two T-Decks over one USB cable.
-// Role A (USB host mode) reaches the peer through the dynamic `tdeck` USB
+// Role A (USB host mode) reaches the peer through the dynamic `espserial` USB
 // driver (link socket in the driver ABI); role B (normal USB device) is
 // reached through its native USB-Serial-JTAG CDC — this bridge pumps that
 // port on a small Core-1 task. Sessions are automatic: the host side sends
@@ -39,7 +39,7 @@
 //
 // A frame's payload is at most TDL_MAX_PAYLOAD (57) bytes: the whole frame
 // is then 64 bytes = exactly one full-speed bulk packet, which is the most
-// the tdeck USB driver hands to one pipe transfer.
+// the espserial USB driver's link_send() hands to one pipe transfer.
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -98,7 +98,7 @@
 // Boot init: state + the Core-1 pump task (device-role serial + timers).
 void tdeck_link_init();
 
-// USB-host backend, driven by the dynamic `tdeck` driver through the ABI
+// USB-host backend, driven by the dynamic `espserial` driver through the ABI
 // link socket (usb_task context). send() must accept a whole frame.
 void tdeck_link_usb_register(bool (*send)(const uint8_t* d, uint32_t n));
 void tdeck_link_usb_unregister();

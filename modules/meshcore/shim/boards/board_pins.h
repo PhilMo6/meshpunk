@@ -1,4 +1,5 @@
 #pragma once
-// Default node-name label. The firmware header carries per-board values;
-// a host-supplied board label is a wiring item (step 5f, campaign ledger).
+// Board label until the host's "board_label" config arrives (mcmain.cpp);
+// it stands only under a firmware that predates that key. The firmware's
+// src/boards/board_pins.h carries the per-board values.
 #define MESHPUNK_BOARD_LABEL "Meshpunk"

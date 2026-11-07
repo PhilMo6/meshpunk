@@ -3,7 +3,9 @@
 
 #include "../../core/lv_global.h"
 #include <SPI.h>
-#include "SD.h"
+// MESHPUNK: files open through the board's SD backend (src/storage/sd_dev.h:
+// SPI on the T-Deck/Heltec, SDMMC on the Wio L2), not the SPI-only SD object.
+#include "storage/sd_dev.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -89,7 +91,7 @@ static void * fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode)
         flags = FILE_WRITE;
 
     lv_sd_spi_take();
-    File file = SD.open(path, flags);
+    File file = sd_dev_fs().open(path, flags);   // MESHPUNK: see the include
     lv_sd_spi_release();
     if(!file) {
         return NULL;

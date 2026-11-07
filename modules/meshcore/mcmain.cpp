@@ -19,6 +19,7 @@
 
 #include "lora_proto_abi.h"
 #include "mc_internal.h"
+#include "boards/board_pins.h"   // MESHPUNK_BOARD_LABEL (shim)
 
 #include <Mesh.h>
 
@@ -196,6 +197,9 @@ static McBoard       s_board;
 // (operator new → mem_alloc).
 PunkMesh* the_mesh = nullptr;
 
+// Set by mc_start, whose begin() loads the saved prefs.
+static bool s_started = false;
+
 // The companion dispatch point (ble_companion.h iface): owned by THIS elf so
 // PunkMesh's RX pushes never import the optional companion elf — that elf
 // imports this global and sets it while attached.
@@ -242,6 +246,7 @@ static bool mc_start(void) {
     // The firmware MESHCORE INIT sequence, over the host ops: prefs load in
     // begin() FIRST (radio params come from _prefs — configuring earlier
     // programs constructor defaults), then params, boost, RX.
+    s_started = true;
     the_mesh->begin();
     the_mesh->showWelcome();
 
@@ -353,8 +358,23 @@ static int mc_get_config(const char* key, char* out, int out_sz) {
 // ble_companion.cpp (DEVICE_INFO cap byte + the set-power clamp).
 int8_t mc_max_tx_dbm = MAX_LORA_TX_POWER;
 
+// Board label (the firmware's board_pins.h, per board), forwarded by the
+// host BEFORE start ("board_label"): names the default node ("Meshpunk
+// <label>") and the BLE companion's model name. The shim label stands under
+// a firmware that predates the key.
+char mc_board_label[24] = MESHPUNK_BOARD_LABEL;
+
 static bool mc_set_config(const char* key, const char* val) {
     if (!key || !val) return false;
+    // Refused after start: begin() has loaded the saved node name by then,
+    // and the label only ever sets the default.
+    if (strcmp(key, "board_label") == 0) {
+        if (!the_mesh || s_started || !val[0]) return false;
+        snprintf(mc_board_label, sizeof(mc_board_label), "%s", val);
+        snprintf(the_mesh->_prefs.node_name, sizeof(the_mesh->_prefs.node_name),
+                 "Meshpunk %s", mc_board_label);
+        return true;
+    }
     // BLE companion sync backlog cap (0 = serve whole files). The host
     // forwards its persisted pref here at boot and on Settings change —
     // the config seam is the only way into a protocol module.

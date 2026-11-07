@@ -79,9 +79,11 @@ function build_page(items, category)
     apps.set_root(body)   -- the manager tears this page down when an app launches
 
     if category then
-        body:Label{text = category, align = lvgl.ALIGN.CENTER, w = 260, h = 40}
+        -- Full-row title, text centered (text_align 2 = LV_TEXT_ALIGN_CENTER).
+        -- A fixed 260px box overflowed narrow screens and clipped the text.
+        body:Label{text = category, text_align = 2, w = lvgl.PCT(100), h = 40}
     else
-        body:Label{text = "Home", align = lvgl.ALIGN.CENTER, w = 260, h = 40}
+        body:Label{text = "Home", text_align = 2, w = lvgl.PCT(100), h = 40}
         -- Backgrounded apps: one row each — tap the wide button to reopen the
         -- app, X to close it for real (runs the contract's on_close; the app
         -- itself never has to be launched for that).

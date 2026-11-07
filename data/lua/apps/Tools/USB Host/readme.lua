@@ -1,7 +1,19 @@
-local caps = ...
+local caps, dev = ...
 
 local body = [[
 Runs the device as a USB host so you can plug accessories into it.
+]]
+
+if dev.usb_power then
+    body = body .. [[
+
+POWER
+This device powers the accessory from its USB-C port while host mode is on: 5 V turns on when an accessory is plugged in, and off when it is unplugged, when you press Stop, and in standby. A USB-C accessory plugs straight in; one with a USB-A plug needs a plain USB-C OTG adapter.
+
+While host mode is on, a USB-C charger plugged into the port does not charge the device - press Stop to charge. The USB accessories page in the guide has the details.
+]]
+else
+    body = body .. [[
 
 POWER COMES FIRST
 The device does not supply power over USB. If nothing happens when you plug something in, that is almost always the reason.
@@ -11,6 +23,10 @@ For a keyboard, mouse, gamepad or thumb drive, use a USB-C OTG splitter Y-cable 
 For headphones, use a USB-C to 3.5mm adapter that also has a USB-C charging port. Those bring their own power, so they need no OTG cable.
 
 Any generic adapter of either kind works. The USB accessories page in the guide covers what to look for.
+]]
+end
+
+body = body .. [[
 
 USB hubs are not supported: the firmware recognises a hub and refuses it, so it is one accessory at a time.
 
@@ -27,9 +43,11 @@ WHAT WORKS
 Drivers for the gamepad, mouse and link cable download automatically from the App Library the first time they are needed.]]
 
 if not caps.keyboard then
+    local audio = (dev.audio == "i2s") and "an audio adapter adds headphones"
+                                       or  "an audio adapter is how you get music and game sound out"
     body = body .. [[
 
-On this device a USB keyboard also unlocks the keyboard shortcuts listed in the Guide tab, a gamepad is the comfortable way to play the emulators, and an audio adapter is how you get music and game sound out.]]
+On this device a USB keyboard also unlocks the keyboard shortcuts listed in the Guide tab, a gamepad is the comfortable way to play the emulators, and ]] .. audio .. [[.]]
 end
 
 body = body .. [[

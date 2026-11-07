@@ -1,17 +1,14 @@
 --[[
-  UI Theme picker + theme downloads.
+  UI Theme picker.
 
-  Picker: lists the themes lib/theme discovered (internal /lua/themes + SD
+  Lists the themes lib/theme discovered (internal /lua/themes + SD
   /meshpunk/themes) and applies the chosen one live — chrome recolors
   instantly, the matching background draws behind this page as a preview.
   The choice persists across reboots.
 
-  Get themes: downloads folder themes from the meshpunk-apps repo's "themes"
-  catalog section via lib/downloader (same engine, staging discipline and
-  .version bookkeeping as the App Library). Installed themes appear in the
-  picker immediately — lib/theme rescans on every list(), no cache to bust.
-  Themes install to /meshpunk/themes/<id> (SD) when a card is mounted, else
-  /lua/themes/<id> (internal).
+  Themes install, update and remove in the App Library (its pinned Themes
+  category); the Get button opens it. Installed themes appear here
+  immediately — lib/theme rescans on every list(), no cache to bust.
 ]]
 
 local lvgl    = require("lvgl")
@@ -19,15 +16,9 @@ local apps    = require("lib/apps")
 local nav     = require("lib/nav")
 local theme   = require("lib/theme")
 local utils   = require("lib/utils")
-local fileman = require("lib/fileman")
-local dl      = require("lib/downloader")
 
 local W = lvgl.HOR_RES()
 local H = lvgl.VER_RES()
-
--- Where themes live (mirrors lib/theme's discovery locations).
-local THEME_BASES = { sd = "S:/meshpunk/themes", internal = "L:/lua/themes" }
-local WIFI_WAIT_MS = 15000
 
 local root = apps.new_root()
 root:set { w = W, h = H, pad_all = 0, border_width = 0, bg_opa = 0 }
@@ -39,11 +30,6 @@ root:clear_flag(lvgl.FLAG.SCROLLABLE)
 theme.show_background()
 
 local vw = nil
-local catalog = nil      -- fetched on first Get-themes open; Refresh refetches
-local offline = false
-local load_err = nil
-local view_gen = 0       -- bumped on every view build; stale async cbs no-op
-local build_picker, build_downloads   -- forward declarations
 
 local function toast(msg)
     pcall(utils.createNotification, root, tostring(msg), 2500)
@@ -60,288 +46,9 @@ local function swap_view(builder)
     if old then apps.delete_view(old) end
 end
 
--- Dimmed overlay + centered box as its own nav scope (Files-app pattern).
-local function modal(build)
-    local overlay = root:Object {
-        w = W, h = H, x = 0, y = 0,
-        bg_color = "#000000", bg_opa = 140, border_width = 0, pad_all = 0,
-        radius = 0,
-    }
-    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
-    overlay:add_flag(lvgl.FLAG.CLICKABLE)
-
-    local box = overlay:Object {
-        w = W - 70, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
-        radius = 6, border_width = 1, pad_all = 8,
-        flex = { flex_direction = "column", flex_wrap = "nowrap" },
-    }
-    nav.push(box)
-
-    local closed = false
-    local function close()
-        if closed then return end
-        closed = true
-        nav.pop()
-        overlay:delete()
-    end
-    build(box, close)
-    return close
-end
-
-local function confirm(title, on_yes)
-    modal(function(box, close)
-        box:Label { text = title, w = lvgl.PCT(100) }
-        local yes = box:Button { w = lvgl.PCT(100), h = 26 }
-        yes:Label { text = "Yes", align = lvgl.ALIGN.CENTER }
-        yes:onevent(lvgl.EVENT.RELEASED, function()
-            close()
-            on_yes()
-        end)
-        local no = box:Button { w = lvgl.PCT(100), h = 26 }
-        no:Label { text = "No", align = lvgl.ALIGN.CENTER }
-        no:onevent(lvgl.EVENT.RELEASED, close)
-    end)
-end
-
--- ── Installed store themes ───────────────────────────────────────────────────
--- Folder name = catalog id. Only dirs with a .version file are store-managed;
--- built-in and hand-copied themes have none and are left alone.
-local function scan_installed()
-    local installed = {}
-    for _, base in pairs(THEME_BASES) do
-        local entries = fileman.list(base, { sizes = false })
-        if entries then
-            for _, en in ipairs(entries) do
-                if en.type == "dir" then
-                    local dir = base .. "/" .. en.name
-                    local v = dl.read_version(dir)
-                    if v then
-                        installed[en.name] = { version = v.version, dir = dir }
-                    end
-                end
-            end
-        end
-    end
-    return installed
-end
-
--- ── Theme downloads view ─────────────────────────────────────────────────────
-
-local function theme_menu(entry, inst)
-    -- entry = catalog entry (nil for an orphaned install), inst = installed rec.
-    local id = entry and entry.id or inst.id
-    local name = entry and entry.name or inst.id
-    modal(function(box, close)
-        box:Label { text = name, w = lvgl.PCT(100), h = 18 }
-        if entry then
-            box:Label {
-                text = "v" .. entry.version
-                    .. (entry.author and ("  by " .. entry.author) or ""),
-                w = lvgl.PCT(100), h = 16,
-            }
-            if entry.description then
-                box:Label { text = entry.description, w = lvgl.PCT(100) }
-            end
-        else
-            box:Label { text = "v" .. inst.version .. "  (no longer in catalog)",
-                        w = lvgl.PCT(100), h = 16 }
-        end
-
-        local function item(text, fn)
-            local b = box:Button { w = lvgl.PCT(100), h = 26 }
-            b:Label { text = text, align = lvgl.ALIGN.CENTER }
-            b:onevent(lvgl.EVENT.RELEASED, function()
-                close()
-                fn()
-            end)
-        end
-
-        local function done(verb)
-            return function(err)
-                -- Rebuild first, toast last (see App Library install_done):
-                -- keeps the toast's timers out of the rebuild freeze and
-                -- draws it above the fresh view.
-                build_downloads()
-                if err == "cancelled" then
-                    toast("Cancelled")
-                elseif err then
-                    toast(err)
-                else
-                    toast(verb .. " " .. name)
-                end
-            end
-        end
-
-        if entry and not inst then
-            item("Install", function()
-                -- SD preferred (wallpaper-heavy themes belong there); internal
-                -- keeps the feature alive on card-less devices.
-                local ok, info = pcall(_storage_get_info)
-                local loc = (ok and info and info.sd_available) and "sd" or "internal"
-                local dir = THEME_BASES[loc] .. "/" .. entry.id
-                if fileman.exists(dir) then
-                    toast("A theme with that id already exists")
-                    return
-                end
-                dl.run_install(root, {
-                    entry = entry, kind = "themes", loc = loc,
-                    final_dir = dir,
-                    on_done = done("Installed"),
-                })
-            end)
-        elseif entry and inst and dl.version_newer(entry.version, inst.version) then
-            item("Update to v" .. entry.version, function()
-                local loc = (fileman.split(inst.dir) == "S") and "sd" or "internal"
-                dl.run_install(root, {
-                    entry = entry, kind = "themes", loc = loc,
-                    final_dir = inst.dir, old_dir = inst.dir,
-                    on_done = done("Updated"),
-                })
-            end)
-        end
-        if inst then
-            item("Apply", function()
-                theme.apply(id)
-                toast("Applied " .. name)
-            end)
-            -- The default theme is the fallback anchor (theme.apply falls back
-            -- to it on any failure) — updatable, never removable.
-            if id ~= "default" then
-                item("Remove", function()
-                    confirm('Remove "' .. name .. '"?', function()
-                        -- Removing the active theme would leave lib/theme's cached
-                        -- record pointing at a deleted dir — fall back first.
-                        if theme.current() == id then theme.apply("default") end
-                        dl.run_remove(root, name, inst.dir, {
-                            on_done = done("Removed"),
-                        })
-                    end)
-                end)
-            end
-        end
-
-        local cancel_btn = box:Button { w = lvgl.PCT(100), h = 26 }
-        cancel_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
-        cancel_btn:onevent(lvgl.EVENT.RELEASED, close)
-    end)
-end
-
-build_downloads = function()
-    view_gen = view_gen + 1
-    local gen = view_gen
-    swap_view(function(v)
-        local content = v:Object {
-            flex = { flex_direction = "row", flex_wrap = "wrap" },
-            w = W, h = H,
-            border_width = 0, pad_all = 6, bg_opa = 0,
-        }
-        nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
-
-        content:Label {
-            text = "Theme Library" .. (offline and "  (offline)" or ""),
-            w = 178, h = 22,
-        }
-
-        local refresh_btn = content:Button { w = 70, h = 22 }
-        refresh_btn:Label { text = "Refresh", align = lvgl.ALIGN.CENTER }
-        refresh_btn:onClicked(function()
-            catalog, load_err = nil, nil
-            build_downloads()
-        end)
-
-        local back_btn = content:Button { w = 50, h = 22 }
-        back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
-        back_btn:onClicked(function() build_picker() end)
-
-        if not catalog then
-            if load_err then
-                content:Label { text = load_err, w = lvgl.PCT(100) }
-                return
-            end
-            content:Label { text = "Loading catalog...", w = lvgl.PCT(100), h = 20 }
-            dl.wifi_wait(WIFI_WAIT_MS, function(connected)
-                if gen ~= view_gen then return end   -- user navigated away
-                if connected then
-                    local cat = dl.fetch_catalog()
-                    if cat then
-                        catalog, offline = cat, false
-                        build_downloads()
-                        return
-                    end
-                end
-                local cached = dl.load_cached_catalog()
-                if cached then
-                    catalog, offline = cached, true
-                    toast("Offline — showing cached catalog")
-                    build_downloads()
-                    return
-                end
-                load_err = "Cannot fetch catalog.\n\n"
-                    .. "Check WiFi in Settings > Wifi, then Refresh."
-                build_downloads()
-            end)
-            return
-        end
-
-        local installed = scan_installed()
-        local themes = catalog.themes or {}
-        local in_catalog = {}
-
-        table.sort(themes, function(a, b) return a.name < b.name end)
-        for _, e in ipairs(themes) do
-            in_catalog[e.id] = true
-            local entry = e
-            local inst = installed[e.id]
-            local state
-            if not inst then
-                state = "Install"
-            elseif dl.version_newer(e.version, inst.version) then
-                state = "Update"
-            else
-                state = "Installed"   -- up to date, or ahead of the catalog
-            end
-
-            local row = content:Button { w = lvgl.PCT(100), h = 52 }
-            row:Label {
-                text = e.name .. "  v" .. e.version,
-                align = lvgl.ALIGN.TOP_LEFT,
-            }
-            local desc = e.description or ""
-            if #desc > 30 then desc = desc:sub(1, 29) .. "~" end
-            row:Label { text = desc, align = lvgl.ALIGN.BOTTOM_LEFT }
-            row:Label { text = state, align = lvgl.ALIGN.RIGHT_MID }
-            nav.tap(row, function() theme_menu(entry, inst) end)
-        end
-
-        if #themes == 0 then
-            content:Label { text = "No themes in the catalog yet", w = lvgl.PCT(100), h = 20 }
-        end
-
-        -- Installed store themes that fell out of the catalog — still removable.
-        local orphans = {}
-        for id, inst in pairs(installed) do
-            if not in_catalog[id] then
-                inst.id = id
-                orphans[#orphans + 1] = inst
-            end
-        end
-        table.sort(orphans, function(a, b) return a.id < b.id end)
-        if #orphans > 0 then
-            content:Label { text = "Installed (not in catalog):", w = lvgl.PCT(100), h = 16 }
-            for _, inst in ipairs(orphans) do
-                local o = inst
-                local row = content:Button { w = lvgl.PCT(100), h = 28 }
-                row:Label { text = o.id .. "  v" .. o.version, align = lvgl.ALIGN.LEFT_MID }
-                nav.tap(row, function() theme_menu(nil, o) end)
-            end
-        end
-    end)
-end
-
 -- ── Picker view ──────────────────────────────────────────────────────────────
 
-build_picker = function()
-    view_gen = view_gen + 1   -- cancels any pending downloads-view fetch cb
+local function build_picker()
     swap_view(function(v)
         local content = v:Object {
             flex = { flex_direction = "row", flex_wrap = "wrap" },
@@ -368,9 +75,14 @@ build_picker = function()
             status.text = sel_solid_on and "Selection: solid" or "Selection: highlighted fill"
         end)
 
+        -- More themes: the App Library's Themes category.
         local get_btn = content:Button { w = 46, h = 22 }
         get_btn:Label { text = "Get", align = lvgl.ALIGN.CENTER }
-        get_btn:onClicked(function() build_downloads() end)
+        get_btn:onClicked(function()
+            if not apps.launch("App Library") then
+                toast("App Library not found")
+            end
+        end)
 
         local back_btn = content:Button { w = 56, h = 22 }
         back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
@@ -408,5 +120,6 @@ end
 
 -- ── Start ────────────────────────────────────────────────────────────────────
 
-dl.cleanup_staging()
 build_picker()
+
+return root

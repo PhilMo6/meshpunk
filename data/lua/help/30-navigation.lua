@@ -1,4 +1,4 @@
-local caps = ...
+local caps, dev = ...
 
 local body
 
@@ -17,7 +17,12 @@ Tap what you want. Tap once to open something, and drag to scroll a long list or
 
 That covers everyday use. For entering text and for game controls, see the Touch controls page.
 
-If you would rather use keys, you can add them: a USB keyboard, mouse or gamepad plugged in through Tools > USB Host. A keyboard types and its keys work as shortcuts, a mouse moves a highlight and clicks to select, and a gamepad plays the emulators. USB accessories need external power - see the USB accessories page before you buy one.]]
+If you would rather use keys, you can add them: a USB keyboard, mouse or gamepad plugged in through Tools > USB Host. A keyboard types and its keys work as shortcuts, a mouse moves a highlight and clicks to select, and a gamepad plays the emulators.]]
+    if dev.usb_power then
+        body = body .. [[ This device powers them from its own USB-C port - the USB accessories page says what plugs in.]]
+    else
+        body = body .. [[ USB accessories need external power - see the USB accessories page before you buy one.]]
+    end
 end
 
 return {

@@ -135,7 +135,7 @@ static void bh_device_reboot(void) {
 
 static const BleHostApi s_host_api = {
     BLE_PROTO_ABI_VERSION,
-    // Serial transport (ble_transport.cpp — the NimBLE service).
+    // Serial transport (ble_transport.cpp — the Bluedroid serial service).
     ble_transport_open,
     ble_transport_close,
     ble_transport_enable,
@@ -186,6 +186,9 @@ void ble_proto_select_and_init(void) {
     strncpy(s_active, ops->id, sizeof(s_active) - 1);
     s_active[sizeof(s_active) - 1] = '\0';
     SLog.printf("[BLEPROTO] active: %s (%s)\n", ops->id, ops->name ? ops->name : "");
+    // Controller + host now, before LVGL/Lua; the protocol's start() opens
+    // the GATT service over them later (ble_transport_open).
+    ble_transport_stack_up();
 }
 
 void ble_proto_start(void) {

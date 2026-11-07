@@ -35,6 +35,7 @@
 #include <Wire.h>
 
 #include "input_dev.h"
+#include "../display/display_dev.h"  // display_dev_orient_point
 #include "../meshpunk_sync.h"  // SLog
 
 // R8-EX kit wiring (schematic-decoded; base-V4 kit pins do not apply):
@@ -259,6 +260,9 @@ int input_dev_touch_read_multi(int16_t* xs, int16_t* ys, int max) {
     int16_t sy = (int16_t)(HELTEC_TOUCH_RAW_X_MAX - raw_x);
     if (sx < 0) sx = 0; if (sx > 319) sx = 319;
     if (sy < 0) sy = 0; if (sy > 239) sy = 239;
+    // Landscape coords from the board transform above; the user-orientation
+    // mapping happens on top. Identity during module video sessions.
+    display_dev_orient_point(&sx, &sy);
     if (out == 0)      { dx0 = (int16_t)raw_x; dy0 = (int16_t)raw_y; }
     else if (out == 1) { dx1 = (int16_t)raw_x; dy1 = (int16_t)raw_y; }
     xs[out] = sx;

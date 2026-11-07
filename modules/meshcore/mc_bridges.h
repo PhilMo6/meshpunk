@@ -33,6 +33,10 @@ void mc_device_reboot(void);
 // config at boot; baked MAX_LORA_TX_POWER only under older firmware.
 extern int8_t mc_max_tx_dbm;
 
+// Board label (mcmain.cpp): host-forwarded "board_label" config before
+// start; the shim label under older firmware.
+extern char mc_board_label[24];
+
 // MC-PKG divergence: the firmware's live-reapply helpers under their
 // firmware NAMES, so copied binding/companion bodies stand verbatim. TX
 // power rides the full config re-apply (no lone power setter in the api).

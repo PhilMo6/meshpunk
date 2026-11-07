@@ -1,0 +1,114 @@
+# OpenCVBuild.yml
+name: OpenCVBuild
+
+env:
+  PROJECT_DIR: examples_for_PC/CMake_OpenCV
+
+
+on:
+  push:
+    paths:
+    - '**.ino'
+    - '**.cpp'
+    - '**.hpp'
+    - '**.h'
+    - '**.c'
+    - '**OpenCVBuild.yml'
+    - '**OpenCV.cmake'
+    - '**installOpenCV.bat'
+  pull_request:
+    paths:
+    - '**.ino'
+    - '**.cpp'
+    - '**.hpp'
+    - '**.h'
+    - '**.c'
+    - '**OpenCVBuild.yml'
+    - '**OpenCV.cmake'
+    - '**installOpenCV.bat'
+
+#  workflow_dispatch:
+
+# supersede queued/running builds of the same branch or PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  LGFXOpenCV:
+
+    name: LGFXOpenCV (${{ matrix.os }})
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, OpenCV_DIR: "D:/a/LovyanGFX/LovyanGFX/opencv-4.5.5/opencv/build/" }
+          - { os: macos-latest }
+          - { os: ubuntu-latest }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: 🪟 📦 Use GNU tar instead BSD tar
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: echo C:\Program Files\Git\usr\bin>>"%GITHUB_PATH%"
+
+      - name: 🪟 📦 Cache OpenCV for Windows
+        if: ${{ matrix.os == 'windows-latest' }}
+        uses: actions/cache@v3
+        id: cache-opencv-windows
+        with:
+          path: D:\a\LovyanGFX\LovyanGFX\opencv-4.5.5\
+          key: ${{ matrix.os }}-opencv-cache
+
+      - name: 🪟 🏗️ Build+Install OpenCV for Windows
+        if: matrix.os == 'windows-latest' && steps.cache-opencv-windows.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          .github/scripts/installOpenCV.bat
+          Remove-Item -Recurse -Force ${{ matrix.OpenCV_DIR }}modules
+
+      - name: 🪟 🏗️ Build LGFXOpenCV example for Windows
+        if: matrix.os == 'windows-latest'
+        env:
+          OpenCV_DIR: ${{ matrix.OpenCV_DIR }}
+          CC: clang
+          CXX: clang++
+        run: |
+          Get-PSDrive
+          cp .github/scripts/OpenCV.cmake ${{ env.PROJECT_DIR }}/CMakeLists.txt
+          cd ${{ env.PROJECT_DIR }}
+          mkdir build
+          cd build
+          cmake -A x64 -T ClangCL ..
+          cmake --build . --config Debug
+
+      - name: 🐧 🏗️ Install OpenCV for Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopencv-dev
+
+
+      - name: 🍏 🍺 Install OpenCV+CMake brew packages for MacOS
+        if: matrix.os == 'macos-latest'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install opencv cmake
+
+      - name: 🐧/🍏 🏗️ Build LGFXOpenCV example for Linux/MacOS
+        if: matrix.os != 'windows-latest'
+        env:
+          OpenCV_DIR: ${{ matrix.OpenCV_DIR }}
+        run: |
+          cp .github/scripts/OpenCV.cmake ${{ env.PROJECT_DIR }}/CMakeLists.txt
+          cd ${{ env.PROJECT_DIR }}
+          mkdir build
+          cd build
+          cmake ..
+          cmake --build .

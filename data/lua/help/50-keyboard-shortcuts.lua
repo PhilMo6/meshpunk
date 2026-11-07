@@ -2,7 +2,7 @@
 -- keyboard these still work through a USB keyboard, so the page is not hidden
 -- there. Only the lead paragraph differs, and a device that has a keyboard
 -- needs no explanation at all.
-local caps = ...
+local caps, dev = ...
 
 local body = [[
 - Mic key: global notifications shortcut. Over a running app it peeks the top bar; on the launcher (or while peeked) it toggles the notification drop-down. Sym+Mic still types 0.
@@ -20,8 +20,10 @@ local body = [[
 - Enter (in a chat): sends the message. Long-press the message input for the clipboard menu.]]
 
 if not caps.keyboard then
+    local power = dev.usb_power and " - the USB accessories page covers connecting one"
+                                 or " - which needs external power, as the USB accessories page explains"
     body = [[
-This device has no built-in keyboard, so these apply to a USB keyboard attached through Tools > USB Host - which needs external power, as the USB accessories page explains. For everyday typing and game controls without one, see the Touch controls page.
+This device has no built-in keyboard, so these apply to a USB keyboard attached through Tools > USB Host]] .. power .. [[. For everyday typing and game controls without one, see the Touch controls page.
 
 ]] .. body
 end

@@ -51,6 +51,19 @@ bool radio_hal_begin() {
   SLog.printf("[RADIO] setDio2AsRfSwitch = %d %s\n", s,
               s == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
   s_radio->setCurrentLimit(140);
+#elif defined(BOARD_WIO_L2)
+  // SX1262 wiring on this board (Meshtastic seeed_wio_tracker_L2 variant:
+  // SX126X_DIO3_TCXO_VOLTAGE 3.0, SX126X_DIO2_AS_RF_SWITCH): 3.0V TCXO on
+  // DIO3, RF switch driven from DIO2. 140 mA over-current limit: the value
+  // SetPaConfig applies for the SX1262's high-power PA, which RadioLib's
+  // begin() replaces with 60 mA.
+  int16_t s = s_radio->setTCXO(3.0);
+  SLog.printf("[RADIO] setTCXO(3.0) = %d %s\n", s,
+              s == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  s = s_radio->setDio2AsRfSwitch(true);
+  SLog.printf("[RADIO] setDio2AsRfSwitch = %d %s\n", s,
+              s == RADIOLIB_ERR_NONE ? "OK" : "FAILED");
+  s_radio->setCurrentLimit(140);
 #endif
   SPI_UNLOCK();
   return state == RADIOLIB_ERR_NONE;
@@ -256,7 +269,7 @@ void radio_hal_reset_agc() {
     s_radio->mod->hal->yield();
   }
   if (s_last_freq_mhz > 0.0f) s_radio->calibrateImage(s_last_freq_mhz);
-#if defined(BOARD_HELTEC_V4)
+#if defined(BOARD_HELTEC_V4) || defined(BOARD_WIO_L2)
   s_radio->setDio2AsRfSwitch(true);
 #endif
   if (s_rx_boost) s_radio->setRxBoostedGainMode(true, true);

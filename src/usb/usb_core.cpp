@@ -34,8 +34,10 @@
 #include "usb_fs.h"                 // usb_fs_mounted — Lua bridge status field
 #include "meshpunk_sync.h"          // sd_spi_take — SD-base driver-dir scans
 #include "tdeck_link.h"             // peer-link bridge (link socket backend)
+#include "power/power_dev.h"        // USB host port power (board)
 #include <dirent.h>                 // POSIX dir walk over the driver bases
 #include <sys/stat.h>               // .disabled marker probe
+#include <errno.h>                  // driver file errors → the USB log
 
 extern void sd_spi_release();       // main.cpp (take is inline in meshpunk_sync.h)
 
@@ -175,6 +177,10 @@ struct DrvSlot {
     uint8_t  pub[64];
     uint8_t  pub_len;
     uint32_t pub_seq;
+    // The driver's one open file (api file_*); usb_task only.
+    FILE*    file;
+    bool     file_sd;
+    uint32_t file_size;
 };
 
 #define DRV_CONF_MAX 1024
@@ -197,6 +203,7 @@ void usb_registry_add_builtin(const UsbDriverDesc* d) {
     s_drv[s_ndrv].conf_len = 0;
     s_drv[s_ndrv].pub_len  = 0;
     s_drv[s_ndrv].pub_seq  = 0;
+    s_drv[s_ndrv].file     = NULL;
     s_ndrv++;
     portEXIT_CRITICAL(&s_reg_mux);
 }
@@ -260,8 +267,17 @@ static bool dyn_desc_valid(const UsbDriverDesc* d) {
     return (d->busy && d->resume) || (!d->busy && !d->resume && !d->park);
 }
 
+static void slot_file_close(DrvSlot* s) {
+    if (!s->file) return;
+    if (s->file_sd) sd_spi_take();
+    fclose(s->file);
+    if (s->file_sd) sd_spi_release();
+    s->file = NULL;
+}
+
 // Remove one dynamic slot (must not be running) and unload its module.
 static void dyn_remove_slot(int i) {
+    slot_file_close(&s_drv[i]);
     void*    mod  = s_drv[i].mod;
     uint8_t* conf = s_drv[i].conf;
     portENTER_CRITICAL(&s_reg_mux);
@@ -383,6 +399,7 @@ static void dyn_scan_and_load(const IfTriple* triples, int ntriples) {
             s_drv[s_ndrv].conf_len = conf_len;
             s_drv[s_ndrv].pub_len  = 0;
             s_drv[s_ndrv].pub_seq  = 0;
+            s_drv[s_ndrv].file     = NULL;
             s_ndrv++;
             portEXIT_CRITICAL(&s_reg_mux);
             strncpy(loaded[nloaded], de->d_name, 31);
@@ -743,8 +760,8 @@ bool usb_kbd_snapshot(bool out[128]) {
 }
 
 // ── Peer-link socket ─────────────────────────────────────────────────────────
-// One binding, registered by the dynamic `tdeck` driver; routes straight
-// into the T-Deck↔T-Deck bridge (src/tdeck_link.cpp).
+// One binding, registered by the dynamic `espserial` driver; routes straight
+// into the device-to-device bridge (src/tdeck_link.cpp).
 
 static const UsbLinkOps* s_link_ops = NULL;
 
@@ -829,6 +846,171 @@ static void api_publish(const void* self, const void* data, uint32_t len) {
     portEXIT_CRITICAL(&s_reg_mux);
 }
 
+// ── App → driver command blobs ───────────────────────────────────────────────
+// Latest blob per driver NAME (not per loaded slot): written from Lua with
+// _usb_drv_write, read by the driver through api->command. Lives in PSRAM,
+// allocated on the first write. s_cmd_counter never repeats a value, so a
+// driver can tell any two writes apart.
+
+#define DRV_CMD_MAX   256
+#define DRV_CMD_NAMES 4
+
+struct DrvCmd {
+    char     name[24];
+    uint8_t  blob[DRV_CMD_MAX];
+    uint16_t len;
+    uint32_t seq;
+};
+static DrvCmd*  s_cmd = NULL;
+static uint32_t s_cmd_counter = 0;
+
+static bool drv_cmd_write(const char* name, const uint8_t* blob, size_t len) {
+    if (!name[0] || strlen(name) >= sizeof(s_cmd[0].name) || len > DRV_CMD_MAX) return false;
+    if (!s_cmd) {
+        DrvCmd* t = (DrvCmd*)heap_caps_calloc(DRV_CMD_NAMES, sizeof(DrvCmd),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!t) return false;
+        s_cmd = t;
+    }
+    bool ok = false;
+    portENTER_CRITICAL(&s_reg_mux);
+    DrvCmd* c = NULL;
+    for (int i = 0; i < DRV_CMD_NAMES && !c; i++)
+        if (strcmp(s_cmd[i].name, name) == 0) c = &s_cmd[i];
+    for (int i = 0; i < DRV_CMD_NAMES && !c; i++)
+        if (!s_cmd[i].name[0]) { c = &s_cmd[i]; strcpy(c->name, name); }
+    if (c) {
+        if (len) memcpy(c->blob, blob, len);
+        c->len = (uint16_t)len;
+        c->seq = ++s_cmd_counter;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_reg_mux);
+    return ok;
+}
+
+static void drv_cmd_clear_all(void) {
+    if (!s_cmd) return;
+    portENTER_CRITICAL(&s_reg_mux);
+    for (int i = 0; i < DRV_CMD_NAMES; i++) {
+        s_cmd[i].len = 0;
+        s_cmd[i].seq = ++s_cmd_counter;
+    }
+    portEXIT_CRITICAL(&s_reg_mux);
+}
+
+static uint32_t api_command(const void* self, uint8_t* buf, uint32_t cap, uint32_t* seq) {
+    uint32_t n = 0, sq = 0;
+    DrvSlot* s = slot_by_desc(self);
+    if (s && s_cmd) {
+        portENTER_CRITICAL(&s_reg_mux);
+        for (int i = 0; i < DRV_CMD_NAMES; i++) {
+            if (strcmp(s_cmd[i].name, s->d->name) != 0) continue;
+            sq = s_cmd[i].seq;
+            n  = s_cmd[i].len;
+            if (n > cap) n = cap;
+            if (buf && n) memcpy(buf, s_cmd[i].blob, n);
+            break;
+        }
+        portEXIT_CRITICAL(&s_reg_mux);
+    }
+    if (seq) *seq = sq;
+    return n;
+}
+
+// ── Driver file access (read-only; usb_task) ─────────────────────────────────
+
+static bool api_file_open(const void* self, const char* path) {
+    DrvSlot* s = slot_by_desc(self);
+    if (!s || !path) return false;
+    slot_file_close(s);
+    char p[192];
+    bool sd;
+    if (strncmp(path, "S:/", 3) == 0)      { sd = true;  snprintf(p, sizeof(p), "/sd/%s", path + 3); }
+    else if (strncmp(path, "L:/", 3) == 0) { sd = false; snprintf(p, sizeof(p), "/littlefs/%s", path + 3); }
+    else return false;
+    if (sd) sd_spi_take();
+    FILE* f = fopen(p, "rb");
+    long size = -1;
+    if (f) {
+        setvbuf(f, NULL, _IOFBF, 4096);
+        if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+        if (size < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); f = NULL; }
+    }
+    if (sd) sd_spi_release();
+    if (!f) return false;
+    s->file      = f;
+    s->file_sd   = sd;
+    s->file_size = (uint32_t)size;
+    return true;
+}
+
+static uint32_t api_file_size(const void* self) {
+    DrvSlot* s = slot_by_desc(self);
+    return (s && s->file) ? s->file_size : 0;
+}
+
+static bool api_file_seek(const void* self, uint32_t offset) {
+    DrvSlot* s = slot_by_desc(self);
+    if (!s || !s->file) return false;
+    if (s->file_sd) sd_spi_take();
+    bool ok = fseek(s->file, (long)offset, SEEK_SET) == 0;
+    if (s->file_sd) sd_spi_release();
+    return ok;
+}
+
+static int32_t api_file_read(const void* self, uint8_t* buf, uint32_t len) {
+    DrvSlot* s = slot_by_desc(self);
+    if (!s || !s->file || !buf) return -1;
+    if (s->file_sd) sd_spi_take();
+    size_t n = fread(buf, 1, len, s->file);
+    bool err = n < len && ferror(s->file);
+    if (s->file_sd) sd_spi_release();
+    return err ? -1 : (int32_t)n;
+}
+
+static void api_file_close(const void* self) {
+    DrvSlot* s = slot_by_desc(self);
+    if (s) slot_file_close(s);
+}
+
+// SD only: see the ABI header.
+static bool api_file_create(const void* self, const char* path) {
+    DrvSlot* s = slot_by_desc(self);
+    if (!s || !path || strncmp(path, "S:/", 3) != 0) return false;
+    slot_file_close(s);
+    char p[192];
+    snprintf(p, sizeof(p), "/sd/%s", path + 3);
+    sd_spi_take();
+    FILE* f = fopen(p, "wb");
+    int err = errno;
+    if (f) setvbuf(f, NULL, _IOFBF, 4096);
+    sd_spi_release();
+    if (!f) {
+        ulog("drv file create %s: %s", path, strerror(err));
+        return false;
+    }
+    s->file      = f;
+    s->file_sd   = true;
+    s->file_size = 0;
+    return true;
+}
+
+static int32_t api_file_write(const void* self, const uint8_t* buf, uint32_t len) {
+    DrvSlot* s = slot_by_desc(self);
+    if (!s || !s->file || !buf) return -1;
+    if (s->file_sd) sd_spi_take();
+    size_t n = fwrite(buf, 1, len, s->file);
+    int err = errno;
+    if (s->file_sd) sd_spi_release();
+    if (n != len) {
+        ulog("drv file write at %u: %s", (unsigned)s->file_size, strerror(err));
+        return -1;
+    }
+    s->file_size += (uint32_t)n;
+    return (int32_t)n;
+}
+
 static const UsbHostApi s_api = {
     USB_DRIVER_ABI_VERSION,
     &usbcore_log,
@@ -862,6 +1044,14 @@ static const UsbHostApi s_api = {
     &sock_link_register,
     &sock_link_unregister,
     &sock_link_rx,
+    &api_command,
+    &api_file_open,
+    &api_file_size,
+    &api_file_seek,
+    &api_file_read,
+    &api_file_close,
+    &api_file_create,
+    &api_file_write,
 };
 
 const UsbHostApi* usbcore_api(void) { return &s_api; }
@@ -1008,12 +1198,18 @@ static void usb_task(void*) {
         usb_host_uninstall(); s_client = NULL; s_running = false; vTaskDelete(NULL); return;
     }
 
-    ulog("Host running — plug in a powered dongle.");
+    // Board port power (power_dev.h): true when the board itself supplies
+    // 5 V to an attached device.
+    if (power_dev_usb_host_begin())
+        ulog("Host running — plug in a device (this port supplies 5 V).");
+    else
+        ulog("Host running — plug in a powered dongle.");
 
     while (!s_stop_req) {
         uint32_t flags = 0;
         usb_host_lib_handle_events(0, &flags);
         usb_host_client_handle_events(s_client, pdMS_TO_TICKS(50));
+        power_dev_usb_host_tick();
 
         // Flash-write guard: park every running driver's deadline-bearing
         // transfers, drain them to zero in flight, then idle until released.
@@ -1105,6 +1301,7 @@ static void usb_task(void*) {
     }
     esp_err_t uerr = usb_host_uninstall();
     restore_serial_jtag_phy();
+    power_dev_usb_host_end();
     memset(&s_info, 0, sizeof(s_info));
     ulog("Host stopped (%s). USB serial restored", uerr == ESP_OK ? "clean" : esp_err_to_name(uerr));
     ulog("(replug the PC cable if it doesn't show).");
@@ -1149,6 +1346,7 @@ bool usb_manager_start() {
     ulog("Switching USB port to HOST mode.");
     ulog("(USB serial is OFF until Stop or reboot)");
 
+    drv_cmd_clear_all();
     s_stop_req = false; s_new_addr = 0; s_dev_gone = false;
     s_client = NULL; s_running = true;
     for (int i = 0; i < s_ndrv; i++) { s_drv[i].probed = false; s_drv[i].running = false; }
@@ -1337,5 +1535,18 @@ void usb_manager_register_lua(lua_State* L) {
         lua_pushlstring(L, (const char*)buf, len);
         lua_pushinteger(L, (lua_Integer)seq);
         return 2;
+    });
+
+    // _usb_drv_write(name, blob) -> bool. Hands a blob (at most 256 bytes) to
+    // the named dynamic driver, which reads it through api->command. The
+    // latest blob is kept per name whether or not that driver is loaded; an
+    // empty blob clears it. False: host mode is off, the blob or the name is
+    // too long, or four names already hold a blob.
+    lua_register(L, "_usb_drv_write", [](lua_State* L) -> int {
+        const char* name = luaL_checkstring(L, 1);
+        size_t len = 0;
+        const char* blob = luaL_checklstring(L, 2, &len);
+        lua_pushboolean(L, s_running && drv_cmd_write(name, (const uint8_t*)blob, len));
+        return 1;
     });
 }

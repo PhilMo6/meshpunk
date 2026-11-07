@@ -112,8 +112,11 @@ open_picker = function(role, row_lbl)
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
     overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
+    -- Content-sized up to the screen, then the box scrolls: gridnav scrolls
+    -- the focused row into view, touch drags the list.
     local box = overlay:Object {
-        w = W - 40, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        w = W - 40, h = lvgl.SIZE_CONTENT, max_height = H - 16,
+        align = lvgl.ALIGN.CENTER,
         bg_color = "#333333", radius = 6,
         border_width = 1, border_color = "#555555", pad_all = 8, pad_row = 3,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },

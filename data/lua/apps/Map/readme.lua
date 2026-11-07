@@ -1,6 +1,7 @@
 -- Title comes from the app's own name in the registry, so this returns body
--- only. caps decides whether the key list is worth printing.
-local caps = ...
+-- only. caps decides whether the key list is worth printing; dev.usb_power
+-- whether a USB keyboard needs the external-power note.
+local caps, dev = ...
 
 local body = [[
 The Map app shows OpenStreetMap tiles with mesh contact positions overlaid. Tiles download over WiFi and are cached on the SD card for offline use.
@@ -37,9 +38,12 @@ Roll the trackball to pan, and press Enter to select the contact at the center.]
 else
     body = body .. [[
 
-With a USB keyboard attached through Tools > USB Host, these keys work too:]] .. keys .. [[
+With a USB keyboard attached through Tools > USB Host, these keys work too:]] .. keys
+    if not dev.usb_power then
+        body = body .. [[
 
 USB accessories need external power - see the USB accessories page.]]
+    end
 end
 
 return { body = body }

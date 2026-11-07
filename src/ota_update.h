@@ -14,3 +14,10 @@ void ota_init_report(void);
 
 // Registers the _ota_* Lua bindings (Settings/Firmware).
 void ota_register_lua(lua_State* L);
+
+// Release channel: "stable" or "dev", selecting which GitHub repo _ota_check
+// polls and _ota_begin downloads from. Persisted by main.cpp in
+// /firmware_prefs as `ota_channel=`; set sanitizes, and any id that is not a
+// known channel becomes "stable".
+const char* ota_channel_requested(void);
+void        ota_channel_set_requested(const char* id);

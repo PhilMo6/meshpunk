@@ -3,9 +3,8 @@
   GitHub repo, straight onto the device over WiFi.
 
   How it works:
-    * lib/downloader is the engine (shared with the theme downloads in
-      Settings/Theme): catalog parse, staging discipline, atomic installs,
-      .version bookkeeping. This app is the UI + the apps-specific bits:
+    * lib/downloader is the engine: catalog parse, staging discipline, atomic
+      installs, .version bookkeeping. This app is the UI + the apps-specific bits:
       the catalog fetch and its on-card cache (see Startup below), install
       targets under the apps bases (category = subfolder), the
       launcher-registry scan, and apps.refresh() after installs/removes so
@@ -18,8 +17,13 @@
       about protocols installs silently — installing a protocol OFFERS its
       apps, and installing an app whose protocol is missing ASKS to download
       the protocol first. Activation stays in Settings > Lora.
+    * Themes (the catalog's themes list) have a pinned "Themes" category the
+      same way: install/update/remove here, Apply here or in Settings > Theme
+      (the picker; it has no downloads of its own). A store theme is a theme
+      dir carrying a .version marker; the built-in default and hand-copied
+      themes have none and are never touched.
 
-  Catalog rows show a [Lua]/[ELF]/[Protocol] type badge; the Info view
+  Catalog rows show a [Lua]/[ELF]/[Protocol]/[Theme] type badge; the Info view
   explains the difference (labeling, not gating, per the store's trust model).
 
   UI structure mirrors Tools/Files: one root, swap_view for pages, modal() over
@@ -76,6 +80,14 @@ local PROTO_BASES   = { internal = "L:/meshpunk/lora_protos", sd = "S:/meshpunk/
 local BLEPROTO_BASE = "L:/meshpunk/ble_protos"
 local PROTO_CAT     = "LoRa Protocols"   -- the pinned browse category
 
+-- ── Themes ───────────────────────────────────────────────────────────────────
+-- Folder themes live under these two bases (lib/theme discovers both on every
+-- list(); folder name = catalog id). Installs go to the user's pick, the card
+-- recommended like apps. Truth for "installed" = a .version marker in the
+-- theme dir (store.themes, scanned at startup and after installs/removes).
+local THEME_BASES = { internal = "L:/lua/themes", sd = "S:/meshpunk/themes" }
+local THEME_CAT   = "Themes"   -- the pinned browse category
+
 -- Where a protocol package lives: its dir and loc ("internal"|"sd"), internal
 -- first (the loader's order), or nil when not installed.
 local function proto_where(id)
@@ -131,6 +143,7 @@ end
 local store = {
     catalog   = nil,     -- parsed catalog.toml ({ meta=, apps={...}, protocols={...} })
     installed = {},      -- clean name -> {version, location, category, dir, display}
+    themes    = {},      -- theme id -> {id, version, loc, dir} for store themes
     offline   = false,   -- true when showing the cached catalog
 }
 
@@ -142,7 +155,7 @@ theme.show_background()
 local vw = nil
 local cur_cat = nil        -- category page being viewed (nil = category root)
 local cur_updates = false  -- true when the Updates page is showing
-local show_browse, show_category, show_protocols, show_updates, refresh_view, start  -- forward decls
+local show_browse, show_category, show_protocols, show_themes, show_updates, refresh_view, start  -- forward decls
 
 local function toast(msg)
     pcall(utils.createNotification, root, tostring(msg), 2500)
@@ -294,6 +307,62 @@ local function scan_step()
     end
 end
 
+-- ── Installed themes ─────────────────────────────────────────────────────────
+-- Store themes are the theme dirs carrying a .version marker; the built-in
+-- default and hand-copied themes have none and never appear here. One record
+-- per id, internal first when both drives hold a marker.
+
+local function note_theme(found, loc, name)
+    if found[name] then return end
+    local dir = THEME_BASES[loc] .. "/" .. name
+    local v = dl.read_version(dir)
+    if v then found[name] = { id = name, dir = dir, loc = loc, version = v.version } end
+end
+
+local function theme_dirs()
+    local out = {}
+    for _, loc in ipairs({ "internal", "sd" }) do
+        for _, en in ipairs(fileman.list(THEME_BASES[loc], { sizes = false }) or {}) do
+            if en.type == "dir" then out[#out + 1] = { loc = loc, name = en.name } end
+        end
+    end
+    return out
+end
+
+-- Synchronous scan, used by the theme install/remove completion paths.
+local function scan_themes()
+    local found = {}
+    for _, q in ipairs(theme_dirs()) do note_theme(found, q.loc, q.name) end
+    store.themes = found
+end
+
+-- The same scan as a run_steps step, paced like scan_step: the two directory
+-- listings take one tick, then one card read (or SCAN_BATCH internal reads)
+-- per tick. store.themes is replaced only once the walk completes.
+local function theme_scan_step()
+    local queue, i, found = nil, 0, {}
+    return function()
+        if not queue then
+            queue = theme_dirs()
+            return false
+        end
+        local reads = 0
+        while true do
+            i = i + 1
+            local q = queue[i]
+            if not q then
+                store.themes = found
+                return true
+            end
+            note_theme(found, q.loc, q.name)
+            reads = reads + 1
+            if reads >= SCAN_BATCH or q.loc == "sd" then
+                return false
+            end
+        end
+    end
+end
+
 -- Catalog entries whose installed version differs from the catalog version.
 -- The Updates list on the root page; empty = nothing to show. Firmware-gated
 -- updates are excluded — nothing actionable to offer; their category rows
@@ -345,6 +414,15 @@ local function proto_inst(pe)
     return { dir = dir, loc = loc, version = (v and v.version) or "?" }
 end
 
+local function catalog_themes()
+    return (store.catalog and store.catalog.themes) or {}
+end
+
+-- Installed record of a catalog theme (see store.themes), or nil.
+local function theme_inst(te)
+    return store.themes[te.id]
+end
+
 -- ── Install targets ──────────────────────────────────────────────────────────
 
 local function type_badge(entry)
@@ -386,6 +464,10 @@ local function show_info()
                 .. "storage, load at boot, and are chosen in\n"
                 .. "Settings > Lora. Installing one offers its\n"
                 .. "apps; nothing about them installs silently.\n\n"
+                .. "[Theme] packages recolor the whole UI and may\n"
+                .. "bring a wallpaper and font. Apply one here or\n"
+                .. "switch between installed themes in\n"
+                .. "Settings > Theme.\n\n"
                 .. "Everything in the store comes from a curated\n"
                 .. "GitHub repo, reviewed before listing.",
             w = lvgl.PCT(100),
@@ -396,10 +478,23 @@ local function show_info()
     end)
 end
 
+-- Below this many free bytes a drive cannot hold the two folders every
+-- install creates (staging dir, then the final dir): the mkdir fails before
+-- any download starts. Same value as lib/downloader's LOW_SPACE gate, kept
+-- here too because this app is store-updated onto firmware whose downloader
+-- may predate that field.
+local LOW_SPACE = 16 * 1024
+
+local function low_space_msg(loc)
+    return "Low space on " .. (loc == "sd" and "the SD card" or "internal storage")
+        .. ". Free up space and try again."
+end
+
 -- Pick SD/Internal, showing free space; cb(loc) on choice. Apps recommend
 -- the card; opts.recommend = "internal" flips that (protocols: an internal
 -- package loads even when the card is missing at boot) and opts.note adds
--- the reason line under the title.
+-- the reason line under the title. A drive under LOW_SPACE is marked
+-- "low space" and refused.
 local function pick_location(cb, opts)
     opts = opts or {}
     local drives = {}
@@ -411,11 +506,13 @@ local function pick_location(cb, opts)
         end
 
         local function option(label, loc, d)
-            local sub
+            local sub, low
             if not d.mounted then
                 sub = "not mounted"
             elseif d.total then
-                sub = fileman.size_str((d.total or 0) - (d.used or 0)) .. " free"
+                local free = (d.total or 0) - (d.used or 0)
+                low = free < LOW_SPACE
+                sub = fileman.size_str(free) .. " free" .. (low and " - low space" or "")
             else
                 sub = "mounted"
             end
@@ -425,6 +522,10 @@ local function pick_location(cb, opts)
             b:onevent(lvgl.EVENT.RELEASED, function()
                 if not d.mounted then
                     toast("SD card not mounted")
+                    return
+                end
+                if low then
+                    toast(low_space_msg(loc))
                     return
                 end
                 close()
@@ -646,6 +747,20 @@ local function pending_proto_updates()
             out[#out + 1] = { entry = pe, inst = pinst }
         end
     end
+    return out
+end
+
+-- Installed store themes whose catalog version is ahead: Updates rows that
+-- apply in place where the theme lives.
+local function pending_theme_updates()
+    local out = {}
+    for _, te in ipairs(catalog_themes()) do
+        local tinst = (not fw_required(te)) and theme_inst(te) or nil
+        if tinst and version_newer(te.version, tinst.version) then
+            out[#out + 1] = { entry = te, inst = tinst }
+        end
+    end
+    table.sort(out, function(a, b) return a.entry.name < b.entry.name end)
     return out
 end
 
@@ -1098,6 +1213,188 @@ local function bleproto_issue_row(content, bi)
     end)
 end
 
+-- ── Themes: install, remove, menu, rows ──────────────────────────────────────
+
+-- Install (fresh, at `loc`) or update (in place, wherever it lives) one
+-- theme, with its own progress modal. done(err): nil on success, "cancelled"
+-- on cancel. A hand-copied theme folder under the catalog id is never
+-- overwritten.
+local function run_theme_install(te, loc, done)
+    local inst = theme_inst(te)
+    local dir = inst and inst.dir or (THEME_BASES[loc] .. "/" .. te.id)
+    if not inst and fileman.exists(dir) then
+        done("A theme folder named " .. te.id .. " already exists there")
+        return
+    end
+    dl.run_install(root, {
+        entry = te, kind = "themes", loc = inst and inst.loc or loc,
+        final_dir = dir, old_dir = inst and inst.dir or nil,
+        on_done = function(err)
+            if not err then scan_themes() end
+            done(err)
+        end,
+    })
+end
+
+-- Remove one store theme (its dir only; the themes base is its parent, so no
+-- parent_base). Removing the active theme would leave lib/theme's cached
+-- record pointing at a deleted dir — default is applied first. The default
+-- theme itself is the fallback anchor (theme.apply falls back to it on any
+-- failure): updatable, never removable — theme_menu never offers this for it.
+local function do_remove_theme(name, inst)
+    confirm('Remove the "' .. name .. '" theme?', nil, function()
+        if theme.current() == inst.id then theme.apply("default") end
+        dl.run_remove(root, name, inst.dir, {
+            on_done = function(err)
+                scan_themes()
+                refresh_view()
+                if err then toast(err) else toast("Removed " .. name) end
+            end,
+        })
+    end)
+end
+
+-- Detail menu for a theme: `te` = catalog entry (nil for a store install
+-- that fell out of the catalog), `inst` = installed record (nil when not
+-- installed). Install asks where (the card recommended, like apps); Apply
+-- recolors the chrome live and persists the choice.
+local function theme_menu(te, inst)
+    local id = te and te.id or inst.id
+    local name = te and te.name or inst.id
+    modal({}, function(box, close)
+        box:Label { text = name, w = lvgl.PCT(100), h = 18 }
+        if te then
+            box:Label {
+                text = "[Theme]  v" .. tostring(te.version)
+                    .. (te.author and ("  by " .. te.author) or ""),
+                w = lvgl.PCT(100), h = 16,
+            }
+            if te.description then
+                box:Label { text = te.description, w = lvgl.PCT(100) }
+            end
+        else
+            box:Label {
+                text = "v" .. tostring(inst.version) .. "  (no longer in catalog)",
+                w = lvgl.PCT(100), h = 16,
+            }
+        end
+        if inst then
+            box:Label {
+                text = "Installed: v" .. tostring(inst.version) .. " on "
+                    .. ((inst.loc == "sd") and "SD" or "Internal")
+                    .. ((theme.current() == id) and "  (active)" or ""),
+                w = lvgl.PCT(100), h = 16,
+            }
+        end
+
+        local function item(text, fn)
+            local b = box:Button { w = lvgl.PCT(100), h = 26 }
+            b:Label { text = text, align = lvgl.ALIGN.CENTER }
+            b:onevent(lvgl.EVENT.RELEASED, function()
+                close()
+                fn()
+            end)
+        end
+
+        -- Rebuild first, toast last (see install_done).
+        local function finish(verb)
+            return function(err)
+                refresh_view()
+                if err then
+                    toast(err == "cancelled" and "Cancelled" or err)
+                else
+                    toast(verb .. " " .. name)
+                end
+            end
+        end
+
+        local need = te and fw_required(te)
+        local actionable = te and (not inst or version_newer(te.version, inst.version))
+        if actionable and need then
+            box:Label {
+                text = "Needs a firmware update first\n(needs API " .. need
+                    .. ", device has " .. FW_API .. ")",
+                text_color = "#ff5555", w = lvgl.PCT(100),
+            }
+        elseif te and not inst then
+            item("Install", function()
+                pick_location(function(loc)
+                    run_theme_install(te, loc, finish("Installed"))
+                end)
+            end)
+        elseif te and inst and version_newer(te.version, inst.version) then
+            item("Update to v" .. tostring(te.version), function()
+                run_theme_install(te, nil, finish("Updated"))
+            end)
+        end
+        if inst then
+            item("Apply", function()
+                theme.apply(id)
+                refresh_view()
+                toast("Applied " .. name)
+            end)
+            if id ~= "default" then
+                item("Remove", function() do_remove_theme(name, inst) end)
+            end
+        end
+
+        local cancel_btn = box:Button { w = lvgl.PCT(100), h = 26 }
+        cancel_btn:Label { text = "Close", align = lvgl.ALIGN.CENTER }
+        cancel_btn:onevent(lvgl.EVENT.RELEASED, close)
+    end)
+end
+
+-- One row on the Themes page (same shape as an app row).
+local function theme_row(content, te)
+    local inst = theme_inst(te)
+    local state
+    if inst and not version_newer(te.version, inst.version) then
+        state = "Installed"
+    elseif fw_required(te) then
+        state = "Needs FW"
+    elseif inst then
+        state = "Update"
+    else
+        state = "Install"
+    end
+    if inst and theme.current() == te.id then state = state .. " (active)" end
+
+    local row = content:Button { w = lvgl.PCT(100), h = 52 }
+    row:Label {
+        text = te.name .. "  v" .. tostring(te.version) .. "  [Theme]",
+        align = lvgl.ALIGN.TOP_LEFT,
+    }
+    local desc = te.description or ""
+    if #desc > 30 then desc = desc:sub(1, 29) .. "~" end
+    row:Label { text = desc, align = lvgl.ALIGN.BOTTOM_LEFT }
+    row:Label { text = state, align = lvgl.ALIGN.RIGHT_MID }
+    nav.tap(row, function() theme_menu(te, inst) end)
+end
+
+-- One Updates-page row for a theme; tapping applies the update in place (its
+-- detail menu offers the same thing).
+local function theme_update_row(content, tu)
+    local te = tu.entry
+    local row = content:Button { w = lvgl.PCT(100), h = 52 }
+    row:Label {
+        text = te.name .. "  v" .. tostring(tu.inst.version)
+            .. " > v" .. tostring(te.version) .. "  [Theme]",
+        align = lvgl.ALIGN.TOP_LEFT,
+    }
+    row:Label { text = "UI theme", align = lvgl.ALIGN.BOTTOM_LEFT }
+    row:Label { text = "Update", align = lvgl.ALIGN.RIGHT_MID }
+    nav.tap(row, function()
+        run_theme_install(te, nil, function(err)
+            if err then
+                if err ~= "cancelled" then toast("Theme: " .. tostring(err)) end
+                return
+            end
+            refresh_view()
+            toast("Updated theme " .. te.name)
+        end)
+    end)
+end
+
 local function do_remove(name, dir)
     -- Emptied category folders are cleaned up, but never the apps base itself.
     local p = apps.paths()
@@ -1351,10 +1648,62 @@ show_protocols = function()
     end)
 end
 
+-- The pinned Themes page: every catalog theme rendered like an app row, then
+-- store-installed themes that fell out of the catalog (still removable).
+show_themes = function()
+    cur_cat, cur_updates = THEME_CAT, false
+    swap_view(function(v)
+        local content = v:Object {
+            w = W, h = H, x = 0, y = 0,
+            bg_opa = 0, border_width = 0, pad_all = 4,
+            flex = { flex_direction = "row", flex_wrap = "wrap" },
+        }
+        nav.replace(content, { flags = nav.ROLLOVER + nav.SCROLL_FIRST })
+
+        content:Label { text = THEME_CAT, w = lvgl.PCT(100), h = 18 }
+
+        local back_btn = content:Button { w = lvgl.PCT(100), h = 24 }
+        back_btn:Label { text = "Back", align = lvgl.ALIGN.CENTER }
+        back_btn:onClicked(function() show_browse() end)
+
+        local list, in_catalog = {}, {}
+        for _, te in ipairs(catalog_themes()) do
+            list[#list + 1] = te
+            in_catalog[te.id] = true
+        end
+        table.sort(list, function(a, b) return a.name < b.name end)
+        for _, te in ipairs(list) do
+            theme_row(content, te)
+        end
+        if #list == 0 then
+            content:Label { text = "No themes in this catalog", w = lvgl.PCT(100), h = 24 }
+        end
+
+        local orphans = {}
+        for id, inst in pairs(store.themes) do
+            if not in_catalog[id] then orphans[#orphans + 1] = inst end
+        end
+        table.sort(orphans, function(a, b) return a.id < b.id end)
+        if #orphans > 0 then
+            content:Label { text = "Installed (not in catalog):", w = lvgl.PCT(100), h = 16 }
+            for _, inst in ipairs(orphans) do
+                local o = inst
+                local row = content:Button { w = lvgl.PCT(100), h = 28 }
+                row:Label { text = o.id .. "  v" .. tostring(o.version), align = lvgl.ALIGN.LEFT_MID }
+                nav.tap(row, function() theme_menu(nil, o) end)
+            end
+        end
+    end)
+end
+
 -- One category's app list (launcher-style sub-page with a Back button).
 show_category = function(cat)
     if cat == PROTO_CAT then
         show_protocols()
+        return
+    end
+    if cat == THEME_CAT then
+        show_themes()
         return
     end
     cur_cat, cur_updates = cat, false
@@ -1393,8 +1742,9 @@ show_updates = function()
     local sups = pending_proto_updates()
     local bups = pending_bleproto_issues()
     local dups = pending_driver_updates()
-    if #ups == 0 and #sups == 0 and #bups == 0 and #dups == 0 then   -- last update just applied
-        show_browse()
+    local tups = pending_theme_updates()
+    if #ups == 0 and #sups == 0 and #bups == 0 and #dups == 0 and #tups == 0 then
+        show_browse()   -- last update just applied
         return
     end
 
@@ -1424,18 +1774,21 @@ show_updates = function()
         for _, du in ipairs(dups) do
             driver_update_row(content, du)
         end
+        for _, tu in ipairs(tups) do
+            theme_update_row(content, tu)
+        end
     end)
 end
 
 -- Category root: an "Updates (N)" button when updates are pending, the pinned
--- LoRa Protocols button (whenever the catalog carries protocols), then one
--- button per app category.
+-- LoRa Protocols and Themes buttons (whenever the catalog carries those),
+-- then one button per app category.
 show_browse = function()
     cur_cat, cur_updates = nil, false
     local _, order = group_catalog()
     local ups = pending_updates()
     local n_ups = #ups + #pending_proto_updates() + #pending_bleproto_issues()
-                  + #pending_driver_updates()
+                  + #pending_driver_updates() + #pending_theme_updates()
 
     swap_view(function(v)
         local content = v:Object {
@@ -1469,6 +1822,12 @@ show_browse = function()
             local b = content:Button { w = lvgl.PCT(100), h = 32 }
             b:Label { text = PROTO_CAT, align = lvgl.ALIGN.LEFT_MID }
             nav.tap(b, function() show_protocols() end)
+        end
+
+        if #catalog_themes() > 0 then
+            local b = content:Button { w = lvgl.PCT(100), h = 32 }
+            b:Label { text = THEME_CAT, align = lvgl.ALIGN.LEFT_MID }
+            nav.tap(b, function() show_themes() end)
         end
 
         for _, cat in ipairs(order) do
@@ -1618,6 +1977,7 @@ local function load_and_show(online)
     end
 
     steps[#steps + 1] = scan_step()
+    steps[#steps + 1] = theme_scan_step()
 
     steps[#steps + 1] = function()
         show_browse()

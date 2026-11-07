@@ -34,28 +34,36 @@ def git_version(project_dir):
 # All release artifacts land here.
 RELEASES_DIR_NAME = "releases"
 
-# Per-board release naming. The slug matches MESHPUNK_BOARD_NAME in
+# Per-board release naming: every artifact, the Launcher image included, is
+# meshpunk-<slug>-<version>-<kind>.bin. The slug matches MESHPUNK_BOARD_NAME in
 # src/boards/board_pins.h, which is also what the on-device guide tells the
-# user to look for. The LAUNCHER artifact is the one exception: its filename
-# pattern predates the slugs and the LauncherHub catalog entry downloads it
-# by explicit URL, so its name must not change shape (T-Deck only - the
-# Launcher firmware does not exist for the Heltec).
+# user to look for. The stable repo's (PhilMo6/meshpunk) LauncherHub entry
+# builds its download URL from the git tag as meshpunk-<tag>-launcher.bin, with
+# no slug, so a stable release carrying only this name 404s in that entry.
 BOARD_SLUG = {
     "meshpunk":               "tdeck",
     "meshpunk_release":       "tdeck",
     "meshpunk_heltec":        "heltec_v4",
     "meshpunk_heltec_release": "heltec_v4",
+    "meshpunk_wio_l2":        "wio_l2",
+    "meshpunk_wio_l2_release": "wio_l2",
 }
-RELEASE_ENVS  = {"meshpunk_release", "meshpunk_heltec_release"}
-LAUNCHER_ENVS = {"meshpunk_release"}   # bmorcelli Launcher exists for T-Deck only
+RELEASE_ENVS  = {"meshpunk_release", "meshpunk_heltec_release",
+                 "meshpunk_wio_l2_release"}
+LAUNCHER_ENVS = {"meshpunk_release",   # bmorcelli Launcher exists for these boards
+                 "meshpunk_wio_l2_release"}
 
 # The updater firmware of each board (src/updater/main_updater.cpp), built by
-# its own env and included in merged.bin at OFFSETS["updater"].
+# its own env and included in merged.bin at OFFSETS["updater"]. A board with
+# no entry has no updater yet: merge_bin produces no artifacts for it (another
+# board's updater must never land in its image).
 UPDATER_ENV = {
     "meshpunk":                "meshpunk_updater",
     "meshpunk_release":        "meshpunk_updater",
     "meshpunk_heltec":         "meshpunk_heltec_updater",
     "meshpunk_heltec_release": "meshpunk_heltec_updater",
+    "meshpunk_wio_l2":         "meshpunk_wio_l2_updater",
+    "meshpunk_wio_l2_release": "meshpunk_wio_l2_updater",
 }
 
 # Launcher build (bmorcelli/Launcher): a merged image of bootloader + table +
@@ -78,8 +86,9 @@ UPDATER_ENV = {
 #            then repopulates it on first boot.
 #
 # The payload is a SEPARATE littlefs image of data/ sized LAUNCHER_FS_SIZE, not
-# the build's assets image: the Launcher's T-Deck table keeps 0x1A0000 of the
-# 16 MB flash for itself (nvs, otadata, its 1.5 MB app, coredump), so an
+# the build's assets image: the Launcher's 16 MB table (support_files/
+# custom_16Mb.csv, used by its T-Deck and Wio Tracker L2 builds) keeps 0x1A0000
+# of the flash for itself (nvs, otadata, its 1.5 MB app, coredump), so an
 # install has 0xE60000 bytes for our declared 0x580000 app plus this image.
 # 0x600000 fits (0xB80000 total); the CSV's 0x9F0000 assets image does not
 # (0xF70000), and the Launcher then refuses the install for lack of space.
@@ -128,7 +137,11 @@ def merge_bin(source, target, env):
                                "meshpunk-%s-%s-merged.bin" % (slug, version))
 
     framework_dir = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
-    updater_env   = UPDATER_ENV.get(pioenv, "meshpunk_updater")
+    updater_env   = UPDATER_ENV.get(pioenv)
+    if updater_env is None:
+        print("merge_bin: %s has no updater env yet - no merged/release"
+              " artifacts (flash with 'pio run -e %s -t upload')" % (pioenv, pioenv))
+        return
 
     bins = {
         "bootloader": os.path.join(build_dir, "bootloader.bin"),
@@ -141,9 +154,10 @@ def merge_bin(source, target, env):
 
     # The littlefs image is identical across envs (same data/ + partition csv),
     # so if this env hasn't run buildfs, reuse the same board's dev-env image
-    # instead of requiring a second buildfs run.
+    # (the release env's name without "_release") instead of requiring a
+    # second buildfs run.
     if not os.path.isfile(bins["littlefs"]):
-        dev_env = "meshpunk_heltec" if "heltec" in pioenv else "meshpunk"
+        dev_env = pioenv[:-len("_release")] if pioenv.endswith("_release") else pioenv
         alt = os.path.join(os.path.dirname(build_dir), dev_env, "littlefs.bin")
         if os.path.isfile(alt):
             print("merge_bin: using littlefs.bin from %s env" % dev_env)
@@ -201,8 +215,7 @@ def merge_bin(source, target, env):
     # empty filesystem.
     if pioenv not in RELEASE_ENVS:
         print("merge_bin: dev env - skipping firmware/launcher artifacts"
-              " (use 'pio run -e meshpunk_release' or"
-              " 'pio run -e meshpunk_heltec_release' for release builds)")
+              " (use 'pio run -e %s_release' for release builds)" % pioenv)
         print("merge_bin: done")
         return
 
@@ -216,9 +229,8 @@ def merge_bin(source, target, env):
     shutil.copy2(bins["firmware"], firmware_out)
     print("merge_bin: copied firmware (app) binary to %s" % firmware_out)
 
-    # Launcher image: T-Deck only, and its filename pattern is LOAD-BEARING -
-    # the LauncherHub catalog entry downloads it by explicit URL, so the name
-    # keeps its original versioned shape with no board slug.
+    # Launcher image: only for boards in LAUNCHER_ENVS. Its filename is what a
+    # LauncherHub entry downloads (see BOARD_SLUG above).
     if pioenv not in LAUNCHER_ENVS:
         print("merge_bin: no Launcher firmware for this board -"
               " skipping launcher artifact")
@@ -255,7 +267,8 @@ def merge_bin(source, target, env):
     with open(launcher_table, "wb") as f:
         f.write(build_launcher_partition_table(fs_size))
 
-    launcher_img = os.path.join(releases_dir, "meshpunk-%s-launcher.bin" % version)
+    launcher_img = os.path.join(releases_dir,
+                                "meshpunk-%s-%s-launcher.bin" % (slug, version))
     launcher_cmd = [
         sys.executable, esptool,
         "--chip", "esp32s3",

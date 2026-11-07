@@ -27,9 +27,34 @@ void display_dev_init(void);
 // replaces it.
 void display_dev_splash(void);
 
-// Active (post-rotation) panel dimensions in pixels.
+// Active (post-rotation) panel dimensions in pixels. These follow the
+// EFFECTIVE orientation below, so LVGL sizing, elf_host bounds checks and
+// _device_caps all read the same geometry.
 int display_dev_width(void);
 int display_dev_height(void);
+
+// User display orientation: quarter turns from the board's native landscape
+// (0 = landscape as shipped, 1/3 = the two portraits, 2 = landscape flipped).
+// set applies the panel rotation and clears to black — callers apply it once
+// after the prefs load and BEFORE LVGL is created; a later change persists
+// the pref and takes effect on restart. The getter returns the EFFECTIVE
+// orientation: 0 while a module video session is active, the user setting
+// otherwise.
+void    display_dev_set_orientation(uint8_t o);
+uint8_t display_dev_orientation(void);
+
+// Module video session: ELF modules are built against the landscape 320x240
+// contract (see above), so entering a session forces the panel to native
+// landscape and makes width/height/orientation report it; leaving restores
+// the user setting. Both edges clear the panel to black.
+void display_dev_module_video(bool active);
+
+// Map a point from native-landscape screen coordinates into the effective
+// orientation's coordinates. The input backends run every touch point
+// through this after their board transform (which produces landscape
+// coords); identity at effective orientation 0, so module sessions and
+// their touch overlays are untouched.
+void display_dev_orient_point(int16_t* x, int16_t* y);
 
 // LVGL flush path: write a rectangle of RGB565 pixels at (x, y). The backend
 // owns whatever bus locking / tear-sync the board needs; the caller only
@@ -50,9 +75,10 @@ void display_dev_fill_black(void);
 void display_dev_backlight_init(void);
 void display_dev_brightness(uint8_t value);
 
-// Panel sleep-in/sleep-out (ST7789/ILI9341 SLPIN 0x10 / SLPOUT 0x11) for
-// standby. Frame memory is retained through sleep-in, so waking shows the
-// screen exactly as it was. Callers pair this with display_dev_brightness().
+// Panel sleep-in/sleep-out for standby. Frame memory survives it on the
+// ST7789 boards (SLPIN 0x10 / SLPOUT 0x11) but not on every panel — the
+// Wio L2's NV3031B wakes through a software reset — so callers repaint the
+// UI after waking. Callers pair this with display_dev_brightness().
 void display_dev_sleep(bool sleep);
 
 // Full known-state backlight re-init to `value`. The T-Deck's pulse-counted

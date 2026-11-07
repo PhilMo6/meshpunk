@@ -1,0 +1,56 @@
+# Meshpunk P4 — hardware-true settings for the LilyGo T-Display P4.
+# Seeded from Xinyuan-LilyGO/T-Display-P4 sdkconfig.defaults (the board
+# vendor's values for this exact module); their app-specific entries
+# (speech recognition, LVGL Kconfig, Ethernet PHY) are deliberately absent.
+
+CONFIG_IDF_TARGET="esp32p4"
+
+# THIS UNIT IS PRE-v3.0 SILICON (ROM banner "esp32p4-eco2"). IDF's default
+# code generation targets chip revision v3.0; per Espressif's chip-revision
+# documentation, a build for a pre-3.0 chip WITHOUT this option "will build
+# an incompatible binary" — observed here as an illegal-instruction panic at
+# the bootloader entry. Keep this line as long as any target unit is
+# pre-3.0; it remains compatible with v3.x chips.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_meshpunk_p4.csv"
+
+# 32MB PSRAM, hex (16-line) bus at 200MHz — the vendor configuration.
+# 200MHz PSRAM sits behind the experimental-features gate in this IDF.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# Execute-in-place from PSRAM. On pre-rev3.0 silicon (this unit: ROM banner
+# "esp32p4-eco2") IDF-5.5-era images WITHOUT this flag die at the bootloader
+# entry with an illegal-instruction panic — esphome/esphome#15336 confirms
+# this line as the fix for that exact crash, and wadamesh's working
+# T-Display P4 build sets it too. It also stops whole-screen flicker during
+# flash writes once the display is up (cache is not disabled for code).
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# DSI ISR stays serviceable during flash-cache-disabled windows (the
+# wadamesh T-Display P4 build ships this; keeps the DPI stream from
+# underflowing during flash writes).
+CONFIG_LCD_DSI_ISR_IRAM_SAFE=y
+
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+
+CONFIG_FREERTOS_HZ=1000
+
+# Console: DEFAULT (UART0 primary + USB-Serial-JTAG as the non-blocking
+# secondary). Output reaches the P4.U USB port through the secondary
+# console — this is the configuration both working builds for this board
+# (LilyGo factory, wadamesh) ship. Forcing USB-Serial-JTAG as the PRIMARY
+# console was tried and the boot went silent before the bootloader's first
+# log line on this v1.0 chip; do not reintroduce it without a hw round.
+
+# esp-hosted (rung 8): rung8_wifi.c registers the C6 reset callback (the C6
+# EN line is expander IO14) and then calls esp_hosted_init() itself, so
+# the constructor that would call it before app_main is left out
+# (MESHPUNK option, libraries/esp_hosted/Kconfig).
+CONFIG_ESP_HOSTED_AUTO_INIT=n

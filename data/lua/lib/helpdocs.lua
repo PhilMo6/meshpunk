@@ -70,16 +70,18 @@ local function caps_snapshot()
     }
 end
 
--- Board identity and audio kind, so a page can name this device's release
--- build or say where sound comes out. Fresh table per page, same as caps.
+-- Board identity, audio kind and USB port power, so a page can name this
+-- device's release build, say where sound comes out, and say whether a USB
+-- accessory needs its own power. Fresh table per page, same as caps.
 local function dev_snapshot()
     local ok, d = pcall(_device_caps)
     if not ok or type(d) ~= "table" then d = {} end
     return {
-        name     = d.name  or "",        -- board slug, e.g. "heltec_v4"
-        audio    = d.audio or "none",    -- "i2s" | "buzzer" | "none"
-        screen_w = d.screen_w or 0,
-        screen_h = d.screen_h or 0,
+        name      = d.name  or "",        -- board slug, e.g. "heltec_v4"
+        audio     = d.audio or "none",    -- "i2s" | "buzzer" | "none"
+        screen_w  = d.screen_w or 0,
+        screen_h  = d.screen_h or 0,
+        usb_power = d.usb_power or false, -- host mode powers the accessory (FW_API 15)
     }
 end
 

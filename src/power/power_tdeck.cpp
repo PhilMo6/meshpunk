@@ -101,4 +101,10 @@ void power_dev_standby_exit(void) {
   digitalWrite(BOARD_POWERON, HIGH);
 }
 
+// USB host port power: no port power control on this board.
+bool power_dev_usb_host_begin(void) { return false; }
+void power_dev_usb_host_tick(void) {}
+void power_dev_usb_host_end(void) {}
+bool power_dev_usb_port_power(void) { return false; }
+
 #endif // BOARD_TDECK

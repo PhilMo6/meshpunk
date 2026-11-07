@@ -15,6 +15,7 @@
 #include "TouchDrvGT911.hpp"
 
 #include "input_dev.h"
+#include "../display/display_dev.h"  // display_dev_orient_point
 #include "../utilities.h"      // BOARD_* pin defines (LilyGo T-Deck)
 #include "../tdeck-pins.h"     // TDECK_* pin defines
 #include "../meshpunk_sync.h"  // SLog
@@ -408,7 +409,13 @@ int input_dev_touch_read_multi(int16_t* xs, int16_t* ys, int max) {
   if (want < 1) want = 1;
   int n = (int)touch.getPoint(x, y, (uint8_t)want);
   if (n > max) n = max;
-  for (int i = 0; i < n; i++) { xs[i] = x[i]; ys[i] = y[i]; }
+  // The driver returns landscape screen coordinates (setSwapXY/setMirrorXY
+  // above); the user-orientation mapping happens on top of that. Identity
+  // during module video sessions (display_dev.h).
+  for (int i = 0; i < n; i++) {
+    xs[i] = x[i]; ys[i] = y[i];
+    display_dev_orient_point(&xs[i], &ys[i]);
+  }
   if (n > 0) {
     s_raw_x  = x[0];
     s_raw_y  = y[0];

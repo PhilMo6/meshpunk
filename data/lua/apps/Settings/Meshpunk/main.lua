@@ -220,26 +220,42 @@ tz_input:onevent(lvgl.EVENT.KEY, function(obj, code)
     if indev:get_key() == lvgl.KEY.ENTER then apply_tz(tz_input.text) end
 end)
 
--- Quick-set shortcuts (direct children of content)
+-- Quick-set shortcuts (direct children of content). Standard-time offsets;
+-- the Daylight Saving toggle below adds the hour.
 local presets = {
-    { label = "Auto", value = "auto" },
-    { label = "UTC",  value = "0" },
-    { label = "PT",   value = "-480" },
-    { label = "MT",   value = "-420" },
-    { label = "CT",   value = "-360" },
-    { label = "ET",   value = "-300" },
-    { label = "CET",  value = "60" },
-    { label = "IN",   value = "330" },
-    { label = "JP",   value = "540" },
+    { label = "Auto",     value = "auto" },
+    { label = "UTC",      value = "0" },
+    { label = "Pacific",  value = "-480" },
+    { label = "Mountain", value = "-420" },
+    { label = "Central",  value = "-360" },
+    { label = "Eastern",  value = "-300" },
+    { label = "Berlin",   value = "60" },
+    { label = "India",    value = "330" },
+    { label = "Japan",    value = "540" },
 }
 for _, p in ipairs(presets) do
-    local b = content:Button { w = 52, h = 28 }
+    local b = content:Button { w = lvgl.PCT(30), h = 28 }
     b:Label { text = p.label, align = lvgl.ALIGN.CENTER }
     b:onClicked(function()
         tz_input.text = p.value
         apply_tz(p.value)
     end)
 end
+
+-- ── DST toggle ──
+local dst_on = pcall(_dst_get) and _dst_get()
+local dst_btn = content:Button { w = lvgl.PCT(60), h = 30 }
+local dst_label = dst_btn:Label {
+    text = dst_on and "[x] Daylight Saving" or "[ ] Daylight Saving",
+    align = lvgl.ALIGN.CENTER,
+}
+dst_btn:onClicked(function()
+    dst_on = not dst_on
+    pcall(_dst_set, dst_on)
+    dst_label.text = dst_on and "[x] Daylight Saving" or "[ ] Daylight Saving"
+    status_label.text = dst_on and "DST: +1 hour" or "DST: off"
+    tz_info_label.text = describe_tz()
+end)
 
 -- ── Section: Clock Format ──
 content:Label { text = "-- Clock Format --", w = lvgl.PCT(100), h = 16 }
@@ -268,21 +284,6 @@ btn_24:onClicked(function()
     refresh_fmt_labels()
 end)
 
--- ── DST toggle ──
-local dst_on = pcall(_dst_get) and _dst_get()
-local dst_btn = content:Button { w = lvgl.PCT(60), h = 30 }
-local dst_label = dst_btn:Label {
-    text = dst_on and "[x] Daylight Saving" or "[ ] Daylight Saving",
-    align = lvgl.ALIGN.CENTER,
-}
-dst_btn:onClicked(function()
-    dst_on = not dst_on
-    pcall(_dst_set, dst_on)
-    dst_label.text = dst_on and "[x] Daylight Saving" or "[ ] Daylight Saving"
-    status_label.text = dst_on and "DST: +1 hour" or "DST: off"
-    tz_info_label.text = describe_tz()
-end)
-
 -- ── Section: Manual Time ──
 content:Label { text = "-- Manual Time --", w = lvgl.PCT(100), h = 16 }
 
@@ -300,40 +301,33 @@ end
 
 local now = get_current_local()
 
-content:Label { text = "Y:", w = 16, h = 26 }
-local mt_y = content:Textarea {
-    one_line = true, text = tostring(now.year),
-    accepted_chars = "0123456789", w = 48, h = 26,
-}
-mt_y:clear_flag(lvgl.FLAG.SCROLLABLE)
+-- One row of fields per label; a zero-height full-width spacer forces the
+-- flex wrap after each row (the Settings > Emoji key-grid pattern).
+local function row_break()
+    local brk = content:Object { w = lvgl.PCT(100), h = 0, border_width = 0, pad_all = 0, bg_opa = 0 }
+    brk:clear_flag(lvgl.FLAG.SCROLLABLE)
+    brk:clear_flag(lvgl.FLAG.CLICKABLE)
+end
 
-content:Label { text = "M:", w = 18, h = 26 }
-local mt_m = content:Textarea {
-    one_line = true, text = string.format("%02d", now.month),
-    accepted_chars = "0123456789", w = 30, h = 26,
-}
-mt_m:clear_flag(lvgl.FLAG.SCROLLABLE)
+local function time_field(text, w)
+    local ta = content:Textarea {
+        one_line = true, text = text,
+        accepted_chars = "0123456789", w = w, h = 30,
+    }
+    ta:clear_flag(lvgl.FLAG.SCROLLABLE)
+    return ta
+end
 
-content:Label { text = "D:", w = 16, h = 26 }
-local mt_d = content:Textarea {
-    one_line = true, text = string.format("%02d", now.day),
-    accepted_chars = "0123456789", w = 30, h = 26,
-}
-mt_d:clear_flag(lvgl.FLAG.SCROLLABLE)
+content:Label { text = "Date: year / month / day", w = lvgl.PCT(100), h = 16 }
+local mt_y = time_field(tostring(now.year), 60)
+local mt_m = time_field(string.format("%02d", now.month), 44)
+local mt_d = time_field(string.format("%02d", now.day), 44)
+row_break()
 
-content:Label { text = "H:", w = 16, h = 26 }
-local mt_h = content:Textarea {
-    one_line = true, text = string.format("%02d", now.hour),
-    accepted_chars = "0123456789", w = 30, h = 26,
-}
-mt_h:clear_flag(lvgl.FLAG.SCROLLABLE)
-
-content:Label { text = "Mi:", w = 20, h = 26 }
-local mt_mi = content:Textarea {
-    one_line = true, text = string.format("%02d", now.min),
-    accepted_chars = "0123456789", w = 30, h = 26,
-}
-mt_mi:clear_flag(lvgl.FLAG.SCROLLABLE)
+content:Label { text = "Time: hour / minute (24h)", w = lvgl.PCT(100), h = 16 }
+local mt_h  = time_field(string.format("%02d", now.hour), 44)
+local mt_mi = time_field(string.format("%02d", now.min), 44)
+row_break()
 
 local mt_override_active = pcall(_rtc_manual_override_get) and _rtc_manual_override_get()
 local mt_override_label = content:Label {

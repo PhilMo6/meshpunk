@@ -1,7 +1,7 @@
 // main_updater.cpp — MeshPunk updater firmware. Lives in the `updater`
-// factory partition of meshpunk_custom_16Mb.csv (envs meshpunk_updater and
-// meshpunk_heltec_updater) and writes a staged app image into the `main`
-// (ota_0) partition, then boots it.
+// factory partition of meshpunk_custom_16Mb.csv (envs meshpunk_updater,
+// meshpunk_heltec_updater and meshpunk_wio_l2_updater) and writes a staged
+// app image into the `main` (ota_0) partition, then boots it.
 //
 // Handoff from the main firmware (src/ota_update.cpp): it stages the image on
 // the SD card or LittleFS, writes L:/.ota_job and calls
@@ -21,17 +21,19 @@
 //   main empty, or rolled back by the bootloader (ESP_OTA_IMG_ABORTED) -> halt
 //   write failure -> halt with the job kept: the next boot lands here and retries
 //
-// The panel comes up with the same TFT_eSPI configuration as the main build
-// (the env extends the board env), the SD card on the same bus and chip
-// select, and nothing else: no WiFi, no BLE, no input, no PSRAM use.
+// Each env extends its board's main env and compiles, besides this file, the
+// main build's SD backend (storage/sd_spi.cpp or storage/sd_wio_l2.cpp,
+// contract storage/sd_dev.h) and SLog (meshpunk_sync.cpp), plus the board
+// layer on the Wio L2 (boards/wio_l2_board.cpp). The panel runs the main
+// build's configuration: TFT_eSPI on the T-Deck and Heltec, the LovyanGFX
+// device of boards/wio_l2_lgfx.h on the Wio L2. Nothing else comes up: no
+// WiFi, no BLE, no input.
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <FS.h>
-#include <SD.h>
 #include <LittleFS.h>
 #include <Update.h>
-#include <TFT_eSPI.h>
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_ota_ops.h"
@@ -39,7 +41,14 @@
 #include "esp_system.h"
 #include "mbedtls/sha256.h"
 #include "boards/board_pins.h"
+#include "storage/sd_dev.h"
 #include "ota_tag.h"
+#if defined(BOARD_WIO_L2)
+#include "boards/wio_l2_board.h"
+#include "boards/wio_l2_lgfx.h"
+#else
+#include <TFT_eSPI.h>
+#endif
 
 static const char*  kJobPath     = "/.ota_job";      // on the assets LittleFS
 static const char*  kRecoveryDir = "/meshpunk/ota";  // on the SD card
@@ -50,14 +59,25 @@ static const size_t kChunk       = 16384;
 static const char kUpdaterTag[] = "MESHPUNK-UPDATER:" MESHPUNK_BOARD_NAME;
 
 static uint8_t  s_buf[kChunk];
-static TFT_eSPI tft;
 static bool     s_sd_mounted = false;
+
+// The main build's panel driver, and its rotation number for the 320 x 240
+// landscape the main firmware uses (rotation 0 on the Wio L2: the
+// offset_rotation in boards/wio_l2_lgfx.h).
+#if defined(BOARD_WIO_L2)
+static WioL2Lgfx     tft;
+static const uint8_t kLandscape = 0;
+#else
+static TFT_eSPI      tft;
+static const uint8_t kLandscape = 1;
+#endif
 
 // ── Board bring-up ───────────────────────────────────────────────────────────
 
 #if defined(BOARD_TDECK)
 
-// The SD slot shares the FSPI bus with the panel and the radio.
+// The SD slot shares the FSPI bus with the panel and the radio; the SD
+// backend (storage/sd_spi.cpp) mounts the card on the bus returned here.
 SPIClass& board_sd_spi(void) { return SPI; }
 
 static void board_init(void) {
@@ -99,7 +119,8 @@ static void board_backlight_on(void) {
 #define HELTEC_TFT_BL_PIN 44
 #define HELTEC_BL_LEDC_CH 1
 
-// The SD slot shares the panel's HSPI bus (SCK 16 / MISO 45 / MOSI 15).
+// The SD slot shares the panel's HSPI bus (SCK 16 / MISO 45 / MOSI 15); the
+// SD backend (storage/sd_spi.cpp) mounts the card on the bus returned here.
 SPIClass& board_sd_spi(void) {
   static SPIClass hspi(HSPI);
   static bool begun = false;
@@ -136,13 +157,31 @@ static void board_backlight_on(void) {
   ledcWrite(HELTEC_BL_LEDC_CH, 255);
 }
 
+#elif defined(BOARD_WIO_L2)
+
+// Every switched rail and reset line is a PCA9555 expander output. The main
+// firmware's bring-up (wio_l2_board_init, boards/wio_l2_board.h) sets the
+// direction and level of all 16 expander lines, pulses the panel's LCD_RST
+// and parks SD power off; the SD backend (storage/sd_wio_l2.cpp) switches
+// it on to mount. Power-off (power_wio_l2.cpp) holds no pad this program
+// uses: its rails are expander outputs and its GPIO0 wake routing is never
+// read here.
+static void board_init(void) {
+  wio_l2_board_init();   // logs its own FAIL line
+}
+
+// LP5814 over I2C: register setup, all four channels at full duty.
+static void board_backlight_on(void) {
+  wio_l2_backlight_init(255);
+}
+
 #endif
 
 // ── Panel text ───────────────────────────────────────────────────────────────
 
 static void ui_init(void) {
   tft.begin();
-  tft.setRotation(1);   // 320 x 240 landscape, as the main firmware
+  tft.setRotation(kLandscape);
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
@@ -187,20 +226,17 @@ static void halt(const char* l1, const char* l2, const char* l3) {
 
 // ── Files ────────────────────────────────────────────────────────────────────
 
-// Up to four rounds of 25 MHz then 4 MHz, 250 ms apart, each failure logged.
+// Up to four rounds of the SD backend's mount (sd_dev.h: its own clock
+// ladder, each attempt logged), 250 ms apart.
 static bool sd_mount(void) {
   if (s_sd_mounted) return true;
-  static const uint32_t freqs[] = {25000000U, 4000000U};
   for (int attempt = 1; attempt <= 4; attempt++) {
-    for (uint32_t f : freqs) {
-      if (SD.begin(PIN_SD_CS, board_sd_spi(), f)) {
-        s_sd_mounted = true;
-        Serial.printf("[UPD] SD mounted at %lu Hz (attempt %d)\n", (unsigned long)f, attempt);
-        return true;
-      }
-      SD.end();
-      Serial.printf("[UPD] SD mount attempt %d at %lu Hz failed\n", attempt, (unsigned long)f);
+    if (sd_dev_mount()) {
+      s_sd_mounted = true;
+      Serial.printf("[UPD] SD mounted (attempt %d)\n", attempt);
+      return true;
     }
+    Serial.printf("[UPD] SD mount attempt %d failed\n", attempt);
     delay(250);
   }
   Serial.println("[UPD] SD mount failed");
@@ -215,7 +251,7 @@ static bool is_lfs_path(const String& p) { return p.startsWith("L:/"); }
 static fs::File open_image(const String& path) {
   if (is_sd_path(path)) {
     if (!sd_mount()) return fs::File();
-    return SD.open(path.c_str() + 2, FILE_READ);
+    return sd_dev_fs().open(path.c_str() + 2, FILE_READ);
   }
   if (is_lfs_path(path)) return LittleFS.open(path.c_str() + 2, "r");
   return fs::File();
@@ -223,7 +259,7 @@ static fs::File open_image(const String& path) {
 
 static void remove_image(const String& path) {
   if (is_sd_path(path)) {
-    if (sd_mount()) SD.remove(path.c_str() + 2);
+    if (sd_mount()) sd_dev_fs().remove(path.c_str() + 2);
   } else if (is_lfs_path(path)) {
     LittleFS.remove(path.c_str() + 2);
   }
@@ -262,7 +298,7 @@ static Job read_job(void) {
 // is installed as a recovery. The first matching name wins.
 static String sd_recovery_file(void) {
   if (!sd_mount()) return String();
-  fs::File dir = SD.open(kRecoveryDir);
+  fs::File dir = sd_dev_fs().open(kRecoveryDir);
   if (!dir || !dir.isDirectory()) return String();
   String prefix = String("meshpunk-") + MESHPUNK_BOARD_NAME + "-";
   String found;
@@ -342,7 +378,7 @@ static const char* verify_image(fs::File& f, uint32_t expect_size, const String&
     if (!expect_sha.equalsIgnoreCase(hex)) return "SHA-256 differs from the job";
   }
 
-  // Board tag (ota_tag.h): both boards are ESP32-S3, so this is the only
+  // Board tag (ota_tag.h): every board is an ESP32-S3, so this is the only
   // thing that tells their images apart.
   if (!tag.found) return "image carries no board tag (built before the on-device updater)";
   if (strcmp(tag.slug, MESHPUNK_BOARD_NAME) != 0) {

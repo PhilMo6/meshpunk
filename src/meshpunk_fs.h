@@ -63,3 +63,10 @@ const char* meshpunk_parse_drive(const char* path, MpDrive* drive, bool default_
 // the real partition label and is immune to that clobber. Returns false and
 // leaves *total/*used untouched if the query fails.
 bool mp_littlefs_df(size_t* total, size_t* used);
+
+// Total/free bytes of one drive. MP_SD takes the SPI lock for the query
+// (the caller must NOT hold it); the first SD/USB call can take a moment on
+// big volumes (FAT free-cluster scan), cached by the FS driver afterwards.
+// Returns false when the drive is not mounted or the query fails, leaving
+// *total/*free_bytes untouched.
+bool meshpunk_df(MpDrive drive, uint64_t* total, uint64_t* free_bytes);

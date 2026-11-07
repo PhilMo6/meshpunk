@@ -142,7 +142,7 @@ local function open_panel()
     -- Parentless -> sibling of the bar under the luavgl root; foreground so it
     -- covers whatever is up (launcher, or an app while peeked).
     local overlay = lvgl.Object {
-        w = 320, h = 240, x = 0, y = 0,
+        w = lvgl.HOR_RES(), h = lvgl.VER_RES(), x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
@@ -158,8 +158,8 @@ local function open_panel()
     -- capped to the screen. Past the cap the panel scrolls (SCROLLABLE kept),
     -- so the Clear button stays reachable however tall the content gets.
     local panel = overlay:Object {
-        w = 320, h = lvgl.SIZE_CONTENT, x = 0, y = 0,
-        max_height = 240,
+        w = lvgl.HOR_RES(), h = lvgl.SIZE_CONTENT, x = 0, y = 0,
+        max_height = lvgl.VER_RES(),
         bg_color = "#333333", border_width = 1, border_color = "#555555",
         pad_all = 4,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
@@ -242,7 +242,7 @@ end
 -- over (the bindings defer to the next loop() tick, so this stays visible).
 local function power_farewell(text, fn)
     local f = lvgl.Object {
-        w = 320, h = 240, x = 0, y = 0,
+        w = lvgl.HOR_RES(), h = lvgl.VER_RES(), x = 0, y = 0,
         bg_color = "#000000", bg_opa = 255, border_width = 0, pad_all = 0,
     }
     f:clear_flag(lvgl.FLAG.SCROLLABLE)
@@ -271,7 +271,7 @@ local function open_power_panel()
     if power_overlay then return end
 
     local overlay = lvgl.Object {
-        w = 320, h = 240, x = 0, y = 0,
+        w = lvgl.HOR_RES(), h = lvgl.VER_RES(), x = 0, y = 0,
         bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
     }
     overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
@@ -282,8 +282,8 @@ local function open_power_panel()
     -- Same gridnav rule as the notification panel: every focusable is a
     -- DIRECT child of the pushed container.
     local panel = overlay:Object {
-        w = 320, h = lvgl.SIZE_CONTENT, x = 0, y = 0,
-        max_height = 240,
+        w = lvgl.HOR_RES(), h = lvgl.SIZE_CONTENT, x = 0, y = 0,
+        max_height = lvgl.VER_RES(),
         bg_color = "#333333", border_width = 1, border_color = "#555555",
         pad_all = 4,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
@@ -373,7 +373,7 @@ function M.create()
 
     bar = lvgl.Object({
         flex = { flex_direction = "row", flex_wrap = "nowrap", justify_content = "space-between" },
-        w = 320, h = 20, x = 0, y = 0,
+        w = lvgl.HOR_RES(), h = 20, x = 0, y = 0,
         -- bg_opa follows the topbar_transparant device setting: transparent lets
         -- the themed wallpaper show behind the status text; opaque gives the plain
         -- Object its themed card background. apply_transparency() updates it live.

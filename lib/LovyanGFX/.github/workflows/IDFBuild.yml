@@ -1,0 +1,107 @@
+name: IDFBuild
+
+
+
+env:
+  PROJECT_DIR: examples/Test/build_test
+
+on:
+  push:
+    paths:
+    - '**.ino'
+    - '**.cpp'
+    - '**.hpp'
+    - '**.h'
+    - '**.c'
+    - '**.cmake'
+    - '**CMakeLists.txt'
+    - '**sdkconfig*'
+    - '**IDFBuild.yml'
+    - '**esp-idf-versions.php'
+  pull_request:
+    paths:
+    - '**.ino'
+    - '**.cpp'
+    - '**.hpp'
+    - '**.h'
+    - '**.c'
+    - '**.cmake'
+    - '**CMakeLists.txt'
+    - '**sdkconfig*'
+    - '**IDFBuild.yml'
+    - '**esp-idf-versions.php'
+  schedule:
+    # weekly full matrix, also catches freshly released IDF versions
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      matrix_mode:
+        description: 'quick = representative IDF versions, full = all current versions'
+        type: choice
+        options:
+        - quick
+        - full
+        default: full
+
+# supersede queued/running builds of the same branch or PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+
+  set_matrix:
+    name: Version planner ⊹
+    runs-on: ubuntu-latest
+    env:
+      # pull requests and scheduled runs build the full matrix so the merge
+      # gate always validates every current IDF version; plain pushes
+      # (post-merge smoke on develop, work-in-progress branches on forks)
+      # build the representative 'quick' matrix
+      IDF_MATRIX_MODE: ${{ (github.event_name == 'pull_request' || github.event_name == 'schedule') && 'full' || github.event_name == 'workflow_dispatch' && inputs.matrix_mode || 'quick' }}
+    outputs:
+      matrix: ${{steps.set-matrix.outputs.matrix}}
+      project_dir: ${{steps.set-matrix.outputs.project_dir}}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Setup matrix (${{ env.IDF_MATRIX_MODE }})
+      id: set-matrix
+      run: |
+        matrix=`php .github/scripts/esp-idf-versions.php`
+        # echo $matrix | jq # debug
+        matrix="${matrix//'%'/'%25'}" # escape percent entities
+        matrix="${matrix//$'\n'/''}"  # remove lf
+        matrix="${matrix//$'\r'/''}"  # remove cr
+        echo "matrix=${matrix}" >> $GITHUB_OUTPUT
+        echo "project_dir=${{env.PROJECT_DIR}}" >> $GITHUB_OUTPUT
+
+  build:
+    name: idf ${{ matrix.target }}@${{ matrix.idf }}
+    needs: set_matrix
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v${{ matrix.idf }}
+
+    strategy:
+      matrix: ${{fromJSON(needs.set_matrix.outputs.matrix)}}
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Build example for ${{ matrix.target }}@${{ matrix.idf }}
+        shell: bash
+        working-directory: ${{ needs.set_matrix.outputs.project_dir }}
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target ${{ matrix.target }}
+          idf.py build

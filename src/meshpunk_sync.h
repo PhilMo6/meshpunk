@@ -56,7 +56,7 @@ extern QueueHandle_t gps_event_queue;
 // While a T-Deck peer-link gblink session is active on the DEVICE role, the
 // USB serial *is* the link cable: log lines compete with link frames for the
 // CDC TX buffer, and a squeezed-out frame corrupts a GameBoy transfer. The
-// bridge (tdeck_link.cpp, which owns/defines this flag) mutes logging for
+// bridge (tdeck_link.cpp, which sets this flag) mutes logging for
 // the session; frames themselves bypass SerialMux (raw Serial.write under
 // SLOG_LOCK) so they are never muted.
 extern volatile bool g_slog_quiet;
@@ -130,11 +130,18 @@ struct GpsEvent {
 // the mutexes/queues. Safe to call under normal Arduino init order.
 void meshpunk_sync_init();
 
-// Spawn the Core 1 mesh task. Call once after lora_proto_start(), once the
-// radio is initialized and Lua is up. Defined in meshpunk_tasks.cpp.
+// Allocate the stacks (internal RAM) and TCBs of the two Core 1 tasks. Call
+// once early in setup(), before luaBringUp(); the spawns below need it.
+// Defined in meshpunk_tasks.cpp.
+void meshpunk_reserve_task_stacks();
+
+// Spawn the Core 1 mesh task on its reserved stack. Call once after
+// lora_proto_start(), once the radio is initialized and Lua is up. Defined in
+// meshpunk_tasks.cpp.
 void meshpunk_spawn_mesh_task();
 
-// Spawn the Core 1 GPS task. Defined in meshpunk_tasks.cpp.
+// Spawn the Core 1 GPS task on its reserved stack. Defined in
+// meshpunk_tasks.cpp.
 void meshpunk_spawn_gps_task();
 
 // Wake the GPS task early from its inter-cycle sleep (manual trigger).

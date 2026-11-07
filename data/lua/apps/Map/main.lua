@@ -1190,16 +1190,20 @@ redraw_markers = function()
     -- Live contact markers (red) from the cache. Drawn across the whole oversized
     -- canvas (the PAD margin) so they're already there when the canvas slides in.
     local pts = marker_cache.pts
+    -- One descriptor reused for every 8x8 marker below: draw_rect copies the
+    -- fields it needs and keeps no reference to the table.
+    local dot = {
+        x1 = 0, y1 = 0, x2 = 0, y2 = 0,
+        bg_color = "#ff6644", bg_opa = 255, radius = 4,
+        border_color = "#ffffff", border_width = 1, border_opa = 255,
+    }
     for i = 1, marker_cache.n do
         local p = pts[i]
         local cx = p.px - view_left + MARKER_PAD
         local cy = p.py - view_top + MARKER_PAD
         if cx >= -4 and cx < MCANVAS_W + 4 and cy >= -4 and cy < MCANVAS_H + 4 then
-            marker_canvas:draw_rect({
-                x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
-                bg_color = "#ff6644", bg_opa = 255, radius = 4,
-                border_color = "#ffffff", border_width = 1, border_opa = 255,
-            })
+            dot.x1, dot.y1, dot.x2, dot.y2 = cx - 4, cy - 4, cx + 3, cy + 3
+            marker_canvas:draw_rect(dot)
         end
     end
 
@@ -1212,15 +1216,13 @@ redraw_markers = function()
             end
             arch_load.draw_zoom = map.zoom
         end
+        dot.bg_color = "#888888"
         for _, p in ipairs(arch_load.pts) do
             local cx = p.px - view_left + MARKER_PAD
             local cy = p.py - view_top + MARKER_PAD
             if cx >= -4 and cx < MCANVAS_W + 4 and cy >= -4 and cy < MCANVAS_H + 4 then
-                marker_canvas:draw_rect({
-                    x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
-                    bg_color = "#888888", bg_opa = 255, radius = 4,
-                    border_color = "#ffffff", border_width = 1, border_opa = 255,
-                })
+                dot.x1, dot.y1, dot.x2, dot.y2 = cx - 4, cy - 4, cx + 3, cy + 3
+                marker_canvas:draw_rect(dot)
             end
         end
     end
@@ -1246,6 +1248,12 @@ redraw_markers = function()
                 end
                 pl.zoom = map.zoom
             end
+            dot.bg_color = pl.color
+            local disc = {
+                x1 = 0, y1 = 0, x2 = 0, y2 = 0,
+                bg_color = pl.color, bg_opa = 36, radius = 0,
+                border_color = pl.color, border_width = 1, border_opa = 160,
+            }
             for _, p in ipairs(pl.pts) do
                 local cx = p.px - view_left + MARKER_PAD
                 local cy = p.py - view_top + MARKER_PAD
@@ -1254,18 +1262,13 @@ redraw_markers = function()
                     if p.rpx then
                         -- Blurred position: translucent accuracy disc — the
                         -- node is somewhere in here, not at the pin.
-                        marker_canvas:draw_rect({
-                            x1 = cx - p.rpx, y1 = cy - p.rpx,
-                            x2 = cx + p.rpx - 1, y2 = cy + p.rpx - 1,
-                            bg_color = pl.color, bg_opa = 36, radius = p.rpx,
-                            border_color = pl.color, border_width = 1, border_opa = 160,
-                        })
+                        disc.x1, disc.y1 = cx - p.rpx, cy - p.rpx
+                        disc.x2, disc.y2 = cx + p.rpx - 1, cy + p.rpx - 1
+                        disc.radius = p.rpx
+                        marker_canvas:draw_rect(disc)
                     end
-                    marker_canvas:draw_rect({
-                        x1 = cx - 4, y1 = cy - 4, x2 = cx + 3, y2 = cy + 3,
-                        bg_color = pl.color, bg_opa = 255, radius = 4,
-                        border_color = "#ffffff", border_width = 1, border_opa = 255,
-                    })
+                    dot.x1, dot.y1, dot.x2, dot.y2 = cx - 4, cy - 4, cx + 3, cy + 3
+                    marker_canvas:draw_rect(dot)
                 end
             end
         end

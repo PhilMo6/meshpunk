@@ -20,6 +20,35 @@ local H = lvgl.VER_RES()
 -- ── Guide content ───────────────────────────────────────────────────────────
 -- Plain ASCII on purpose (every theme font renders it). Long strings keep the
 -- text editable without escape noise.
+
+-- Device facts for the inline pages, read as lib/helpdocs reads them for the
+-- guide pages; a field an older firmware lacks reads as nil.
+local dev = {}
+do
+    local ok, d = pcall(_device_caps)
+    if ok and type(d) == "table" then dev = d end
+end
+
+local audio_page = [[
+Where sound comes out, and how to route it.
+
+USB audio: route all device audio to a USB audio adapter via Tools > USB Host. Music, app sounds and game audio all follow the route.]]
+if dev.usb_power then
+    audio_page = audio_page .. [[ This device powers the adapter from its USB-C port.]]
+else
+    audio_page = audio_page .. [[ The adapter needs external power - see the USB accessories page.]]
+end
+if dev.audio == "buzzer" then
+    audio_page = audio_page .. [[
+
+
+This device has a buzzer instead of a speaker. It plays notification melodies and app tones on the buzzer, one note at a time; for music and game audio, a USB audio adapter is the way.]]
+end
+audio_page = audio_page .. [[
+
+
+Music playback is the Music app (App Library) - its page in the Apps tab covers the library, playlists and background playback.]]
+
 local PAGES = {
 
 { t = "Games and emulators", b = [[
@@ -34,14 +63,7 @@ Quitting a native game, any of these:
 
 Each game launcher's ? button shows this plus the game's controls.]] },
 
-{ t = "Audio", b = [[
-Where sound comes out, and how to route it.
-
-USB audio: route all device audio to a USB audio adapter via Tools > USB Host. Music, app sounds and game audio all follow the route. The adapter needs external power - see the USB accessories page.
-
-Devices with a buzzer instead of a speaker play notification melodies and app tones on the buzzer, one note at a time. For music and game audio on those, a powered USB audio adapter is the way.
-
-Music playback is the Music app (App Library) - its page in the Apps tab covers the library, playlists and background playback.]] },
+{ t = "Audio", b = audio_page },
 
 { t = "Files and storage", b = [[
 Tools > Files is the file manager, covering both internal flash and the SD card.

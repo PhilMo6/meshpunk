@@ -1,6 +1,6 @@
 // BleHostApi serial transport — the firmware half of the BLE slot's module
-// seam. Wraps its OWN PunkBLEInterface instance (NimBLE stays firmware).
-// Polled + frame-based, one-to-one with MeshCore's
+// seam. Wraps its OWN PunkBLEInterface instance (the Bluedroid stack stays
+// firmware). Polled + frame-based, one-to-one with MeshCore's
 // BaseSerialInterface: the ported companion's McBleSerial calls straight
 // through these.
 
@@ -14,8 +14,31 @@
 
 #include "../punk_ble_interface.h"
 #include <BLEDevice.h>
+#include <esp_bt_main.h>        // esp_bluedroid_*
 
 static PunkBLEInterface* s_bt = nullptr;
+
+// The controller, then the Bluedroid host. The order and status checks are
+// BLEDevice::init()'s own; ble_transport_open()'s begin() calls it, and it
+// skips both layers once they are up. Returns at once when both are up.
+bool ble_transport_stack_up(void) {
+    if (btStarted() &&
+        esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED)
+        return true;
+    if (!btStarted() && !btStart()) {
+        SLog.println("[BLE] FAIL: controller start (btStart)");
+        return false;
+    }
+    esp_err_t err = ESP_OK;
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED)
+        err = esp_bluedroid_init();
+    if (err == ESP_OK &&
+        esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED)
+        err = esp_bluedroid_enable();
+    if (err != ESP_OK)
+        SLog.printf("[BLE] FAIL: Bluedroid host bring-up: %s\n", esp_err_to_name(err));
+    return err == ESP_OK;
+}
 
 bool ble_transport_open(const char* name_prefix, const char* dev_name,
                         uint32_t pin) {
@@ -26,6 +49,8 @@ bool ble_transport_open(const char* name_prefix, const char* dev_name,
     static char name_buf[13];
     snprintf(name_buf, sizeof(name_buf), "%s",
              dev_name ? dev_name : "@@MAC");
+
+    ble_transport_stack_up();
     s_bt = new PunkBLEInterface();
     s_bt->begin(name_prefix ? name_prefix : "", name_buf, pin);
     s_bt->enable();
@@ -61,6 +86,7 @@ int ble_transport_read(uint8_t* buf) {
 
 #else  // !BLE_COMPANION_ENABLED
 
+bool ble_transport_stack_up(void) { return false; }
 bool ble_transport_open(const char*, const char*, uint32_t) { return false; }
 void ble_transport_close(void) {}
 void ble_transport_enable(void) {}

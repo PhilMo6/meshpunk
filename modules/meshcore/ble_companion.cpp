@@ -163,7 +163,9 @@ void BleCompanionHandler::handleCmdFrame(size_t len) {
     strncpy((char*)&out_frame[i], MESHPUNK_FW_BUILD_DATE, 12);
     i += 12;
 
-    StrHelper::strzcpy((char*)&out_frame[i], MESHPUNK_MODEL_NAME, 40);
+    char model[40];
+    snprintf(model, sizeof(model), "MeshPunk %s", mc_board_label);
+    StrHelper::strzcpy((char*)&out_frame[i], model, 40);
     i += 40;
 
     StrHelper::strzcpy((char*)&out_frame[i], MESHPUNK_FW_VERSION, 20);

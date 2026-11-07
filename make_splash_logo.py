@@ -6,7 +6,7 @@ RGB565 words: the byte order of LVGL's LV_COLOR_16_SWAP buffers, which the
 display backends push unchanged with tft.pushColors(..., swap=false).
 
 Run from the project root with the PlatformIO Python (standard library only):
-  C:/Users/noahl/.platformio/penv/Scripts/python.exe make_splash_logo.py
+  ~/.platformio/penv/Scripts/python.exe make_splash_logo.py
 Options: --chrome PATH, --magick PATH, --width N (default 320; the height
 follows the SVG's 960x300 aspect), --svg PATH, --out PATH.
 """

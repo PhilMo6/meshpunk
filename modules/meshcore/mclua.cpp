@@ -418,28 +418,38 @@ static uint32_t s_union_arch_gen = 0;
 static uint32_t s_union_built_ms = 0;
 static int s_union_count = 0;
 
-// Copy the live contact table into a transient PSRAM snapshot under MESH_LOCK.
-// Returns the buffer (caller frees) or NULL; *out_n = contacts copied. Exists
-// so the Lua pushes below run with NO locks held: lua_push* can longjmp on a
-// true OOM, and an escape while MESH_LOCK is held would deadlock the mesh task
-// permanently — strictly worse than the OOM itself. Bonus: the lock is now held
-// only for a memcpy loop, not table pushes + archive-file I/O.
-static ContactInfo* snapshot_live_contacts(int* out_n) {
-  *out_n = 0;
+// Contacts reach Lua CONTACT_BATCH at a time through one small transient
+// buffer (heap_caps_malloc = the protocol pool): a whole-table copy is 500 x
+// sizeof(ContactInfo) = 92,000 bytes, more than the pool has free at runtime.
+// Each live batch is copied under MESH_LOCK and turned into Lua tables with NO
+// locks held: lua_push* can longjmp on a true OOM, and an escape while
+// MESH_LOCK is held would deadlock the mesh task permanently.
+// Between batches the live table can change. MeshCore appends a new contact,
+// overwrites the oldest slot in place when full, and removes by shifting the
+// rest down, so one build can hold a stale entry or miss one, never a
+// duplicate; each change bumps contacts_generation and the next call rebuilds.
+#define CONTACT_BATCH 32
+
+// Copy the live contacts with index in [*next, *next + CONTACT_BATCH) into buf
+// and advance *next past them. Returns the count copied, or -1 once *next is
+// past the end of the table.
+static int copy_live_batch(ContactInfo* buf, int* next) {
   MESH_LOCK();
   int n = the_mesh->getNumContacts();
-  ContactInfo* live = (ContactInfo*)heap_caps_malloc(
-      sizeof(ContactInfo) * (n > 0 ? n : 1), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (live) {
-    ContactInfo c;
-    int nlive = 0;
-    for (int i = 0; i < n; i++) {
-      if (the_mesh->getContactByIdx(i, c)) live[nlive++] = c;
-    }
-    *out_n = nlive;
+  int start = *next;
+  if (start >= n) {
+    MESH_UNLOCK();
+    return -1;
   }
+  int end = (start + CONTACT_BATCH < n) ? start + CONTACT_BATCH : n;
+  int cnt = 0;
+  ContactInfo c;
+  for (int i = start; i < end; i++) {
+    if (the_mesh->getContactByIdx(i, c)) buf[cnt++] = c;
+  }
+  *next = end;
   MESH_UNLOCK();
-  return live;
+  return cnt;
 }
 
 static int lua_mesh_get_contacts(lua_State *L) {
@@ -455,10 +465,10 @@ static int lua_mesh_get_contacts(lua_State *L) {
     bool fresh = (s_contacts_ref != LUA_NOREF) && (gen == s_contacts_gen) &&
                  (millis() - s_contacts_built_ms < 10000);
     if (!fresh) {
-      int nlive = 0;
-      ContactInfo* live = snapshot_live_contacts(&nlive);
-      if (!live) {
-        // No snapshot memory: serve the stale cache if one exists, else empty.
+      ContactInfo* buf = (ContactInfo*)heap_caps_malloc(
+          sizeof(ContactInfo) * CONTACT_BATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!buf) {
+        // No batch memory: serve the stale cache if one exists, else empty.
         if (s_contacts_ref == LUA_NOREF) {
           lua_newtable(L);
           return 1;
@@ -504,23 +514,28 @@ static int lua_mesh_get_contacts(lua_State *L) {
 
         lua_newtable(L);                 // the new master array
         int arr = lua_gettop(L);
-        for (int i = 0; i < nlive; i++) {
-          char key[17];                  // first 8 pubkey bytes identify it
-          mesh::Utils::toHex(key, live[i].id.pub_key, 8);
-          lua_getfield(L, map, key);
-          if (lua_istable(L, -1)) {
-            update_contact_table(L, live[i]);
-            // Drop the key so a prefix collision can't hand the same table to
-            // two contacts; the second one then builds its own.
-            lua_pushnil(L);
-            lua_setfield(L, map, key);
-          } else {
-            lua_pop(L, 1);
-            push_contact_table(L, live[i], false);
+        int nlive = 0;
+        int next = 0;
+        int cnt;
+        while ((cnt = copy_live_batch(buf, &next)) >= 0) {
+          for (int i = 0; i < cnt; i++) {
+            char key[17];                // first 8 pubkey bytes identify it
+            mesh::Utils::toHex(key, buf[i].id.pub_key, 8);
+            lua_getfield(L, map, key);
+            if (lua_istable(L, -1)) {
+              update_contact_table(L, buf[i]);
+              // Drop the key so a prefix collision can't hand the same table
+              // to two contacts; the second one then builds its own.
+              lua_pushnil(L);
+              lua_setfield(L, map, key);
+            } else {
+              lua_pop(L, 1);
+              push_contact_table(L, buf[i], false);
+            }
+            lua_rawseti(L, arr, ++nlive);
           }
-          lua_rawseti(L, arr, i + 1);
         }
-        heap_caps_free(live);
+        heap_caps_free(buf);
         lua_remove(L, map);              // sits below arr; arr ends on top
 
         if (s_contacts_ref != LUA_NOREF) {
@@ -543,56 +558,79 @@ static int lua_mesh_get_contacts(lua_State *L) {
                  (agen == s_union_arch_gen) &&
                  (millis() - s_union_built_ms < 10000);
     if (!fresh) {
-      int nlive = 0;
-      ContactInfo* live = snapshot_live_contacts(&nlive);
-      if (!live) {
+      ContactInfo* buf = (ContactInfo*)heap_caps_malloc(
+          sizeof(ContactInfo) * CONTACT_BATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!buf) {
         if (s_union_ref == LUA_NOREF) {
           lua_newtable(L);
           return 1;
         }
       } else {
-        // Archived contacts live on disk only. Read a transient, deduped view
-        // here (freed immediately after) so the archive costs ZERO steady-state
-        // PSRAM — this whole branch only runs when the user has "show archived"
-        // on, and is cached for 10s. The on-map display is bounded; the disk
-        // archive keeps everything (re-add can still pull back any contact).
-        // readArchivedDeduped does its own SPI locking — no MESH_LOCK needed.
+        // Archived contacts live on disk only; they are streamed here
+        // CONTACT_BATCH records at a time, so the archive costs ZERO
+        // steady-state PSRAM — this whole branch only runs when the user has
+        // "show archived" on, and is cached for 10s. The display holds at most
+        // ARCH_DISPLAY_MAX archived contacts; the disk archive keeps everything
+        // (re-add can still pull back any contact). Live wins by pubkey — also
+        // self-heals entries left behind when a contact re-adverted in. Among
+        // archived records for one pubkey the newest (latest in the
+        // append-order log) wins, at the first one's place.
         const int ARCH_DISPLAY_MAX = 1000;
-        ContactInfo* abuf = (ContactInfo*)heap_caps_malloc(
-            sizeof(ContactInfo) * ARCH_DISPLAY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        int na = 0;
-        if (abuf) na = the_mesh->readArchivedDeduped(abuf, ARCH_DISPLAY_MAX);
-
-        lua_newtable(L);
-        int idx = 1;
-        for (int i = 0; i < nlive; i++) {
-          push_contact_table(L, live[i], false);
-          lua_rawseti(L, -2, idx++);
+        lua_newtable(L);                 // the master array
+        int arr = lua_gettop(L);
+        int idx = 0;
+        int next = 0;
+        int cnt;
+        while ((cnt = copy_live_batch(buf, &next)) >= 0) {
+          for (int i = 0; i < cnt; i++) {
+            push_contact_table(L, buf[i], false);
+            lua_rawseti(L, arr, ++idx);
+          }
         }
-        if (abuf) {
-          for (int i = 0; i < na; i++) {
-            // Live wins by pubkey (checked against the snapshot) — also
-            // self-heals entries left behind when a contact re-adverted in.
-            bool is_live = false;
-            for (int j = 0; j < nlive; j++) {
-              if (memcmp(live[j].id.pub_key, abuf[i].id.pub_key, PUB_KEY_SIZE) == 0) {
-                is_live = true;
-                break;
-              }
-            }
-            if (!is_live) {
-              push_contact_table(L, abuf[i], true);
-              lua_rawseti(L, -2, idx++);
+
+        lua_newtable(L);                 // pubkey16 -> archived entry's index in arr
+        int aidx = lua_gettop(L);
+        int narch = 0;
+        bool is_live[CONTACT_BATCH];
+        uint32_t off = 0;
+        bool done = false;
+        while (!done) {
+          uint32_t next_off = off;
+          // readArchiveBatch does its own SPI locking — no MESH_LOCK needed.
+          int n = the_mesh->readArchiveBatch(off, CONTACT_BATCH, buf, &next_off, &done);
+          if (n <= 0 || next_off == off) break;
+          off = next_off;
+          MESH_LOCK();
+          for (int i = 0; i < n; i++) {
+            is_live[i] = the_mesh->lookupContactByPubKey(buf[i].id.pub_key, PUB_KEY_SIZE) != nullptr;
+          }
+          MESH_UNLOCK();
+          for (int i = 0; i < n; i++) {
+            if (is_live[i]) continue;
+            char key[17];
+            mesh::Utils::toHex(key, buf[i].id.pub_key, 8);
+            lua_getfield(L, aidx, key);
+            int at = (int)lua_tointeger(L, -1);   // 0 when not seen yet (nil)
+            lua_pop(L, 1);
+            if (at > 0) {
+              push_contact_table(L, buf[i], true);
+              lua_rawseti(L, arr, at);
+            } else if (narch < ARCH_DISPLAY_MAX) {
+              push_contact_table(L, buf[i], true);
+              lua_rawseti(L, arr, ++idx);
+              narch++;
+              lua_pushinteger(L, idx);
+              lua_setfield(L, aidx, key);
             }
           }
-          heap_caps_free(abuf);
         }
-        heap_caps_free(live);
+        lua_pop(L, 1);                   // aidx; arr ends on top
+        heap_caps_free(buf);
 
         if (s_union_ref != LUA_NOREF) {
           luaL_unref(L, LUA_REGISTRYINDEX, s_union_ref);
         }
-        s_union_count = idx - 1;
+        s_union_count = idx;
         s_union_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // pops the master
         s_union_gen = gen;
         s_union_arch_gen = agen;
@@ -648,10 +686,11 @@ static int lua_mesh_archive_read(lua_State *L) {
   uint32_t offset = (uint32_t)luaL_optinteger(L, 1, 0);
   int max_count = (int)luaL_optinteger(L, 2, 150);
   if (max_count < 1) max_count = 1;
-  if (max_count > 300) max_count = 300;  // bound the transient buffer
+  if (max_count > 300) max_count = 300;
 
+  // Read CONTACT_BATCH records at a time through one small transient buffer.
   ContactInfo *buf = (ContactInfo *)heap_caps_malloc(
-      sizeof(ContactInfo) * max_count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      sizeof(ContactInfo) * CONTACT_BATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!buf) {
     lua_newtable(L);
     lua_pushinteger(L, offset);
@@ -660,29 +699,35 @@ static int lua_mesh_archive_read(lua_State *L) {
   }
 
   uint32_t next_offset = offset;
-  bool done = true;
-  // No MESH_LOCK: only touches the archive file (sd_spi serialized inside),
-  // not the live contact table.
-  int n = the_mesh->readArchiveBatch(offset, max_count, buf, &next_offset, &done);
-
+  bool done = false;
+  int total = 0;
   lua_newtable(L);
-  for (int i = 0; i < n; i++) {
-    const ContactInfo &c = buf[i];
-    // LEAN entry — only what the Map needs to draw a gray dot and open the
-    // re-add popup (name/pubkey/type/last_seen/lat/lon). NO path array / lastmod
-    // / favorite, so thousands can be held for a fraction of the PSRAM the full
-    // push_contact_table would cost.
-    lua_newtable(L);
-    lua_pushstring(L, c.name);                          lua_setfield(L, -2, "name");
-    char hex[PUB_KEY_SIZE * 2 + 1];
-    mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
-    lua_pushstring(L, hex);                             lua_setfield(L, -2, "pubkey");
-    lua_pushstring(L, the_mesh->getTypeName(c.type));   lua_setfield(L, -2, "type_name");
-    lua_pushinteger(L, (lua_Integer)c.lastmod); lua_setfield(L, -2, "last_seen");  // our RX clock
-    lua_pushnumber(L, c.gps_lat / 1000000.0);           lua_setfield(L, -2, "lat");
-    lua_pushnumber(L, c.gps_lon / 1000000.0);           lua_setfield(L, -2, "lon");
-    lua_pushboolean(L, 1);                              lua_setfield(L, -2, "archived");
-    lua_rawseti(L, -2, i + 1);
+  while (!done && total < max_count) {
+    int want = max_count - total;
+    if (want > CONTACT_BATCH) want = CONTACT_BATCH;
+    uint32_t off = next_offset;
+    // No MESH_LOCK: only touches the archive file (sd_spi serialized inside),
+    // not the live contact table.
+    int n = the_mesh->readArchiveBatch(off, want, buf, &next_offset, &done);
+    for (int i = 0; i < n; i++) {
+      const ContactInfo &c = buf[i];
+      // LEAN entry — only what the Map needs to draw a gray dot and open the
+      // re-add popup (name/pubkey/type/last_seen/lat/lon). NO path array /
+      // lastmod / favorite, so thousands can be held for a fraction of the
+      // PSRAM the full push_contact_table would cost.
+      lua_newtable(L);
+      lua_pushstring(L, c.name);                          lua_setfield(L, -2, "name");
+      char hex[PUB_KEY_SIZE * 2 + 1];
+      mesh::Utils::toHex(hex, c.id.pub_key, PUB_KEY_SIZE);
+      lua_pushstring(L, hex);                             lua_setfield(L, -2, "pubkey");
+      lua_pushstring(L, the_mesh->getTypeName(c.type));   lua_setfield(L, -2, "type_name");
+      lua_pushinteger(L, (lua_Integer)c.lastmod); lua_setfield(L, -2, "last_seen");  // our RX clock
+      lua_pushnumber(L, c.gps_lat / 1000000.0);           lua_setfield(L, -2, "lat");
+      lua_pushnumber(L, c.gps_lon / 1000000.0);           lua_setfield(L, -2, "lon");
+      lua_pushboolean(L, 1);                              lua_setfield(L, -2, "archived");
+      lua_rawseti(L, -2, ++total);
+    }
+    if (n <= 0 || next_offset == off) break;   // no progress -> stop
   }
   heap_caps_free(buf);
 

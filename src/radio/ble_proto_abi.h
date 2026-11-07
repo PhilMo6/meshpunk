@@ -23,7 +23,7 @@ extern "C" {
 
 #define BLE_PROTO_ABI_VERSION 1
 
-// Host services for MODULE BLE protocols. The NimBLE stack stays firmware
+// Host services for MODULE BLE protocols. The Bluedroid stack stays firmware
 // (internal-SRAM budget); a module protocol drives it through the serial
 // transport below — POLLED and FRAME-based, mirroring MeshCore's
 // BaseSerialInterface one-to-one (the shape its first client, the ported

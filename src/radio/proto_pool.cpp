@@ -14,7 +14,7 @@
 #include <esp_heap_caps.h>
 #include <multi_heap.h>
 #include <LittleFS.h>
-#include <SD.h>
+#include "../storage/sd_dev.h"
 
 #include "radio_hal.h"          // lora_proto_requested (pool sizing)
 #include "../meshpunk_sync.h"   // SLog, sd_spi_take
@@ -44,7 +44,7 @@ void proto_pool_init(void) {
         bool have = LittleFS.exists("/meshpunk/lora_protos/meshcore");
         if (!have && sd_mounted) {
             sd_spi_take();
-            have = SD.exists("/meshpunk/lora_protos/meshcore");
+            have = sd_dev_fs().exists("/meshpunk/lora_protos/meshcore");
             sd_spi_release();
         }
         if (have) kb = PROTO_POOL_KB_PACKAGE;

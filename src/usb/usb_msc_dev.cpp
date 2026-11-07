@@ -2,13 +2,13 @@
 //
 // DEVICE-mode counterpart of the host stack in usb_core.cpp: the OTG port
 // enumerates as a thumb drive whose sectors are the SD card's, via
-// SD.readRAW/writeRAW. The PC owns the FAT volume for the whole session; two
+// sd_dev_read_raw/sd_dev_write_raw. The PC owns the FAT volume for the whole session; two
 // filesystems must never write one FAT volume concurrently, so a session
 // holds three locks at once:
 //   1. sd_mounted = false — every firmware FS path (Lua _fs_*, io.open,
 //      meshpunk_open, the _list_dir_sd helpers) already treats an unmounted
-//      card as absent; the Arduino SD object itself stays initialized so the
-//      raw-sector callbacks keep working.
+//      card as absent; the card itself stays mounted (storage/sd_dev.h) so
+//      the raw-sector callbacks keep working.
 //   2. mesh_task_paused = true — punkmesh persists contacts/messages/
 //      channels to SD from the mesh task; parking the dispatcher stops
 //      those writes at the source (and frees the shared SPI bus).
@@ -39,7 +39,7 @@
 #include "emoji_font.h"            // emoji_font_reload(close_only)
 
 #include <Arduino.h>
-#include <SD.h>
+#include "../storage/sd_dev.h"
 
 #include "sdkconfig.h"
 #if CONFIG_TINYUSB_MSC_ENABLED
@@ -80,7 +80,7 @@ static int32_t on_msc_read(uint32_t lba, uint32_t offset, void* buffer, uint32_t
     uint32_t sectors = bufsize / 512;
     sd_spi_take();
     for (uint32_t i = 0; i < sectors; i++) {
-        if (!SD.readRAW(p + i * 512, lba + i)) { sd_spi_release(); return -1; }
+        if (!sd_dev_read_raw(p + i * 512, lba + i)) { sd_spi_release(); return -1; }
     }
     sd_spi_release();
     s_reads += sectors;
@@ -93,7 +93,7 @@ static int32_t on_msc_write(uint32_t lba, uint32_t offset, uint8_t* buffer, uint
     uint32_t sectors = bufsize / 512;
     sd_spi_take();
     for (uint32_t i = 0; i < sectors; i++) {
-        if (!SD.writeRAW(buffer + i * 512, lba + i)) { sd_spi_release(); return -1; }
+        if (!sd_dev_write_raw(buffer + i * 512, lba + i)) { sd_spi_release(); return -1; }
     }
     sd_spi_release();
     s_writes += sectors;
@@ -127,8 +127,8 @@ bool usbdrive_start(void) {
     uint32_t sectors = 0;
     uint16_t secsize = 0;
     sd_spi_take();
-    sectors = (uint32_t)SD.numSectors();
-    secsize = (uint16_t)SD.sectorSize();
+    sectors = sd_dev_num_sectors();
+    secsize = (uint16_t)sd_dev_sector_size();
     sd_spi_release();
     if (!sectors || !secsize) { s_fail = "card geometry read failed"; return false; }
 
@@ -176,7 +176,7 @@ void usbdrive_stop(void) {
 
     // Remount: drop every FAT structure the PC's writes invalidated.
     sd_spi_take();
-    SD.end();
+    sd_dev_unmount();
     sd_spi_release();
     meshpunk_sd_mount();
 

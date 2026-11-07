@@ -6,10 +6,12 @@
 // Lua bindings (Settings/Firmware). Every binding returns a table; a failure
 // carries ok=false and error=<text>.
 //   _ota_info()             {mode, reason, running, main, updater, installed,
-//                            board, staged, phase}
-//   _ota_check()            {ok, tag, url, installed, newer}: the latest
-//                            GitHub release, read from the /releases/latest
-//                            redirect (no JSON), plus this board's asset URL
+//                            channel, board, staged, phase}
+//   _ota_check()            {ok, channel, tag, url, installed, newer, older}:
+//                            the latest release on the selected channel, read
+//                            from the /releases/latest redirect (no JSON), plus
+//                            this board's asset URL. newer and older are both
+//                            false when the tags are the same version.
 //   _ota_begin(source, arg) source "url" (asset URL, downloaded to the staging
 //                            path) or "file" (an S:/L: path); {ok, path, total}
 //   _ota_step()             one bounded slice of the download or the verify:
@@ -19,6 +21,11 @@
 //   _ota_abort()            stops an in-flight session (a partial download is
 //                            deleted, a finished staged image is kept)
 //   _ota_cancel()           abort, then delete the staged images and the job
+//
+// Release channels: "stable" and "dev" select which GitHub repo is polled
+// (kChannels below). The id is persisted in /firmware_prefs; the _ota_channel
+// binding that reads and writes it lives in main.cpp next to the other
+// firmware prefs, because firmware_prefs_save() is static there.
 //
 // Layout modes (_ota_info().mode):
 //   "ota"      running from ota_0 next to the `updater` factory partition
@@ -32,7 +39,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <FS.h>
-#include <SD.h>
+#include "storage/sd_dev.h"
 #include <LittleFS.h>
 extern "C" {
 #include <lua.h>
@@ -65,12 +72,49 @@ static const char kBoardTag[] = "MESHPUNK-BOARD:" MESHPUNK_BOARD_NAME;
 static const char* kUpdaterEnv = "meshpunk_updater";
 #elif defined(BOARD_HELTEC_V4)
 static const char* kUpdaterEnv = "meshpunk_heltec_updater";
+#elif defined(BOARD_WIO_L2)
+static const char* kUpdaterEnv = "meshpunk_wio_l2_updater";
 #else
 static const char* kUpdaterEnv = "<board>_updater";
 #endif
 
-static const char* kRepoLatest   = "https://github.com/PhilMo6/meshpunk/releases/latest";
-static const char* kRepoDownload = "https://github.com/PhilMo6/meshpunk/releases/download/";
+// Release channels. The id is persisted in /firmware_prefs as `ota_channel=`
+// (written by main.cpp, which also owns the _ota_channel binding because
+// firmware_prefs_save() is static there). The repo is the only thing that
+// differs between channels: the dev repo publishes the same asset-name
+// template, so tag_from_name, the board-tag guard and the updater handoff are
+// identical on both.
+struct OtaChannel {
+  const char* id;
+  const char* repo;   // "<owner>/<name>" on github.com
+};
+static const OtaChannel kChannels[] = {
+  { "stable", "PhilMo6/meshpunk"     },
+  { "dev",    "PhilMo6/meshpunk-dev" },
+};
+static const OtaChannel* s_chan = &kChannels[0];
+
+const char* ota_channel_requested() { return s_chan->id; }
+
+void ota_channel_set_requested(const char* id) {
+  for (size_t i = 0; i < sizeof kChannels / sizeof kChannels[0]; i++) {
+    if (id && strcmp(id, kChannels[i].id) == 0) {
+      s_chan = &kChannels[i];
+      return;
+    }
+  }
+  s_chan = &kChannels[0];   // unknown id falls back to stable, never a dead URL
+}
+
+// Built per call, not stored: the channel can change between a check and a
+// download.
+static String repo_latest_url() {
+  return String("https://github.com/") + s_chan->repo + "/releases/latest";
+}
+static String repo_download_url() {
+  return String("https://github.com/") + s_chan->repo + "/releases/download/";
+}
+
 static const char* kJobPath      = "/.ota_job";       // LittleFS
 static const char* kMarkerPath   = "/.pack_version";  // LittleFS, written by the pack extractor
 static const char* kStageSd      = "S:/meshpunk/ota/firmware.bin";
@@ -201,7 +245,7 @@ static String read_installed_version(void) {
 static bool sd_path_exists(const char* bare) {
   if (!sd_mounted) return false;
   sd_spi_take();
-  bool e = SD.exists(bare);
+  bool e = sd_dev_fs().exists(bare);
   sd_spi_release();
   return e;
 }
@@ -210,7 +254,7 @@ static void remove_staged(const char* path) {
   if (path[0] == 'S') {
     if (!sd_mounted) return;
     sd_spi_take();
-    SD.remove(path + 2);
+    sd_dev_fs().remove(path + 2);
     sd_spi_release();
   } else {
     UsbFlashGuard g;
@@ -238,14 +282,23 @@ static String tag_from_name(const String& name) {
   return base.substring(prefix.length(), base.length() - strlen(suffix));
 }
 
-// First three numeric fields of a version string ("v0.4.1" -> 0 4 1).
-static int parse_version(const String& s, int out[3]) {
-  int n = 0;
-  int i = 0, len = s.length();
-  while (i < len && n < 3) {
+// First three numeric fields of a version string, then a fourth pre-release
+// field: "v0.4.1" -> 0 4 1 kRelease, "v0.5.0-dev3" -> 0 5 0 3. A tag with no
+// -dev suffix takes kRelease, which sorts above every -dev of the same x.y.z,
+// so v0.5.0-dev3 < v0.5.0-dev4 < v0.5.0. Every shipped tag is suffix-free and
+// therefore compares exactly as it did before the fourth field existed.
+// The x.y.z scan stops at the suffix so the N in -devN can never be read as a
+// version field.
+static const int kRelease = 0x7FFFFFFF;
+
+static int parse_version(const String& s, int out[4]) {
+  int dev = s.indexOf("-dev");
+  int scan_len = dev >= 0 ? dev : (int)s.length();
+  int n = 0, i = 0;
+  while (i < scan_len && n < 3) {
     if (isdigit((unsigned char)s[i])) {
       int v = 0;
-      while (i < len && isdigit((unsigned char)s[i])) {
+      while (i < scan_len && isdigit((unsigned char)s[i])) {
         v = v * 10 + (s[i] - '0');
         i++;
       }
@@ -254,13 +307,24 @@ static int parse_version(const String& s, int out[3]) {
       i++;
     }
   }
+  out[3] = kRelease;
+  if (dev >= 0) {
+    int j = dev + 4, v = 0;
+    bool any = false;
+    while (j < (int)s.length() && isdigit((unsigned char)s[j])) {
+      v = v * 10 + (s[j] - '0');
+      j++;
+      any = true;
+    }
+    out[3] = any ? v : 0;   // a bare "-dev" sorts below every numbered one
+  }
   return n;
 }
 
 static bool tag_newer(const String& tag, const String& installed) {
-  int a[3] = {0, 0, 0}, b[3] = {0, 0, 0};
+  int a[4] = {0, 0, 0, 0}, b[4] = {0, 0, 0, 0};
   if (parse_version(tag, a) == 0 || parse_version(installed, b) == 0) return false;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {
     if (a[i] != b[i]) return a[i] > b[i];
   }
   return false;
@@ -515,10 +579,10 @@ void ota_init_report(void) {
     LittleFS.remove(kJobPath);
   }
   String staged = staged_path();
-  SLog.printf("[OTA] mode=%s running=%s main=%s updater=%s installed=%s staged=%s%s\n",
+  SLog.printf("[OTA] mode=%s running=%s main=%s updater=%s installed=%s channel=%s staged=%s%s\n",
               mode_name(lay.mode), part_label(lay.running), part_label(lay.main),
               part_label(lay.updater), installed.length() ? installed.c_str() : "dev",
-              staged.length() ? staged.c_str() : "none",
+              ota_channel_requested(), staged.length() ? staged.c_str() : "none",
               stale_job ? " (stale job removed)" : "");
   if (lay.mode != OTA_MODE_OTA) SLog.printf("[OTA] %s\n", lay.reason);
 }
@@ -556,6 +620,7 @@ static int lua_ota_info(lua_State* L) {
   set_str(L, "main", part_label(lay.main));
   set_str(L, "updater", part_label(lay.updater));
   set_str(L, "installed", installed.c_str());
+  set_str(L, "channel", ota_channel_requested());
   set_str(L, "board", MESHPUNK_BOARD_NAME);
   set_str(L, "image_tag", kBoardTag);
   set_str(L, "staged", staged.c_str());
@@ -569,30 +634,41 @@ static int lua_ota_check(lua_State* L) {
   http.setUserAgent("meshpunk/1.0");
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   http.setTimeout(10000);
-  if (!http.begin(kRepoLatest)) return push_fail(L, "bad URL");
+  if (!http.begin(repo_latest_url())) return push_fail(L, "bad URL");
   int code = http.GET();
   String location = http.getLocation();
   http.end();
   if (code != 301 && code != 302) {
-    String msg = code > 0 ? String("HTTP ") + code : http.errorToString(code);
+    // GitHub answers /releases/latest with 404 when the repo has published no
+    // releases at all — the normal state of a brand-new channel, not an error
+    // worth showing as a bare status code.
+    String msg;
+    if (code == 404)
+      msg = String("no releases published on the ") + s_chan->id + " channel yet";
+    else
+      msg = code > 0 ? String("HTTP ") + code : http.errorToString(code);
     return push_fail(L, msg.c_str());
   }
-  // https://github.com/PhilMo6/meshpunk/releases/tag/<tag>
+  // https://github.com/<owner>/<repo>/releases/tag/<tag>
   int slash = location.lastIndexOf('/');
   String tag = slash >= 0 ? location.substring(slash + 1) : String();
   tag.trim();
   if (tag.length() < 2 || tag[0] != 'v' || location.indexOf("/releases/tag/") < 0)
     return push_fail(L, "no release tag in the GitHub redirect");
   String installed = read_installed_version();
-  String url = String(kRepoDownload) + tag + "/meshpunk-" + MESHPUNK_BOARD_NAME + "-" + tag + "-firmware.bin";
-  SLog.printf("[OTA] latest release %s (installed %s)\n", tag.c_str(),
-              installed.length() ? installed.c_str() : "dev");
+  String url = repo_download_url() + tag + "/meshpunk-" + MESHPUNK_BOARD_NAME + "-" + tag + "-firmware.bin";
+  SLog.printf("[OTA] %s channel: latest release %s (installed %s)\n", s_chan->id,
+              tag.c_str(), installed.length() ? installed.c_str() : "dev");
   lua_newtable(L);
   set_bool(L, "ok", true);
+  set_str(L, "channel", s_chan->id);
   set_str(L, "tag", tag.c_str());
   set_str(L, "url", url.c_str());
   set_str(L, "installed", installed.c_str());
+  // Both false = same version. That covers a dev-env marker like "v0.4.1-dirty"
+  // against release v0.4.1, which is neither an update nor a downgrade.
   set_bool(L, "newer", tag_newer(tag, installed));
+  set_bool(L, "older", tag_newer(installed, tag));
   return 1;
 }
 
@@ -636,19 +712,13 @@ static int lua_ota_begin(lua_State* L) {
       session_close_files();
       return push_fail(L, "image larger than the main partition");
     }
-    if (sd_mounted) {
-      sd_spi_take();
-      uint64_t free_bytes = SD.totalBytes() - SD.usedBytes();
-      sd_spi_release();
-      if (free_bytes < (uint64_t)len + 65536) {
+    {
+      uint64_t free_bytes = 0;
+      if (!meshpunk_df(sd_mounted ? MP_SD : MP_FLASH, NULL, &free_bytes)
+          || free_bytes < (uint64_t)len + 65536) {
         session_close_files();
-        return push_fail(L, "not enough free space on the SD card");
-      }
-    } else {
-      size_t total = 0, used = 0;
-      if (!mp_littlefs_df(&total, &used) || total - used < (size_t)len + 65536) {
-        session_close_files();
-        return push_fail(L, "not enough free space on internal flash");
+        return push_fail(L, sd_mounted ? "not enough free space on the SD card"
+                                       : "not enough free space on internal flash");
       }
     }
     meshpunk_mkdirs(path.c_str(), false);
@@ -749,7 +819,7 @@ static int lua_ota_install(lua_State* L) {
   delay(60);   // let an in-flight dispatcher tick finish
   if (sd_mounted) {
     sd_spi_take();
-    SD.end();
+    sd_dev_unmount();
     sd_mounted = false;
     sd_spi_release();
   }

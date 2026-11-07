@@ -57,6 +57,19 @@ local CONFIG_PATH = "S:/meshpunk/appstore.toml"
 M.STAGING = { sd = "S:/meshpunk/.appstore", internal = "L:/lua/.appstore" }
 local CACHE_PATH = M.STAGING.sd .. "/catalog.toml"
 
+-- Below this many free bytes a drive cannot hold the two folders every
+-- install creates (staging dir, then the final dir): the mkdir fails before
+-- any download starts. run_install refuses such a drive. App Library's
+-- location picker carries its own copy of this value: that app is
+-- store-updated onto firmware whose downloader may predate this field.
+M.LOW_SPACE = 16 * 1024
+
+-- The remedy line for an out-of-space refusal at `loc` ("sd" | "internal").
+function M.low_space_msg(loc)
+    return "Low space on " .. (loc == "sd" and "the SD card" or "internal storage")
+        .. ". Free up space and try again."
+end
+
 local base_url = nil
 function M.base_url()
     if base_url then return base_url end
@@ -353,6 +366,13 @@ function M.run_install(root, opts)
             .. ", device has " .. M.fw_api() .. ")")
         return
     end
+    -- Drive gate: the staging dir below needs free blocks; an update stages
+    -- on the live drive too, so this applies to both.
+    local total, used = fileman.df(loc == "sd" and "S" or "L")
+    if total and total - used < M.LOW_SPACE then
+        on_done(M.low_space_msg(loc))
+        return
+    end
     -- Kind-prefixed staging name so ids can never collide across kinds.
     local prefix = (kind == "themes" and "th_")
                 or (kind == "drivers" and "dr_")
@@ -371,7 +391,7 @@ function M.run_install(root, opts)
     overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
     local box = overlay:Object {
-        w = 250, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        w = math.min(250, lvgl.HOR_RES() - 20), h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
         radius = 6, border_width = 1, pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
@@ -393,6 +413,12 @@ function M.run_install(root, opts)
         overlay:delete()
         pcall(_wifi_download_end)
         if err then silent_remove(staging) end
+        -- The two out-of-space errors _wifi_download_file reports get the
+        -- remedy appended; every caller shows err verbatim.
+        if err and (err:find("free space", 1, true) or err:find("Disk full", 1, true)) then
+            err = err .. ". Free up space on "
+                .. (loc == "sd" and "the SD card" or "internal storage") .. " and try again."
+        end
         on_done(err)
     end
 
@@ -576,7 +602,7 @@ function M.run_remove(root, name, dir, opts)
     overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
     local box = overlay:Object {
-        w = 240, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        w = math.min(240, lvgl.HOR_RES() - 20), h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
         radius = 6, border_width = 1, pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }

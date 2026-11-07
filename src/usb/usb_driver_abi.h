@@ -64,8 +64,8 @@ typedef struct {
     bool     (*sync)(void);
 } UsbBlockOps;
 
-// Peer-link socket: the `tdeck` link driver registers this; the firmware's
-// T-Deck↔T-Deck bridge (src/tdeck_link.cpp) transmits frames through it.
+// Peer-link socket: the `espserial` driver registers this; the firmware's
+// device-to-device bridge (src/tdeck_link.cpp) transmits frames through it.
 // send() must deliver one whole frame (<= 64 bytes) and may block briefly
 // (ride pipe_xfer — dual-context). One binding at a time.
 typedef struct {
@@ -161,13 +161,39 @@ typedef struct UsbHostApi {
     // report — this is a diagnostic/learning feed, not a data path.
     void (*publish)(const void* self, const void* data, uint32_t len);
 
-    // ── T-Deck peer-link socket (mirror of the block socket) ────────────────
+    // ── Peer-link socket (mirror of the block socket) ───────────────────────
     // link_register in start(), link_unregister in stop(); link_rx feeds the
     // firmware bridge with received bytes (usb_task context, e.g. from a
     // bulk-IN resubmit loop's completion callback).
     bool (*link_register)(const UsbLinkOps* ops);
     void (*link_unregister)(void);
     void (*link_rx)(const uint8_t* data, uint32_t len);
+
+    // ── App → driver channel (mirror of publish) ────────────────────────────
+    // command(): copies the latest blob an app wrote with
+    // _usb_drv_write(name, blob) into buf (cap 256 bytes) and returns its
+    // length; 0 = none or cleared. *seq changes with every write, including
+    // a clearing one. The blob is kept per driver NAME, so it is still there
+    // for the instance that loads after the device re-enumerates; it is
+    // dropped when USB host mode starts. Present from FW_API 15: a module
+    // that calls anything below needs min_fw = 15 in the catalog.
+    uint32_t (*command)(const void* self, uint8_t* buf, uint32_t cap, uint32_t* seq);
+
+    // ── File access ─────────────────────────────────────────────────────────
+    // One open file per driver. file_open (reading, "S:/..." or "L:/...")
+    // and file_create (writing, truncating; "S:/..." ONLY — an internal-flash
+    // write from usb_task would deadlock against the flash guard this task
+    // services) each close a file the driver already has open; the core
+    // closes it when the driver unloads. file_read returns the bytes read,
+    // 0 at end of file, -1 on error; file_write returns the bytes written or
+    // -1. usb_task context.
+    bool     (*file_open)(const void* self, const char* path);
+    uint32_t (*file_size)(const void* self);
+    bool     (*file_seek)(const void* self, uint32_t offset);
+    int32_t  (*file_read)(const void* self, uint8_t* buf, uint32_t len);
+    void     (*file_close)(const void* self);
+    bool     (*file_create)(const void* self, const char* path);
+    int32_t  (*file_write)(const void* self, const uint8_t* buf, uint32_t len);
 } UsbHostApi;
 
 // A class driver. Built-ins register this via the core; modules export it

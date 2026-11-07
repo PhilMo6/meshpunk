@@ -1,7 +1,24 @@
-local caps = ...
+local caps, dev = ...
 
 local body = [[
 The device can act as a USB host, so you can plug accessories into it: an audio adapter, a keyboard, a mouse, a gamepad, or a thumb drive.
+]]
+
+if dev.usb_power then
+    body = body .. [[
+
+POWER
+This device powers the accessory itself. While host mode is on, the USB-C port supplies 5 V as soon as an accessory is plugged in, and turns it off again when the accessory is unplugged, when host mode stops, and while the device is in standby. The accessory runs from the device's battery.
+
+While host mode is on the port only gives power, so a USB-C charger plugged into it does not charge the device. Stop host mode to charge.
+
+WHAT YOU NEED
+A USB-C accessory plugs straight in. For one with a USB-A plug - most keyboards, mice, gamepads and thumb drives - use a plain USB-C OTG adapter: a USB-C plug on one end, a USB-A socket on the other. Any generic one works.
+
+For headphones or speakers, a USB-C to 3.5mm adapter with a DAC chip inside plugs straight in and appears to the device as a USB audio device.
+]]
+else
+    body = body .. [[
 
 POWER COMES FIRST
 The device does not supply power over USB, so the accessory has to get power from somewhere else. If nothing happens when you plug something in, this is almost always the reason.
@@ -18,6 +35,10 @@ For headphones or speakers:
 A USB-C to 3.5mm adapter that also has a USB-C charging port - sold as a 2-in-1 audio and charge adapter, usually with PD up to 60W. These have a DAC chip inside and appear to the device as a USB audio device. They do not carry data, which is fine: audio and power are all they need to do. This kind does not need the OTG Y-cable, because it brings its own charging port.
 
 An accessory with its own power supply or battery works without any adapter.
+]]
+end
+
+body = body .. [[
 
 USB hubs are not supported. The firmware recognises a hub and refuses it, so it is one accessory at a time.
 
@@ -35,10 +56,12 @@ Drivers for the gamepad, mouse and link cable download automatically from the Ap
 ]]
 
 if not caps.keyboard then
+    local audio = (dev.audio == "i2s") and "an audio adapter adds headphones"
+                                       or  "an audio adapter is how you get music and game sound out"
     body = body .. [[
 
 ON THIS DEVICE
-A USB keyboard unlocks the keyboard shortcuts listed in the Guide tab and types anywhere the on-screen keyboard would. A gamepad is the comfortable way to play the emulators, and an audio adapter is how you get music and game sound out.
+A USB keyboard unlocks the keyboard shortcuts listed in the Guide tab and types anywhere the on-screen keyboard would. A gamepad is the comfortable way to play the emulators, and ]] .. audio .. [[.
 ]]
 end
 

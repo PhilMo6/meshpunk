@@ -1,4 +1,4 @@
-local caps = ...
+local caps, dev = ...
 
 local wake_key = caps.trackball and "click the trackball" or "press the USER button"
 
@@ -23,6 +23,16 @@ It wakes two ways:
 - You ]] .. wake_key .. [[.
 
 Waking returns you to whatever was on screen before.
+]]
+
+if dev.usb_power then
+    body = body .. [[
+
+Power to a USB accessory turns off in standby and comes back when you wake the device.
+]]
+end
+
+body = body .. [[
 
 POWER OFF
 Power off is a deep sleep: everything shuts down and battery drain drops to almost nothing, enough to leave it for weeks. Nothing is received while it is off. To turn it back on, ]] .. wake_key .. [[.
@@ -32,8 +42,17 @@ Messages, contacts and settings are all saved before it powers down.
 AUTO STANDBY
 In Settings > Power you can have the device enter Standby by itself after a period of no input - 5, 10, 15, 30 or 60 minutes. It is off by default. This is the setting that gets you the most battery life out of a day: the device spends its idle time dark and listening instead of lit.
 
+]]
+
+if caps.kbd_backlight then
+    body = body .. [[
 The screen and keyboard backlight timeouts in Settings > Device still work as before, and happen first.
 ]]
+else
+    body = body .. [[
+The screen timeout in Settings > Device still works as before, and happens first.
+]]
+end
 
 if caps.kbd_backlight then
   body = body .. [[

@@ -101,6 +101,15 @@ function utils.relTime(ts)
     return string.format("%d/%d", mo, d)
 end
 
+-- Chat bubble stamp: "HH:MM" within the last day, "N days ago" beyond it.
+function utils.chatStamp(ts)
+    if not ts or ts < 1 then return "--:--" end
+    local diff = utils.now() - ts
+    if diff < SECS_PER_DAY then return utils.clockHM(ts) end
+    local days = math.floor(diff / SECS_PER_DAY)
+    return days .. (days == 1 and " day ago" or " days ago")
+end
+
 -- Create a simple notification
 function utils.createNotification(parent, message, duration)
     duration = duration or 3000  -- default 3 seconds

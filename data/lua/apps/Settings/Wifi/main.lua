@@ -85,15 +85,29 @@ local saved_sel = ""
 local connect_btn = content:Button { w = 70, h = 24 }
 connect_btn:Label { text = "Connect", align = lvgl.ALIGN.CENTER }
 local forget_btn = content:Button { w = 60, h = 24 }
-forget_btn:Label { text = "Forget", align = lvgl.ALIGN.CENTER }
+local forget_lbl = forget_btn:Label { text = "Forget", align = lvgl.ALIGN.CENTER }
+
+-- Forget is two-tap: the first tap arms for FORGET_TIMEOUT_MS, the second
+-- drops the credentials. Any selection change disarms.
+local FORGET_TIMEOUT_MS = 8000
+local forget_armed = false
+local forget_timer = nil
+
+local function disarm_forget()
+    forget_armed = false
+    if forget_timer then forget_timer:delete(); forget_timer = nil end
+    forget_lbl:set({ text = "Forget" })
+end
 
 local function hide_saved_actions()
     saved_sel = ""
+    disarm_forget()
     connect_btn:add_flag(lvgl.FLAG.HIDDEN)
     forget_btn:add_flag(lvgl.FLAG.HIDDEN)
 end
 
 local function show_saved_actions(ssid)
+    disarm_forget()
     saved_sel = ssid
     connect_btn:clear_flag(lvgl.FLAG.HIDDEN)
     forget_btn:clear_flag(lvgl.FLAG.HIDDEN)
@@ -131,50 +145,79 @@ end)
 
 forget_btn:onClicked(function()
     if #saved_sel == 0 then return end
+    if not forget_armed then
+        forget_armed = true
+        forget_lbl:set({ text = "Sure?" })
+        status.text = "Tap again to forget " .. saved_sel
+        forget_timer = apps.add_timer { period = FORGET_TIMEOUT_MS, cb = function(t)
+            t:delete()
+            forget_timer = nil
+            disarm_forget()
+            status.text = "Selected: " .. saved_sel
+        end }
+        return
+    end
     _wifi_forget_cred(saved_sel)
     status.text = "Forgot " .. saved_sel
     refresh_saved()
     refresh_wifi_status()
 end)
 
--- Password input + Join (direct children, hidden initially)
-local pass_input = content:Textarea {
-    password_mode = true, one_line = true,
-    text = "", placeholder_text = "Password",
-    w = lvgl.PCT(60), h = 30,
-}
-pass_input:clear_flag(lvgl.FLAG.SCROLLABLE)
-pass_input:add_flag(lvgl.FLAG.HIDDEN)
+-- Password prompt for a secure network: dimmed overlay parented to the app
+-- root (torn down with the app), centered box pushed as its own nav scope with
+-- the textarea focused. Join / Enter saves the creds and connects; Cancel just
+-- closes. nav.pop() runs BEFORE overlay:delete() (lib/emoji_popup convention).
+local function show_password_popup(ssid)
+    local overlay = root:Object {
+        w = lvgl.HOR_RES(), h = lvgl.VER_RES(), x = 0, y = 0,
+        bg_color = "#000000", bg_opa = 128, border_width = 0, pad_all = 0,
+    }
+    overlay:clear_flag(lvgl.FLAG.SCROLLABLE)
+    overlay:add_flag(lvgl.FLAG.CLICKABLE)   -- modal: swallow taps behind it
+    local box = overlay:Object {
+        w = lvgl.HOR_RES() - 40, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        radius = 6, border_width = 1, pad_all = 8,
+        flex = { flex_direction = "row", flex_wrap = "wrap" },
+    }
+    box:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local join_btn = content:Button { w = 50, h = 28 }
-join_btn:Label { text = "Join", align = lvgl.ALIGN.CENTER }
-join_btn:add_flag(lvgl.FLAG.HIDDEN)
+    -- Every focusable is a DIRECT child of box: gridnav does not descend into
+    -- sub-containers, so a button row would be touch-only.
+    box:Label { text = "Password for " .. ssid, w = lvgl.PCT(100), h = 18 }
+    local pass_input = box:Textarea {
+        password_mode = true, one_line = true,
+        text = "", placeholder_text = "Password",
+        w = lvgl.PCT(100), h = 30,
+    }
+    pass_input:clear_flag(lvgl.FLAG.SCROLLABLE)
 
-local selected_ssid = ""
-local selected_secure = false
+    local join_btn = box:Button { w = lvgl.PCT(48), h = 26 }
+    join_btn:Label { text = "Join", align = lvgl.ALIGN.CENTER }
+    local cancel_btn = box:Button { w = lvgl.PCT(48), h = 26 }
+    cancel_btn:Label { text = "Cancel", align = lvgl.ALIGN.CENTER }
 
-local function show_pass_row()
-    pass_input:clear_flag(lvgl.FLAG.HIDDEN)
-    join_btn:clear_flag(lvgl.FLAG.HIDDEN)
-end
+    nav.push(box, { focus = pass_input })
 
-local function hide_pass_row()
-    pass_input:add_flag(lvgl.FLAG.HIDDEN)
-    join_btn:add_flag(lvgl.FLAG.HIDDEN)
-end
-
-join_btn:onClicked(function()
-    local pass = pass_input.text or ""
-    if #selected_ssid == 0 then
-        status.text = "No network selected"
-        return
+    local function close()
+        nav.pop()
+        overlay:delete()
     end
-    _wifi_save_creds(selected_ssid, pass)
-    _wifi_connect(selected_ssid, pass)
-    hide_pass_row()
-    status.text = "Joining " .. selected_ssid .. "..."
-    refresh_saved()
-end)
+
+    local function do_join()
+        local pass = pass_input.text or ""
+        close()
+        _wifi_save_creds(ssid, pass)
+        _wifi_connect(ssid, pass)
+        status.text = "Joining " .. ssid .. "..."
+        refresh_saved()
+    end
+
+    join_btn:onevent(lvgl.EVENT.RELEASED, do_join)
+    cancel_btn:onevent(lvgl.EVENT.RELEASED, close)
+    pass_input:onevent(lvgl.EVENT.KEY, function()
+        if lvgl.indev.get_act():get_key() == lvgl.KEY.ENTER then do_join() end
+    end)
+end
 
 -- Scan button
 local scan_btn = content:Button { w = lvgl.PCT(60), h = 30 }
@@ -197,7 +240,7 @@ local function show_scan_results(results)
         scan_container:Label { text = "No networks found", w = lvgl.PCT(100), h = 16 }
         return
     end
-    for i = 1, math.min(#results, 8) do
+    for i = 1, #results do
         local net = results[i]
         local label_text = net.ssid
         if net.secure then label_text = label_text .. " *" end
@@ -205,15 +248,10 @@ local function show_scan_results(results)
         local nbtn = scan_container:Button { w = lvgl.PCT(95), h = 26 }
         nbtn:Label { text = label_text, align = lvgl.ALIGN.LEFT_MID }
         nbtn:onClicked(function()
-            selected_ssid = net.ssid
-            selected_secure = net.secure
             exit_scan_select()
             if net.secure then
-                show_pass_row()
-                pass_input.text = ""
-                status.text = "Enter password for " .. net.ssid
+                show_password_popup(net.ssid)
             else
-                hide_pass_row()
                 _wifi_save_creds(net.ssid, "")
                 _wifi_connect(net.ssid, "")
                 status.text = "Joining " .. net.ssid .. "..."

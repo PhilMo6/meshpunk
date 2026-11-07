@@ -28,6 +28,48 @@ static TFT_eSPI tft;
 // radio — the global SPI object main.cpp begins at boot.
 SPIClass& board_sd_spi(void) { return SPI; }
 
+// Orientation state (contract: display_dev.h). The panel's native landscape
+// is TFT_eSPI rotation 1, so the user's quarter-turn count maps to rotation
+// (1 + o) & 3. Module video sessions force the native landscape the 320x240
+// module contract requires.
+static uint8_t s_orient = 0;
+static bool    s_module_video = false;
+
+static uint8_t eff_orient(void) { return s_module_video ? 0 : s_orient; }
+
+static void apply_rotation(void) {
+  SPI_LOCK();
+  tft.setRotation((1 + eff_orient()) & 3);
+  tft.fillScreen(TFT_BLACK);
+  SPI_UNLOCK();
+}
+
+void display_dev_set_orientation(uint8_t o) {
+  s_orient = o & 3;
+  if (!s_module_video) apply_rotation();
+}
+
+uint8_t display_dev_orientation(void) { return eff_orient(); }
+
+void display_dev_module_video(bool active) {
+  if (active == s_module_video) return;
+  s_module_video = active;
+  apply_rotation();
+}
+
+void display_dev_orient_point(int16_t* x, int16_t* y) {
+  // Same quarter-turn algebra the panel rotation applies: one step maps
+  // (x, y) in a WxH space to (y, W-1-x). Applied k times from the native
+  // landscape 320x240 space.
+  int w = 320, h = 240;
+  for (uint8_t k = eff_orient(); k > 0; k--) {
+    int16_t nx = *y;
+    int16_t ny = (int16_t)(w - 1 - *x);
+    *x = nx; *y = ny;
+    int t = w; w = h; h = t;
+  }
+}
+
 void display_dev_init(void) {
   tft.begin();
   tft.setRotation(1);
@@ -48,14 +90,14 @@ void display_dev_splash(void) {
   SPI_UNLOCK();
 }
 
-// Rotation 1 (landscape): the panel's native 240x320 becomes 320 wide by
-// 240 tall. Stated as literals on purpose: TFT_WIDTH/TFT_HEIGHT are defined
-// with OPPOSITE values by utilities.h (320x240, landscape) and TFT_eSPI's
-// Setup210 (240x320, panel-native) — whichever include comes last silently
-// wins, and that ordering trap already shipped one 240-wide UI. Never size
-// anything off those macros in this file.
-int display_dev_width(void)  { return 320; }
-int display_dev_height(void) { return 240; }
+// Landscape orientations report 320x240, portraits 240x320. Stated as
+// literals on purpose: TFT_WIDTH/TFT_HEIGHT are defined with OPPOSITE values
+// by utilities.h (320x240, landscape) and TFT_eSPI's Setup210 (240x320,
+// panel-native) — whichever include comes last silently wins, and that
+// ordering trap already shipped one 240-wide UI. Never size anything off
+// those macros in this file.
+int display_dev_width(void)  { return (eff_orient() & 1) ? 240 : 320; }
+int display_dev_height(void) { return (eff_orient() & 1) ? 320 : 240; }
 
 // Helper: read the ILI9341 current scanline position via command 0x45.
 // Returns 0–319 indicating the gate line the panel is currently refreshing.
@@ -86,23 +128,27 @@ static uint16_t ili9341_get_scanline() {
 void display_dev_flush_rect(int x, int y, int w, int h, const uint16_t* px) {
   SPI_LOCK();
 
-  // Read current scanline position.
-  // In rotation 1 the gate scan maps to the y-axis of the flush area
-  // (the ILI9341's 320 native rows become the 240-pixel vertical axis
-  // after MV swap + rotation). Try y1/y2 first; if tearing persists,
-  // switch flush_start/flush_end to use x1/x2 instead.
-  uint16_t scanline = ili9341_get_scanline();
-  uint16_t flush_start = (uint16_t)y;
-  uint16_t flush_end   = (uint16_t)(y + h - 1 + SCANLINE_MARGIN);
+  // Scanline tear-sync. The gate-window math below is rotation 1's mapping;
+  // the other orientations push without the wait.
+  if (eff_orient() == 0) {
+    // Read current scanline position.
+    // In rotation 1 the gate scan maps to the y-axis of the flush area
+    // (the ILI9341's 320 native rows become the 240-pixel vertical axis
+    // after MV swap + rotation). Try y1/y2 first; if tearing persists,
+    // switch flush_start/flush_end to use x1/x2 instead.
+    uint16_t scanline = ili9341_get_scanline();
+    uint16_t flush_start = (uint16_t)y;
+    uint16_t flush_end   = (uint16_t)(y + h - 1 + SCANLINE_MARGIN);
 
-  // Busy-wait if the scanline is inside (or about to enter) the flush
-  // area.  Timeout after ~8 ms to avoid blocking the system forever
-  // if readcommand8 returns garbage (e.g. MISO not connected).
-  int wait_us = 0;
-  while (scanline >= flush_start && scanline <= flush_end && wait_us < 8000) {
-    delayMicroseconds(10);
-    wait_us += 10;
-    scanline = ili9341_get_scanline();
+    // Busy-wait if the scanline is inside (or about to enter) the flush
+    // area.  Timeout after ~8 ms to avoid blocking the system forever
+    // if readcommand8 returns garbage (e.g. MISO not connected).
+    int wait_us = 0;
+    while (scanline >= flush_start && scanline <= flush_end && wait_us < 8000) {
+      delayMicroseconds(10);
+      wait_us += 10;
+      scanline = ili9341_get_scanline();
+    }
   }
   tft.startWrite();
   tft.setAddrWindow(x, y, w, h);

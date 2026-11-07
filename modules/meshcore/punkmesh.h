@@ -202,12 +202,6 @@ public:
   int compactArchive(uint32_t* before_out, uint32_t* after_out);
   // Records currently in the log, duplicates included (file size / stride).
   uint32_t archiveRecordCount();
-  // Read the archive log into `out` (deduped, newest line per pubkey wins),
-  // up to max_out entries; returns the count. Used by the "show archived" map
-  // union. Caller owns the (transient) buffer; disk keeps everything regardless
-  // of max_out (only the on-map display is bounded).
-  int readArchivedDeduped(ContactInfo* out, int max_out);
-
   // Read up to max_count archived contacts starting at byte `offset` in the log
   // into `out`; sets *next_offset to resume from and *done at EOF; returns the
   // count. Stateless (re-open + seek per call) so the mesh task can keep

@@ -28,11 +28,11 @@
 #include "meshpunk_fs.h"
 #include "meshpunk_sync.h"
 #include "usb_manager.h"   // UsbFlashGuardIf — pause USB audio around flash writes
-#include "usb_fs.h"        // usb_fs()/usb_fs_mounted()/usb_fs_df() — the U: drive
+#include "usb_fs.h"        // usb_fs()/usb_fs_mounted() — the U: drive
 
 #include <Arduino.h>
 #include <FS.h>
-#include <SD.h>
+#include "storage/sd_dev.h"
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
 #include <dirent.h>
@@ -67,7 +67,7 @@ static FsTarget fs_resolve(const char* raw) {
     t.is_sd    = (drive == MP_SD);
     t.is_flash = (drive == MP_FLASH);
     if (drive == MP_SD) {
-        t.fs = &SD;
+        t.fs = &sd_dev_fs();
         t.vfs_base = "/sd";
         t.ok = sd_mounted;
     } else if (drive == MP_USB) {
@@ -460,37 +460,20 @@ static int lua_fs_copy(lua_State* L) {
 }
 
 // _fs_df(drive) -> total, used | nil. drive = "L", "S" or "U".
-// NOTE: the first SD/USB call can take a moment on big volumes (FAT
-// free-cluster scan); it is cached by the FS driver afterwards.
+// "L" answers 0, 0 when the LittleFS query fails (its callers treat the
+// internal drive as always mounted); SD/USB answer nil when unmounted.
 static int lua_fs_df(lua_State* L) {
     const char* drv = luaL_checkstring(L, 1);
-    if (drv[0] == 'S' || drv[0] == 's') {
-        if (!sd_mounted) {
-            lua_pushnil(L);
-            return 1;
-        }
-        sd_spi_take();
-        uint64_t total = SD.totalBytes();
-        uint64_t used = SD.usedBytes();
-        sd_spi_release();
-        lua_pushnumber(L, (lua_Number)total);
-        lua_pushnumber(L, (lua_Number)used);
-        return 2;
+    MpDrive drive = MP_FLASH;
+    if (drv[0] == 'S' || drv[0] == 's') drive = MP_SD;
+    else if (drv[0] == 'U' || drv[0] == 'u') drive = MP_USB;
+    uint64_t total = 0, freeb = 0;
+    if (!meshpunk_df(drive, &total, &freeb) && drive != MP_FLASH) {
+        lua_pushnil(L);
+        return 1;
     }
-    if (drv[0] == 'U' || drv[0] == 'u') {
-        uint64_t total = 0, freeb = 0;
-        if (!usb_fs_df(&total, &freeb)) {
-            lua_pushnil(L);
-            return 1;
-        }
-        lua_pushnumber(L, (lua_Number)total);
-        lua_pushnumber(L, (lua_Number)(total - freeb));
-        return 2;
-    }
-    size_t total = 0, used = 0;
-    mp_littlefs_df(&total, &used);   // stays 0/0 if the query fails
     lua_pushnumber(L, (lua_Number)total);
-    lua_pushnumber(L, (lua_Number)used);
+    lua_pushnumber(L, (lua_Number)(total - freeb));
     return 2;
 }
 

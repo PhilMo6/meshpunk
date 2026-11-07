@@ -1775,13 +1775,31 @@ static inline bool elf_is_psram(const void* p) {
     return a >= 0x3C000000u && a < 0x3E000000u;   // PSRAM data bus window
 }
 
-static uint8_t* s_io_bounce = nullptr;            // lazily allocated, reused
 #define ELF_IO_BOUNCE_SZ 8192
 
-static uint8_t* elf_io_bounce() {
-    if (!s_io_bounce)
-        s_io_bounce = (uint8_t*)heap_caps_malloc(ELF_IO_BOUNCE_SZ, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    return s_io_bounce;
+// The game module's task (elf_run) during a session. Its file I/O keeps one
+// bounce buffer for the whole session (s_io_bounce, freed at session end).
+// Every other caller — the resident protocol modules (mesh task, loopTask),
+// a game's own worker tasks — gets a buffer sized to its transfer, freed
+// before the call returns, so no internal RAM stays held between calls.
+static TaskHandle_t volatile s_elf_run_task = nullptr;
+static uint8_t* s_io_bounce = nullptr;
+
+// Bounce buffer for a PSRAM transfer of `total` bytes; *len = its size.
+// Hand it back with elf_io_bounce_release().
+static uint8_t* elf_io_bounce_get(size_t total, size_t* len) {
+    if (xTaskGetCurrentTaskHandle() == s_elf_run_task) {
+        if (!s_io_bounce)
+            s_io_bounce = (uint8_t*)heap_caps_malloc(ELF_IO_BOUNCE_SZ, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        *len = ELF_IO_BOUNCE_SZ;
+        return s_io_bounce;
+    }
+    *len = (total < ELF_IO_BOUNCE_SZ) ? total : ELF_IO_BOUNCE_SZ;
+    return (uint8_t*)heap_caps_malloc(*len, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+}
+
+static void elf_io_bounce_release(uint8_t* bb) {
+    if (bb && bb != s_io_bounce) heap_caps_free(bb);
 }
 
 // fread that never DMAs into PSRAM (called only by the loaded module, which is
@@ -1961,9 +1979,10 @@ long elf_ftell(FILE* f) {
 
 size_t elf_fread(void* dst, size_t size, size_t nmemb, FILE* f) {
     size_t total = size * nmemb;
-    uint8_t* bb;
+    uint8_t* bb = nullptr;
+    size_t bb_len = 0;
     if (total == 0) return 0;
-    if (!elf_is_psram(dst) || !(bb = elf_io_bounce())) {
+    if (!elf_is_psram(dst) || !(bb = elf_io_bounce_get(total, &bb_len))) {
         SPI_LOCK();
         size_t r = fread(dst, size, nmemb, f);
         SPI_UNLOCK();
@@ -1975,21 +1994,23 @@ size_t elf_fread(void* dst, size_t size, size_t nmemb, FILE* f) {
     uint8_t* d = (uint8_t*)dst;
     size_t done = 0;
     while (done < total) {
-        size_t chunk = (total - done < ELF_IO_BOUNCE_SZ) ? (total - done) : ELF_IO_BOUNCE_SZ;
+        size_t chunk = (total - done < bb_len) ? (total - done) : bb_len;
         SPI_LOCK();
         size_t r = fread(bb, 1, chunk, f);         // SD DMA lands in internal RAM
         SPI_UNLOCK();
         if (r) { memcpy(d + done, bb, r); done += r; }
         if (r < chunk) break;                      // short read / EOF
     }
+    elf_io_bounce_release(bb);
     return (size ? done / size : 0);
 }
 
 size_t elf_fwrite(const void* src, size_t size, size_t nmemb, FILE* f) {
     size_t total = size * nmemb;
-    uint8_t* bb;
+    uint8_t* bb = nullptr;
+    size_t bb_len = 0;
     if (total == 0) return 0;
-    if (!elf_is_psram(src) || !(bb = elf_io_bounce())) {
+    if (!elf_is_psram(src) || !(bb = elf_io_bounce_get(total, &bb_len))) {
         SPI_LOCK();
         size_t r = fwrite(src, size, nmemb, f);
         SPI_UNLOCK();
@@ -1998,7 +2019,7 @@ size_t elf_fwrite(const void* src, size_t size, size_t nmemb, FILE* f) {
     const uint8_t* s = (const uint8_t*)src;
     size_t done = 0;
     while (done < total) {
-        size_t chunk = (total - done < ELF_IO_BOUNCE_SZ) ? (total - done) : ELF_IO_BOUNCE_SZ;
+        size_t chunk = (total - done < bb_len) ? (total - done) : bb_len;
         memcpy(bb, s + done, chunk);
         SPI_LOCK();
         size_t w = fwrite(bb, 1, chunk, f);
@@ -2006,6 +2027,7 @@ size_t elf_fwrite(const void* src, size_t size, size_t nmemb, FILE* f) {
         done += w;
         if (w < chunk) break;
     }
+    elf_io_bounce_release(bb);
     return (size ? done / size : 0);
 }
 
@@ -2632,6 +2654,7 @@ static void elf_set_core1_handlers(bool install) {
 
 static void elf_run_task(void* param) {
     elf_run_ctx* ctx = (elf_run_ctx*)param;
+    s_elf_run_task = xTaskGetCurrentTaskHandle();   // owns s_io_bounce this session
 
     // Report current SP so a fault address can be compared against the stack range.
     uint32_t sp_top = (uint32_t)__builtin_frame_address(0);
@@ -2648,6 +2671,7 @@ static void elf_run_task(void* param) {
     // High-water mark tells us how close we came to overflowing (for tuning).
     SLog.printf("[elf_host] module task finished (result=%d), min stack free: %u bytes\n",
                   ctx->result, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    s_elf_run_task = nullptr;
     xSemaphoreGive(ctx->done);
     vTaskDelete(NULL);
 }
@@ -2825,6 +2849,11 @@ int elf_host_run_pending(void) {
     s_mod_alloc_count = 0;
     s_mod_tracking = true;
 
+    // Module video contract: force the panel to native landscape for the
+    // whole session — modules, zone overlays and the OSK all draw 320x240
+    // (display_dev.h). Restored after the cleanup below, on every path.
+    display_dev_module_video(true);
+
     // Load and relocate
     elf_module_t* mod = elf_load(elf_data, elf_size, host_exports);
     heap_caps_free(elf_data); // raw ELF data no longer needed
@@ -2935,6 +2964,9 @@ int elf_host_run_pending(void) {
     } else {
         SLog.println("[elf_host] elf_load failed");
     }
+
+    // Restore the user's display orientation (no-op when it is landscape).
+    display_dev_module_video(false);
 
     // Touch layout/OSK teardown — after blit_drain: no push reads the
     // overlay buffers past this point. Also clears a layout stashed by

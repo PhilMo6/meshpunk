@@ -10,3 +10,7 @@ releases
 pack
 Todo.txt
 docs
+modules/*/obj/
+modules/*/obj-rv32/
+__pycache__/
+*.pyc

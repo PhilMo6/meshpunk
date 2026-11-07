@@ -17,6 +17,7 @@ extern "C" {
 
 #include "input_dev.h"
 #include "input_ui.h"
+#include "../display/display_dev.h"   // display_dev_orientation (trackball remap)
 #include "input_zones.h"        // controller-mode touch zones
 #include "../meshpunk_sync.h"   // SLog
 #include "../usb_manager.h"     // usb_kbd_snapshot + UsbFlashGuard
@@ -234,6 +235,38 @@ static bool          s_touch_chord_prev    = false;
 static uint32_t      s_touch_chord_last_ms = 0;
 static volatile bool s_touch_chord_pending = false;
 
+// Standby wake-press hold (input_ui_ignore_click_until_release). Standby's
+// exit re-attaches the click ISR while the wake press can still be held, so
+// that press can still produce click edges. While the hold is armed the
+// keyboard reader drops click edges; it disarms once the click line has read
+// released for CLICK_HOLD_RELEASE_MS without a break.
+#define CLICK_HOLD_RELEASE_MS 250
+static bool     s_click_hold          = false;
+static bool     s_click_hold_released = false;
+static uint32_t s_click_hold_up_ms    = 0;
+
+void input_ui_ignore_click_until_release(void) {
+  trackball_click       = 0;
+  s_click_hold_released = false;
+  s_click_hold          = true;
+}
+
+// Top of each keyboard read: drops click edges while the hold is armed and
+// disarms it after the release window. True while armed.
+static bool click_hold_update(void) {
+  if (!s_click_hold) return false;
+  trackball_click = 0;
+  if (input_dev_nav_click_held()) {
+    s_click_hold_released = false;
+  } else if (!s_click_hold_released) {
+    s_click_hold_released = true;
+    s_click_hold_up_ms    = millis();
+  } else if (millis() - s_click_hold_up_ms >= CLICK_HOLD_RELEASE_MS) {
+    s_click_hold = false;
+  }
+  return s_click_hold;
+}
+
 // ── LVGL keyboard read callback ────────────────────────────────────────────
 static bool trackball_btn_pressed = false;
 
@@ -243,6 +276,9 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   static uint32_t kb_mapped_key = 0;
   bool any_new = false;
   bool key_from_trackball = false;
+  // Standby wake-press hold: an edge the click ISR adds while this read runs
+  // is also left unconsumed below, and the next read drops it.
+  bool click_hold = click_hold_update();
 
   // ── Sample the keyboard (raw matrix — or one ASCII byte in legacy mode) ──
   // detect_legacy_fw=true: this interactive reader is where the
@@ -486,7 +522,7 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     for (int ch = 1; ch < 128 && !got; ch++)
       if (kb_key_state[ch] && !kb_key_prev[ch]) got = ch;
     if (!got) {
-      if      (trackball_click > 0) got = 0x85;
+      if      (trackball_click > 0 && !click_hold) got = 0x85;
       else if (trackball_up > 0)    got = 0x81;
       else if (trackball_down > 0)  got = 0x82;
       else if (trackball_left > 0)  got = 0x83;
@@ -555,19 +591,39 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 
   // ── Direction navigation — WASD + trackball, shared sensitivity ──
   if (!kb_active) {
-    if (trackball_click > 0) {
+    if (trackball_click > 0 && !click_hold) {
       trackball_click = 0;
       last_key_code = LV_KEY_ENTER;
       any_new = true;
       key_from_trackball = true;
       trackball_btn_pressed = true;
     } else {
+      // Trackball remap for the display orientation: which PHYSICAL counter
+      // produces each VISUAL direction. Derived from the same quarter-turn
+      // algebra display_dev_orient_point uses, so a finger drag and a
+      // trackball roll agree on every orientation. Identity at orientation
+      // 0 — and module runs consume the raw counters in elf_host, where the
+      // effective orientation is forced to 0 anyway.
+      static volatile int* const tb_phys[4] =
+          { &trackball_up, &trackball_down, &trackball_left, &trackball_right };
+      static const uint8_t tb_vis2phys[4][4] = {
+          { 0, 1, 2, 3 },   // orientation 0: identity
+          { 3, 2, 0, 1 },   // 1: visual up reads physical right
+          { 1, 0, 3, 2 },   // 2: inverted
+          { 2, 3, 1, 0 },   // 3: visual up reads physical left
+      };
+      const uint8_t* v2p = tb_vis2phys[display_dev_orientation() & 3];
+      volatile int* tb_up    = tb_phys[v2p[0]];
+      volatile int* tb_down  = tb_phys[v2p[1]];
+      volatile int* tb_left  = tb_phys[v2p[2]];
+      volatile int* tb_right = tb_phys[v2p[3]];
+
       uint32_t nav_dir = wasd_dir;
       if (!nav_dir) {
-        if      (trackball_up > 0)    nav_dir = LV_KEY_UP;
-        else if (trackball_down > 0)  nav_dir = LV_KEY_DOWN;
-        else if (trackball_left > 0)  nav_dir = LV_KEY_LEFT;
-        else if (trackball_right > 0) nav_dir = LV_KEY_RIGHT;
+        if      (*tb_up > 0)    nav_dir = LV_KEY_UP;
+        else if (*tb_down > 0)  nav_dir = LV_KEY_DOWN;
+        else if (*tb_left > 0)  nav_dir = LV_KEY_LEFT;
+        else if (*tb_right > 0) nav_dir = LV_KEY_RIGHT;
       }
 
       if (nav_dir) {
@@ -579,15 +635,15 @@ static void keyboard_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
           last_nav_ms = now;
           if (!wasd_dir) {
             if (trackball_roll_ms > 0) {
-              if      (nav_dir == LV_KEY_UP)    trackball_up--;
-              else if (nav_dir == LV_KEY_DOWN)  trackball_down--;
-              else if (nav_dir == LV_KEY_LEFT)  trackball_left--;
-              else if (nav_dir == LV_KEY_RIGHT) trackball_right--;
+              if      (nav_dir == LV_KEY_UP)    (*tb_up)--;
+              else if (nav_dir == LV_KEY_DOWN)  (*tb_down)--;
+              else if (nav_dir == LV_KEY_LEFT)  (*tb_left)--;
+              else if (nav_dir == LV_KEY_RIGHT) (*tb_right)--;
             } else {
-              if      (nav_dir == LV_KEY_UP)    trackball_up = 0;
-              else if (nav_dir == LV_KEY_DOWN)  trackball_down = 0;
-              else if (nav_dir == LV_KEY_LEFT)  trackball_left = 0;
-              else if (nav_dir == LV_KEY_RIGHT) trackball_right = 0;
+              if      (nav_dir == LV_KEY_UP)    *tb_up = 0;
+              else if (nav_dir == LV_KEY_DOWN)  *tb_down = 0;
+              else if (nav_dir == LV_KEY_LEFT)  *tb_left = 0;
+              else if (nav_dir == LV_KEY_RIGHT) *tb_right = 0;
             }
           }
           last_key_code = nav_dir;

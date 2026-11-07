@@ -2,7 +2,8 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
-#include <SD.h>
+#include <SPI.h>
+#include "storage/sd_dev.h"
 #include <Ticker.h> // Include ticker for LVGL timing
 #include <WiFi.h>
 #include <Wire.h>
@@ -127,6 +128,9 @@ RADIO_CLASS radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LOR
 #if defined(BOARD_HELTEC_V4)
 #include "boards/punk_heltec_board.h"
 PunkHeltecBoard board;   // FEM TX/RX switching + Heltec battery circuit
+#elif defined(BOARD_WIO_L2)
+#include "boards/punk_wio_l2_board.h"
+PunkWioL2Board board;    // battery through the power backend (ADS1115)
 #else
 ESP32Board board;
 #endif
@@ -285,6 +289,10 @@ static uint8_t kbd_brightness = 200;  // 0–255, persisted
 
 // ── Display Backlight ──────────────────────────────────────────────────────
 static uint8_t display_brightness = 16;  // 0–16, persisted
+// Display orientation: 0–3 quarter turns from the board's native landscape
+// (display_dev.h), persisted. Applied once before LVGL is created; a change
+// from Settings takes effect on restart.
+static uint8_t display_orientation = 0;
 
 // ── Inactivity Timeouts ───────────────────────────────────────────────────
 static uint16_t screen_timeout_secs  = 60;  // 0 = never, persisted
@@ -384,6 +392,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("usb_speaker=%d\n", usb_speaker_pref_get() ? 1 : 0);
   f.printf("kbd_bright=%d\n", kbd_brightness);
   f.printf("disp_bright=%d\n", display_brightness);
+  f.printf("disp_orient=%d\n", display_orientation);
   f.printf("screen_timeout=%d\n", screen_timeout_secs);
   f.printf("kbd_timeout=%d\n", kbd_timeout_secs);
   f.printf("msg_retain_days=%d\n", msg_retain_days);
@@ -398,6 +407,7 @@ static void write_firmware_prefs(fs::FS& fs, const char* path) {
   f.printf("ble_sync_max=%d\n", ble_sync_max_per_channel);
   f.printf("wifi_enabled=%d\n", wifi_enabled_pref ? 1 : 0);
   f.printf("lora_protocol=%s\n", lora_proto_requested());
+  f.printf("ota_channel=%s\n", ota_channel_requested());
   f.printf("trackball_sens=%d\n", input_ui_trackball_sens_get());
   f.printf("trackball_roll=%d\n", input_ui_trackball_roll_get());
   f.printf("sym_toggle=%d\n", input_ui_sym_toggle_get() ? 1 : 0);
@@ -433,7 +443,7 @@ static void firmware_prefs_save() {
   }
   if (sd_mounted && use_sd_pref) {
     sd_spi_take();
-    write_firmware_prefs(SD, "/meshpunk/firmware_prefs");
+    write_firmware_prefs(sd_dev_fs(), "/meshpunk/firmware_prefs");
     sd_spi_release();
   }
 }
@@ -452,7 +462,7 @@ static void wifi_creds_save() {
   write_wifi_creds(LittleFS, "/wifi_creds");
   if (sd_mounted && use_sd_pref) {
     sd_spi_take();
-    write_wifi_creds(SD, "/meshpunk/wifi_creds");
+    write_wifi_creds(sd_dev_fs(), "/meshpunk/wifi_creds");
     sd_spi_release();
     SLog.println("[WIFI_CREDS] Saved to SD");
   }
@@ -485,7 +495,7 @@ static void wifi_creds_clear() {
   LittleFS.remove("/wifi_creds");
   if (sd_mounted && use_sd_pref) {
     sd_spi_take();
-    SD.remove("/meshpunk/wifi_creds");
+    sd_dev_fs().remove("/meshpunk/wifi_creds");
     sd_spi_release();
   }
 }
@@ -756,6 +766,9 @@ static void firmware_prefs_load() {
     } else if (strcmp(key, "disp_bright") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 16) display_brightness = (uint8_t)v;
+    } else if (strcmp(key, "disp_orient") == 0) {
+      int v = atoi(val);
+      if (v >= 0 && v <= 3) display_orientation = (uint8_t)v;
     } else if (strcmp(key, "screen_timeout") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 65535) screen_timeout_secs = (uint16_t)v;
@@ -794,6 +807,8 @@ static void firmware_prefs_load() {
       wifi_enabled_pref = (atoi(val) == 1);
     } else if (strcmp(key, "lora_protocol") == 0) {
       lora_proto_set_requested(val);   // sanitizes; bad ids become "meshcore"
+    } else if (strcmp(key, "ota_channel") == 0) {
+      ota_channel_set_requested(val);  // sanitizes; bad ids become "stable"
     } else if (strcmp(key, "trackball_sens") == 0) {
       int v = atoi(val);
       if (v >= 0 && v <= 500) input_ui_trackball_sens_set((uint16_t)v);
@@ -1304,29 +1319,10 @@ void sd_spi_release() {
 
 // Mount (or remount) the SD card and set sd_mounted. Called at boot and by
 // USB drive mode's stop path (usb_msc_dev.cpp) after the PC releases the
-// card. The SPI bus is shared with the TFT (80 MHz) and SX1262, but every
-// device sets its own per-transaction SPISettings, so this clock only
-// applies to SD transfers. 40 MHz cuts a 131KB map-tile read from ~400ms
-// (4 MHz Arduino default) to ~50ms. Probe descending; 4 MHz floor = old
-// behavior.
+// card. The bus, its clock probe and the /sd mountpoint are the board's
+// (storage/sd_dev.h).
 bool meshpunk_sd_mount() {
-#if defined(PIN_SD_CS)
-  static const uint32_t sd_freqs[] = {40000000U, 25000000U, 4000000U};
-  sd_mounted = false;
-  for (uint32_t freq : sd_freqs) {
-    if (SD.begin(PIN_SD_CS, board_sd_spi(), freq)) {
-      sd_mounted = true;
-      SLog.printf("[SD] Mounted at %lu Hz\n", (unsigned long)freq);
-      break;
-    }
-    SD.end();
-    SLog.printf("[SD] Mount failed at %lu Hz\n", (unsigned long)freq);
-  }
-#else
-  // No confirmed SD wiring for this board.
-  sd_mounted = false;
-  SLog.println("[SD] no SD pins defined for this board");
-#endif
+  sd_mounted = sd_dev_mount();
   return sd_mounted;
 }
 
@@ -1782,6 +1778,12 @@ void setupLvgl() {
   //  assert(buf);
   //}
 
+  // Apply the persisted orientation now — after the prefs load, before any
+  // LVGL geometry exists. Until here the panel ran the native landscape so
+  // the boot splash stayed upright through the whole bring-up; this clears
+  // it to black and LVGL's first frame follows in the oriented geometry.
+  display_dev_set_orientation(display_orientation);
+
 #define BUF_LINES 48
   const size_t BUF_SIZE =
       (size_t)display_dev_width() * BUF_LINES * sizeof(lv_color_t);
@@ -2024,6 +2026,12 @@ static int lua_wifi_fetch(lua_State *L) {
 // _wifi_download_file(url, filepath) -> {success=bool, error=string|nil, size=int|nil}
 // Downloads binary data directly to a file, bypassing Lua strings (which truncate at null bytes).
 // filepath uses S:/L: prefix convention (see meshpunk_fs).
+// A chunked response (Transfer-Encoding: chunked) is decoded: only the body
+// data reaches the file, and the download ends at the zero-size chunk.
+// A body with a known length is refused ("Not enough free space") before any
+// byte is written when the target drive has less than length + 16KB free; a
+// short file write mid-body fails with "Disk full". Either way the partial
+// file is left for the caller to remove.
 //
 // The HTTPClient (and its TLS session) persists between calls: consecutive
 // downloads from the same host reuse the socket and skip DNS + TCP + TLS
@@ -2033,6 +2041,73 @@ static int lua_wifi_fetch(lua_State *L) {
 static HTTPClient *s_dl_http = nullptr;
 static uint8_t *s_dl_buf = nullptr;  // PSRAM transfer buffer, allocated once
 static const size_t DL_BUF_SIZE = 4096;
+
+// Incremental decoder for a chunked HTTP body: "<hex size>[;ext]\r\n", that
+// many data bytes, "\r\n", repeated until a zero-size chunk. The trailer after
+// the zero-size chunk is not read.
+struct ChunkDecoder {
+  enum State : uint8_t { CK_SIZE, CK_EXT, CK_DATA, CK_CR, CK_LF, CK_END, CK_BAD };
+  State state = CK_SIZE;
+  uint32_t size = 0;     // CK_SIZE/CK_EXT: chunk size parsed so far; CK_DATA: data bytes left
+  bool digits = false;   // CK_SIZE: a hex digit has been seen on this size line
+};
+
+// Decodes buf[0..n) in place: data bytes are moved to the front of buf and the
+// framing is dropped. Returns the number of data bytes. Bytes after CK_END or
+// CK_BAD are ignored.
+static int chunk_decode(ChunkDecoder *d, uint8_t *buf, int n) {
+  int out = 0;
+  int i = 0;
+  while (i < n && d->state != ChunkDecoder::CK_END && d->state != ChunkDecoder::CK_BAD) {
+    if (d->state == ChunkDecoder::CK_DATA) {
+      int run = n - i;
+      if ((uint32_t)run > d->size) run = (int)d->size;
+      memmove(buf + out, buf + i, run);
+      out += run;
+      i += run;
+      d->size -= run;
+      if (d->size == 0) d->state = ChunkDecoder::CK_CR;
+      continue;
+    }
+    uint8_t c = buf[i++];
+    switch (d->state) {
+      case ChunkDecoder::CK_CR:
+        d->state = (c == '\r') ? ChunkDecoder::CK_LF : ChunkDecoder::CK_BAD;
+        break;
+      case ChunkDecoder::CK_LF:
+        if (c == '\n') {
+          d->state = ChunkDecoder::CK_SIZE;
+          d->size = 0;
+          d->digits = false;
+        } else {
+          d->state = ChunkDecoder::CK_BAD;
+        }
+        break;
+      default: {  // CK_SIZE or CK_EXT
+        if (c == '\n') {
+          if (!d->digits) d->state = ChunkDecoder::CK_BAD;
+          else d->state = d->size ? ChunkDecoder::CK_DATA : ChunkDecoder::CK_END;
+        } else if (d->state == ChunkDecoder::CK_EXT || c == '\r' || c == ' ' || c == '\t') {
+          // chunk extension text, or whitespace / CR before the LF
+        } else if (c == ';') {
+          d->state = ChunkDecoder::CK_EXT;
+        } else {
+          int v = (c >= '0' && c <= '9') ? c - '0'
+                : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+          if (v < 0 || d->size > 0x07FFFFFF) {
+            d->state = ChunkDecoder::CK_BAD;
+          } else {
+            d->size = d->size * 16 + (uint32_t)v;
+            d->digits = true;
+          }
+        }
+        break;
+      }
+    }
+  }
+  return out;
+}
 
 static void wifi_dl_client_close() {
   if (!s_dl_http) return;
@@ -2047,6 +2122,11 @@ static bool wifi_dl_client_open(const char *url) {
     s_dl_http = new HTTPClient();
     s_dl_http->setUserAgent("meshpunk/1.0");
     s_dl_http->setReuse(true);
+    // GitHub release assets answer with a 302 to their storage host.
+    s_dl_http->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    // Kept across begin(); HTTPClient clears the value before each request.
+    static const char *dl_headers[] = { "Transfer-Encoding" };
+    s_dl_http->collectHeaders(dl_headers, 1);
   }
   return s_dl_http->begin(url);
 }
@@ -2113,8 +2193,28 @@ static int lua_wifi_download_file(lua_State *L) {
     return 1;
   }
 
-  int len = s_dl_http->getSize();
+  // Transfer-Encoding overrides any Content-Length (RFC 7230 3.3.3).
+  const bool chunked =
+      s_dl_http->header("Transfer-Encoding").equalsIgnoreCase("chunked");
+  int len = chunked ? -1 : s_dl_http->getSize();
   WiFiClient *stream = s_dl_http->getStreamPtr();
+
+  if (len > 0) {
+    // Known length: refuse before opening the file when it cannot fit. An
+    // unmounted drive answers false here and fails at meshpunk_open below.
+    MpDrive drive;
+    meshpunk_parse_drive(filepath, &drive, false);
+    uint64_t free_bytes = 0;
+    if (meshpunk_df(drive, NULL, &free_bytes) &&
+        (uint64_t)len + 16384 > free_bytes) {
+      wifi_dl_client_close();   // unread body: the socket cannot be reused
+      lua_pushboolean(L, 0);
+      lua_setfield(L, -2, "success");
+      lua_pushstring(L, "Not enough free space");
+      lua_setfield(L, -2, "error");
+      return 1;
+    }
+  }
 
   MeshpunkFile mf = meshpunk_open(filepath, "w", false);
   if (!mf.valid) {
@@ -2142,7 +2242,9 @@ static int lua_wifi_download_file(lua_State *L) {
   // Stall detector, not a total-time cap: big files legitimately take longer
   // than any fixed budget, so the deadline resets on every received chunk.
   uint32_t deadline = millis() + 20000;
+  ChunkDecoder ck;
   while (len > 0 || len == -1) {
+    if (chunked && (ck.state == ChunkDecoder::CK_END || ck.state == ChunkDecoder::CK_BAD)) break;
     if ((int32_t)(millis() - deadline) >= 0) break;
     int avail = stream->available();
     if (avail <= 0) {
@@ -2153,10 +2255,24 @@ static int lua_wifi_download_file(lua_State *L) {
     int toRead = (avail < (int)DL_BUF_SIZE) ? avail : (int)DL_BUF_SIZE;
     int rd = stream->readBytes(s_dl_buf, toRead);
     if (rd <= 0) break;
-    if (mf.is_sd) sd_spi_take();
-    mf.file.write(s_dl_buf, rd);
-    if (mf.is_sd) sd_spi_release();
-    total += rd;
+    int out = chunked ? chunk_decode(&ck, s_dl_buf, rd) : rd;
+    if (out > 0) {
+      if (mf.is_sd) sd_spi_take();
+      size_t wr = mf.file.write(s_dl_buf, out);
+      if (wr != (size_t)out) {
+        // Short write = the drive is full. meshpunk_close releases the SPI
+        // lock taken above; the unread body makes the socket unusable.
+        meshpunk_close(mf);
+        wifi_dl_client_close();
+        lua_pushboolean(L, 0);
+        lua_setfield(L, -2, "success");
+        lua_pushstring(L, "Disk full");
+        lua_setfield(L, -2, "error");
+        return 1;
+      }
+      if (mf.is_sd) sd_spi_release();
+    }
+    total += out;
     if (len > 0) len -= rd;
     deadline = millis() + 20000;   // progress made — reset the stall clock
   }
@@ -2176,9 +2292,22 @@ static int lua_wifi_download_file(lua_State *L) {
     return 1;
   }
 
+  if (chunked && ck.state != ChunkDecoder::CK_END) {
+    // The chunked body stopped before its zero-size chunk (stall, closed
+    // connection or malformed framing): the file is incomplete.
+    wifi_dl_client_close();
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "success");
+    lua_pushstring(L, ck.state == ChunkDecoder::CK_BAD ? "Bad chunked encoding"
+                                                     : "Truncated download");
+    lua_setfield(L, -2, "error");
+    return 1;
+  }
+
   if (len == -1) {
-    // No Content-Length: body was read until close/stall, so this connection
-    // can't be trusted for another request.
+    // No Content-Length: a close-delimited body was read until close/stall,
+    // and a chunked body's trailer is left unread, so this connection can't
+    // be trusted for another request.
     wifi_dl_client_close();
   } else {
     s_dl_http->end();  // keeps the socket alive when the server allows reuse
@@ -3226,10 +3355,10 @@ static int lua_storage_set_use_sd(lua_State *L) {
   String newPrefix;
 
   if (want_sd) {
-    newFS = &SD;
+    newFS = &sd_dev_fs();
     newPrefix = "/meshpunk";
 
-    if (!SD.exists("/meshpunk")) SD.mkdir("/meshpunk");
+    if (!sd_dev_fs().exists("/meshpunk")) sd_dev_fs().mkdir("/meshpunk");
   } else {
     newFS = &LittleFS;
     newPrefix = "";
@@ -3321,7 +3450,7 @@ static int lua_list_dir_sd(lua_State *L) {
 
   MESH_LOCK();
   sd_spi_take();
-  File root = SD.open(path);
+  File root = sd_dev_fs().open(path);
 
   if (!root || !root.isDirectory()) {
     SLog.printf("[FS] _list_dir_sd: cannot open %s\n", path);
@@ -3412,7 +3541,7 @@ static int lua_list_all_sd(lua_State *L) {
 
   MESH_LOCK();
   sd_spi_take();
-  File root = SD.open(path);
+  File root = sd_dev_fs().open(path);
   if (!root || !root.isDirectory()) {
     SLog.printf("[FS] _list_all_sd: cannot open %s\n", path);
     sd_spi_release();
@@ -3466,7 +3595,7 @@ static int lua_mkdir_sd(lua_State *L) {
     return 1;
   }
   sd_spi_take();
-  bool ok = SD.exists(path) || SD.mkdir(path);
+  bool ok = sd_dev_fs().exists(path) || sd_dev_fs().mkdir(path);
   sd_spi_release();
   lua_pushboolean(L, ok ? 1 : 0);
   return 1;
@@ -3481,7 +3610,7 @@ static int lua_file_exists_sd(lua_State *L) {
   }
 
   sd_spi_take();
-  bool exists = SD.exists(path);
+  bool exists = sd_dev_fs().exists(path);
   sd_spi_release();
 
   lua_pushboolean(L, exists ? 1 : 0);
@@ -3637,6 +3766,55 @@ static unsigned png_decode_raw(const uint8_t *png_data, uint32_t png_size,
 #endif
   *decoded = nullptr;
   return lodepng_decode((unsigned char **)decoded, w, h, state, png_data, png_size);
+}
+
+// Bilinear RGB565 resize of the WHOLE source into exactly dw×dh. The aspect
+// policy belongs to the caller — it picks dw/dh (the wallpaper loader picks
+// the contain-fit box). Equal dimensions degenerate to a row copy. dst rows
+// are dst_stride bytes apart (lv_draw_buf strides can be padded past dw*2).
+static void rgb565_resize(const uint16_t *src, int sw, int sh,
+                          uint8_t *dst, uint32_t dst_stride,
+                          int dw, int dh) {
+  if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+  if (sw == dw && sh == dh) {
+    for (int y = 0; y < dh; y++)
+      memcpy(dst + (size_t)y * dst_stride, src + (size_t)y * sw, (size_t)dw * 2);
+    return;
+  }
+  uint32_t step_x = (uint32_t)(((uint64_t)sw << 16) / (uint32_t)dw);
+  uint32_t step_y = (uint32_t)(((uint64_t)sh << 16) / (uint32_t)dh);
+  for (int y = 0; y < dh; y++) {
+    int32_t syf = (int32_t)((uint32_t)y * step_y);
+    int sy = syf >> 16;
+    if (sy < 0) sy = 0;
+    if (sy > sh - 1) sy = sh - 1;
+    int sy1 = (sy + 1 < sh) ? sy + 1 : sy;
+    uint32_t fy = (syf >> 8) & 0xFF;
+    const uint16_t *r0 = src + (size_t)sy * sw;
+    const uint16_t *r1 = src + (size_t)sy1 * sw;
+    uint16_t *out = (uint16_t *)(dst + (size_t)y * dst_stride);
+    for (int x = 0; x < dw; x++) {
+      int32_t sxf = (int32_t)((uint32_t)x * step_x);
+      int sx = sxf >> 16;
+      if (sx < 0) sx = 0;
+      if (sx > sw - 1) sx = sw - 1;
+      int sx1 = (sx + 1 < sw) ? sx + 1 : sx;
+      uint32_t fx = (sxf >> 8) & 0xFF;
+      uint16_t p00 = r0[sx], p01 = r0[sx1];
+      uint16_t p10 = r1[sx], p11 = r1[sx1];
+      uint32_t top, bot, rr, gg, bb;
+      top = ((p00 >> 11) & 31) * (256 - fx) + ((p01 >> 11) & 31) * fx;
+      bot = ((p10 >> 11) & 31) * (256 - fx) + ((p11 >> 11) & 31) * fx;
+      rr  = (top * (256 - fy) + bot * fy) >> 16;
+      top = ((p00 >> 5) & 63) * (256 - fx) + ((p01 >> 5) & 63) * fx;
+      bot = ((p10 >> 5) & 63) * (256 - fx) + ((p11 >> 5) & 63) * fx;
+      gg  = (top * (256 - fy) + bot * fy) >> 16;
+      top = (p00 & 31) * (256 - fx) + (p01 & 31) * fx;
+      bot = (p10 & 31) * (256 - fx) + (p11 & 31) * fx;
+      bb  = (top * (256 - fy) + bot * fy) >> 16;
+      out[x] = (uint16_t)((rr << 11) | (gg << 5) | bb);
+    }
+  }
 }
 
 // Decode a PNG from memory and pack native little-endian RGB565 into dst.
@@ -3812,7 +3990,7 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
     // between them, so the 131KB write never blocks the display flush or the
     // radio for more than one chunk (~25ms at 40MHz).
     sd_spi_take();
-    File f = SD.open(tmp_sd, FILE_WRITE);
+    File f = sd_dev_fs().open(tmp_sd, FILE_WRITE);
     sd_spi_release();
     if (!f) {
       SLog.printf("[png2bin] FAIL: open tmp %s\n", tmp_path);
@@ -3834,8 +4012,8 @@ static const char *png_buf_to_bin(const uint8_t *png_data, uint32_t png_size,
 
     sd_spi_take();
     f.close();
-    if (!wok) SD.remove(tmp_sd);
-    bool renamed = wok && SD.rename(tmp_sd, dst_sd);
+    if (!wok) sd_dev_fs().remove(tmp_sd);
+    bool renamed = wok && sd_dev_fs().rename(tmp_sd, dst_sd);
     sd_spi_release();
 
     if (!wok) {
@@ -3903,7 +4081,7 @@ static int lua_png_to_bin(lua_State *L) {
     // Conversion landed — the source PNG is dead weight now, so consume it.
     if ((src_path[0] == 'S' || src_path[0] == 's') && src_path[1] == ':') {
       sd_spi_take();
-      SD.remove(src_path + 2);
+      sd_dev_fs().remove(src_path + 2);
       sd_spi_release();
     } else if ((src_path[0] == 'L' || src_path[0] == 'l') && src_path[1] == ':') {
       LittleFS.remove(src_path + 2);
@@ -4286,7 +4464,7 @@ static int lua_tile_show(lua_State *L) {
   uint32_t data_size = 0;
 
   sd_spi_take();
-  File f = SD.open(path, "r");
+  File f = sd_dev_fs().open(path, "r");
   bool ok = f && (f.read(head, sizeof(hdr)) == (int)sizeof(hdr));
   sd_spi_release();
   if (!f) { lua_pushboolean(L, 0); return 1; }
@@ -4448,7 +4626,7 @@ static int lua_dofile_sd(lua_State *L) {
 
   LuaSDChunkReader rdr;
   sd_spi_take();
-  rdr.file = SD.open(path);
+  rdr.file = sd_dev_fs().open(path);
   if (!rdr.file || rdr.file.isDirectory()) {
     if (rdr.file) rdr.file.close();
     sd_spi_release();
@@ -4501,6 +4679,13 @@ static int lua_dofile_sd(lua_State *L) {
 #define MAIN_HEAP_RESERVE  (3584u * 1024u)        // kept free for the Map (tile pool + canvases) + slack
 #define LUA_ARENA_MIN      (1536u * 1024u)        // floor if PSRAM is tight (overflow spills to the gap)
 #define LUA_ARENA_MAX      (3u * 1024u * 1024u)   // ceiling: Lua won't need more; don't starve the Map
+// Collector pacing for the fixed-size arena (applied in setupLuaVGL). PAUSE: a
+// new cycle starts when the heap reaches this percentage of the bytes the last
+// cycle marked live (Lua default 250). STEPMUL: collector work per allocated
+// byte (Lua default 200). Lua stores both in a 5-significant-bit format: 112
+// encodes as 112.5%, 400 as 400%.
+#define LUA_GC_PAUSE       112
+#define LUA_GC_STEPMUL     400
 static multi_heap_handle_t s_lua_heap = NULL;
 static uintptr_t s_lua_arena_base = 0;
 static size_t    s_lua_arena_size = 0;
@@ -4511,6 +4696,12 @@ static size_t    s_lua_arena_size = 0;
 // surfaced in the mesh task's periodic [HEAP] line rather than failing silently.
 // Written on Core 0 (Lua alloc), read on Core 1 (log); aligned 32-bit, no lock.
 volatile uint32_t g_lua_arena_spill_count = 0;
+
+// Bytes Lua holds through lua_psram_alloc (arena + spilled) and the free bytes
+// inside the arena, republished on every allocator call for the same [HEAP]
+// line. Written on Core 0, read on Core 1, like the spill counter.
+volatile uint32_t g_lua_heap_bytes = 0;
+volatile uint32_t g_lua_arena_free_bytes = 0;
 
 static inline bool lua_in_arena(void *p) {
   return s_lua_arena_base && (uintptr_t)p >= s_lua_arena_base &&
@@ -4553,6 +4744,7 @@ static void lua_arena_destroy() {
   s_lua_heap = NULL;
   s_lua_arena_base = 0;
   s_lua_arena_size = 0;
+  g_lua_arena_free_bytes = 0;
   heap_caps_free(blk);
   SLog.printf("[lua_arena] freed; psram largest now %uKB\n",
               (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
@@ -4561,7 +4753,7 @@ static void lua_arena_destroy() {
 // PSRAM allocator for Lua. Routes through the arena (multi_heap) when it exists,
 // falling back to the shared PSRAM heap (small Lua objects -> TLSF puts them in the
 // gap). osize is Lua's valid old size (only when ptr != NULL) for cross-heap memcpy.
-static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+static void *lua_psram_route(void *ud, void *ptr, size_t osize, size_t nsize) {
     (void)ud;
     if (nsize == 0) {                       // free
         if (ptr) {
@@ -4591,6 +4783,20 @@ static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     }
     // No arena (pre-create / create failed): plain shared-heap realloc.
     return heap_caps_realloc(ptr, nsize, MALLOC_CAP_SPIRAM);
+}
+
+// The lua_Alloc given to lua_newstate: routes the request, then republishes the
+// [HEAP] figures. For a new block (ptr == NULL) Lua passes an object-type tag
+// in osize, not a size.
+static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    void *r = lua_psram_route(ud, ptr, osize, nsize);
+    if (nsize == 0) {
+        if (ptr) g_lua_heap_bytes -= osize;
+    } else if (r) {
+        g_lua_heap_bytes += nsize - (ptr ? osize : 0);
+    }
+    g_lua_arena_free_bytes = s_lua_heap ? multi_heap_free_size(s_lua_heap) : 0;
+    return r;
 }
 
 
@@ -4665,6 +4871,10 @@ void setupLuaVGL() {
     SLog.println("Failed to create Lua state");
     return;
   }
+
+  // Collector pacing (LUA_GC_PAUSE / LUA_GC_STEPMUL, defined with the arena).
+  lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE, LUA_GC_PAUSE);
+  lua_gc(L, LUA_GCPARAM, LUA_GCPSTEPMUL, LUA_GC_STEPMUL);
 
   // Open standard Lua libraries
   luaL_openlibs(L);
@@ -4744,6 +4954,7 @@ void setupLuaVGL() {
     lua_pushstring(L, MESHPUNK_BOARD_NAME);        lua_setfield(L, -2, "name");
     lua_pushinteger(L, display_dev_width());       lua_setfield(L, -2, "screen_w");
     lua_pushinteger(L, display_dev_height());      lua_setfield(L, -2, "screen_h");
+    lua_pushinteger(L, display_dev_orientation()); lua_setfield(L, -2, "orientation");
     switch (audio_dev_kind()) {
       case AUDIO_DEV_I2S:    lua_pushstring(L, "i2s");    break;
       case AUDIO_DEV_BUZZER: lua_pushstring(L, "buzzer"); break;
@@ -4751,6 +4962,7 @@ void setupLuaVGL() {
     }
     lua_setfield(L, -2, "audio");
     lua_pushboolean(L, power_dev_battery_mv() > 0);  lua_setfield(L, -2, "battery");
+    lua_pushboolean(L, power_dev_usb_port_power()); lua_setfield(L, -2, "usb_power");
     lua_pushstring(L, lora_proto_active());         lua_setfield(L, -2, "lora_proto");
     return 1;
   });
@@ -4775,6 +4987,24 @@ void setupLuaVGL() {
     SLog.printf("[PROTO] boot protocol set to '%s' (reboot to apply)\n",
                 lora_proto_requested());
     lua_pushstring(L, lora_proto_requested());
+    return 1;
+  });
+
+  // Firmware update channel (Settings/Firmware). No argument reads it; a
+  // string argument persists it and takes effect on the next check — unlike
+  // the protocol choice there is nothing to reload, the channel only decides
+  // which GitHub repo _ota_check polls. Returns the sanitized id actually
+  // stored; anything that is not a known channel becomes "stable".
+  // Usage: local id = _ota_channel()        -- read
+  //        local id = _ota_channel("dev")   -- write
+  lua_register(L, "_ota_channel", [](lua_State *L) -> int {
+    if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
+      const char* id = luaL_checkstring(L, 1);
+      ota_channel_set_requested(id);
+      firmware_prefs_save();
+      SLog.printf("[OTA] update channel set to '%s'\n", ota_channel_requested());
+    }
+    lua_pushstring(L, ota_channel_requested());
     return 1;
   });
 
@@ -4807,7 +5037,7 @@ void setupLuaVGL() {
     list_dir(LittleFS, false);
     if (sd_mounted) {
       sd_spi_take();
-      list_dir(SD, true);
+      list_dir(sd_dev_fs(), true);
       sd_spi_release();
     }
     return 1;
@@ -5692,6 +5922,25 @@ void setupLuaVGL() {
     return 1;
   });
 
+  // Display orientation (Settings/Device). No argument reads the persisted
+  // setting; an integer 0-3 persists it. The panel is NOT rotated live —
+  // LVGL was created with the boot geometry — so a change takes effect on
+  // restart (the page says so). Returns the stored value.
+  // Usage: local o = _disp_orientation()     -- read
+  //        local o = _disp_orientation(1)    -- write
+  lua_register(L, "_disp_orientation", [](lua_State* L) -> int {
+    if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
+      int v = luaL_checkinteger(L, 1);
+      if (v < 0) v = 0; if (v > 3) v = 3;
+      display_orientation = (uint8_t)v;
+      firmware_prefs_save();
+      SLog.printf("[DISP] orientation set to %d (restart to apply)\n",
+                  display_orientation);
+    }
+    lua_pushinteger(L, display_orientation);
+    return 1;
+  });
+
   // ── Inactivity timeouts ──────────────────────────────────────────────────
   lua_register(L, "_screen_timeout_set", [](lua_State* L) -> int {
     int v = luaL_checkinteger(L, 1);
@@ -6061,6 +6310,100 @@ void setupLuaVGL() {
       }, LV_EVENT_DELETE, buf);
     }
     return 0;
+  });
+
+  // _bg_load_scaled(src, max_w, max_h) -> draw_buf, fit_w, fit_h (or nil).
+  // Wallpaper loader: reads a PNG through the LVGL fs layer (the same S:/L:
+  // drive letters Image sources use), decodes once via png_decode_565, then
+  // CONTAIN-fits it — bilinear resize to the largest size that fits inside
+  // max_w×max_h with the aspect ratio kept, never cropping. The buffer is
+  // the FITTED size (the returned fit_w/fit_h); the caller centers the
+  // widget and the layer behind shows through the letterbox. Nothing enters
+  // the LVGL image cache and both transient buffers are freed before
+  // returning — the caller owns ONLY the returned draw_buf (free via
+  // _snapshot_free or _snapshot_attach_free). Equal source and target copy
+  // through unscaled. LVGL-thread only (the decode may drop the image cache
+  // under fragmentation).
+  lua_register(L, "_bg_load_scaled", [](lua_State *L) -> int {
+    const char *src = luaL_checkstring(L, 1);
+    int dw = (int)luaL_checkinteger(L, 2);
+    int dh = (int)luaL_checkinteger(L, 3);
+    if (dw <= 0 || dh <= 0) { lua_pushnil(L); return 1; }
+
+    lv_fs_file_t f;
+    if (lv_fs_open(&f, src, LV_FS_MODE_RD) != LV_FS_RES_OK) {
+      SLog.printf("[bg] open failed: %s\n", src);
+      lua_pushnil(L); return 1;
+    }
+    uint32_t fsize = 0;
+    lv_fs_seek(&f, 0, LV_FS_SEEK_END);
+    lv_fs_tell(&f, &fsize);
+    lv_fs_seek(&f, 0, LV_FS_SEEK_SET);
+    uint8_t *png = (fsize > 0 && fsize < 4u * 1024 * 1024)
+        ? (uint8_t *)heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        : nullptr;
+    uint32_t rd = 0;
+    if (png) lv_fs_read(&f, png, fsize, &rd);
+    lv_fs_close(&f);
+    if (!png || rd != fsize) {
+      if (png) heap_caps_free(png);
+      SLog.printf("[bg] read failed: %s (%u/%u)\n", src, (unsigned)rd,
+                  (unsigned)fsize);
+      lua_pushnil(L); return 1;
+    }
+
+    PngInfo info;
+    if (!png_read_ihdr(png, fsize, &info)) {
+      heap_caps_free(png);
+      SLog.printf("[bg] not a PNG: %s\n", src);
+      lua_pushnil(L); return 1;
+    }
+    uint32_t raw_bytes = (uint32_t)info.w * info.h * 2;
+    uint16_t *raw = (uint16_t *)heap_caps_malloc(
+        raw_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) {
+      heap_caps_free(png);
+      SLog.printf("[bg] no memory for %ux%u decode\n", info.w, info.h);
+      lua_pushnil(L); return 1;
+    }
+    // Two statements on purpose: lua_register is a MACRO, and a comma at
+    // brace level inside the lambda splits its argument list.
+    unsigned sw = 0;
+    unsigned sh = 0;
+    const char *stage = png_decode_565(png, fsize, raw, raw_bytes, true,
+                                       &sw, &sh);
+    heap_caps_free(png);
+    if (stage) {
+      heap_caps_free(raw);
+      SLog.printf("[bg] decode failed (%s): %s\n", stage, src);
+      lua_pushnil(L); return 1;
+    }
+
+    // Contain fit: one scale factor (the smaller axis ratio), no crop. A
+    // source smaller than the screen upscales to fit — one wallpaper file
+    // serves every panel size.
+    float fit = fminf((float)dw / (float)sw, (float)dh / (float)sh);
+    int fw = (int)((float)sw * fit + 0.5f);
+    int fh = (int)((float)sh * fit + 0.5f);
+    if (fw < 1) fw = 1;
+    if (fh < 1) fh = 1;
+    if (fw > dw) fw = dw;
+    if (fh > dh) fh = dh;
+
+    lv_draw_buf_t *dbuf =
+        lv_draw_buf_create(fw, fh, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO);
+    if (!dbuf) {
+      heap_caps_free(raw);
+      SLog.printf("[bg] no memory for %dx%d wallpaper\n", fw, fh);
+      lua_pushnil(L); return 1;
+    }
+    rgb565_resize(raw, (int)sw, (int)sh, (uint8_t *)dbuf->data,
+                  dbuf->header.stride, fw, fh);
+    heap_caps_free(raw);
+    lua_pushlightuserdata(L, dbuf);
+    lua_pushinteger(L, fw);
+    lua_pushinteger(L, fh);
+    return 3;
   });
 
   // _screenshot([obj]) -> true. Queues a capture of whatever is on the panel;
@@ -6782,7 +7125,7 @@ void setup() {
   meshpunk_sd_mount();
 
   if (sd_mounted) {
-    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    uint64_t cardSize = sd_dev_card_size() / (1024 * 1024);
     SLog.printf("[SD] Card mounted, size: %llu MB\n", cardSize);
 
     const char* required_dirs[] = {
@@ -6792,15 +7135,15 @@ void setup() {
       "/meshpunk/fonts",     // user-droppable .ttf files for Settings > Fonts
     };
     for (auto dir : required_dirs) {
-      if (!SD.exists(dir)) {
-        SD.mkdir(dir);
+      if (!sd_dev_fs().exists(dir)) {
+        sd_dev_fs().mkdir(dir);
         SLog.printf("[SD] Created %s\n", dir);
       }
     }
 
-    if (!LittleFS.exists("/firmware_prefs") && SD.exists("/meshpunk/firmware_prefs")) {
+    if (!LittleFS.exists("/firmware_prefs") && sd_dev_fs().exists("/meshpunk/firmware_prefs")) {
       sd_spi_take();
-      bool ok = copyFile(SD, "/meshpunk/firmware_prefs", LittleFS, "/firmware_prefs");
+      bool ok = copyFile(sd_dev_fs(), "/meshpunk/firmware_prefs", LittleFS, "/firmware_prefs");
       sd_spi_release();
       if (ok) {
         SLog.println("[FW_PREFS] Imported from SD after reflash");
@@ -6810,9 +7153,9 @@ void setup() {
       }
     }
 
-    if (!LittleFS.exists("/wifi_creds") && SD.exists("/meshpunk/wifi_creds")) {
+    if (!LittleFS.exists("/wifi_creds") && sd_dev_fs().exists("/meshpunk/wifi_creds")) {
       sd_spi_take();
-      bool ok = copyFile(SD, "/meshpunk/wifi_creds", LittleFS, "/wifi_creds");
+      bool ok = copyFile(sd_dev_fs(), "/meshpunk/wifi_creds", LittleFS, "/wifi_creds");
       sd_spi_release();
       SLog.printf("[WIFI_CREDS] %s from SD after reflash\n", ok ? "Imported" : "Import FAILED");
     }
@@ -6831,7 +7174,7 @@ void setup() {
   // protocol's data home (peers/config/identity) lives on this storage — the
   // MeshCore contacts rule, so it survives reflashes when the user runs on SD.
   if (sd_mounted && use_sd_pref) {
-    mstore::set_storage(&SD, "/meshpunk");
+    mstore::set_storage(&sd_dev_fs(), "/meshpunk");
     SLog.println("[SD] Mesh storage: SD:/meshpunk/");
   } else {
     mstore::set_storage(&LittleFS, "");
@@ -6846,10 +7189,18 @@ void setup() {
 
   // BLE protocol slot (two-slot model, docs/PROTOCOL_ABI.md §6): selected
   // independently of the LoRa protocol. The companion protocol declares
-  // requires_lora="meshcore" and the selector enforces it loudly. Early on
-  // purpose: BLE-stack allocations land low in internal SRAM.
+  // requires_lora="meshcore" and the selector enforces it loudly. This loads
+  // and inits the protocol module and brings up the BLE controller and host
+  // (ble_transport_stack_up), so their internal-RAM allocations are made
+  // before the Lua session; the protocol's start() opens the GATT service in
+  // ble_proto_start() below.
   ble_proto_select_and_init();
   log_boot_mem("after BLE early");
+
+  // The Core 1 task stacks join the other long-lived internal-RAM residents
+  // here, ahead of the Lua session; the tasks start at the end of setup().
+  meshpunk_reserve_task_stacks();
+  log_boot_mem("after task stacks");
 
   mstore::set_retain_days(msg_retain_days);  // routing/message retention window
 
@@ -6927,6 +7278,16 @@ void setup() {
   // itself. A start failure leaves the protocol selected with the radio not
   // running, logged + bell-noticed — see lora_proto_start().
   SLog.printf("===== PROTO INIT: %s =====\n", lora_proto_active());
+  // This board's label (board_pins.h) names the protocol's default node
+  // ("Meshpunk <label>") and its BLE model name. Forwarded BEFORE start: it
+  // sets the protocol's defaults, and a saved node name loaded by start()
+  // replaces them. Protocols without the key ignore it.
+  {
+    const LoraProtoOps* ops = lora_proto_ops();
+    if (ops && ops->set_config) {
+      MESH_LOCK(); ops->set_config("board_label", MESHPUNK_BOARD_LABEL); MESH_UNLOCK();
+    }
+  }
   if (!lora_proto_start()) {
     // The load-failure notice site above already ran (notify is up by now):
     // post the start-failure notice here.
@@ -7214,7 +7575,7 @@ static void system_shutdown() {
   MESH_UNLOCK();
   if (sd_mounted) {
     sd_spi_take();
-    SD.end();
+    sd_dev_unmount();
     sd_mounted = false;
     sd_spi_release();
   }
@@ -7287,7 +7648,7 @@ static void standby_run() {
   screen_timed_out = true;
   input_dev_kbd_backlight(0);
   kbd_timed_out = true;
-  display_dev_sleep(true);      // frame memory survives; wake shows the old screen
+  display_dev_sleep(true);      // the restore below repaints the UI on wake
   power_dev_standby_enter();    // Heltec: GNSS rail off
 
   // Keep the wake pins' runtime input config through light sleep instead of
@@ -7423,13 +7784,19 @@ static void standby_run() {
   input_dev_wake_pin_restore();   // re-attach the GPIO0 click ISR (edge config included)
   power_dev_standby_exit();     // Heltec: GNSS rail back on
   display_dev_sleep(false);
+  // Not every panel keeps its frame memory through sleep (display_dev.h):
+  // repaint the whole UI.
+  lv_obj_invalidate(lv_screen_active());
   // Full backlight re-init, not the incremental path: after minutes held in
   // shutdown the pulse chip's state cannot be trusted to match the driver's
   // tracking, and a mismatch leaves the screen black with no self-heal.
   display_dev_backlight_reset(display_brightness);
   wake_activity();              // backlights + inactivity timers
   trackball_up = trackball_down = trackball_left = trackball_right = 0;
-  trackball_click = 0;          // the wake press must not click whatever was focused
+  // The wake press must not click whatever was focused: the click ISR
+  // re-attached above is live while that press can still be held
+  // (input_ui.h).
+  input_ui_ignore_click_until_release();
   if (wifi_was_on && wifi_enabled_pref) { WiFi.mode(WIFI_STA); wifi_auto_kick(); }
   if (ble_was_on) ble_proto_resume();
   gps_dev_wake();               // T-Deck: RXD activity wake; Heltec: no-op

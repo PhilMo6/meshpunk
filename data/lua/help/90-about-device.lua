@@ -17,9 +17,11 @@ Touchscreen - %s
 Keyboard - %s
 Trackball - %s
 Sound - %s
+Powers USB accessories - %s
 ]], dev.name ~= "" and dev.name or "unknown",
     dev.screen_w, dev.screen_h,
-    yes(caps.touch), yes(caps.keyboard), yes(caps.trackball), audio)
+    yes(caps.touch), yes(caps.keyboard), yes(caps.trackball), audio,
+    yes(dev.usb_power))
 
 return {
     title   = "About this device",

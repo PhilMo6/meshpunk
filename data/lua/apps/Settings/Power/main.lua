@@ -34,7 +34,7 @@ content:Label { text = "-- Actions --", w = lvgl.PCT(100), h = 16 }
 
 local function farewell(text, fn)
     local f = lvgl.Object {
-        w = 320, h = 240, x = 0, y = 0,
+        w = lvgl.HOR_RES(), h = lvgl.VER_RES(), x = 0, y = 0,
         bg_color = "#000000", bg_opa = 255, border_width = 0, pad_all = 0,
     }
     f:clear_flag(lvgl.FLAG.SCROLLABLE)
@@ -61,6 +61,28 @@ end
 
 local off_lbl, restart_lbl
 local armed = nil   -- "off" | "restart": tapped once, awaiting the confirm tap
+local ARM_TIMEOUT_MS = 8000
+local arm_timer = nil
+
+-- The confirm tap must land within ARM_TIMEOUT_MS of the arming tap; after
+-- that the labels revert and the next tap arms again instead of acting.
+local function disarm()
+    armed = nil
+    if arm_timer then arm_timer:delete(); arm_timer = nil end
+    if off_lbl then off_lbl:set({ text = "Power off" }) end
+    if restart_lbl then restart_lbl:set({ text = "Restart" }) end
+end
+
+local function arm(which)
+    disarm()
+    armed = which
+    arm_timer = apps.add_timer { period = ARM_TIMEOUT_MS, cb = function(t)
+        t:delete()
+        arm_timer = nil
+        disarm()
+        status.text = ""
+    end }
+end
 
 if _system_standby then
     local standby_btn = content:Button { w = lvgl.PCT(100), h = 30 }
@@ -78,12 +100,12 @@ if _system_poweroff then
     off_lbl = off_btn:Label { text = "Power off", align = lvgl.ALIGN.CENTER }
     off_btn:onClicked(function()
         if armed ~= "off" then
-            armed = "off"
+            arm("off")
             off_lbl:set({ text = "Tap again to power off" })
-            if restart_lbl then restart_lbl:set({ text = "Restart" }) end
             status.text = "Tap Power off again to confirm"
             return
         end
+        disarm()
         farewell("Powering off...\n" .. wake_hint(), _system_poweroff)
     end)
 end
@@ -92,12 +114,12 @@ local restart_btn = content:Button { w = lvgl.PCT(100), h = 30 }
 restart_lbl = restart_btn:Label { text = "Restart", align = lvgl.ALIGN.CENTER }
 restart_btn:onClicked(function()
     if armed ~= "restart" then
-        armed = "restart"
+        arm("restart")
         restart_lbl:set({ text = "Tap again to restart" })
-        if off_lbl then off_lbl:set({ text = "Power off" }) end
         status.text = "Tap Restart again to confirm"
         return
     end
+    disarm()
     farewell("Restarting...", _system_reboot)
 end)
 

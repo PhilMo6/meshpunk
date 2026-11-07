@@ -19,7 +19,7 @@
 
 #define TDL_MAGIC        0xA5
 // 57 makes the largest frame exactly 64 bytes = one full-speed bulk packet,
-// the most the tdeck USB driver's link_send() accepts per pipe transfer
+// the most the espserial USB driver's link_send() accepts per pipe transfer
 // (it rejects anything over the endpoint's 64-byte max packet size). gblink
 // frames stay tiny; the dgram service fills frames to this limit.
 #define TDL_MAX_PAYLOAD  57
@@ -55,13 +55,11 @@ static volatile bool s_dgram_open    = false;   // a module listens on svc 2
 static volatile uint32_t s_last_rx_ms            = 0;
 static volatile uint32_t s_last_remote_attach_ms = 0;
 
-// Log mute (declared in meshpunk_sync.h): device role + live session + our
+// Log mute (g_slog_quiet, meshpunk_sync.h): device role + live session + our
 // game running = the serial port is a busy link cable; log lines competing
 // for the CDC buffer can squeeze out frames (tdl_send drops when full) and
 // one lost frame corrupts a GameBoy transfer. Host role never mutes (its
 // frames ride the USB driver pipes; its Serial is dead in host mode anyway).
-volatile bool g_slog_quiet = false;
-
 static void update_quiet() {
     // A linked game = a GameBoy game attached OR a module listening on the
     // dgram service (Doom netplay over the cable): same wire, same policy.
@@ -802,6 +800,17 @@ void tdeck_link_init() {
     // acks/keepalives froze, answer latency spiked, leases falsely expired
     // (hw runs 3-4). Same rationale as elf_input's: tiny latency-critical
     // work preempts bulk work whose buffers absorb the jitter.
-    xTaskCreatePinnedToCore(tdl_task_body, "tdl_link", 6144,
-                            nullptr, 4, &s_tdl_task, 1 /* Core 1 */);
+    // Stack and task block live in RTC fast RAM (MALLOC_CAP_RTCRAM): 8 KB of
+    // internal RAM the allocator only reaches once the main heap is full,
+    // kept powered through light sleep because it is heap. It runs on the
+    // APB clock; this task's work is microseconds per 5 ms.
+    const uint32_t stack_bytes = 6144;
+    StackType_t*  stack = (StackType_t*)heap_caps_malloc(stack_bytes, MALLOC_CAP_RTCRAM);
+    StaticTask_t* tcb   = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_RTCRAM);
+    if (!stack || !tcb) {
+        SLog.println("[tdl] FAIL: no RTC fast RAM for the tdl_link task");
+        return;
+    }
+    s_tdl_task = xTaskCreateStaticPinnedToCore(tdl_task_body, "tdl_link", stack_bytes,
+                                               nullptr, 4, stack, tcb, 1 /* Core 1 */);
 }

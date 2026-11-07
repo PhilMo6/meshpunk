@@ -113,6 +113,21 @@ local function clear_view()
     if current_input then current_input:delete(); current_input = nil end
 end
 
+-- Measured height of the wrap-flex control strip a view builds at the top of
+-- its gridnav body: forces a layout pass, then spans from the body's top edge
+-- to the lowest control's bottom edge. Narrow screens wrap the strip onto
+-- more rows and the measurement follows; a fixed one-row budget does not.
+local function controls_h(body, ctrls)
+    body:update_layout()
+    local top = body:get_coords().y1
+    local bottom = top
+    for _, c in ipairs(ctrls) do
+        local y2 = c:get_coords().y2
+        if y2 > bottom then bottom = y2 end
+    end
+    return bottom - top
+end
+
 local function truncate(str, max)
     if not str then return "" end
     if #str <= max then return str end
@@ -808,10 +823,12 @@ show_inbox = function()
     current_view = body
 
     -- Control buttons (narrow, wrap into the top row).
+    local ctrls = {}
     local function ctrl(label, w, cb)
         local b = body:Button { w = w, h = 24 }
         b:Label { text = label, align = lvgl.ALIGN.CENTER }
         b:onevent(lvgl.EVENT.RELEASED, cb)
+        ctrls[#ctrls + 1] = b
         return b
     end
 
@@ -836,8 +853,9 @@ show_inbox = function()
     ctrl("?", 26, function() show_nav_help() end)
 
     -- Scrollable conversation list (rows live here, not in the gridnav body).
+    -- Height = what the (possibly wrapped) control strip leaves, + row gap.
     local list = body:Object {
-        w = lvgl.PCT(100), h = H - HEADER_H - 36,
+        w = lvgl.PCT(100), h = H - HEADER_H - controls_h(body, ctrls) - 12,
         border_width = 0, pad_all = 0, bg_opa = 0,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }
@@ -993,10 +1011,14 @@ local function build_chat(target)
     local body = gridnav_body(root, HEADER_H, H - HEADER_H, GRIDNAV_ROLLOVER + GRIDNAV_SCROLL_FIRST, true)
     current_view = body
 
-    -- Top buttons (narrow, wrap in first row)
+    -- Top buttons (narrow, wrap in first row). Collected so the message area
+    -- below is sized from the strip's MEASURED height — on narrow screens
+    -- (and with a wide region label) the strip wraps onto a second row.
+    local top_ctrls = {}
     local back_btn = body:Button { w = 45, h = 20 }
     back_btn:Label { text = "Home", align = lvgl.ALIGN.CENTER }
     back_btn:onevent(lvgl.EVENT.RELEASED, function() show_inbox() end)
+    top_ctrls[#top_ctrls + 1] = back_btn
 
     -- Region / flood-scope settings. Channel chats also get that channel's
     -- per-channel override section; DMs/rooms/repeaters see only the global.
@@ -1007,6 +1029,8 @@ local function build_chat(target)
     -- (per-channel override > phone-set runtime scope > global; blank = none).
     -- Shows "[phone]" for the runtime BLE scope — it's a raw key with no name.
     local rgn_lbl = body:Label { text = "", text_color = COL_META, h = 20 }
+    top_ctrls[#top_ctrls + 1] = scope_btn
+    top_ctrls[#top_ctrls + 1] = rgn_lbl
     local function refresh_rgn()
         local rname = ""
         if target.type == "channel" then
@@ -1034,6 +1058,7 @@ local function build_chat(target)
         local info_btn = body:Button { w = 45, h = 20 }
         info_btn:Label { text = "Info", align = lvgl.ALIGN.CENTER }
         info_btn:onevent(lvgl.EVENT.RELEASED, function() show_contact_detail(target.name) end)
+        top_ctrls[#top_ctrls + 1] = info_btn
     end
 
     -- Login/Logout (room server or repeater). The button reads Logout while a
@@ -1044,6 +1069,7 @@ local function build_chat(target)
             text = messages:isConnected(target.name) and "Logout" or "Login",
             align = lvgl.ALIGN.CENTER,
         }
+        top_ctrls[#top_ctrls + 1] = login_btn
         login_btn:onevent(lvgl.EVENT.RELEASED, function()
             if messages:isConnected(target.name) then
                 messages:logout(target.name)
@@ -1080,13 +1106,15 @@ local function build_chat(target)
         -- is the canned-tasks shortcut on top of it.
         local adm_btn = body:Button { w = 45, h = 20 }
         adm_btn:Label { text = "Adm", align = lvgl.ALIGN.CENTER }
+        top_ctrls[#top_ctrls + 1] = adm_btn
         adm_btn:onevent(lvgl.EVENT.RELEASED, function()
             show_server_admin(target.name)
         end)
     end
 
-    -- Message scroll area (full width).
-    local MSG_H = H - HEADER_H - 20 - 34 - 24
+    -- Message scroll area (full width). The control-strip term is measured,
+    -- not assumed one row (§controls_h); 34 = input row, 24 = gaps/padding.
+    local MSG_H = H - HEADER_H - controls_h(body, top_ctrls) - 34 - 24
     local msg_list = body:Object {
         w = lvgl.PCT(100), h = MSG_H,
         border_width = 0, pad_all = 2, bg_opa = 0,
@@ -1177,7 +1205,7 @@ local function build_chat(target)
         bubble:clear_flag(lvgl.FLAG.SCROLLABLE)
 
         local hdr = is_me and "You" or utils.emojiText(msg.from or "?")
-        local meta = utils.clockHM(msg.timestamp)
+        local meta = utils.chatStamp(msg.timestamp)
         -- Show a status word on any own message that has one: DMs/rooms carry an
         -- ack status ("sent"→"delivered"/…); channels get a repeat-until-heard
         -- status only once the poll sets it (nil until then → no word).
@@ -1234,7 +1262,8 @@ local function build_chat(target)
             if context_menu_open then return end
             context_menu_open = true
             show_msg_info(msg, function(m)
-                textArea.text = "@[" .. (m.from or "?") .. "] "
+                local draft = (textArea.text or ""):gsub("^@%[[^%]]*%] ", "", 1)
+                textArea.text = "@[" .. (m.from or "?") .. "] " .. draft
             end, function()
                 -- show_msg_info already nav.pop()'d back to this chat's scope;
                 -- just clear the menu guard and re-focus the image we acted on.

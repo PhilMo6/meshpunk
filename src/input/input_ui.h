@@ -91,6 +91,13 @@ void     input_ui_alt_toggle_set(bool on);
 // Load /emoji_keymap over the compiled defaults (boot, after FS mount).
 void input_ui_emoji_map_load(void);
 
+// ── Standby wake press ─────────────────────────────────────────────────────
+// The nav click line (GPIO0) is also the standby wake button. Called at
+// standby exit: click edges are dropped until the line has read released
+// for 250 ms without a break, so the press that woke the device never
+// clicks the focused object.
+void input_ui_ignore_click_until_release(void);
+
 // ── Hooks PROVIDED BY the firmware (main.cpp) to this layer ────────────────
 // Activity/timeout policy and the nav-scope stack stay in main.cpp; the
 // callbacks reach them only through these seams.

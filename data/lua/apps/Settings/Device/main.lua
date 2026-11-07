@@ -42,7 +42,7 @@ disp_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 disp_bar:clear_flag(lvgl.FLAG.CLICKABLE)
 local dsegs = {}
 for i = 1, DISP_SEGS do
-    dsegs[i] = disp_bar:Object { w = 16, h = 14, border_width = 1, pad_all = 0, bg_color = "#24ba24"}
+    dsegs[i] = disp_bar:Object { w = math.min(16, math.floor((lvgl.HOR_RES() - 12) / DISP_SEGS) - 1), h = 14, border_width = 1, pad_all = 0, bg_color = "#24ba24"}
     dsegs[i]:clear_flag(lvgl.FLAG.SCROLLABLE)
     dsegs[i]:clear_flag(lvgl.FLAG.CLICKABLE)
 end
@@ -95,6 +95,35 @@ scr_to_btn:onClicked(function()
     _screen_timeout_set(math.floor(v))
     status.text = "Screen timeout: " .. math.floor(v) .. "s"
 end)
+
+-- Orientation: quarter turns from the board's native landscape. Takes
+-- effect on restart (the UI is built once at boot with the chosen
+-- geometry). Guarded so the page still loads on firmware without the
+-- binding.
+if _disp_orientation then
+    -- Names use a physical landmark where one is hw-verified: the T-Deck's
+    -- two portraits put the USB port on the screen's right (option 1) and
+    -- left (option 3). Boards without a verified landmark keep neutral
+    -- names until their own pass names an edge.
+    local ORIENT_NAMES = { [0] = "Landscape", [1] = "Portrait A",
+                           [2] = "Landscape flipped", [3] = "Portrait B" }
+    local caps_ok, caps = pcall(_device_caps)
+    if caps_ok and type(caps) == "table" and caps.name == "tdeck" then
+        ORIENT_NAMES = { [0] = "Default", [1] = "USB right",
+                         [2] = "Flipped", [3] = "USB left" }
+    end
+    local orient_val = _disp_orientation()
+    local function orient_text()
+        return "Orientation: < " .. (ORIENT_NAMES[orient_val] or "?") .. " >"
+    end
+    local orient_btn = content:Button { w = lvgl.PCT(100), h = 30 }
+    local orient_lbl = orient_btn:Label { text = orient_text(), align = lvgl.ALIGN.LEFT_MID }
+    orient_btn:onClicked(function()
+        orient_val = _disp_orientation((orient_val + 1) % 4)
+        orient_lbl:set({ text = orient_text() })
+        status.text = (ORIENT_NAMES[orient_val] or "?") .. " - restart to apply"
+    end)
+end
 
 -- Top bar: transparent (themed wallpaper shows behind the status bar) vs opaque
 -- (solid themed panel). Applies live; visible on the home screen.
@@ -158,7 +187,7 @@ kbd_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 kbd_bar:clear_flag(lvgl.FLAG.CLICKABLE)
 local ksegs = {}
 for i = 1, KBD_SEGS do
-    ksegs[i] = kbd_bar:Object { w = 30, h = 14, border_width = 1, pad_all = 0 , bg_color = "#24ba24" }
+    ksegs[i] = kbd_bar:Object { w = math.min(30, math.floor((lvgl.HOR_RES() - 12) / KBD_SEGS) - 1), h = 14, border_width = 1, pad_all = 0 , bg_color = "#24ba24" }
     ksegs[i]:clear_flag(lvgl.FLAG.SCROLLABLE)
     ksegs[i]:clear_flag(lvgl.FLAG.CLICKABLE)
 end
@@ -313,7 +342,7 @@ trk_bar:clear_flag(lvgl.FLAG.SCROLLABLE)
 trk_bar:clear_flag(lvgl.FLAG.CLICKABLE)
 local tsegs = {}
 for i = 1, TRK_SEGS do
-    tsegs[i] = trk_bar:Object { w = 12, h = 14, border_width = 1, pad_all = 0, bg_color = "#24ba24" }
+    tsegs[i] = trk_bar:Object { w = math.min(12, math.floor((lvgl.HOR_RES() - 12) / TRK_SEGS) - 1), h = 14, border_width = 1, pad_all = 0, bg_color = "#24ba24" }
     tsegs[i]:clear_flag(lvgl.FLAG.SCROLLABLE)
     tsegs[i]:clear_flag(lvgl.FLAG.CLICKABLE)
 end

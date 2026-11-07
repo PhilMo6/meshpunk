@@ -949,50 +949,6 @@ void PunkMesh::archiveIndexInit()
     if (is_sd) sd_spi_release();
 }
 
-// Read the log into `out` (deduped — the newest line per pubkey wins, since the
-// file is append-order), up to max_out entries; returns the count. The whole
-// archive stays on disk regardless of max_out — only the on-map display is
-// bounded so the transient buffer can't blow up PSRAM on a huge mesh.
-int PunkMesh::readArchivedDeduped(ContactInfo* out, int max_out)
-{
-    int n = 0;
-    bool is_sd = (_storage != &LittleFS);
-    if (is_sd) sd_spi_take();
-
-    String path = storagePath(_storage_prefix, "/contacts_arch.bin");
-    if (_storage->exists(path.c_str()))
-    {
-        File file = _storage->open(path.c_str());
-        if (file)
-        {
-            uint8_t rec[CONTACT_REC];
-            ContactInfo entry;
-            int cnt = 0;
-            while (file.available() >= CONTACT_REC)
-            {
-                if (file.read(rec, CONTACT_REC) != CONTACT_REC) break;
-                deserialize_contact(rec, entry);
-
-                int slot = -1;
-                for (int i = 0; i < n; i++) {
-                    if (memcmp(out[i].id.pub_key, entry.id.pub_key, PUB_KEY_SIZE) == 0) {
-                        slot = i;
-                        break;
-                    }
-                }
-                if (slot >= 0) out[slot] = entry;        // newer record supersedes
-                else if (n < max_out) out[n++] = entry;  // display cap; disk keeps all
-
-                if (is_sd && ++cnt % 200 == 0) { sd_spi_release(); vTaskDelay(1); sd_spi_take(); }
-            }
-            file.close();
-        }
-    }
-
-    if (is_sd) sd_spi_release();
-    return n;
-}
-
 int PunkMesh::readArchiveBatch(uint32_t offset, int max_count, ContactInfo* out,
                                uint32_t* next_offset, bool* done)
 {

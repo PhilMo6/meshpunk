@@ -46,6 +46,21 @@
 #define R_XTENSA_JMP_SLOT   4
 #define R_XTENSA_RELATIVE   5
 
+// RISC-V dynamic relocation types (RISC-V psABI). The numeric values
+// collide with the Xtensa set (1 is "32" on both, but 3 is RELATIVE here
+// vs GLOB_DAT there, 5 is JUMP_SLOT here vs RELATIVE there), so the
+// relocation switch is selected per-architecture at compile time — a
+// firmware build only ever parses its own machine's modules (enforced by
+// the e_machine gate in elf_load_ex).
+#define R_RISCV_NONE        0
+#define R_RISCV_32          1
+#define R_RISCV_RELATIVE    3
+#define R_RISCV_JUMP_SLOT   5
+
+// e_machine values for the load-time architecture gate
+#define EM_XTENSA           94
+#define EM_RISCV            243
+
 // Segment flags
 #define PF_X        0x1
 #define PF_W        0x2
@@ -263,10 +278,15 @@ static uint32_t remap_if_text(const elf_module_t* mod, uint32_t addr) {
     if (mod->hot_mem && addr >= mod->hot_lo && addr < mod->hot_hi) {
         return (uint32_t)((int32_t)addr + mod->hot_delta);
     }
+#if !defined(__riscv)
+    // Xtensa-only: the ESP32-S3 exposes PSRAM on separate data and
+    // instruction buses. RISC-V ESP32 targets fetch code through the same
+    // mapping data uses, so there addresses pass through unchanged.
     if (addr >= mod->text_start && addr < mod->text_end &&
         is_psram_data_addr(addr)) {
         return psram_data_to_inst(addr);
     }
+#endif
     return addr;
 }
 
@@ -289,6 +309,7 @@ static int process_rela_section(elf_module_t* mod, void* load_base,
         uint32_t* target = (uint32_t*)(rela[i].r_offset + mod->base);
 
         switch (type) {
+#if !defined(__riscv)
             case R_XTENSA_NONE:
             case R_XTENSA_RTLD:
                 break;
@@ -355,6 +376,67 @@ static int process_rela_section(elf_module_t* mod, void* load_base,
                 }
                 break;
             }
+#else
+            case R_RISCV_NONE:
+                break;
+
+            case R_RISCV_RELATIVE: {
+                // Pure RELA semantics: the addend carries the pre-relocation
+                // virtual address; the target word's prior contents are not
+                // an input (unlike the Xtensa linker's addend-0 form).
+                uint32_t val = (uint32_t)(rela[i].r_addend + mod->base);
+                *target = remap_if_text(mod, val);
+                break;
+            }
+
+            case R_RISCV_JUMP_SLOT: {
+                if (!mod->dynsym || !mod->dynstr) {
+                    LOG_E("relocation needs symbol table but none found");
+                    return -1;
+                }
+                Elf32_Sym* sym = &mod->dynsym[sym_idx];
+                const char* name = mod->dynstr + sym->st_name;
+                void* addr = resolve_symbol(mod, sym, name);
+                if (!addr) {
+                    // Weak undefined resolves to NULL per the ELF spec.
+                    if (ELF32_ST_BIND(sym->st_info) == STB_WEAK) {
+                        *target = 0;
+                        break;
+                    }
+                    LOG_E("unresolved symbol: %s", name);
+                    return -1;
+                }
+                // JUMP_SLOT addends are 0 per the psABI; adding is a no-op
+                // there and correct RELA semantics if one ever appears.
+                *target = (uint32_t)addr + rela[i].r_addend;
+                break;
+            }
+
+            case R_RISCV_32: {
+                // GOT data slots and absolute data words (RISC-V has no
+                // GLOB_DAT; symbolic 32-bit data relocations all arrive as
+                // R_RISCV_32 = S + A).
+                if (sym_idx && mod->dynsym && mod->dynstr) {
+                    Elf32_Sym* sym = &mod->dynsym[sym_idx];
+                    const char* name = mod->dynstr + sym->st_name;
+                    void* addr = resolve_symbol(mod, sym, name);
+                    if (!addr) {
+                        if (ELF32_ST_BIND(sym->st_info) == STB_WEAK) {
+                            *target = 0;
+                            break;
+                        }
+                        LOG_E("unresolved symbol (R_RISCV_32): %s", name);
+                        return -1;
+                    }
+                    *target = (uint32_t)addr + rela[i].r_addend;
+                } else {
+                    // No symbol: value is base + addend (RELA — not a
+                    // read-modify-write of the target word).
+                    *target = (uint32_t)(rela[i].r_addend + mod->base);
+                }
+                break;
+            }
+#endif
 
             default:
                 LOG_E("unsupported relocation type %u at offset 0x%08x",
@@ -394,6 +476,18 @@ elf_module_t* elf_load_ex(const void* data, size_t size,
         LOG_E("not a shared object (ET_DYN), type=%d", ehdr->e_type);
         return NULL;
     }
+#if defined(__riscv)
+    // Architecture gate: this firmware executes RISC-V machine code only.
+    // Xtensa artifacts keep the historical `<x>.app.elf` name, so a
+    // wrong-arch install fails here with a clear message instead of dying
+    // inside the relocation walk.
+    if (ehdr->e_machine != EM_RISCV) {
+        LOG_E("module built for another CPU (e_machine=%u, this device needs"
+              " %u/RISC-V) — install the rv32 build of this app",
+              ehdr->e_machine, EM_RISCV);
+        return NULL;
+    }
+#endif
 
     // Allocate module handle
     elf_module_t* mod = (elf_module_t*)calloc(1, sizeof(elf_module_t));
@@ -618,6 +712,8 @@ elf_module_t* elf_load_ex(const void* data, size_t size,
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     extern void Cache_WriteBack_All(void);
     Cache_WriteBack_All();
+#elif defined(__riscv)
+#error "RISC-V target: add this chip's cache writeback/invalidate here (IDF esp_cache_msync) so code written via the data path becomes fetchable — do not build without it"
 #endif
 
     mod->entry = remap_if_text(mod, ehdr->e_entry + mod->base);

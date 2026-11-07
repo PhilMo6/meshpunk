@@ -8,8 +8,17 @@ Highlights:
 - GPS sets the clock automatically
 - Full emoji support, with a downloadable extended set
 - Background apps - music keeps playing while you do other things
+]]
+
+if dev.usb_power then
+    body = body .. [[
+- USB accessories: keyboard, mouse, gamepad, audio adapter, thumb drive - powered by the device itself (see the USB accessories page)
+]]
+else
+    body = body .. [[
 - USB accessories: keyboard, mouse, gamepad, audio adapter, thumb drive (they need external power - see the USB accessories page)
 ]]
+end
 
 -- What this particular device gives you to work with. Everything else in the
 -- guide is written for the device it is being read on, so this sets the scene
@@ -25,9 +34,10 @@ This device is driven by its touchscreen. There is no built-in keyboard, so text
 end
 
 if dev.audio == "buzzer" then
+    local power = dev.usb_power and "" or ", and like every USB accessory it needs external power"
     body = body .. [[
 
-Sound comes from a buzzer, which plays notification melodies and app tones. For music and game audio you need a USB audio adapter, and like every USB accessory it needs external power - see the USB accessories page.]]
+Sound comes from a buzzer, which plays notification melodies and app tones. For music and game audio you need a USB audio adapter]] .. power .. [[ - see the USB accessories page.]]
 end
 
 body = body .. [[

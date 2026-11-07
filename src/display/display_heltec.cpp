@@ -59,6 +59,48 @@ SPIClass& board_sd_spi(void) {
 
 static TFT_eSPI tft;
 
+// Orientation state (contract: display_dev.h). This panel's native
+// landscape is TFT_eSPI rotation 1, same as the T-Deck, so the quarter-turn
+// count maps to rotation (1 + o) & 3. Portrait 0/2 is the ST7789's native
+// 240x320 scan order.
+static uint8_t s_orient = 0;
+static bool    s_module_video = false;
+
+static uint8_t eff_orient(void) { return s_module_video ? 0 : s_orient; }
+
+static void apply_rotation(void) {
+  SPI_LOCK();
+  tft.setRotation((1 + eff_orient()) & 3);
+  tft.fillScreen(TFT_BLACK);
+  SPI_UNLOCK();
+}
+
+void display_dev_set_orientation(uint8_t o) {
+  s_orient = o & 3;
+  if (!s_module_video) apply_rotation();
+}
+
+uint8_t display_dev_orientation(void) { return eff_orient(); }
+
+void display_dev_module_video(bool active) {
+  if (active == s_module_video) return;
+  s_module_video = active;
+  apply_rotation();
+}
+
+void display_dev_orient_point(int16_t* x, int16_t* y) {
+  // Same quarter-turn algebra the panel rotation applies: one step maps
+  // (x, y) in a WxH space to (y, W-1-x). Applied k times from the native
+  // landscape 320x240 space.
+  int w = 320, h = 240;
+  for (uint8_t k = eff_orient(); k > 0; k--) {
+    int16_t nx = *y;
+    int16_t ny = (int16_t)(w - 1 - *x);
+    *x = nx; *y = ny;
+    int t = w; w = h; h = t;
+  }
+}
+
 void display_dev_init(void) {
   tft.begin();
   tft.setRotation(1);
@@ -79,12 +121,11 @@ void display_dev_splash(void) {
   SPI_UNLOCK();
 }
 
-// Rotation 1 (landscape): the panel's native 240x320 becomes 320 wide by
-// 240 tall. Literals on purpose — never size anything off TFT_WIDTH/
-// TFT_HEIGHT macros in a backend (see display_tdeck.cpp for the collision
-// this avoids).
-int display_dev_width(void)  { return 320; }
-int display_dev_height(void) { return 240; }
+// Landscape orientations report 320x240, portraits 240x320. Literals on
+// purpose — never size anything off TFT_WIDTH/TFT_HEIGHT macros in a
+// backend (see display_tdeck.cpp for the collision this avoids).
+int display_dev_width(void)  { return (eff_orient() & 1) ? 240 : 320; }
+int display_dev_height(void) { return (eff_orient() & 1) ? 320 : 240; }
 
 void display_dev_flush_rect(int x, int y, int w, int h, const uint16_t* px) {
   SPI_LOCK();

@@ -161,7 +161,7 @@ local function run_task(task, title, on_done)
     overlay:add_flag(lvgl.FLAG.CLICKABLE)
 
     local box = overlay:Object {
-        w = 240, h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
+        w = math.min(240, W - 20), h = lvgl.SIZE_CONTENT, align = lvgl.ALIGN.CENTER,
         radius = 6, border_width = 1, pad_all = 8,
         flex = { flex_direction = "column", flex_wrap = "nowrap" },
     }

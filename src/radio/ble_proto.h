@@ -7,8 +7,11 @@
 //   1. firmware_prefs_load resolves ble_protocol= via ble_proto_set_requested
 //   2. ble_proto_select_and_init() — early in setup(), AFTER the LoRa
 //      protocol selection (requires_lora checks read lora_proto_active())
-//      and before LVGL/Lua (BLE-stack allocs land low in internal SRAM)
-//   3. ble_proto_start() — after the LoRa protocol is up
+//      and before LVGL/Lua; with a protocol active it also brings up the
+//      BLE controller and host (ble_transport_stack_up), so their
+//      internal-RAM allocations are made before the Lua session
+//   3. ble_proto_start() — after the LoRa protocol is up; the protocol's
+//      start() opens the GATT service (ble_transport_open)
 //   4. mesh_task ticks ble_proto_loop() (Core 1)
 // stop/resume manage the RUNTIME of the current selection (standby, module
 // runs borrowing internal SRAM); apply changes the SELECTION live.
@@ -37,7 +40,10 @@ bool ble_proto_apply(const char* id, const char** reason);
 // once the notify system is up. NULL when the boot was clean.
 const char* ble_proto_boot_notice(void);
 
-// The NimBLE serial transport backing BleHostApi (ble_transport.cpp).
+// The Bluedroid serial transport backing BleHostApi (ble_transport.cpp).
+// stack_up: controller + host only (open calls it; a no-op once both are
+// up). open: stack_up, then the GATT serial service and advertising.
+bool ble_transport_stack_up(void);
 bool ble_transport_open(const char* name_prefix, const char* dev_name,
                         uint32_t pin);
 void ble_transport_close(void);

@@ -62,7 +62,7 @@ bar_row:clear_flag(lvgl.FLAG.SCROLLABLE)
 bar_row:clear_flag(lvgl.FLAG.CLICKABLE)
 local segs = {}
 for i = 1, 21 do
-    segs[i] = bar_row:Object { w = 13, h = 14, border_width = 1, pad_all = 0,bg_color = "#24ba24"}
+    segs[i] = bar_row:Object { w = math.min(13, math.floor((lvgl.HOR_RES() - 12) / 21) - 1), h = 14, border_width = 1, pad_all = 0,bg_color = "#24ba24"}
     segs[i]:clear_flag(lvgl.FLAG.SCROLLABLE)
     segs[i]:clear_flag(lvgl.FLAG.CLICKABLE)
 end
@@ -109,159 +109,35 @@ btn_mute:onClicked(function()
 end)
 
 -- ── Test ──────────────────────────────────────────────────────────────────────
+-- The same C-E-G-C arpeggio notify.cpp pre-renders for message alerts
+-- (notes and envelope copied from NOTIFY_MELODY there), so this plays what
+-- an alert sounds like at the volume set above. Generated once, on first tap.
 content:Label { text = "-- Test --", w = lvgl.PCT(100), h = 16 }
 
-local test_tone = nil
-local btn_tone = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_tone:Label { text = "Test Tone", align = lvgl.ALIGN.CENTER }
-btn_tone:onClicked(function()
-    if not test_tone then
-        test_tone = sound.generateTone(880, 300)
+local test_sound = nil
+local btn_test = content:Button { w = lvgl.PCT(100), h = 30 }
+btn_test:Label { text = "Play notification sound", align = lvgl.ALIGN.CENTER }
+btn_test:onClicked(function()
+    if not test_sound then
+        test_sound = sound.generateMelody({
+            {freq=523, ms=150}, {freq=0, ms=30},
+            {freq=659, ms=150}, {freq=0, ms=30},
+            {freq=784, ms=150}, {freq=0, ms=30},
+            {freq=1047, ms=300},
+        }, { attack = 5, decay = 30, sustain = 0.6, release = 30 })
     end
-    if test_tone then
-        test_tone:play()
-        status.text = "Playing tone..."
-    else
-        status.text = "Tone gen failed"
+    if not test_sound then
+        status.text = "Sound generation failed"
+        return
     end
-end)
-
-local test_file = nil
-local btn_file = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_file:Label { text = "Test File", align = lvgl.ALIGN.CENTER }
-btn_file:onClicked(function()
-    if not test_file then
-        local f = io.open("L:/sounds/notify.mp3", "r")
-        if f then
-            test_file = sound.loadFile(f)
-        end
-    end
-    if test_file then
-        test_file:play()
-        status.text = "Playing file..."
-    else
-        status.text = "No notify.mp3 found"
-    end
-end)
-
--- ── Waveforms ─────────────────────────────────────────────────────────────────
-content:Label { text = "-- Waveforms --", w = lvgl.PCT(100), h = 16 }
-
-local demo_tones = {}
-
-local wave_types = { "sine", "square", "saw", "triangle", "noise" }
-local wave_labels = { "Sine", "Square", "Saw", "Tri", "Noise" }
-for i, wf in ipairs(wave_types) do
-    local btn = content:Button { w = lvgl.PCT(30), h = 30 }
-    btn:Label { text = wave_labels[i], align = lvgl.ALIGN.CENTER }
-    btn:onClicked(function()
-        local opts = nil
-        if wf ~= "sine" then opts = { waveform = wf } end
-        local t = sound.generateTone(440, 300, opts)
-        if t then
-            t:play()
-            demo_tones[#demo_tones + 1] = t
-            status.text = wave_labels[i] .. " wave"
-        end
-    end)
-end
-
--- ── Effects ───────────────────────────────────────────────────────────────────
-content:Label { text = "-- Effects --", w = lvgl.PCT(100), h = 16 }
-
-local btn_adsr = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_adsr:Label { text = "ADSR", align = lvgl.ALIGN.CENTER }
-btn_adsr:onClicked(function()
-    local t = sound.generateTone(440, 800, {
-        attack = 100, decay = 100, sustain = 0.5, release = 200
-    })
-    if t then
-        t:play()
-        demo_tones[#demo_tones + 1] = t
-        status.text = "ADSR envelope"
-    end
-end)
-
-local btn_sweep = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_sweep:Label { text = "Sweep", align = lvgl.ALIGN.CENTER }
-btn_sweep:onClicked(function()
-    local t = sound.generateTone(200, 500, {
-        end_freq = 2000, sweep = "exp"
-    })
-    if t then
-        t:play()
-        demo_tones[#demo_tones + 1] = t
-        status.text = "Exp sweep"
-    end
-end)
-
-local btn_bell = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_bell:Label { text = "Bell", align = lvgl.ALIGN.CENTER }
-btn_bell:onClicked(function()
-    local t = sound.generateTone(440, 1000, {
-        fm_ratio = 1.4, fm_index = 5,
-        attack = 5, decay = 200, sustain = 0.2, release = 300
-    })
-    if t then
-        t:play()
-        demo_tones[#demo_tones + 1] = t
-        status.text = "FM bell"
-    end
-end)
-
-local btn_epiano = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_epiano:Label { text = "EPiano", align = lvgl.ALIGN.CENTER }
-btn_epiano:onClicked(function()
-    local t = sound.generateTone(440, 800, {
-        fm_ratio = 1.0, fm_index = 1.5,
-        attack = 10, decay = 150, sustain = 0.4, release = 200
-    })
-    if t then
-        t:play()
-        demo_tones[#demo_tones + 1] = t
-        status.text = "FM e-piano"
-    end
-end)
-
--- ── Chord / Melody ────────────────────────────────────────────────────────────
-content:Label { text = "-- Chord / Melody --", w = lvgl.PCT(100), h = 16 }
-
-local btn_chord = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_chord:Label { text = "Chord", align = lvgl.ALIGN.CENTER }
-btn_chord:onClicked(function()
-    local t = sound.generateChord({262, 330, 392}, 600, {
-        attack = 20, decay = 100, sustain = 0.5, release = 150
-    })
-    if t then
-        t:play()
-        demo_tones[#demo_tones + 1] = t
-        status.text = "C major chord"
-    end
-end)
-
-local btn_melody = content:Button { w = lvgl.PCT(45), h = 30 }
-btn_melody:Label { text = "Melody", align = lvgl.ALIGN.CENTER }
-btn_melody:onClicked(function()
-    local t = sound.generateMelody({
-        {freq=523, ms=150}, {freq=0, ms=30},
-        {freq=659, ms=150}, {freq=0, ms=30},
-        {freq=784, ms=150}, {freq=0, ms=30},
-        {freq=1047, ms=300},
-    }, { attack = 5, decay = 30, sustain = 0.6, release = 30 })
-    if t then
-        t:play()
-        demo_tones[#demo_tones + 1] = t
-        status.text = "C-E-G-C melody"
-    end
+    test_sound:play()
+    status.text = is_muted and "Muted - unmute to hear it" or "Playing notification sound"
 end)
 
 -- Cleanup on back
 back_btn:onClicked(function()
     -- app-specific audio cleanup first, then let the manager tear down the root
-    if test_tone then test_tone:delete(); test_tone = nil end
-    if test_file then test_file:delete(); test_file = nil end
-    for _, t in ipairs(demo_tones) do t:delete() end
-    demo_tones = {}
+    if test_sound then test_sound:delete(); test_sound = nil end
     apps.go_home()
 end)
 

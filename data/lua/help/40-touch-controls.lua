@@ -1,9 +1,18 @@
-local caps = ...
+local caps, dev = ...
 
 -- The mode cycle is driven by the board's aux button where there is no
--- keyboard, and by Shift+Alt where there is one.
-local trigger = caps.keyboard and "hold Shift and Alt together"
-                              or  "press the IO button on the side of the device"
+-- keyboard (the Heltec kit's IO button, the Wio L2's WAKE button), and by
+-- Shift+Alt where there is one.
+local trigger
+if caps.keyboard then
+    trigger = "hold Shift and Alt together"
+elseif dev.name == "heltec_v4" then
+    trigger = "press the IO button on the side of the device"
+elseif dev.name == "wio_l2" then
+    trigger = "press the WAKE button"
+else
+    trigger = "press the device's input-mode button"
+end
 
 local body
 

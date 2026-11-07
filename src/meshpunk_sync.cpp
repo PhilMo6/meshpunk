@@ -16,6 +16,7 @@ QueueHandle_t     tx_cmd_queue    = nullptr;
 QueueHandle_t     gps_event_queue = nullptr;
 
 SerialMux SLog;
+volatile bool g_slog_quiet = false;
 
 void meshpunk_sync_init() {
   if (spi_bus_mutex == nullptr) {

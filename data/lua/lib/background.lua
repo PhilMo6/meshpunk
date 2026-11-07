@@ -80,16 +80,42 @@ function M.fill(color)
     send_to_back()
 end
 
--- Image wallpaper from a path, e.g. "S:/themes/midnight/wall.bin" (RGB565 native
--- little-endian per the lodepng/RGB565 note) or a .png.
+-- Image wallpaper from a path, e.g. "S:/themes/midnight/wall.png" or a .bin.
+--
+-- PNG: decoded ONCE and CONTAIN-fitted (bilinear, aspect kept, never
+-- cropped) to the screen by _bg_load_scaled, so one wallpaper file fits
+-- every resolution and orientation. The fitted image is centered; the
+-- letterbox strips show the layer behind it (the theme's screen color).
+-- The C-level delete handler frees the buffer when the layer is torn down,
+-- and nothing enters the LVGL image cache (the decode buffers are transient
+-- inside the binding).
+--
+-- .bin (RGB565 native little-endian): pre-rendered at a specific resolution
+-- by design — drawn as-is through the LVGL cache, evicted in free().
 function M.image(src)
     local base = new_base(false)
-    local ok = pcall(function()
-        local img = base:Image({ src = src, x = 0, y = 0, w = W(), h = H() })
-        img:clear_flag(lvgl.FLAG.CLICKABLE)
-        img:clear_flag(lvgl.FLAG.SCROLLABLE)
-    end)
-    last_image_src = ok and src or nil
+    if src:sub(-4):lower() == ".png" then
+        local buf, fw, fh = _bg_load_scaled(src, W(), H())
+        if buf then
+            local ok = pcall(function()
+                local img = base:Image({ w = fw, h = fh, align = lvgl.ALIGN.CENTER })
+                img:set_src(buf)
+                img:clear_flag(lvgl.FLAG.CLICKABLE)
+                img:clear_flag(lvgl.FLAG.SCROLLABLE)
+                _snapshot_attach_free(img, buf)
+            end)
+            if not ok then pcall(_snapshot_free, buf) end
+        else
+            print("[background] wallpaper load failed; skipped: " .. tostring(src))
+        end
+    else
+        local ok = pcall(function()
+            local img = base:Image({ src = src, x = 0, y = 0, w = W(), h = H() })
+            img:clear_flag(lvgl.FLAG.CLICKABLE)
+            img:clear_flag(lvgl.FLAG.SCROLLABLE)
+        end)
+        last_image_src = ok and src or nil
+    end
     send_to_back()
 end
 

@@ -33,3 +33,17 @@ void power_dev_shutdown(void);
 // with no power control. Heltec: VGNSS rail off/on (GPS).
 void power_dev_standby_enter(void);
 void power_dev_standby_exit(void);
+
+// USB host port power. usb_core calls begin() when host mode starts, tick()
+// from its task loop while host mode runs, and end() when host mode stops.
+// begin() returns true when the board will supply 5 V on its USB-C port to
+// an attached device. Boards with no port power control return false and
+// do nothing in tick()/end(). Wio L2: the AW35615 port controller detects
+// the device and OTG_EN (expander P13) switches VBUS (power_wio_l2.cpp).
+bool power_dev_usb_host_begin(void);
+void power_dev_usb_host_tick(void);
+void power_dev_usb_host_end(void);
+
+// True when host mode will supply 5 V on the USB-C port to an attached
+// device (_device_caps().usb_power). Wio L2: the AW35615 answered at boot.
+bool power_dev_usb_port_power(void);

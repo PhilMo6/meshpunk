@@ -25,6 +25,8 @@
 
 extern VolatileRTCClock* host_rtc;    // host-owned device clock (main.cpp)
 extern volatile uint32_t g_lua_arena_spill_count;   // main.cpp: Lua allocs that missed the arena
+extern volatile uint32_t g_lua_heap_bytes;          // main.cpp: bytes Lua holds (arena + spilled)
+extern volatile uint32_t g_lua_arena_free_bytes;    // main.cpp: free bytes inside the Lua arena
 
 static TaskHandle_t s_mesh_task_handle = nullptr;
 volatile bool mesh_task_paused = false;
@@ -68,13 +70,15 @@ static void mesh_task_body(void *param) {
     uint32_t now = millis();
     if (now - last_heap_log > 60000) {
       last_heap_log = now;
-      SLog.printf("[HEAP] internal: %u free, %u largest | PSRAM: %u free, %u largest | min ever: %u | lua_spill: %u\n",
+      SLog.printf("[HEAP] internal: %u free, %u largest | PSRAM: %u free, %u largest | min ever: %u | lua_spill: %u | lua_heap: %u | arena_free: %u\n",
           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
           heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
           heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
           heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
           esp_get_minimum_free_heap_size(),
-          (unsigned)g_lua_arena_spill_count);
+          (unsigned)g_lua_arena_spill_count,
+          (unsigned)g_lua_heap_bytes,
+          (unsigned)g_lua_arena_free_bytes);
     }
 
     // Yield so lower priority tasks (IDLE, watchdog) can run.
@@ -83,19 +87,50 @@ static void mesh_task_body(void *param) {
   }
 }
 
+// Stacks (internal RAM) and TCBs of the two Core 1 tasks, allocated by
+// meshpunk_reserve_task_stacks() early in setup(), before the Lua session;
+// the spawns below create the tasks on them.
+// mesh_task: dispatcher + AES + storage writes fit in 8 KB comfortably;
+// 12 KB leaves slack for deep call chains. gps_task: NMEA parse + UART reads
+// only; 4 KB is plenty.
+#define MESH_TASK_STACK_BYTES (12 * 1024)
+#define GPS_TASK_STACK_BYTES  (4 * 1024)
+static StackType_t*  s_mesh_stack = nullptr;
+static StaticTask_t* s_mesh_tcb   = nullptr;
+static StackType_t*  s_gps_stack  = nullptr;
+static StaticTask_t* s_gps_tcb    = nullptr;
+
+static void reserve_task_memory(StackType_t** stack, StaticTask_t** tcb,
+                                size_t stack_bytes, const char* name) {
+  *stack = (StackType_t*)heap_caps_malloc(stack_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  *tcb   = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!*stack || !*tcb)
+    SLog.printf("[TASK] FAIL: no internal RAM for the %s stack (%u bytes)\n",
+                name, (unsigned)stack_bytes);
+}
+
+void meshpunk_reserve_task_stacks() {
+  if (s_mesh_stack) return;
+  reserve_task_memory(&s_mesh_stack, &s_mesh_tcb, MESH_TASK_STACK_BYTES, "mesh_task");
+  reserve_task_memory(&s_gps_stack,  &s_gps_tcb,  GPS_TASK_STACK_BYTES,  "gps_task");
+}
+
 void meshpunk_spawn_mesh_task() {
   if (s_mesh_task_handle) return;
-  // Stack: mesh dispatcher + AES + storage writes fit in 8 KB comfortably;
-  // 12 KB leaves slack for deep call chains.
+  if (!s_mesh_stack || !s_mesh_tcb) {
+    SLog.println("[TASK] FAIL: mesh_task not started: no reserved stack");
+    return;
+  }
   // Priority 2 keeps it above IDLE (0) and loopTask-equivalents (1) without
   // starving FreeRTOS internals.
-  xTaskCreatePinnedToCore(
+  s_mesh_task_handle = xTaskCreateStaticPinnedToCore(
     mesh_task_body,
     "mesh_task",
-    12 * 1024,
+    MESH_TASK_STACK_BYTES,
     nullptr,
     2,
-    &s_mesh_task_handle,
+    s_mesh_stack,
+    s_mesh_tcb,
     1 /* pinned to Core 1 */
   );
 }
@@ -134,15 +169,19 @@ static void gps_task_body(void *param) {
 
 void meshpunk_spawn_gps_task() {
   if (s_gps_task_handle) return;
-  // Small task: NMEA parse + UART reads only. 4 KB is plenty.
+  if (!s_gps_stack || !s_gps_tcb) {
+    SLog.println("[TASK] FAIL: gps_task not started: no reserved stack");
+    return;
+  }
   // Priority 1 (below mesh_task).
-  xTaskCreatePinnedToCore(
+  s_gps_task_handle = xTaskCreateStaticPinnedToCore(
     gps_task_body,
     "gps_task",
-    4 * 1024,
+    GPS_TASK_STACK_BYTES,
     nullptr,
     1,
-    &s_gps_task_handle,
+    s_gps_stack,
+    s_gps_tcb,
     1 /* pinned to Core 1 */
   );
 }

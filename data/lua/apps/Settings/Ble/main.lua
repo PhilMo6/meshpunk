@@ -94,17 +94,20 @@ local function refresh_conn()
 end
 refresh_conn()
 
--- Bond clear: forces PIN re-entry on every reconnect.
-content:Label { text = "Requires PIN re-entry on reconnect", w = lvgl.PCT(100), h = 16 }
+-- Bond clear: the pairing is dropped after each session, so the phone has to
+-- enter the PIN again on every reconnect.
 local bc_on = _ble_get_bond_clear()
-local btn_bc = content:Button { w = lvgl.PCT(60), h = 30 }
-local lbl_bc = btn_bc:Label { align = lvgl.ALIGN.CENTER }
-lbl_bc.text = bc_on and "Bond Clear: ON" or "Bond Clear: OFF"
+local function bc_text()
+    return (bc_on and "[x]" or "[ ]") .. " Ask for PIN on every reconnect"
+end
+local btn_bc = content:Button { w = lvgl.PCT(100), h = 30 }
+local lbl_bc = btn_bc:Label { text = bc_text(), align = lvgl.ALIGN.LEFT_MID }
 
 btn_bc:onClicked(function()
     bc_on = not bc_on
     _ble_set_bond_clear(bc_on)
-    lbl_bc.text = bc_on and "Bond Clear: ON" or "Bond Clear: OFF"
+    lbl_bc:set({ text = bc_text() })
+    status.text = bc_on and "PIN asked on every reconnect" or "Phone stays paired"
 end)
 
 -- Backlog sync limit: newest messages sent per chat on a fresh connection
