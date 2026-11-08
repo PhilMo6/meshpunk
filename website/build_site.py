@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Builds the MeshPunk website.
 
-Copies website/site/ into the output directory and mirrors the newest release
-of the stable and the dev repository into firmware/, with the index the
-flasher page reads.
+Copies website/site/ into the output directory, renders website/docs/*.md
+into pages (md2html.py), and mirrors the newest release of the stable and the
+dev repository into firmware/, with the index the flasher page reads.
 
     build_site.py --out DIR [--live URL] [--force]
 
@@ -24,8 +24,11 @@ import time
 import urllib.error
 import urllib.request
 
+import md2html  # website/md2html.py, beside this file
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SITE_SRC = os.path.join(HERE, "site")
+DOCS_SRC = os.path.join(HERE, "docs")
 BOARDS_JSON = os.path.join(HERE, "boards.json")
 CACHE_DIR = os.path.join(HERE, ".cache")
 
@@ -338,6 +341,11 @@ def mirror_release(out, channel_id, release, boards, used_cache):
 def build(out, releases, boards, fp):
     prepare_out(out)
     shutil.copytree(SITE_SRC, out, dirs_exist_ok=True)
+    try:
+        for slug in md2html.render_docs(DOCS_SRC, out):
+            log("docs: /%s/" % slug)
+    except ValueError as e:
+        raise BuildError(str(e))
     used_cache = set()
     channels = {}
     for (channel_id, repo), release in zip(CHANNELS, releases):

@@ -7,8 +7,10 @@ only.
 ```
 website/
 ├─ site/                 published as-is: pages, css, js, images, vendored esptool-js
+├─ docs/                 Markdown pages; each one becomes /<name>/ on the site
 ├─ boards.json           the devices the flasher offers
 ├─ build_site.py         builds the site and mirrors the newest stable and dev release
+├─ md2html.py            renders docs/*.md into pages (stdlib only)
 ├─ serve.py              local preview server
 └─ tests/                generator tests (Python) and flasher tests (Node)
 .github/workflows/website.yml   builds and deploys to GitHub Pages
@@ -55,6 +57,24 @@ names them. The build **fails** — and the site keeps its previous state — wh
 The failed run names the file. Fix the release asset and run the workflow
 again.
 
+## Docs pages
+
+A Markdown file `docs/<name>.md` is published as `/<name>/` with the site's
+header, nav and footer; `docs/elf-app-developer-guide.md` is the ELF App
+Developer Guide. Edit the Markdown and push; the workflow renders it.
+
+- The file name is the URL: lower-case letters, digits and dashes.
+- The first `# Heading` is the page title, the first paragraph after it the
+  meta description.
+- Supported Markdown: `#` to `###` headings (they get GitHub-style ids, so
+  `[text](#before-you-start)` links work), paragraphs, `-` and `1.` lists,
+  `- [ ]` task items, pipe tables with a `---` separator row, fenced code
+  blocks, and inline `` `code` ``, `**bold**`, `[text](url)`. Anything else is
+  shown as plain text.
+- A page without a title, or with a bad file name, fails the build.
+- The nav link to a page is hand-written: `md2html.py` (`NAV`), `site/index.html`,
+  `site/flash/index.html` and `site/404.html`.
+
 ## Adding a board
 
 Add an entry to `boards.json`, keyed by the slug (`MESHPUNK_BOARD_NAME`):
@@ -93,8 +113,8 @@ there for origin and checksum).
 ## Local preview
 
 ```
-C:\Users\noahl\.platformio\penv\Scripts\python.exe website\build_site.py --out website\_site
-C:\Users\noahl\.platformio\penv\Scripts\python.exe website\serve.py
+%USERPROFILE%\.platformio\penv\Scripts\python.exe website\build_site.py --out website\_site
+%USERPROFILE%\.platformio\penv\Scripts\python.exe website\serve.py
 ```
 
 Then open `http://localhost:8137/` in Chrome or another compatible Chromium browser. Web Serial works on
@@ -104,7 +124,7 @@ localhost, so a device can be flashed from the preview. Downloads are cached in
 ## Tests
 
 ```
-C:\Users\noahl\.platformio\penv\Scripts\python.exe -m unittest discover -s website\tests
+%USERPROFILE%\.platformio\penv\Scripts\python.exe -m unittest discover -s website\tests
 node --test website\tests\core.test.mjs
 ```
 

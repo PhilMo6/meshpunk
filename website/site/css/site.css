@@ -273,12 +273,58 @@ progress::-moz-progress-bar { background: var(--green); }
 .aside li { margin: 3px 0; font-size: 0.94rem; }
 .aside .size { color: var(--muted); font-family: var(--mono); font-size: 0.82rem; }
 
+/* ---- docs pages (website/docs/*.md, rendered by md2html.py) ---- */
+
+.article { max-width: 60rem; padding: 36px 0 8px; }
+.article h1 { font-size: clamp(1.7rem, 4vw, 2.3rem); margin-bottom: 16px; }
+.article h2 { font-size: 1.4rem; margin: 44px 0 12px; padding-top: 18px; border-top: 1px solid var(--line); }
+.article h3 { font-size: 1.1rem; margin: 28px 0 10px; color: var(--teal); }
+.article h2, .article h3 { scroll-margin-top: 76px; }
+.article p { margin: 0 0 14px; }
+.article p.run-in { margin-top: 22px; margin-bottom: 8px; }
+.article ul, .article ol { margin: 0 0 14px; padding-left: 1.4em; }
+.article li { margin: 5px 0; }
+.article li.task { list-style: none; position: relative; margin-left: -1.4em; padding-left: 1.7em; }
+.article li.task::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.42em;
+  width: 0.85em;
+  height: 0.85em;
+  border: 1px solid var(--line-hi);
+  border-radius: 3px;
+  background: var(--panel-hi);
+}
+.article li.task.done::before { background: var(--green); border-color: var(--green); }
+.article pre {
+  margin: 0 0 16px;
+  font: 0.84rem/1.55 var(--mono);
+  white-space: pre;
+  overflow-x: auto;
+  background: #060a09;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  color: #b9d3c5;
+}
+.article pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+.table-wrap { overflow-x: auto; margin: 0 0 16px; border: 1px solid var(--line); border-radius: 8px; }
+.article table { border-collapse: collapse; width: 100%; font-size: 0.93rem; }
+.article th, .article td { text-align: left; vertical-align: top; padding: 8px 12px; border-top: 1px solid var(--line); }
+.article thead th { border-top: 0; background: var(--panel-hi); color: var(--muted); font-weight: 600; font-size: 0.85rem; letter-spacing: 0.02em; }
+.article tbody tr:nth-child(even) { background: var(--panel); }
+
 @media (max-width: 640px) {
   .shots { grid-template-columns: repeat(2, 1fr); }
 }
 
 @media (max-width: 560px) {
   .hero { padding-top: 40px; }
+  /* Brand on its own row, the nav pills below it: five links no longer squeeze the brand. */
+  .site-header .wrap { flex-wrap: wrap; gap: 4px 16px; min-height: 0; padding-top: 10px; padding-bottom: 8px; }
+  .brand { flex-shrink: 0; }
+  .site-nav { margin-left: 0; width: 100%; }
   .site-nav a { padding: 6px 9px; }
   .step { padding: 16px; }
 }
