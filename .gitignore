@@ -14,3 +14,4 @@ modules/*/obj/
 modules/*/obj-rv32/
 __pycache__/
 *.pyc
+*.o
