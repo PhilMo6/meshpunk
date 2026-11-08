@@ -1,11 +1,13 @@
 """
-md2html.py -- renders website/docs/*.md into pages of the site.
+md2html.py -- renders website/pages/*.md into pages of the site.
 
-Each docs/<slug>.md becomes <out>/<slug>/index.html, wrapped in the same
+Each pages/<slug>.md becomes <out>/<slug>/index.html, wrapped in the same
 header, nav and footer as the hand-written pages. The first "# " heading
 is the page title and the first paragraph after it is the meta description.
+(The folder is "pages", not "docs": the repository's .gitignore ignores every
+folder named docs, at any depth.)
 
-Markdown subset (everything the docs use; anything else comes out as
+Markdown subset (everything the pages use; anything else comes out as
 HTML-escaped text):
 
   # .. ###          headings, given GitHub-style ids for in-page links
@@ -272,7 +274,7 @@ def nav_html(root, current_slug):
 
 
 def page(slug, md):
-    """A docs page as a complete HTML document (served at /<slug>/index.html)."""
+    """A Markdown page as a complete HTML document (served at /<slug>/index.html)."""
     title, description, body = render(md)
     root = "../"
     return PAGE.format(
@@ -284,23 +286,23 @@ def page(slug, md):
     )
 
 
-def render_docs(docs_dir, out_dir):
-    """Render every docs_dir/*.md into out_dir/<slug>/index.html. Returns the slugs."""
+def render_pages(pages_dir, out_dir):
+    """Render every pages_dir/*.md into out_dir/<slug>/index.html. Returns the slugs."""
     slugs = []
-    if not os.path.isdir(docs_dir):
+    if not os.path.isdir(pages_dir):
         return slugs
-    for name in sorted(os.listdir(docs_dir)):
+    for name in sorted(os.listdir(pages_dir)):
         if not name.endswith(".md"):
             continue
         slug = name[:-3]
         if not SLUG_RE.match(slug):
-            raise ValueError("docs/%s: file name must be lower-case letters, digits and dashes" % name)
-        with open(os.path.join(docs_dir, name), encoding="utf-8") as f:
+            raise ValueError("pages/%s: file name must be lower-case letters, digits and dashes" % name)
+        with open(os.path.join(pages_dir, name), encoding="utf-8") as f:
             md = f.read()
         try:
             doc = page(slug, md)
         except ValueError as e:
-            raise ValueError("docs/%s: %s" % (name, e))
+            raise ValueError("pages/%s: %s" % (name, e))
         target = os.path.join(out_dir, slug)
         os.makedirs(target, exist_ok=True)
         with open(os.path.join(target, "index.html"), "w", encoding="utf-8", newline="\n") as f:

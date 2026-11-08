@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Builds the MeshPunk website.
 
-Copies website/site/ into the output directory, renders website/docs/*.md
+Copies website/site/ into the output directory, renders website/pages/*.md
 into pages (md2html.py), and mirrors the newest release of the stable and the
 dev repository into firmware/, with the index the flasher page reads.
 
@@ -28,7 +28,7 @@ import md2html  # website/md2html.py, beside this file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SITE_SRC = os.path.join(HERE, "site")
-DOCS_SRC = os.path.join(HERE, "docs")
+PAGES_SRC = os.path.join(HERE, "pages")  # not "docs": the repo's .gitignore hides every docs/ folder
 BOARDS_JSON = os.path.join(HERE, "boards.json")
 CACHE_DIR = os.path.join(HERE, ".cache")
 
@@ -342,8 +342,8 @@ def build(out, releases, boards, fp):
     prepare_out(out)
     shutil.copytree(SITE_SRC, out, dirs_exist_ok=True)
     try:
-        for slug in md2html.render_docs(DOCS_SRC, out):
-            log("docs: /%s/" % slug)
+        for slug in md2html.render_pages(PAGES_SRC, out):
+            log("page: /%s/" % slug)
     except ValueError as e:
         raise BuildError(str(e))
     used_cache = set()

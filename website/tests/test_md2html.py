@@ -1,6 +1,6 @@
 """python -m unittest discover -s website/tests
 
-Covers md2html.py, the Markdown-to-page renderer: the subset the docs use
+Covers md2html.py, the Markdown-to-page renderer: the subset the pages use
 must come out as the HTML the site styles, and a shipped page's in-page
 links must have a heading to land on.
 """
@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import md2html  # noqa: E402
 
-DOCS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs")
+PAGES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pages")
 
 
 def body(md):
@@ -76,14 +76,14 @@ class Blocks(unittest.TestCase):
 
 
 class Pages(unittest.TestCase):
-    def test_renders_docs_dir_into_slug_folders(self):
+    def test_renders_pages_dir_into_slug_folders(self):
         with tempfile.TemporaryDirectory() as tmp:
-            docs = os.path.join(tmp, "docs")
-            os.makedirs(docs)
-            with open(os.path.join(docs, "my-page.md"), "w", encoding="utf-8") as f:
+            pages = os.path.join(tmp, "pages")
+            os.makedirs(pages)
+            with open(os.path.join(pages, "my-page.md"), "w", encoding="utf-8") as f:
                 f.write("# My Page\n\nHello.\n")
             out = os.path.join(tmp, "out")
-            self.assertEqual(md2html.render_docs(docs, out), ["my-page"])
+            self.assertEqual(md2html.render_pages(pages, out), ["my-page"])
             with open(os.path.join(out, "my-page", "index.html"), encoding="utf-8") as f:
                 page = f.read()
             self.assertIn("<title>My Page &mdash; MeshPunk</title>", page)
@@ -93,28 +93,28 @@ class Pages(unittest.TestCase):
 
     def test_bad_file_name_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
-            docs = os.path.join(tmp, "docs")
-            os.makedirs(docs)
-            with open(os.path.join(docs, "Bad Name.md"), "w", encoding="utf-8") as f:
+            pages = os.path.join(tmp, "pages")
+            os.makedirs(pages)
+            with open(os.path.join(pages, "Bad Name.md"), "w", encoding="utf-8") as f:
                 f.write("# T\n")
             with self.assertRaises(ValueError):
-                md2html.render_docs(docs, os.path.join(tmp, "out"))
+                md2html.render_pages(pages, os.path.join(tmp, "out"))
 
-    def test_no_docs_dir_is_fine(self):
+    def test_no_pages_dir_is_fine(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(md2html.render_docs(os.path.join(tmp, "missing"), tmp), [])
+            self.assertEqual(md2html.render_pages(os.path.join(tmp, "missing"), tmp), [])
 
 
-class ShippedDocs(unittest.TestCase):
+class ShippedPages(unittest.TestCase):
     def test_in_page_links_resolve(self):
-        for name in sorted(os.listdir(DOCS)):
+        for name in sorted(os.listdir(PAGES)):
             if not name.endswith(".md"):
                 continue
-            with open(os.path.join(DOCS, name), encoding="utf-8") as f:
+            with open(os.path.join(PAGES, name), encoding="utf-8") as f:
                 _, _, out = md2html.render(f.read())
             ids = set(re.findall(r' id="([^"]+)"', out))
             for anchor in re.findall(r'href="#([^"]+)"', out):
                 self.assertIn(anchor, ids, "%s: broken in-page link #%s" % (name, anchor))
 
     def test_developer_guide_is_shipped(self):
-        self.assertTrue(os.path.isfile(os.path.join(DOCS, "elf-app-developer-guide.md")))
+        self.assertTrue(os.path.isfile(os.path.join(PAGES, "elf-app-developer-guide.md")))

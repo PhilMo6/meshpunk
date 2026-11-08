@@ -7,10 +7,10 @@ only.
 ```
 website/
 ├─ site/                 published as-is: pages, css, js, images, vendored esptool-js
-├─ docs/                 Markdown pages; each one becomes /<name>/ on the site
+├─ pages/                Markdown pages; each one becomes /<name>/ on the site
 ├─ boards.json           the devices the flasher offers
 ├─ build_site.py         builds the site and mirrors the newest stable and dev release
-├─ md2html.py            renders docs/*.md into pages (stdlib only)
+├─ md2html.py            renders pages/*.md into site pages (stdlib only)
 ├─ serve.py              local preview server
 └─ tests/                generator tests (Python) and flasher tests (Node)
 .github/workflows/website.yml   builds and deploys to GitHub Pages
@@ -57,11 +57,13 @@ names them. The build **fails** — and the site keeps its previous state — wh
 The failed run names the file. Fix the release asset and run the workflow
 again.
 
-## Docs pages
+## Markdown pages
 
-A Markdown file `docs/<name>.md` is published as `/<name>/` with the site's
-header, nav and footer; `docs/elf-app-developer-guide.md` is the ELF App
-Developer Guide. Edit the Markdown and push; the workflow renders it.
+A Markdown file `pages/<name>.md` is published as `/<name>/` with the site's
+header, nav and footer; `pages/elf-app-developer-guide.md` is the ELF App
+Developer Guide. Edit the Markdown and push; the workflow renders it. (The
+folder is not called `docs` because the repository's `.gitignore` ignores
+every folder of that name.)
 
 - The file name is the URL: lower-case letters, digits and dashes.
 - The first `# Heading` is the page title, the first paragraph after it the
