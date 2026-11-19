@@ -13,5 +13,10 @@
     "name": "Seeed Wio Tracker L2",
     "chip": "ESP32-S3",
     "usb": { "vid": "0x303A", "pid": "0x1001" }
+  },
+  "tdisplay_p4": {
+    "name": "LilyGo T-Display P4",
+    "chip": "ESP32-P4",
+    "usb": { "vid": "0x1A86", "pid": "0x55D3" }
   }
 }
