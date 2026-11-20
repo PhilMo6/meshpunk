@@ -2,6 +2,8 @@
 
 Join the MeshPunk Discord: https://discord.gg/cmJKV5gEdP
 
+MeshPunk website and web flasher: https://philmo6.github.io/meshpunk/
+
 ## Supported devices
 
 | Device | PlatformIO env | Inputs |

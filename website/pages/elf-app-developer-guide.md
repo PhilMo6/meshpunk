@@ -1,6 +1,6 @@
 # Meshpunk ELF App Developer Guide
 
-Passages marked **(Coming)** describe T-Display P4 (RISC-V) support that exists in the development tree but has not shipped in any release. Everything else is true of v0.5.0.
+The stable release is v0.5.0 (App API level 15). Passages marked **(Dev)** describe the development release v0.6.0-dev1 (level 16), which adds the LilyGo T-Display P4 (RISC-V) and touch as a mouse: they need v0.6.0-dev1 firmware on the device and, to build, the scripts in [meshpunk-dev](https://github.com/PhilMo6/meshpunk-dev). Everything else is true of both releases.
 
 **Contents:** [Overview](#overview) · [Before you start](#before-you-start) · [The module contract](#the-module-contract) · [Writing the module](#writing-the-module) · [Building the module](#building-the-module) · [The launcher app](#the-launcher-app) · [Controls](#controls) · [Testing on hardware](#testing-on-hardware) · [Publishing to the App Library](#publishing-to-the-app-library) · [Release checklist](#release-checklist) · [Key files](#key-files)
 
@@ -23,9 +23,9 @@ You build the module on a PC with the same scripts the bundled games use, and th
 
 **What you need**
 
-- **The firmware repo.** Clone [PhilMo6/meshpunk](https://github.com/PhilMo6/meshpunk) (stable) or [PhilMo6/meshpunk-dev](https://github.com/PhilMo6/meshpunk-dev) (newest). Put your module in `modules/<name>/` beside the bundled ones; the build scripts expect that layout. (Coming) The next scripts also read `src/elf_host.cpp` from there to check your imports.
-- **The apps repo, if you will publish.** Clone [PhilMo6/meshpunk-apps](https://github.com/PhilMo6/meshpunk-apps) beside the firmware folder. Scripts such as `modules/doom/build.ps1` copy their output to `..\..\..\meshpunk-apps\apps\<App>\`.
-- **PlatformIO.** Building the firmware once (`pio run` in its folder) installs `toolchain-xtensa-esp32s3` (GCC 8.4.0, esp-2021r2-patch5) under `%USERPROFILE%\.platformio\packages\`. One catch on a fresh machine: the firmware's `platformio.ini` pins `toolchain-riscv32-esp` to the copy the P4 project installs under `%USERPROFILE%\.platformio\tools\`, so build `p4/` once before any S3 environment. That build also brings the P4's `toolchain-riscv32-esp` (GCC 14.2.0).
+- **The firmware repo.** Clone [PhilMo6/meshpunk](https://github.com/PhilMo6/meshpunk) (stable) or [PhilMo6/meshpunk-dev](https://github.com/PhilMo6/meshpunk-dev) (newest). Put your module in `modules/<name>/` beside the bundled ones; the build scripts expect that layout. (Dev) The meshpunk-dev scripts also read `src/elf_host.cpp` from there to check your imports.
+- **The apps repo, if you will publish.** Clone [PhilMo6/meshpunk-apps](https://github.com/PhilMo6/meshpunk-apps) beside the firmware folder. Scripts such as `modules/doom/build.ps1` copy their output to `..\..\..\meshpunk-apps\apps\<App>\`. (Dev) The meshpunk-dev scripts copy to `..\..\..\meshpunk-apps-dev\apps\<App>\` instead, so clone [PhilMo6/meshpunk-apps-dev](https://github.com/PhilMo6/meshpunk-apps-dev) there too.
+- **PlatformIO.** Building the firmware once (`pio run` in its folder) installs `toolchain-xtensa-esp32s3` (GCC 8.4.0, esp-2021r2-patch5) under `%USERPROFILE%\.platformio\packages\`. One catch on a fresh machine: the firmware's `platformio.ini` pins `toolchain-riscv32-esp` to the copy the P4 project installs under `%USERPROFILE%\.platformio\tools\`, so build `p4/` once before any S3 environment, from PowerShell or cmd: the P4 platform's ESP-IDF tool installer refuses to run under Git Bash or another MSYS shell. That build also brings the P4's `toolchain-riscv32-esp` (GCC 14.2.0), which `build.ps1 -Arch rv32` runs from `%USERPROFILE%\.platformio\packages\toolchain-riscv32-esp\bin`.
 - **Windows PowerShell.** Run a script as `powershell -ExecutionPolicy Bypass -File .\build.ps1`, because Windows refuses unsigned scripts by default. On Linux or macOS, copy the flags into a shell script; the compilers have the same names.
 - **A device and a microSD card.** Game data, saves and large assets live on the card.
 
@@ -33,12 +33,12 @@ You build the module on a PC with the same scripts the bundled games use, and th
 
 | Board | Chip, PSRAM | Module file | Input while a module runs | Module audio | Firmware |
 | --- | --- | --- | --- | --- | --- |
-| LilyGo T-Deck / T-Deck Plus | ESP32-S3 (Xtensa), 8 MB | `<name>.app.elf` | keyboard, trackball, touch | speaker or USB audio | stable (v0.5.0) |
-| Heltec V4-R8 | ESP32-S3, 8 MB | `<name>.app.elf` | touch pad, IO button | USB audio adapter only; the buzzer plays tones | stable (v0.5.0) |
-| Seeed Wio Tracker L2 | ESP32-S3, 8 MB | `<name>.app.elf` | touch pad, WAKE button | speaker or USB audio | stable (v0.5.0) |
-| LilyGo T-Display P4 | ESP32-P4 (RISC-V), 32 MB | `<name>.app.rv32.elf` | touch, BOOT button | speaker | coming (development tree, no release yet) |
+| LilyGo T-Deck / T-Deck Plus | ESP32-S3 (Xtensa), 8 MB | `<name>.app.elf` | keyboard, trackball, touch | speaker or USB audio | stable v0.5.0, dev v0.6.0-dev1 |
+| Heltec V4-R8 | ESP32-S3, 8 MB | `<name>.app.elf` | touch pad, IO button | USB audio adapter only; the buzzer plays tones | stable v0.5.0, dev v0.6.0-dev1 |
+| Seeed Wio Tracker L2 | ESP32-S3, 8 MB | `<name>.app.elf` | touch pad, WAKE button | speaker or USB audio | stable v0.5.0, dev v0.6.0-dev1 |
+| LilyGo T-Display P4 | ESP32-P4 (RISC-V), 32 MB | `<name>.app.rv32.elf` | touch, BOOT button | speaker | dev v0.6.0-dev1 |
 
-Every board gives a module the same 320x240 RGB565 screen, so one source tree serves all of them. The three S3 boards run the same `.app.elf`. The P4 needs a RISC-V build: the App Library catalog already carries per-device file lists for it (`files_rv32`), but the P4 firmware itself has not been released.
+Every board gives a module the same 320x240 RGB565 screen, so one source tree serves all of them. The three S3 boards run the same `.app.elf`. (Dev) The P4 needs a RISC-V build of the same source, `<name>.app.rv32.elf`, published beside the Xtensa one (`files_rv32`, see Publishing to the App Library).
 
 ## The module contract
 
@@ -47,11 +47,12 @@ A module is an ELF shared object whose entry point is `int main(int argc, char**
 **What the loader accepts**
 
 - Type `ET_DYN`, linked with `-shared -fPIC -nostartfiles -nodefaultlibs -nostdlib -Wl,-e,main`.
-- Relocations: Xtensa `NONE`, `32`, `RTLD`, `GLOB_DAT`, `JMP_SLOT` and `RELATIVE`. (Coming) RISC-V `NONE`, `32`, `RELATIVE` and `JUMP_SLOT`. Any other type fails the load.
+- Relocations: Xtensa `NONE`, `32`, `RTLD`, `GLOB_DAT`, `JMP_SLOT` and `RELATIVE`. (Dev) RISC-V `NONE`, `32`, `RELATIVE` and `JUMP_SLOT`. Any other type fails the load.
 - Weak undefined symbols, which resolve to NULL.
-- An optional `.iram.text` section, copied into internal SRAM on the S3 boards (see Writing the module).
+- An optional `.iram.text` section, copied into internal SRAM on the S3 boards (see Writing the module). (Dev) On the P4 it stays where it was loaded, in PSRAM.
+- (Dev) An ELF header and program header table that lie within the file's first 1,024 bytes: the firmware sizes the module's memory block from them before it reads the whole file. A normal link puts both at the start.
 
-(Coming) On the P4, a module built for Xtensa is refused with `module built for another CPU`.
+(Dev) On the P4, a module built for Xtensa is refused with `module built for another CPU`.
 
 **What the loader does not do**
 
@@ -63,7 +64,7 @@ A module is an ELF shared object whose entry point is `int main(int argc, char**
 
 1. The launcher calls `_launch_elf(path, args...)`. The call only records the request: up to 16 arguments of up to 255 characters each.
 2. The firmware closes the whole Lua state and frees its memory, so the module gets the PSRAM the interface was using.
-3. It reads the file, stops LVGL, relaxes both watchdogs, clears the screen and forces landscape. It reads the host flags `-keymap`, `-trkball`, `-kbtoggle` and `-stackkb` from argv; your module receives them too and must skip them. (Coming) On the P4 it swaps `.elf` for `.rv32.elf` before reading.
+3. It reads the file, stops LVGL, relaxes both watchdogs, clears the screen and forces landscape. It reads the host flags `-keymap`, `-trkball`, `-kbtoggle` and `-stackkb` from argv; your module receives them too and must skip them. (Dev) On the P4 it swaps `.elf` for `.rv32.elf` before reading; `argv[0]` stays the name the launcher passed.
 4. `main` runs on a new task on Core 0 with a 64 KB stack in internal RAM, falling back to 48 and then 32 KB. `-stackkb N` (16 to 64) caps the first try at N KB.
 5. A task on Core 1 samples the keyboard at 100 Hz and the trackball and touch at about 33 Hz, and queues key events for `host_get_key`.
 6. When `main` returns, the firmware closes the sockets and files you left open (up to 16 files are tracked), frees leaked `malloc` blocks, stops leftover worker tasks, unloads the module, and rebuilds Lua and the launcher.
@@ -99,6 +100,7 @@ void     host_sleep_ms(uint32_t ms);
 int      host_get_key(int* pressed, unsigned char* key);
 void     host_trackball_read(int* dx, int* dy, int* click);
 int      host_trackball_button(void);
+int      host_touch_read(int* x, int* y, int* downs);  /* (Dev) touch as a mouse */
 int      host_key_mods(void);               /* bit 0 Shift, 1 Alt, 2 Sym */
 void     host_kb_blink(void);
 int      host_should_exit(void);
@@ -173,6 +175,7 @@ int main(int argc, char** argv) {
 - Pixels are RGB565 with the two bytes swapped: store `(c >> 8) | (c << 8)`. For a palette game, convert through a swapped 256-entry table, as `modules/nes/osd_tdeck.c` does.
 - `host_blit_rect(px, x, y, w, h)` pushes a strip at absolute coordinates. The `_async` forms push from Core 1 while you draw into a second buffer; alternate two buffers and call `host_blit_wait()` before freeing either.
 - There is no DMA on the shared bus. A 256x224 frame costs about 18 ms of Core 1 time on the T-Deck (11.5 ms of wire time at 80 MHz, at about 65% driver efficiency), so budget about 20 ms for a full 320x200 frame.
+- (Dev) The T-Display P4's screen is 616x284, each pixel a 2x2 block of the panel's, and the 320x240 module screen sits in its middle. `host_blit_frame` centers a frame there as on every board, and `host_blit_rect_async` takes coordinates on the 320x240 module screen. `host_blit_rect` takes coordinates on the whole 616x284 screen, so a strip meant for the module screen lands above and left of it: push strips with `host_blit_rect_async`.
 
 ### Input
 
@@ -196,9 +199,11 @@ int main(int argc, char** argv) {
 
 Give each game action a fixed code and let the launcher bind keys to it (see Controls). `0xFF` (quit) and `0xFD` (screenshot) are reserved; the firmware swallows them.
 
-- **Pointer.** `host_trackball_read(&dx, &dy, &click)` returns raw motion. The first call switches the trackball to raw mode for the rest of the run, so it stops sending `0x81`-`0x85`. A USB mouse's motion lands in the same counters.
+- **Pointer.** `host_trackball_read(&dx, &dy, &click)` returns raw motion. The first call switches the trackball to raw mode for the rest of the run, so it stops sending `0x81`-`0x85`. A USB mouse's motion lands in the same counters. (Dev) A call made while the module's latest `host_touch_read` reported a mouse mode does not switch on raw mode, so a module that reads the trackball only in the mouse modes gets its arrow keys back when the user leaves them.
 - `host_trackball_button()` is the live trackball press level, and `host_key_mods()` returns the live modifiers (bit 0 Shift, bit 1 Alt, bit 2 Sym). `modules/dos/dos_input.c` turns all three into a PS/2 mouse.
-- **Touch.** A module never sees touch coordinates. The launcher hands the firmware a layout of rectangles that each send one of your codes, with several held at once. A pointer-driven game on a touch board therefore needs a cursor moved by keys.
+- **Touch.** Outside the mouse modes below, a module never sees touch coordinates. The launcher hands the firmware a layout of rectangles that each send one of your codes, with several held at once (see Controls).
+- (Dev) **Touch as a mouse.** `host_touch_read(&x, &y, &downs)` returns -1 unless the user has switched touch to MOUSE, where the whole screen is the pointer, or MOUSE PAD, where a second pad layout from the launcher works and the touch between its pads is the pointer. In those modes it returns how many fingers are on the pointer area. `x`, `y` is the first of them in 320x240 module coordinates (or where the last one lifted), and `downs` counts touch-downs since the previous call, so a tap shorter than your poll interval still registers.
+- (Dev) The first `host_touch_read` call adds the two modes to the touch-mode cycle, so make it as soon as the game wants a pointer; `host_touch_read(NULL, NULL, NULL)` works. In both modes the trackball sends no arrow keys and its motion is left for `host_trackball_read`. A module that imports `host_touch_read` needs `min_fw = 16`. `modules/pyxel/src/input.c` puts the pointer under the finger; `modules/dos/dos_input.c` turns touch into touchpad gestures for a PS/2 mouse.
 
 ### Sound
 
@@ -219,7 +224,7 @@ Give each game action a fixed code and let the launcher bind keys to it (see Con
 
 ### Memory
 
-- `malloc`, `calloc`, `realloc` and `free` come from PSRAM (8 MB on the S3 boards, shared with the firmware). The host frees anything you leak, and the launch log prints free PSRAM and the largest block.
+- `malloc`, `calloc`, `realloc` and `free` come from PSRAM, shared with the firmware: 8 MB on the S3 boards, (Dev) 32 MB on the P4. The host frees anything you leak, and the launch log prints free PSRAM and the largest block.
 - Code, data and `.bss` load as one contiguous PSRAM block. Allocate multi-megabyte buffers with `malloc` at startup rather than as static arrays, which inflate that one block.
 - Internal RAM is scarce. `host_malloc_internal(size)` is for structures of a few hundred bytes touched constantly, and may return NULL. Your 64 KB task stack is internal RAM too, so hot line buffers can live there.
 
@@ -237,12 +242,12 @@ Give each game action a fixed code and let the launcher bind keys to it (see Con
 
 ## Building the module
 
-Start from the build script of the module closest to yours and edit its source lists. `modules/dos/build.ps1` is the most complete template: hidden visibility, dead-code removal, `-lgcc` after the objects, and an `.iram.text` audit. `modules/doom/build.ps1` is the plainest C game port. Each script compiles changed sources into `obj\`, links `<name>.app.elf`, then lists every undefined symbol for you to check against `host_exports[]`. (Coming) The next scripts do that comparison themselves, mark misses with `<-- NOT IN host_exports[]`, and add `-Arch rv32` for the P4.
+Start from the build script of the module closest to yours and edit its source lists. `modules/dos/build.ps1` is the most complete template: hidden visibility, dead-code removal, `-lgcc` after the objects, and an `.iram.text` audit. `modules/doom/build.ps1` is the plainest C game port. Each script compiles changed sources into `obj\`, links `<name>.app.elf`, then lists every undefined symbol for you to check against `host_exports[]`. (Dev) The meshpunk-dev game scripts do that comparison themselves, mark a miss with `<-- NOT IN host_exports[]` (Pyxel's script: `<-- NOT EXPORTED`), and take `-Arch rv32` to build `<name>.app.rv32.elf` for the P4, with its objects in `obj-rv32\`.
 
 ```powershell
 cd modules\mygame
 powershell -ExecutionPolicy Bypass -File .\build.ps1             # <name>.app.elf for the S3 boards
-# Coming: powershell -ExecutionPolicy Bypass -File .\build.ps1 -Arch rv32  -> <name>.app.rv32.elf for the P4
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Arch rv32  # (Dev) <name>.app.rv32.elf for the P4
 ```
 
 **Flags and why they are there**
@@ -255,17 +260,18 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1             # <name>.app.el
 | `-fvisibility=hidden` and `-Wl,-Bsymbolic` | Internal globals bind directly instead of through the GOT; only host imports stay dynamic. About 10% smaller on the NGPC module. |
 | `-ffunction-sections -fdata-sections -Wl,--gc-sections` | Drops unused code and data. |
 | `-Wl,-z,nocombreloc` (Xtensa) | Without it, any code change can trip an assert in the Xtensa linker (`elf32-xtensa.c:3288`). |
-| `-Wl,--no-relax` | Xtensa relaxation in this binutils is unreliable. (Coming) The RISC-V build compiles with `-mno-relax` for the same reason. |
+| `-Wl,--no-relax` | Xtensa relaxation in this binutils is unreliable. (Dev) The RISC-V build also compiles with `-mno-relax`. |
 | `-lgcc` after the objects (Xtensa) | Links 64-bit and soft-float helpers into the module. Placed before the objects it pulls nothing, and the helpers must then be host exports. |
 | `-DNDEBUG` | `assert()` would import `__assert_func`, which is not exported. |
-| (Coming) `-march=rv32imafc_zicsr_zifencei -mabi=ilp32f -mno-relax`, no `-lgcc` (RISC-V) | Matches the P4 firmware. Its `libgcc.a` is not position-independent, so every helper must be a host export. |
+| (Dev) `-march=rv32imafc_zicsr_zifencei -mabi=ilp32f` (RISC-V) | The P4 firmware's instruction set and float ABI. |
+| (Dev) no `-lgcc` (RISC-V) | The toolchain's `libgcc.a` is not position-independent, so every helper the compiler calls must be a host export; the build's symbol check names any that are not. |
 
 **Check the output before you copy it**
 
 1. Look for the success line, such as `Success: doom.app.elf (624.8 KB)`.
-2. Read the undefined-symbol list under it and find every name in `host_exports[]` in `src/elf_host.cpp`. A name that is not there means the device will refuse the module. Avoid that call, implement it in your module, or ask for a new export, which needs a firmware release and a higher `min_fw`. (Coming) The next scripts print `<-- NOT IN host_exports[]` after such a name, and the RISC-V build stops on one.
-3. Check by hand with `xtensa-esp32s3-elf-readelf -W --dyn-syms mygame.app.elf`, looking at the `UND` rows.
-4. After editing a shared header, delete `obj\` and rebuild. The scripts recompile a source only when it is newer than its object; `dos/build.ps1` also checks the newest header.
+2. Read the undefined-symbol list under it and find every name in `host_exports[]` in `src/elf_host.cpp`. A name that is not there means the device will refuse the module. Avoid that call, implement it in your module, or ask for a new export, which needs a firmware release and a higher `min_fw`. (Dev) The meshpunk-dev scripts print `<-- NOT IN host_exports[]` after such a name, and the RISC-V build stops on one.
+3. Check by hand with `xtensa-esp32s3-elf-readelf -W --dyn-syms mygame.app.elf` (`riscv32-esp-elf-readelf` for the `.rv32.elf`), looking at the `UND` rows.
+4. After editing a shared header, delete `obj\` (and `obj-rv32\`) and rebuild. The scripts recompile a source only when it is newer than its object; `dos/build.ps1` also checks the newest header.
 5. Compare the new file with the old one (`fc /b old.elf new.elf`). Identical bytes after a source edit mean your change never reached the binary.
 
 Keep `.ps1` files ASCII-only. Windows PowerShell 5.1 reads a script without a byte-order mark as Windows-1252, so an em dash or a curly quote breaks the parser far from the real line.
@@ -280,7 +286,8 @@ The launcher is an ordinary Meshpunk Lua app: its `main.lua` draws the menu, sto
 Games/MyGame/
   main.lua             launcher (a folder with main.lua is an app)
   readme.lua           help page for the Read Me app
-  mygame.app.elf       the module (Coming: a mygame.app.rv32.elf beside it for the P4)
+  mygame.app.elf       the module for the S3 boards
+  mygame.app.rv32.elf  (Dev) the module for the P4
   controls.cfg         written by the launcher at run time
 ```
 
@@ -305,7 +312,7 @@ local function to_vfs_path(p)
 end
 ```
 
-The `.elf` path itself stays in drive form. (Coming) On the P4 the firmware swaps `.elf` for `.rv32.elf`, so one launcher serves every board.
+The `.elf` path itself stays in drive form. (Dev) On the P4 the firmware swaps `.elf` for `.rv32.elf`, so one launcher serves every board. `_elf_arch_path(path)` returns the file the device will open, for a launcher that checks the module is installed.
 
 **Launching**
 
@@ -326,7 +333,8 @@ playBtn:onClicked(function()
         if km then args[#args + 1] = "-keymap"; args[#args + 1] = km end
         if _elf_touch_layout and pad then         -- touch boards
             local tl = pad:zones()
-            if tl then _elf_touch_layout(tl) end
+            local mtl = mpad and mpad:zones()     -- (Dev) the mouse pad layout
+            if tl or mtl then _elf_touch_layout(tl, mtl) end
         end
         _launch_elf(table.unpack(args))
     end }
@@ -378,11 +386,14 @@ If the game needs real text entry, such as save names, pass `-kbtoggle 1`. Alt+E
 
 **Touch pads (lib/padlayout)**
 
-- A preset is a list of zones `{ id, out, label, x, y, w, h }` in 320x240 screen coordinates: up to 48 zones, labels up to 7 characters. The panel sets how many fingers count at once: five on the T-Deck and Wio L2 (GT911), two on the Heltec (CHSC6X).
+- A preset is a list of zones `{ id, out, label, x, y, w, h }` in 320x240 screen coordinates: up to 48 zones, labels up to 7 characters. The panel sets how many fingers count at once: five on the T-Deck and Wio L2 (GT911), two on the Heltec (CHSC6X), and (Dev) five on the P4 (the firmware reads five of the ten its GT9895 reports).
+- (Dev) On a wider screen, such as the P4's 616x284, pads within 12 pixels of each other move as a group to their side's screen edge, so they sit beside the centered game picture. A group on the left half of the preset stays left and one on the right half moves right; vertically it keeps to its third of the screen (top, middle or bottom). Edits are saved in that screen's pixels.
 - Add your own QUIT zone with `out = keybind.QUIT`; the firmware fires it only after a 0.6 s hold. A Screenshot pad is added to every preset for you.
 - `pad:open{ show_screen, font, accent, on_back }` is the editor where the user drags, resizes or turns off pads. Edits are saved in `L:/touch_layouts/<app>.cfg` by zone id, so changing out codes later keeps them.
 - Feature-check both halves, because a store app can land on older firmware: `pcall(require, "lib/padlayout")`, then `if _elf_touch_layout and pad then`. Call `_elf_touch_layout(pad:zones())` before every `_launch_elf`.
-- During play, the board's button or Shift+Alt cycles touch mode: off, pad, pad with labels hidden, on-screen keyboard. The keyboard sends plain ASCII to your module.
+- (Dev) For a module that reads touch as a mouse, a second `padlayout.new{ app = "MyGame_mouse", ... }` with its own editor button gives MOUSE PAD mode its pads. Pass its zones as the second table, `_elf_touch_layout(pad:zones(), mpad:zones())`, as the launch code above does; older firmware ignores the second table. The DOS and Pyxel launchers in meshpunk-apps-dev do this.
+- During play, the board's button or Shift+Alt cycles touch mode: off, pad, pad with labels hidden, on-screen keyboard, then (Dev) mouse and mouse pad for a module that has called `host_touch_read`. Modes with nothing to arm are skipped, such as mouse pad when the launcher passed no mouse pad layout. The keyboard sends plain ASCII to your module.
+- (Dev) Each change shows the new mode's name in the middle of the screen for 1.5 s. On the P4 the button is BOOT, which does nothing while Ethernet is on, because the Ethernet port uses its pin.
 
 ## Testing on hardware
 
@@ -412,18 +423,29 @@ offset = PC - 0x06000000 - bias          (bias from the load-base line)
 xtensa-esp32s3-elf-addr2line -f -C -e mygame.app.elf 0x<offset>
 ```
 
-Cause 28 (LoadProhibited) and 29 (StoreProhibited) are bad pointers, often NULL plus a small offset in `excvaddr`. Cause 3 (LoadStoreError) is a byte or halfword access to instruction RAM. (Coming) The P4 build has no module fault hook yet, so faults there go to the standard ESP-IDF panic output.
+Cause 28 (LoadProhibited) and 29 (StoreProhibited) are bad pointers, often NULL plus a small offset in `excvaddr`. Cause 3 (LoadStoreError) is a byte or halfword access to instruction RAM.
+
+**Reading a crash (P4)** (Dev)
+
+The P4 build has no module fault hook: a fault prints the standard ESP-IDF panic report (`Guru Meditation Error`, then a register dump) and the device restarts. The P4 runs module code at the address it was loaded to, so the `MEPC` value needs only the bias taken off:
+
+```text
+offset = MEPC - bias                     (bias from the load-base line)
+riscv32-esp-elf-addr2line -f -C -e mygame.app.rv32.elf 0x<offset>
+```
 
 **Habits that save time**
 
 - Keep a perf line: `host_log` frames per second, audio samples delivered and the worst frame gap every 5 s. Remove it before release.
 - `host_check_heap("tag")` prints the stack headroom and both heaps' integrity, which narrows a corruption to the step that caused it.
-- A USB device in host mode (gamepad, mouse, audio) takes over the USB port, so serial output stops. Test with serial first, then with accessories.
-- Test on each board you claim. The T-Deck has a keyboard and trackball; the Heltec and Wio L2 have only touch and one button.
+- A USB device in host mode (gamepad, mouse, audio) takes over the USB port, so serial output stops. Test with serial first, then with accessories. (Dev) On the P4 the USB-A socket is separate from the serial port, so the log keeps running.
+- Test on each board you claim. The T-Deck has a keyboard and trackball; the Heltec, the Wio L2 and (Dev) the P4 have only touch and one button, and the P4's wider screen moves the pads.
 
 ## Publishing to the App Library
 
 The App Library downloads `catalog.toml` from [meshpunk-apps](https://github.com/PhilMo6/meshpunk-apps) over WiFi and installs every file an entry lists; an app exists for devices only once its entry is merged. You publish by pull request with three parts: the app files under `apps/<id>/`, the module's full source under `module-src/<name>/`, and the catalog entry.
+
+(Dev) A dev firmware, and so every P4, opens the Dev catalog, [meshpunk-apps-dev](https://github.com/PhilMo6/meshpunk-apps-dev), and a button in the App Library switches catalogs. Every app change lands there first; an entry moves to meshpunk-apps once it is tested on the boards it supports and its `min_fw` is no higher than the stable firmware's level.
 
 ```toml
 [[apps]]
@@ -436,6 +458,7 @@ description = "One line shown in the App Library"
 category = "Games"
 min_fw = 9                      # 15 if the launcher uses lib/filepick, as the GameBoy template does
 files = ["readme.lua", "main.lua", "mygame.app.elf"]
+files_rv32 = ["mygame.app.rv32.elf"]  # (Dev) the P4 build
 ```
 
 **Entry rules**
@@ -445,7 +468,8 @@ files = ["readme.lua", "main.lua", "mygame.app.elf"]
 - Updates overwrite in place, so `controls.cfg` and saves in the app folder survive; files you drop from `files` stay behind on devices.
 - Bump the version once per release. Further changes before it is merged ride in the same version.
 - `drivers = ["gamepad"]` installs USB drivers alongside the app.
-- (Coming) `files_rv32 = [...]` names the P4 build's files; a P4 device downloads that list instead of the Xtensa modules.
+- (Dev) `files_rv32` lists files only a P4 downloads, on top of `files`. A P4 skips the Xtensa modules in `files` (`*.app.elf`, `*.drv.elf`, `*.loraproto.elf`, `*.bleproto.elf`), and an S3 board skips every `*.rv32.elf`. Adding `files_rv32` to an entry needs no `min_fw` change.
+- (Dev) `requires = ["xtensa"]` keeps an entry off devices where one of its tokens does not hold. An app with no P4 build needs it, or a P4 installs the launcher without its module. The tokens are `xtensa`, `rv32`, `esp32s3`, `esp32p4`, `board:<name>`, `keyboard`, `touch`, `trackball`, `sound`, `i2s`, `battery`, `mic`, `gps`, `usb_host` and `psram>=N`; `"keyboard|touch"` accepts either, and a token the App Library does not know is not met. An entry with `requires` carries `min_fw = 15` or higher, 16 with `mic`. The rules are in `data/lua/lib/downloader.lua`.
 
 **Choosing min_fw**
 
@@ -453,6 +477,7 @@ A device below `min_fw` shows "Needs FW" instead of Install. Set it to the level
 
 | Feature | Level |
 | --- | --- |
+| (Dev) `host_touch_read`, `_elf_arch_path`, the `mic` token in `requires` | 16 (dev v0.6.0-dev1) |
 | `lib/filepick`, `kb:keymap_string(opts)` | 15 (stable since v0.5.0) |
 | `host_net_*`, `host_udp_*`, `host_tcp_*`, `host_link_dgram_*` | 13 |
 | `lib/padlayout`, `_elf_touch_layout` | 9 |
@@ -461,11 +486,11 @@ A device below `min_fw` shows "Needs FW" instead of Install. Set it to the level
 | `host_spawn_task`, `host_task_join` | 4 |
 | `host_link_*` cable link | 2 |
 
-The stable release v0.5.0 is level 15. To check a module, list its `UND` symbols with `readelf --dyn-syms` and find each one in `git show v0.5.0:src/elf_host.cpp`. Link `-lgcc` after your objects so libgcc helpers added since the release are never imported.
+The stable release v0.5.0 is level 15, and (Dev) v0.6.0-dev1 is level 16. To check a module, list its `UND` symbols with `readelf --dyn-syms` and find each one in `git show v0.5.0:src/elf_host.cpp` (stable repo) or `git show v0.6.0-dev1:src/elf_host.cpp` (meshpunk-dev). Link `-lgcc` after your objects so libgcc helpers added since the release are never imported.
 
 **Source, licenses and credits**
 
-- Copy the module's whole tree (sources, `build.ps1`, license files, the built `.elf`) to `module-src/<name>/`. Most engines are copyleft, and the source has to travel with the binary the store distributes.
+- Copy the module's whole tree (sources, `build.ps1`, license files, the built `.elf` files) to `module-src/<name>/`. Most engines are copyleft, and the source has to travel with the binary the store distributes.
 - Keep upstream code in its own folder with a `VENDOR.md` naming the upstream URL and commit, the licenses and every local edit, and tag each edit `MESHPUNK` in the source. `module-src/dos/tiny386-src/VENDOR.md` is the model.
 - Credit the engine in five places: the launcher's About screen (pointing at `module-src/<name>`), the first line of `readme.lua`, the license files in the module tree, `VENDOR.md`, and the firmware README's Credits list (ask Phil to add it).
 - Never ship copyrighted game data. Say "supply your own" and look for the files on the card.
@@ -476,13 +501,15 @@ The stable release v0.5.0 is level 15. To check a module, list its `UND` symbols
 - [ ] The module's undefined-symbol list contains only names that are in `host_exports[]`, for each architecture you ship.
 - [ ] `main` polls `host_should_exit()`, yields every frame and returns 0; `exit()` and `abort()` are trapped.
 - [ ] Worker tasks are joined, pull audio is unregistered and async blits are waited on before anything is freed.
-- [ ] Tested on every board you claim: keyboard and trackball on the T-Deck, touch pad and QUIT hold on the Heltec V4 or Wio L2.
+- [ ] Tested on every board you claim: keyboard and trackball on the T-Deck, touch pad and QUIT hold on the Heltec V4 or Wio L2, (Dev) the `.rv32.elf` on the T-Display P4.
 - [ ] The launcher makes one root with `apps.new_root`, saves settings before `_launch_elf`, converts paths to `/sd/...` and leaves with `apps.go_home()`.
 - [ ] keybind actions have sensible defaults, and the pad preset has a QUIT zone; both are feature-checked.
+- [ ] (Dev) A module that calls `host_touch_read` has `min_fw = 16`, and MOUSE (and MOUSE PAD, when the launcher passes its layout) were tried on a touch board.
 - [ ] `readme.lua` reads correctly on keyboard and touch devices and is in `files`.
 - [ ] The About screen and the first line of `readme.lua` credit the engine and point at `module-src/<name>`.
-- [ ] `module-src/<name>/` holds the full tree, license files, `VENDOR.md` and an `.elf` byte-identical to the one in `apps/<id>/`.
+- [ ] `module-src/<name>/` holds the full tree, license files, `VENDOR.md` and `.elf` files byte-identical to the ones in `apps/<id>/`.
 - [ ] The catalog entry lists every file, has a new version, and its `min_fw` was checked against the release tag.
+- [ ] (Dev) The P4 build is in `files_rv32`, or `requires = ["xtensa"]` keeps the entry off the P4.
 - [ ] Perf lines and debug logging are removed.
 - [ ] No copyrighted game data is anywhere in the pull request.
 
@@ -492,16 +519,20 @@ The stable release v0.5.0 is level 15. To check a module, list its `UND` symbols
 | --- | --- |
 | `src/elf_host.h` | The older `host_*` prototypes; the full set is in Writing the module |
 | `src/elf_host.cpp` | `host_exports[]`, the input task, blit paths, launch and cleanup |
-| `lib/elf_loader/elf_loader.c` | Accepted relocations and `.iram.text` (Coming: the P4 cache sync) |
+| `lib/elf_loader/elf_loader.c` | Accepted relocations, `.iram.text` and (Dev) the P4 cache sync |
 | `src/version.h` | `FW_API` history: what each level added, the basis for `min_fw` |
+| `src/input/input_ui.h` | The touch modes, (Dev) the two mouse modes included |
 | `src/display/display_dev.h` | The 320x240 module video contract |
 | `src/usb/usb_drv_hid.cpp` | Key codes a USB keyboard sends |
 | `modules/test_elf/` | The smallest module: a test pattern and an exit wait |
 | `modules/doom/` | A plain C game port: exit trap, color conversion, push audio, OPL music |
-| `modules/dos/` | The fullest build script, mouse emulation and PC scancodes (`dos_input.c`) |
+| `modules/dos/` | The fullest build script, mouse emulation and PC scancodes (`dos_input.c`); (Dev) touchpad gestures from `host_touch_read` |
 | `modules/jet3d/` | A C++ module that runs its own static constructors |
+| `modules/pyxel/` | (Dev) Touch as a pointer under the finger (`src/input.c`) |
 | `data/lua/lib/apps.lua` | The app contract: `new_root`, `go_home`, `delete_view`, phased init |
 | `data/lua/lib/keybind.lua`, `padlayout.lua`, `fileman.lua` | Launcher libraries for bindings, touch pads and file listing |
+| `data/lua/lib/downloader.lua` | (Dev) `files_<target>` and the `requires` tokens |
 | `meshpunk-apps/apps/GameBoy/` | The reference launcher and `readme.lua` |
+| `meshpunk-apps-dev/apps/Dos/`, `apps/Pyxel/` | (Dev) Launchers that pass a mouse pad layout |
 | `meshpunk-apps/README.md`, `catalog.toml` | Catalog fields and every published entry |
 | `meshpunk-apps/module-src/` | Published module sources and their `VENDOR.md` files |
